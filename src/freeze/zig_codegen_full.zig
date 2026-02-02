@@ -51,9 +51,9 @@ const ENABLE_NATIVE_LOOPS = false;
 // Dispatch table threshold: functions with more than this many blocks use
 // runtime dispatch tables instead of compile-time switch statements.
 // This avoids hitting Zig's comptime eval branch quota for large functions.
-// Set to 0 to use dispatch tables for ALL functions - this prevents
-// comptime monomorphization explosion when freezing large codebases (e.g., TSC with 30k functions).
-const DISPATCH_TABLE_THRESHOLD: usize = 0;
+// Higher values reduce generated code size but may hit comptime eval limits.
+// NOTE: 10000 effectively disables dispatch tables (uses inline comptime switch)
+const DISPATCH_TABLE_THRESHOLD: usize = 10000;
 
 // Global counter for tracking unsupported opcodes during code generation
 // Used for discovering which opcodes need to be implemented

@@ -1356,7 +1356,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         };
         defer bytecode_file.close();
 
-        const bytecode_content = bytecode_file.readToEndAlloc(allocator, 500 * 1024 * 1024) catch |err| {
+        const bytecode_content = bytecode_file.readToEndAlloc(allocator, 1024 * 1024 * 1024) catch |err| { // 1GB limit
             std.debug.print("[warn] Could not read bundle_original.c: {}\n", .{err});
             break :blk false;
         };
@@ -1520,6 +1520,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
     const cache_prefix_arg = std.fmt.bufPrint(&cache_prefix_arg_buf, "-Dcache-prefix={s}/cache", .{out_prefix}) catch "-Dcache-prefix=zig-out/cache";
 
     const optimize_arg = if (options.debug_build) "-Doptimize=Debug" else "-Doptimize=ReleaseFast";
+    // Use ReleaseSafe for frozen modules to reduce LLVM memory/time pressure
+    // TSC has 138MB+ of frozen code that crashes LLVM with ReleaseFast
+    const frozen_optimize_arg = "-Dfrozen-optimize=ReleaseSafe";
 
     // Step 7: Build WASM static (with host imports for edgebox daemon AOT)
     if (!options.binary_only) {
@@ -1567,11 +1570,11 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
     std.debug.print("[build] Building native binary with embedded bytecode (native)...\n", .{});
     const native_result = if (source_dir_arg.len > 0)
         try runCommand(allocator, &.{
-            "zig", "build", "-j4", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native", optimize_arg, source_dir_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
+            "zig", "build", "-j4", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native", optimize_arg, frozen_optimize_arg, source_dir_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
         })
     else
         try runCommand(allocator, &.{
-            "zig", "build", "-j4", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native", optimize_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
+            "zig", "build", "-j4", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native", optimize_arg, frozen_optimize_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
         });
     defer {
         if (native_result.stdout) |s| allocator.free(s);

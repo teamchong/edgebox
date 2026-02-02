@@ -44,9 +44,10 @@ const RELOOPER_DEBUG = false;
 
 // Dispatch table threshold: functions with more than this many blocks use
 // runtime dispatch tables instead of compile-time switch statements.
-// Set to 0 to use dispatch tables for ALL functions - this prevents
-// comptime monomorphization explosion when freezing large codebases.
-const DISPATCH_TABLE_THRESHOLD: usize = 0;
+// Higher values reduce generated code size but may hit comptime eval limits.
+// Lower values generate more code but avoid comptime explosion.
+// NOTE: 10000 effectively disables dispatch tables (uses inline comptime switch)
+const DISPATCH_TABLE_THRESHOLD: usize = 10000;
 
 // ============================================================================
 // Switch Pattern Detection
