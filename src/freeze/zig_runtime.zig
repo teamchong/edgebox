@@ -166,6 +166,18 @@ pub const jsDupValue = js_ops.jsDupValue;
 pub const getVarRef = js_ops.getVarRef;
 
 // ============================================================================
+// Constructor Call Detection
+// ============================================================================
+
+/// Check if function was called as constructor (with 'new').
+/// In QuickJS, when called as constructor, this_val is new.target (a function).
+/// When called normally, this_val is the actual this value (undefined/object).
+pub inline fn isConstructorCall(ctx: *JSContext, this_val: JSValue) bool {
+    // When called as constructor, this_val is new.target which is a function/constructor
+    return quickjs.JS_IsFunction(ctx, this_val) != 0;
+}
+
+// ============================================================================
 // Strict Equality with FFI for Reference Types
 // ============================================================================
 

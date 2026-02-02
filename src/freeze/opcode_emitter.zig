@@ -791,7 +791,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         // ============================================================
         .check_ctor => {
             try self.flushVstack();
-            try self.writeLine("if (!zig_runtime.isConstructorCall(this_val)) return JSValue.throwTypeError(ctx, \"Constructor requires 'new'\");");
+            try self.writeLine("if (!zig_runtime.isConstructorCall(ctx, this_val)) return JSValue.throwTypeError(ctx, \"Constructor requires 'new'\");");
         },
         .check_ctor_return => {
             try self.flushVstack();
@@ -1124,4 +1124,35 @@ fn findClosureVarPosition(comptime CodeGen: type, self: *CodeGen, bytecode_idx: 
     }
     // Fallback: if not found, use original index (shouldn't happen for valid bytecode)
     return bytecode_idx;
+}
+
+// ============================================================================
+// Shared Return Helpers
+// ============================================================================
+// These helpers provide common patterns for return handling that are shared
+// between codegens (zig_codegen_full.zig and zig_codegen_relooper.zig).
+
+/// Emit cleanup code for locals before function return.
+/// Frees any ref-type locals to prevent memory leaks.
+/// Uses collect-then-free pattern to avoid g_return_slot corruption.
+/// @param indent - indentation prefix for generated code (e.g., "" or "    ")
+pub fn emitLocalsCleanupShared(comptime CodeGen: type, self: *CodeGen, var_count: u16, indent: []const u8) !void {
+    if (var_count == 0) return;
+    // Free all locals that might hold ref types
+    // Collect phase: gather all JSValues first (each toJSValueWithCtx call is safe before any free)
+    // Free phase: then free them all (g_return_slot no longer in use during frees)
+    try self.printLine("{s}// Cleanup locals before return (collect-then-free to avoid g_return_slot corruption)", .{indent});
+    try self.printLine("{s}var _locals_to_free: [{d}]JSValue = undefined;", .{ indent, var_count });
+    try self.printLine("{s}var _locals_free_count: usize = 0;", .{indent});
+    try self.printLine("{s}for (0..{d}) |_loc_i| {{ const _loc_v = locals[_loc_i]; if (_loc_v.isRefType()) {{ _locals_to_free[_locals_free_count] = _loc_v.toJSValueWithCtx(ctx); _locals_free_count += 1; }} }}", .{ indent, var_count });
+    try self.printLine("{s}for (0.._locals_free_count) |_lfi| {{ JSValue.free(ctx, _locals_to_free[_lfi]); }}", .{indent});
+}
+
+/// Emit cleanup code for arg_shadow array before function return.
+/// Frees any ref-type values that were duped at function entry.
+/// @param indent - indentation prefix for generated code
+pub fn emitArgShadowCleanupShared(comptime CodeGen: type, self: *CodeGen, arg_count: anytype, indent: []const u8) !void {
+    for (0..arg_count) |i| {
+        try self.printLine("{s}if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ indent, i, i });
+    }
 }

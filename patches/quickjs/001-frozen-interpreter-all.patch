@@ -145,7 +145,7 @@ index 62f4381..cd5bed3 100644
  #define GLOBAL_VAR_OFFSET 0x40000000
  #define ARGUMENT_VAR_OFFSET 0x20000000
  
-@@ -15598,6 +15640,867 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
+@@ -15598,6 +15640,881 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
      return 0;
  }
  
@@ -207,7 +207,21 @@ index 62f4381..cd5bed3 100644
 +    (void)ctx;
 +    if (!var_refs || idx < 0 || idx >= var_refs_count || !var_refs[idx])
 +        return JS_UNDEFINED;
-+    return js_dup(*var_refs[idx]->pvalue);
++    JSVarRef *var_ref = var_refs[idx];
++    JSValue val = *var_ref->pvalue;
++    /* Debug check for corrupted objects */
++    if (JS_VALUE_GET_TAG(val) == JS_TAG_OBJECT) {
++        JSObject *p = JS_VALUE_GET_OBJ(val);
++        if (!p || !p->shape) {
++            fprintf(stderr, "FROZEN DEBUG: corrupted object in var_ref[%d], pvalue=%p, is_detached=%d, val_tag=%d\n",
++                    idx, (void*)var_ref->pvalue, var_ref->is_detached, JS_VALUE_GET_TAG(val));
++            if (p) {
++                fprintf(stderr, "  obj=%p, shape=%p\n", (void*)p, (void*)p->shape);
++            }
++            abort();
++        }
++    }
++    return js_dup(val);
 +}
 +
 +void js_frozen_set_var_ref_safe(JSContext *ctx, JSVarRef **var_refs, int idx, int var_refs_count, JSValue val)
