@@ -40,8 +40,8 @@ var arena: ?std.heap.ArenaAllocator = null;
 /// Name-based registry: name@line -> FrozenFnPtr (uses wyhash for fast lookups)
 var name_registry: ?hashmap_helper.StringHashMap(FrozenFnPtr) = null;
 
-/// Bytecode pointer registry: *anyopaque -> FrozenFnPtr
-var bytecode_registry: ?std.AutoArrayHashMap(*anyopaque, FrozenFnPtr) = null;
+/// Bytecode pointer registry: *anyopaque -> FrozenFnPtr (uses wyhash for fast lookups)
+var bytecode_registry: ?hashmap_helper.PointerHashMap(*anyopaque, FrozenFnPtr) = null;
 
 /// Initialize the registries with arena allocator
 fn ensureInit() void {
@@ -49,7 +49,7 @@ fn ensureInit() void {
         arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         const alloc = arena.?.allocator();
         name_registry = hashmap_helper.StringHashMap(FrozenFnPtr).init(alloc);
-        bytecode_registry = std.AutoArrayHashMap(*anyopaque, FrozenFnPtr).init(alloc);
+        bytecode_registry = hashmap_helper.PointerHashMap(*anyopaque, FrozenFnPtr).init(alloc);
     }
 }
 
@@ -317,6 +317,13 @@ pub export fn frozen_dispatch_lookup_bytecode(
         result_out.* = func(ctx, this_val, argc, argv, var_refs, closure_var_count, cpool);
     }
     return 1;
+}
+
+/// Get frozen function pointer for a bytecode (for caching in JSFunctionBytecode.frozen_impl)
+/// Called by C after successful dispatch to cache the pointer for fast path
+pub export fn frozen_dispatch_get_impl(bytecode_ptr: *anyopaque) callconv(.c) ?*anyopaque {
+    const func = lookupByBytecode(bytecode_ptr) orelse return null;
+    return @ptrCast(@constCast(func));
 }
 
 /// Get the number of registered frozen functions
