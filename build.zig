@@ -467,7 +467,7 @@ pub fn build(b: *std.Build) void {
                 });
                 shard_mod.addImport("zig_runtime", zig_runtime_mod);
                 shard_mod.addImport("math_polyfill", math_polyfill_mod);
-                shard_mod.addImport("native_dispatch", native_dispatch_mod);
+                // native_dispatch is NOT imported - shards use extern fn native_dispatch_register instead
                 shard_mod.addIncludePath(b.path(quickjs_dir));
 
                 // Create object from module
@@ -661,7 +661,7 @@ pub fn build(b: *std.Build) void {
                 });
                 shard_mod.addImport("zig_runtime", native_zig_runtime_mod);
                 shard_mod.addImport("math_polyfill", native_math_polyfill_mod);
-                shard_mod.addImport("native_dispatch", native_dispatch_mod_static);
+                // native_dispatch is NOT imported - shards use extern fn native_dispatch_register instead
                 shard_mod.addIncludePath(b.path(quickjs_dir));
 
                 // Create object from module and link to main executable
@@ -884,7 +884,7 @@ pub fn build(b: *std.Build) void {
                 });
                 shard_mod.addImport("zig_runtime", embed_zig_runtime_mod);
                 shard_mod.addImport("math_polyfill", embed_math_polyfill_mod);
-                shard_mod.addImport("native_dispatch", embed_native_dispatch_mod);
+                // native_dispatch is NOT imported - shards use extern fn native_dispatch_register instead
                 shard_mod.addIncludePath(b.path(quickjs_dir));
 
                 const shard_obj = b.addObject(.{
@@ -1092,7 +1092,7 @@ pub fn build(b: *std.Build) void {
                 });
                 shard_mod.addImport("zig_runtime", standalone_zig_runtime_mod);
                 shard_mod.addImport("math_polyfill", standalone_math_polyfill_mod);
-                shard_mod.addImport("native_dispatch", standalone_native_dispatch_mod);
+                // native_dispatch is NOT imported - shards use extern fn native_dispatch_register instead
                 shard_mod.addIncludePath(b.path(quickjs_dir));
 
                 const shard_obj = b.addObject(.{

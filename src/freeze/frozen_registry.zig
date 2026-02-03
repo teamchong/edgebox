@@ -765,9 +765,19 @@ pub fn generateModuleZigSharded(
         \\const std = @import("std");
         \\const zig_runtime = @import("zig_runtime");
         \\const math_polyfill = @import("math_polyfill");
-        \\const native_dispatch = @import("native_dispatch");
         \\const JSValue = zig_runtime.JSValue;
         \\const JSContext = zig_runtime.JSContext;
+        \\
+        \\// Extern declarations for native_dispatch functions
+        \\// Using extern instead of @import to avoid compiling native_dispatch's exports into each shard
+        \\const FrozenFnPtr = *const fn (*JSContext, JSValue, c_int, [*]JSValue, ?[*]*zig_runtime.JSVarRef, c_int, ?[*]JSValue) callconv(.c) JSValue;
+        \\extern fn native_dispatch_register(name: [*:0]const u8, func: FrozenFnPtr) void;
+        \\
+        \\// Wrapper namespace for native_dispatch calls in function bodies
+        \\const native_dispatch = struct {
+        \\    pub const registerCpoolBytecodeByName = native_dispatch_registerCpoolBytecodeByName;
+        \\};
+        \\extern fn native_dispatch_registerCpoolBytecodeByName(bfunc: JSValue, name: [*:0]const u8) void;
         \\
         \\// Increase eval quota for large shards (date-fns, etc.)
         \\comptime { @setEvalBranchQuota(1000000); }
@@ -848,46 +858,74 @@ pub fn generateModuleZigSharded(
     // This function registers all functions in the shard with native_dispatch
     // Each shard is compiled as a separate object file, solving the LLVM TU explosion
     for (shard_contents.items, 0..) |*sc, shard_idx| {
-        // Start the init function
-        var init_buf: [256]u8 = undefined; // Increased from 128 to fit header
-        const init_header = std.fmt.bufPrint(&init_buf,
-            \\
-            \\/// Initialize this shard - register all frozen functions with native_dispatch
-            \\/// Called from frozen_module.zig via extern linkage
-            \\pub export fn frozen_init_shard_{d}() callconv(.c) c_int {{
-            \\    var count: c_int = 0;
-            \\
-        , .{shard_idx}) catch continue;
-        try sc.appendSlice(allocator, init_header);
-
-        // Add registration calls for each function in this shard
+        // Count how many registrations this shard will have
+        var shard_reg_count: usize = 0;
         for (generated_funcs.items) |gf| {
             if (gf.shard != shard_idx) continue;
-
             const is_anonymous = std.mem.eql(u8, gf.name, "anonymous");
-
-            // Skip if collides with another function of same name (named) or same line (anonymous)
             if (is_anonymous) {
                 if ((anon_line_counts.get(gf.line_num) orelse 0) > 1) continue;
             } else {
                 if ((name_counts.get(gf.name) orelse 0) > 1) continue;
             }
-
-            var reg_buf: [512]u8 = undefined;
-            const reg_line = std.fmt.bufPrint(&reg_buf,
-                \\    native_dispatch.register("{s}@{d}", &__frozen_{d}_{s});
-                \\    count += 1;
-                \\
-            , .{ gf.name, gf.line_num, gf.idx, gf.sanitized_name }) catch continue;
-            try sc.appendSlice(allocator, reg_line);
+            shard_reg_count += 1;
         }
 
-        // Close the init function
-        try sc.appendSlice(allocator,
-            \\    return count;
-            \\}
-            \\
-        );
+        // Start the init function
+        var init_buf: [256]u8 = undefined;
+        if (shard_reg_count == 0) {
+            // Empty shard - return 0 directly to avoid unused variable warning
+            const init_header = std.fmt.bufPrint(&init_buf,
+                \\
+                \\/// Initialize this shard - no functions to register
+                \\/// Called from frozen_module.zig via extern linkage
+                \\pub export fn frozen_init_shard_{d}() callconv(.c) c_int {{
+                \\    return 0;
+                \\}}
+                \\
+            , .{shard_idx}) catch continue;
+            try sc.appendSlice(allocator, init_header);
+        } else {
+            // Shard has functions - use normal pattern
+            const init_header = std.fmt.bufPrint(&init_buf,
+                \\
+                \\/// Initialize this shard - register all frozen functions with native_dispatch
+                \\/// Called from frozen_module.zig via extern linkage
+                \\pub export fn frozen_init_shard_{d}() callconv(.c) c_int {{
+                \\    var count: c_int = 0;
+                \\
+            , .{shard_idx}) catch continue;
+            try sc.appendSlice(allocator, init_header);
+
+            // Add registration calls for each function in this shard
+            for (generated_funcs.items) |gf| {
+                if (gf.shard != shard_idx) continue;
+
+                const is_anonymous = std.mem.eql(u8, gf.name, "anonymous");
+
+                // Skip if collides with another function of same name (named) or same line (anonymous)
+                if (is_anonymous) {
+                    if ((anon_line_counts.get(gf.line_num) orelse 0) > 1) continue;
+                } else {
+                    if ((name_counts.get(gf.name) orelse 0) > 1) continue;
+                }
+
+                var reg_buf: [512]u8 = undefined;
+                const reg_line = std.fmt.bufPrint(&reg_buf,
+                    \\    native_dispatch_register("{s}@{d}", &__frozen_{d}_{s});
+                    \\    count += 1;
+                    \\
+                , .{ gf.name, gf.line_num, gf.idx, gf.sanitized_name }) catch continue;
+                try sc.appendSlice(allocator, reg_line);
+            }
+
+            // Close the init function
+            try sc.appendSlice(allocator,
+                \\    return count;
+                \\}
+                \\
+            );
+        }
     }
 
     // Convert to output format
@@ -1200,7 +1238,7 @@ pub fn generateModuleZig(
         // Use name@line_num format to match QuickJS dispatch key
         const reg_line = std.fmt.bufPrint(&reg_buf,
             \\    // Register {s}@{d} with native dispatch
-            \\    native_dispatch.register("{s}@{d}", &__frozen_{d}_{s});
+            \\    native_dispatch_register("{s}@{d}", &__frozen_{d}_{s});
             \\    count += 1;
             \\
         , .{ func.name, func.line_num, func.name, func.line_num, idx, sanitized_name }) catch continue;

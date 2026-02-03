@@ -220,21 +220,47 @@ pub fn js_calloc(ctx: ?*anyopaque, count: usize, size: usize) callconv(.c) ?*any
     return ptr;
 }
 
+/// Check if a pointer belongs to any of our arena blocks
+fn isArenaPointer(ptr: *anyopaque) bool {
+    const addr = @intFromPtr(ptr);
+    var block = first_block;
+    while (block) |b| {
+        const block_start = @intFromPtr(b.data.ptr);
+        const block_end = block_start + b.data.len;
+        if (addr >= block_start and addr < block_end) {
+            return true;
+        }
+        block = b.next;
+    }
+    return false;
+}
+
 pub fn js_free(ctx: ?*anyopaque, ptr: ?*anyopaque) callconv(.c) void {
     _ = ctx;
     if (ptr == null) return;
     if (!initialized) return;
 
-    // LIFO optimization: if freeing the last allocation, reclaim space
-    const p: [*]u8 = @ptrCast(ptr.?);
-    const header_ptr = p - HEADER_SIZE;
-    const header: *const Header = @ptrCast(@alignCast(header_ptr));
+    // Guard: ignore pointers not from our arena (e.g., frozen/static data)
+    if (!isArenaPointer(ptr.?)) return;
 
-    const alloc_end = @intFromPtr(header_ptr) - @intFromPtr(heap_base) + HEADER_SIZE + alignUp(header.size);
-    if (alloc_end == heap_ptr) {
-        // This is the last allocation - reclaim it!
-        heap_ptr = @intFromPtr(header_ptr) - @intFromPtr(heap_base);
-        stats_free_reclaimed += 1;
+    // LIFO optimization only works if pointer is in the CURRENT block
+    // (not an older block from before a grow)
+    const addr = @intFromPtr(ptr.?);
+    const current_block_start = @intFromPtr(heap_base);
+    const current_block_end = current_block_start + heap_end;
+
+    // Only attempt LIFO reclaim if pointer is in current block
+    if (addr >= current_block_start + HEADER_SIZE and addr < current_block_end) {
+        const p: [*]u8 = @ptrCast(ptr.?);
+        const header_ptr = p - HEADER_SIZE;
+        const header: *const Header = @ptrCast(@alignCast(header_ptr));
+
+        const alloc_end = @intFromPtr(header_ptr) - @intFromPtr(heap_base) + HEADER_SIZE + alignUp(header.size);
+        if (alloc_end == heap_ptr) {
+            // This is the last allocation - reclaim it!
+            heap_ptr = @intFromPtr(header_ptr) - @intFromPtr(heap_base);
+            stats_free_reclaimed += 1;
+        }
     }
     // Else: "leak" it - we clean up at compilation end via reset()
 }
@@ -247,6 +273,18 @@ pub fn js_realloc(ctx: ?*anyopaque, ptr: ?*anyopaque, new_size: usize) callconv(
     if (ptr == null) return js_malloc(null, new_size);
     if (new_size == 0) return null;
 
+    // Guard: if pointer is not from arena (e.g., frozen/static data),
+    // we can't realloc it - just allocate fresh
+    if (!isArenaPointer(ptr.?)) {
+        return js_malloc(null, new_size);
+    }
+
+    // Check if pointer is in CURRENT block (for LIFO optimizations)
+    const addr = @intFromPtr(ptr.?);
+    const current_block_start = @intFromPtr(heap_base);
+    const current_block_end = current_block_start + heap_end;
+    const in_current_block = (addr >= current_block_start + HEADER_SIZE and addr < current_block_end);
+
     const p: [*]u8 = @ptrCast(ptr.?);
     const header_ptr = p - HEADER_SIZE;
     const header: *Header = @ptrCast(@alignCast(header_ptr));
@@ -254,33 +292,37 @@ pub fn js_realloc(ctx: ?*anyopaque, ptr: ?*anyopaque, new_size: usize) callconv(
 
     // Case B: Shrinking -> just update size
     if (new_size <= old_size) {
-        // If at top of arena, reclaim the extra space
-        const old_end = @intFromPtr(header_ptr) - @intFromPtr(heap_base) + HEADER_SIZE + alignUp(old_size);
-        if (old_end == heap_ptr) {
-            heap_ptr = @intFromPtr(header_ptr) - @intFromPtr(heap_base) + HEADER_SIZE + alignUp(new_size);
+        // If in current block and at top of arena, reclaim the extra space
+        if (in_current_block) {
+            const old_end = @intFromPtr(header_ptr) - @intFromPtr(heap_base) + HEADER_SIZE + alignUp(old_size);
+            if (old_end == heap_ptr) {
+                heap_ptr = @intFromPtr(header_ptr) - @intFromPtr(heap_base) + HEADER_SIZE + alignUp(new_size);
+            }
         }
         header.size = new_size;
         return ptr;
     }
 
-    // Case C: Growing - check if at top of arena (LIFO optimization)
-    const old_end = @intFromPtr(header_ptr) - @intFromPtr(heap_base) + HEADER_SIZE + alignUp(old_size);
-    if (old_end == heap_ptr) {
-        // This is the last allocation! We can grow in-place (zero copy)
-        const extra = alignUp(new_size) - alignUp(old_size);
-        const new_end = heap_ptr + extra;
+    // Case C: Growing - check if at top of arena (LIFO optimization) - only for current block
+    if (in_current_block) {
+        const old_end = @intFromPtr(header_ptr) - @intFromPtr(heap_base) + HEADER_SIZE + alignUp(old_size);
+        if (old_end == heap_ptr) {
+            // This is the last allocation! We can grow in-place (zero copy)
+            const extra = alignUp(new_size) - alignUp(old_size);
+            const new_end = heap_ptr + extra;
 
-        // Ensure capacity
-        if (new_end <= heap_end) {
-            heap_ptr = new_end;
-            header.size = new_size;
-            stats_realloc_inplace += 1;
-            return ptr; // Same pointer, no copy!
+            // Ensure capacity
+            if (new_end <= heap_end) {
+                heap_ptr = new_end;
+                header.size = new_size;
+                stats_realloc_inplace += 1;
+                return ptr; // Same pointer, no copy!
+            }
+            // Fall through to copy path if we can't grow current block
         }
-        // Fall through to copy path if we can't grow current block
     }
 
-    // Case D: Not at top or block full, must copy to new location
+    // Case D: Not at top or block full or in old block, must copy to new location
     const new_ptr = js_malloc(null, new_size) orelse return null;
     const new_slice: [*]u8 = @ptrCast(new_ptr);
     const copy_size = @min(old_size, new_size);
@@ -293,6 +335,9 @@ pub fn js_realloc(ctx: ?*anyopaque, ptr: ?*anyopaque, new_size: usize) callconv(
 pub fn js_malloc_usable_size(ptr: ?*const anyopaque) callconv(.c) usize {
     if (ptr == null) return 0;
     if (!initialized) return 0;
+
+    // Guard: return 0 for non-arena pointers (e.g., frozen/static data)
+    if (!isArenaPointer(@constCast(ptr.?))) return 0;
 
     const p: [*]const u8 = @ptrCast(ptr.?);
     const header: *const Header = @ptrCast(@alignCast(p - HEADER_SIZE));

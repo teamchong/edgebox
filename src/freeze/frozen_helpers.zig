@@ -53,7 +53,7 @@ pub inline fn exitStack() void {
 }
 
 /// Reset call depth (call at start of each request)
-pub export fn frozen_reset_call_depth_zig() void {
+pub fn frozen_reset_call_depth_zig() void {
     frozen_call_depth = 0;
 }
 

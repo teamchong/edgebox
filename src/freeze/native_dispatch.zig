@@ -150,7 +150,8 @@ fn lookupByBytecode(bytecode_ptr: *anyopaque) ?FrozenFnPtr {
 
 /// Register a frozen function in the native registry
 /// Called from frozen_init during startup
-pub fn register(name: [*:0]const u8, func: FrozenFnPtr) void {
+/// Exported as native_dispatch_register for shards to call via extern linkage
+pub fn register(name: [*:0]const u8, func: FrozenFnPtr) callconv(.c) void {
     ensureInit();
     const alloc = arena.?.allocator();
 
@@ -167,6 +168,13 @@ pub fn register(name: [*:0]const u8, func: FrozenFnPtr) void {
     name_registry.?.put(owned_name, func) catch {
         std.debug.print("[native_dispatch] Failed to register: {s}\n", .{name_slice});
     };
+}
+
+// Export functions for shards to call via extern linkage
+// This avoids compiling all of native_dispatch into each shard
+comptime {
+    @export(&register, .{ .name = "native_dispatch_register" });
+    @export(&registerCpoolBytecodeByName, .{ .name = "native_dispatch_registerCpoolBytecodeByName" });
 }
 
 /// Lookup a frozen function by name
