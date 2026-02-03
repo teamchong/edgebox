@@ -336,8 +336,8 @@ pub const global_to_runtime = [_]struct { global: []const u8, module: []const u8
     // host.js
     .{ .global = "HostArray", .module = "src/polyfills/runtime/host.js" },
     .{ .global = "HostMap", .module = "src/polyfills/runtime/host.js" },
-    // tsc.js (TypeScript-specific)
-    .{ .global = "__edgebox_intercept_tsc_factory", .module = "src/polyfills/runtime/tsc.js" },
+    // tsc.js (TypeScript-specific) - triggered by createSourceFile which is TypeScript's main API
+    .{ .global = "createSourceFile", .module = "src/polyfills/runtime/tsc.js" },
 };
 
 /// Runtime module dependencies
