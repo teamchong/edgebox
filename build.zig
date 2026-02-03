@@ -326,7 +326,18 @@ pub fn build(b: *std.Build) void {
 
     // Bytecode embedding options (for universal-runtime and wasm-standalone)
     const bytecode_path = b.option([]const u8, "bytecode", "Path to bytecode file to embed");
-    const runtime_output = b.option([]const u8, "output", "Output binary name");
+    const runtime_output = b.option([]const u8, "output", "Output binary name") orelse blk: {
+        // Derive output name from source file (e.g., _tsc.js -> _tsc)
+        if (source_dir_raw.len > 0) {
+            const basename = std.fs.path.basename(source_dir_raw);
+            // Remove .js extension if present
+            if (std.mem.endsWith(u8, basename, ".js")) {
+                break :blk basename[0 .. basename.len - 3];
+            }
+            break :blk basename;
+        }
+        break :blk null;
+    };
 
     // Allocator type for native binaries (c=fastest, arena=batch, gpa=debug)
     const AllocatorType = enum { c, arena, gpa };
@@ -525,7 +536,7 @@ pub fn build(b: *std.Build) void {
     // For large modules like TypeScript that exceed WAMR limits
     // ===================
     const native_static_exe = b.addExecutable(.{
-        .name = "edgebox-native",
+        .name = runtime_output orelse "edgebox-native",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/native_main_static.zig"),
             .target = target,
