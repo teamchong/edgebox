@@ -46,3 +46,10 @@ int frozen_dispatch_lookup_bytecode(JSContext *ctx, void *bytecode_ptr,
     (void)result_out;
     return 0;  // No frozen function found in CLI mode
 }
+
+// Get frozen function pointer for a bytecode (for caching in JSFunctionBytecode.frozen_impl)
+// Returns NULL - real dispatch is in Zig runtime
+void *frozen_dispatch_get_impl(void *bytecode_ptr) {
+    (void)bytecode_ptr;
+    return NULL;  // No frozen function in CLI mode
+}
