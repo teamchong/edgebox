@@ -211,7 +211,7 @@ pub fn disableDispatch() void {
 ///
 /// This is the hot path - must be as fast as possible
 /// Uses name@line_num format to disambiguate functions with the same name in different scopes
-// Debug counters for frozen dispatch (remove after debugging)
+// Debug counters for frozen dispatch
 var dispatch_hits: usize = 0;
 var dispatch_misses: usize = 0;
 

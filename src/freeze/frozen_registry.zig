@@ -319,7 +319,8 @@ pub fn analyzeModule(
 
         // Self-recursion detection is DISABLED for now.
         // Get function name - must duplicate since parser will be freed
-        const parser_name = parser.getAtomString(func_info.name_atom) orelse "anonymous";
+        // Use getAtomByIndex to properly look up built-in atoms like <eval>
+        const parser_name = parser.getAtomByIndex(func_info.name_atom) orelse "anonymous";
 
         // Skip functions with invalid names (contains spaces, not valid C identifier)
         // These are often error messages that got captured as function names due to QuickJS quirks
@@ -975,10 +976,10 @@ pub fn generateModuleZigSharded(
     // Native registry functions and init
     try main_output.appendSlice(allocator,
         \\
-        \\// Native registry functions (from frozen_runtime.c)
+        \\// Native registry functions (from native_shapes.zig)
         \\extern fn native_registry_init() void;
         \\extern fn native_registry_count() c_int;
-        \\extern fn native_node_register32(js_addr32: u32, kind: i32, flags: i32, pos: i32, end: i32) ?*anyopaque;
+        \\extern fn native_node_register(js_addr: u64, kind: i32, flags: i32, pos: i32, end: i32) ?*anyopaque;
         \\
         \\fn registerNodeImpl(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {
         \\    if (argc < 5) return zig_runtime.JSValue.UNDEFINED;
@@ -992,9 +993,9 @@ pub fn generateModuleZigSharded(
         \\    _ = zig_runtime.quickjs.JS_ToInt32(ctx, &flags, argv[2]);
         \\    _ = zig_runtime.quickjs.JS_ToInt32(ctx, &pos, argv[3]);
         \\    _ = zig_runtime.quickjs.JS_ToInt32(ctx, &end, argv[4]);
-        \\    const ptr_addr = @intFromPtr(obj.getPtr());
-        \\    const addr32: u32 = @truncate(ptr_addr);
-        \\    const node = native_node_register32(addr32, kind, flags, pos, end);
+        \\    // Use full 64-bit pointer address (matches jsvalueToAddr in frozen_helpers.zig)
+        \\    const ptr_addr: u64 = @intFromPtr(obj.getPtr());
+        \\    const node = native_node_register(ptr_addr, kind, flags, pos, end);
         \\    return if (node != null) zig_runtime.JSValue.TRUE else zig_runtime.JSValue.FALSE;
         \\}
         \\
@@ -1157,10 +1158,10 @@ pub fn generateModuleZig(
     // Generate init function that registers all frozen functions
     try output.appendSlice(allocator,
         \\
-        \\// Native registry functions (from frozen_runtime.c)
+        \\// Native registry functions (from native_shapes.zig)
         \\extern fn native_registry_init() void;
         \\extern fn native_registry_count() c_int;
-        \\extern fn native_node_register32(js_addr32: u32, kind: i32, flags: i32, pos: i32, end: i32) ?*anyopaque;
+        \\extern fn native_node_register(js_addr: u64, kind: i32, flags: i32, pos: i32, end: i32) ?*anyopaque;
         \\
         \\/// __edgebox_register_node - register a node in native registry
         \\fn registerNodeImpl(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {
@@ -1175,10 +1176,9 @@ pub fn generateModuleZig(
         \\    _ = zig_runtime.quickjs.JS_ToInt32(ctx, &flags, argv[2]);
         \\    _ = zig_runtime.quickjs.JS_ToInt32(ctx, &pos, argv[3]);
         \\    _ = zig_runtime.quickjs.JS_ToInt32(ctx, &end, argv[4]);
-        \\    // Extract object pointer address as 32-bit hash key
-        \\    const ptr_addr = @intFromPtr(obj.getPtr());
-        \\    const addr32: u32 = @truncate(ptr_addr);
-        \\    const node = native_node_register32(addr32, kind, flags, pos, end);
+        \\    // Use full 64-bit pointer address (matches jsvalueToAddr in frozen_helpers.zig)
+        \\    const ptr_addr: u64 = @intFromPtr(obj.getPtr());
+        \\    const node = native_node_register(ptr_addr, kind, flags, pos, end);
         \\    return if (node != null) zig_runtime.JSValue.TRUE else zig_runtime.JSValue.FALSE;
         \\}
         \\

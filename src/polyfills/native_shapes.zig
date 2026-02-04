@@ -64,13 +64,8 @@ fn registerNode(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
     const js_addr = jsvalueToAddr(obj);
     const js_addr32: u32 = @truncate(js_addr);
 
-    // Debug: log what we're about to call
-    std.debug.print("[ZIG] About to call native_node_register32 with addr32={}\n", .{js_addr32});
-
     // Register in native registry using 32-bit ABI-compatible version
     const node = native_node_register32(js_addr32, kind, flags, pos, end);
-
-    std.debug.print("[ZIG] native_node_register32 returned: {?}\n", .{node});
 
     // Return true if registered, false if failed
     return if (node != null) quickjs.jsTrue() else quickjs.jsFalse();

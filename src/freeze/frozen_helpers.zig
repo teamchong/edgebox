@@ -421,24 +421,24 @@ pub const NativeAstNode = extern struct {
 };
 
 /// Convert JSValue to address for registry lookup
-/// Uses the raw representation as a unique identifier
+/// Uses the pointer as a unique identifier for objects
+/// IMPORTANT: Must match the address computation in frozen_module's registerNodeImpl
 pub inline fn jsvalueToAddr(val: JSValue) u64 {
     if (is_wasm32) {
         // WASM32: 64-bit NaN-boxed value, use bits directly
         return val.bits;
     } else {
-        // Native 64-bit: Use both tag and value parts for unique address
-        // This matches the C macro: union { JSValue v; uint64_t u; } u; u.u = val;
-        // For 16-byte JSValue, we use tag as high bits, value.ptr as low bits
-        const ptr_bits: u64 = @intFromPtr(val.u.ptr);
-        const tag_bits: u64 = @bitCast(val.tag);
-        return ptr_bits ^ (tag_bits << 32);
+        // Native 64-bit: Use just the pointer for object identity
+        // Objects have unique pointers, so this is sufficient
+        // This matches frozen_module.zig's: @intFromPtr(obj.getPtr())
+        return @intFromPtr(val.u.ptr);
     }
 }
 
 /// Import native registry lookup from native_shapes.zig
 /// The native_shapes module provides a SIMD-optimized columnar registry
 extern fn native_shapes_lookup(js_addr: u64) ?*NativeAstNode;
+extern fn native_node_register(js_addr: u64, kind: i32, flags: i32, pos: i32, end_val: i32) ?*NativeAstNode;
 
 /// Fast lookup for native node - delegates to native_shapes.zig implementation
 /// Returns null if not registered
@@ -447,20 +447,48 @@ pub inline fn native_node_lookup(js_addr: u64) ?*NativeAstNode {
     return native_shapes_lookup(js_addr);
 }
 
-/// Get node.kind with native fast path
-/// Falls back to JSValue.getPropertyStr if not a native node
-pub inline fn nativeGetKind(ctx: *JSContext, obj: JSValue) JSValue {
-    const native = native_node_lookup(jsvalueToAddr(obj));
-    if (native) |node| {
+/// Get node.kind with native fast path + lazy registration
+/// On cache miss: reads all properties once, registers node, returns kind
+pub fn nativeGetKind(ctx: *JSContext, obj: JSValue) JSValue {
+    const js_addr = jsvalueToAddr(obj);
+
+    // Fast path: check cache first
+    if (native_node_lookup(js_addr)) |node| {
         return JSValue.newInt(node.kind);
     }
-    return JSValue.getPropertyStr(ctx, obj, "kind");
+
+    // Read kind from JS (we need this value anyway)
+    const kind_val = JSValue.getPropertyStr(ctx, obj, "kind");
+    var kind: i32 = 0;
+
+    // Check if it's a valid AST node (numeric kind > 0)
+    const toInt_result = JSValue.toInt32(ctx, &kind, kind_val);
+    if (toInt_result == 0 and kind > 0) {
+        // Try to register - read remaining properties
+        const flags_val = JSValue.getPropertyStr(ctx, obj, "flags");
+        var flags: i32 = 0;
+        _ = JSValue.toInt32(ctx, &flags, flags_val);
+
+        const pos_val = JSValue.getPropertyStr(ctx, obj, "pos");
+        var pos: i32 = 0;
+        _ = JSValue.toInt32(ctx, &pos, pos_val);
+
+        const end_val = JSValue.getPropertyStr(ctx, obj, "end");
+        var end_int: i32 = 0;
+        _ = JSValue.toInt32(ctx, &end_int, end_val);
+
+        // Register for future lookups
+        _ = native_node_register(js_addr, kind, flags, pos, end_int);
+    }
+
+    // Return the kind value we already read
+    return kind_val;
 }
 
 /// Get node.flags with native fast path
-pub inline fn nativeGetFlags(ctx: *JSContext, obj: JSValue) JSValue {
-    const native = native_node_lookup(jsvalueToAddr(obj));
-    if (native) |node| {
+/// Registration happens via nativeGetKind - we only check cache here
+pub fn nativeGetFlags(ctx: *JSContext, obj: JSValue) JSValue {
+    if (native_node_lookup(jsvalueToAddr(obj))) |node| {
         return JSValue.newInt(node.flags);
     }
     return JSValue.getPropertyStr(ctx, obj, "flags");
@@ -468,8 +496,7 @@ pub inline fn nativeGetFlags(ctx: *JSContext, obj: JSValue) JSValue {
 
 /// Get node.pos with native fast path
 pub inline fn nativeGetPos(ctx: *JSContext, obj: JSValue) JSValue {
-    const native = native_node_lookup(jsvalueToAddr(obj));
-    if (native) |node| {
+    if (native_node_lookup(jsvalueToAddr(obj))) |node| {
         return JSValue.newInt(node.pos);
     }
     return JSValue.getPropertyStr(ctx, obj, "pos");
@@ -477,8 +504,7 @@ pub inline fn nativeGetPos(ctx: *JSContext, obj: JSValue) JSValue {
 
 /// Get node.end with native fast path
 pub inline fn nativeGetEnd(ctx: *JSContext, obj: JSValue) JSValue {
-    const native = native_node_lookup(jsvalueToAddr(obj));
-    if (native) |node| {
+    if (native_node_lookup(jsvalueToAddr(obj))) |node| {
         return JSValue.newInt(node.end);
     }
     return JSValue.getPropertyStr(ctx, obj, "end");
