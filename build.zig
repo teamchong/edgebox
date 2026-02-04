@@ -88,7 +88,15 @@ pub fn build(b: *std.Build) void {
     // LLVM compile speed optimization: disable vectorization and loop unrolling
     // TSC is logic-heavy (branching, object lookups) - SIMD/unrolling don't help
     // This gives 30-50% faster compile times with negligible runtime impact
-    const quickjs_c_flags = &[_][]const u8{
+    // ASan flag for debugging heap corruption
+    const enable_asan = b.option(bool, "asan", "Enable AddressSanitizer for heap corruption debugging") orelse false;
+
+    const quickjs_c_flags = if (enable_asan) &[_][]const u8{
+        "-D_GNU_SOURCE",
+        "-fsanitize=address",
+        "-fno-omit-frame-pointer",
+        "-g",
+    } else &[_][]const u8{
         "-D_GNU_SOURCE",
         "-fno-sanitize=undefined",
         "-fno-vectorize", // Disable auto-vectorization (30-50% compile speedup)
@@ -985,6 +993,11 @@ pub fn build(b: *std.Build) void {
         // libresolv for DNS resolution (macOS)
         if (target.result.os.tag == .macos) {
             native_exe.linkSystemLibrary("resolv");
+            // Link ASan runtime when enabled (must use Clang's runtime, not Zig's)
+            if (enable_asan) {
+                native_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@20/lib/clang/20/lib/darwin" });
+                native_exe.linkSystemLibrary("clang_rt.asan_osx_dynamic");
+            }
         }
 
         native_exe.linkLibC();
@@ -1580,6 +1593,11 @@ pub fn build(b: *std.Build) void {
         build_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@20/lib" });
         build_exe.linkSystemLibrary("LLVM-20");
         build_exe.linkSystemLibrary("c++");
+        // Link ASan runtime when enabled (must use Clang's runtime, not Zig's)
+        if (enable_asan) {
+            build_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@20/lib/clang/20/lib/darwin" });
+            build_exe.linkSystemLibrary("clang_rt.asan_osx_dynamic");
+        }
     } else if (target.result.os.tag == .linux) {
         build_exe.root_module.addIncludePath(.{ .cwd_relative = "/usr/lib/llvm-20/include" });
         build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/llvm-20/lib" });
