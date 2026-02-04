@@ -43,7 +43,7 @@ index ae01300..587c949 100644
  }
  
 diff --git a/quickjs.c b/quickjs.c
-index 62f4381..7160277 100644
+index 62f4381..6dcd603 100644
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -702,7 +702,8 @@ typedef struct JSFunctionBytecode {
@@ -132,23 +132,49 @@ index 62f4381..7160277 100644
              if (var_ref->is_detached) {
                  JS_FreeValueRT(rt, var_ref->value);
                  remove_gc_object(&var_ref->header);
-@@ -6280,6 +6324,15 @@ static void gc_free_cycles(JSRuntime *rt)
+@@ -6280,18 +6324,39 @@ static void gc_free_cycles(JSRuntime *rt)
  #endif
              free_gc_object(rt, p);
              break;
 +        case JS_GC_OBJ_TYPE_VAR_REF:
-+            /* Frozen interpreter can create var_refs in cycles - free them directly */
++            /* Frozen interpreter can create var_refs in cycles.
++             * Free the captured value NOW (before other objects that might
++             * reference it are freed), then defer the var_ref struct freeing
++             * until after all finalizers have run. Setting ref_count=0
++             * tells free_var_ref() to skip this var_ref. */
 +            {
 +                JSVarRef *var_ref = (JSVarRef *)p;
-+                JS_FreeValueRT(rt, var_ref->value);
++                JS_FreeValueRT(rt, var_ref->value);  /* Free value while still valid */
++                var_ref->value = JS_UNDEFINED;  /* Clear to avoid double-free */
++                var_ref->header.ref_count = 0;  /* Mark as being freed by GC */
 +                list_del(&p->link);
-+                js_free_rt(rt, var_ref);
++                list_add_tail(&p->link, &rt->gc_zero_ref_count_list);
 +            }
 +            break;
          default:
              list_del(&p->link);
              list_add_tail(&p->link, &rt->gc_zero_ref_count_list);
-@@ -10148,7 +10201,7 @@ static bool js_object_has_name(JSContext *ctx, JSValue obj)
+             break;
+         }
+     }
+     rt->gc_phase = JS_GC_PHASE_NONE;
+
+     list_for_each_safe(el, el1, &rt->gc_zero_ref_count_list) {
+         p = list_entry(el, JSGCObjectHeader, link);
+-        assert(p->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT ||
+-               p->gc_obj_type == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
++        /* Handle deferred VAR_REFs from frozen interpreter cycles.
++         * The value was already freed in the switch case above. */
++        if (p->gc_obj_type == JS_GC_OBJ_TYPE_VAR_REF) {
++            js_free_rt(rt, p);
++            continue;
++        }
++        assert(p->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT ||
++               p->gc_obj_type == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
+         js_free_rt(rt, p);
+     }
+
+@@ -10148,7 +10223,7 @@ static bool js_object_has_name(JSContext *ctx, JSValue obj)
      return (p->len != 0);
  }
  
@@ -179,7 +205,7 @@ index 62f4381..7160277 100644
  #define GLOBAL_VAR_OFFSET 0x40000000
  #define ARGUMENT_VAR_OFFSET 0x20000000
  
-@@ -15598,6 +15657,881 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
+@@ -15598,6 +15657,931 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
      return 0;
  }
  
@@ -561,9 +587,27 @@ index 62f4381..7160277 100644
 +} JSFrozenVarRefEntry;
 +
 +/* Initialize frozen var_ref tracking list */
++static unsigned long long g_init_count = 0;
++static unsigned long long g_closure_count = 0;
++
 +void js_frozen_var_ref_list_init(struct list_head *list)
 +{
 +    init_list_head(list);
++    g_init_count++;
++
++    /* DEBUG: verify init worked */
++    if (list->next != list || list->prev != list) {
++        fprintf(stderr, "[BUG] js_frozen_var_ref_list_init FAILED after %llu inits: list=%p next=%p prev=%p\n",
++                g_init_count, (void*)list, (void*)list->next, (void*)list->prev);
++    }
++}
++
++/* Debug: verify list is still valid (can be called from Zig) */
++void js_frozen_var_ref_list_verify(struct list_head *list, const char *label)
++{
++    (void)list;
++    (void)label;
++    /* Debug verification disabled - use for debugging list corruption issues */
 +}
 +
 +/* Get or create shared var_ref for a frozen function's local variable */
@@ -573,17 +617,30 @@ index 62f4381..7160277 100644
 +    struct list_head *el;
 +    JSValue *local_ptr = &locals[var_idx];
 +
++    /* Defensive: validate list head */
++    if (!var_ref_list || !var_ref_list->next || !var_ref_list->prev) {
++        goto create_new;
++    }
++
 +    /* Reuse existing var_ref if already tracking this slot */
 +    list_for_each(el, var_ref_list) {
 +        JSFrozenVarRefEntry *entry = list_entry(el, JSFrozenVarRefEntry, link);
++        /* Defensive: check for corrupted entry (NaN-boxed value instead of pointer) */
++        if ((uintptr_t)entry->local_ptr > 0x7ff0000000000000ULL) {
++            fprintf(stderr, "[BUG] Corrupted var_ref_list entry: local_ptr=%p (looks like JSValue)\n",
++                    (void*)entry->local_ptr);
++            goto create_new;
++        }
 +        if (entry->local_ptr == local_ptr) {
 +            entry->var_ref->header.ref_count++;
 +            return entry->var_ref;
 +        }
 +    }
 +
++create_new:
 +    /* Create new var_ref pointing to live local slot */
 +    /* Use js_mallocz to zero-initialize all fields including gc_obj_type/mark */
++    ;  /* Empty statement after label */
 +    JSVarRef *var_ref = js_mallocz(ctx, sizeof(JSVarRef));
 +    if (!var_ref)
 +        return NULL;
@@ -665,6 +722,25 @@ index 62f4381..7160277 100644
 +    JSObject *p;
 +    JSVarRef **var_refs;
 +    int i;
++
++    g_closure_count++;
++    /* DEBUG: check if list is already corrupted on entry */
++    if (local_var_ref_list) {
++        uintptr_t next_val = (uintptr_t)local_var_ref_list->next;
++        uintptr_t prev_val = (uintptr_t)local_var_ref_list->prev;
++        int is_corrupted = (next_val > 0x7ff0000000000000ULL) ||
++                          (prev_val > 0x7ff0000000000000ULL) ||
++                          (next_val != (uintptr_t)local_var_ref_list && next_val < 0x100000000ULL);
++        if (is_corrupted) {
++            fprintf(stderr, "[BUG] js_frozen_create_closure_v2 #%llu (init=%llu): list CORRUPTED!\n",
++                    g_closure_count, g_init_count);
++            fprintf(stderr, "  list=%p next=%p prev=%p locals=%p num_locals=%d\n",
++                    (void*)local_var_ref_list,
++                    (void*)local_var_ref_list->next,
++                    (void*)local_var_ref_list->prev,
++                    (void*)locals, num_locals);
++        }
++    }
 +
 +    b = JS_VALUE_GET_PTR(bfunc);
 +    /* Use correct class based on func_kind for async/generator support */
@@ -1061,7 +1137,7 @@ index 62f4381..7160277 100644
  static JSValue JS_IteratorGetCompleteValue(JSContext *ctx, JSValue obj,
                                             int *pdone)
  {
-@@ -15853,7 +16787,7 @@ static __exception int JS_CopyDataProperties(JSContext *ctx,
+@@ -15853,7 +16837,7 @@ static __exception int JS_CopyDataProperties(JSContext *ctx,
  }
  
  /* only valid inside C functions */
@@ -1070,7 +1146,7 @@ index 62f4381..7160277 100644
  {
      return ctx->rt->current_stack_frame->cur_func;
  }
-@@ -15955,9 +16889,9 @@ static const uint16_t func_kind_to_class_id[] = {
+@@ -15955,9 +16939,9 @@ static const uint16_t func_kind_to_class_id[] = {
      [JS_FUNC_ASYNC_GENERATOR] = JS_CLASS_ASYNC_GENERATOR_FUNCTION,
  };
  
@@ -1083,7 +1159,7 @@ index 62f4381..7160277 100644
  {
      JSFunctionBytecode *b;
      JSValue func_obj;
-@@ -16422,6 +17356,43 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16422,6 +17406,43 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
      }
      b = p->u.func.function_bytecode;
  
@@ -1127,7 +1203,7 @@ index 62f4381..7160277 100644
      if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
          arg_allocated_size = b->arg_count;
      } else {
-@@ -17281,11 +18252,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -17281,11 +18302,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          CASE(OP_get_var_ref):
              {
                  int idx;
@@ -1140,7 +1216,7 @@ index 62f4381..7160277 100644
                  sp++;
              }
              BREAK;
-@@ -29006,7 +29975,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
+@@ -29006,7 +30025,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
      return promise;
  }
  
@@ -1149,7 +1225,7 @@ index 62f4381..7160277 100644
                                       int argc, JSValueConst *argv)
  {
      JSValueConst *resolving_funcs = argv;
-@@ -29041,7 +30010,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
+@@ -29041,7 +30060,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
      return JS_UNDEFINED;
  }
  
@@ -1158,7 +1234,7 @@ index 62f4381..7160277 100644
  {
      JSAtom basename;
      JSValue promise, resolving_funcs[2], basename_val;
-@@ -33979,6 +34948,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+@@ -33979,6 +34998,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
      b->has_prototype = fd->has_prototype;
      b->has_simple_parameter_list = fd->has_simple_parameter_list;
      b->is_strict_mode = fd->is_strict_mode;
@@ -1166,7 +1242,7 @@ index 62f4381..7160277 100644
      b->is_derived_class_constructor = fd->is_derived_class_constructor;
      b->func_kind = fd->func_kind;
      b->need_home_object = (fd->home_object_var_idx >= 0 ||
-@@ -35616,6 +36586,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+@@ -35616,6 +36636,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
      assert(idx <= 16);
      bc_put_u16(s, flags);
      bc_put_u8(s, b->is_strict_mode);
@@ -1174,7 +1250,7 @@ index 62f4381..7160277 100644
      bc_put_atom(s, b->func_name);
  
      bc_put_leb128(s, b->arg_count);
-@@ -36552,6 +37523,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -36552,6 +37573,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
      if (bc_get_u8(s, &v8))
          goto fail;
      bc.is_strict_mode = (v8 > 0);
