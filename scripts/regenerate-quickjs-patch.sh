@@ -1,50 +1,39 @@
 #!/usr/bin/env bash
-set -e
+# Regenerate QuickJS patch from current vendor/quickjs-ng changes
+# Usage: ./scripts/regenerate-quickjs-patch.sh
+#
+# Prerequisites:
+# 1. Run ./scripts/apply-quickjs-patches.sh first
+# 2. Make your edits to vendor/quickjs-ng files
+# 3. Run this script to save changes to patch file
+#
+# This script does NOT reset vendor - you must test your changes first!
 
-# Regenerate QuickJS patch from scratch
-# This script:
-# 1. Resets QuickJS submodule to clean state
-# 2. Manually applies all frozen interpreter changes
-# 3. Generates a clean patch file
+set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUICKJS_DIR="$REPO_ROOT/vendor/quickjs-ng"
-PATCH_FILE="$REPO_ROOT/patches/001-frozen-interpreter-all.patch"
+PATCH_FILE="$REPO_ROOT/patches/quickjs/001-frozen-interpreter-all.patch"
 
-echo "[1/3] Resetting QuickJS to clean state..."
+# Pinned commit - must match git submodule
+QUICKJS_COMMIT="fa9472db3607d9682755ab0e73690297fff8a811"
+
+echo "=== Regenerating QuickJS patch ==="
+
 cd "$QUICKJS_DIR"
-git reset --hard HEAD
-git clean -fd
 
-echo "[2/3] Applying frozen interpreter changes..."
+# Generate patch against pinned commit
+echo "Generating patch against $QUICKJS_COMMIT..."
+git diff "$QUICKJS_COMMIT" > "$PATCH_FILE"
 
-# Change 1: quickjs-libc.c - Remove exit(1) on promise rejection
-cat > /tmp/quickjs-libc-patch.txt << 'EOF'
---- a/quickjs-libc.c
-+++ b/quickjs-libc.c
-@@ -4507,11 +4507,14 @@ static void js_std_promise_rejection_check(JSContext *ctx)
-     if (unlikely(!list_empty(&ts->rejected_promise_list))) {
-         list_for_each(el, &ts->rejected_promise_list) {
-             JSRejectedPromiseEntry *rp = list_entry(el, JSRejectedPromiseEntry, link);
-+#ifndef __wasi__
-+            /* Only print rejection warnings on non-WASI platforms */
-             fprintf(stderr, "Possibly unhandled promise rejection: ");
-             js_std_dump_error1(ctx, rp->reason);
-             fflush(stderr);
-+#endif
-         }
--        exit(1);
-+        /* Don't exit - allow the event loop to continue or exit naturally */
-     }
- }
-EOF
-
-patch -p1 < /tmp/quickjs-libc-patch.txt
-
-echo "[3/3] Generating clean patch..."
-git add -A
-git diff --cached > "$PATCH_FILE"
-
-echo "✅ Patch regenerated successfully: $PATCH_FILE"
+echo ""
+echo "Patch saved to: patches/quickjs/001-frozen-interpreter-all.patch"
 echo "Lines: $(wc -l < "$PATCH_FILE")"
+echo ""
+echo "=== NEXT STEPS ==="
+echo "1. Build and test:  zig build cli"
+echo "2. Test your changes thoroughly"
+echo "3. If working:      git add patches/quickjs/001-frozen-interpreter-all.patch"
+echo "4. Commit:          git commit -m 'fix(quickjs): your change description'"
+echo "5. Reset vendor:    ./scripts/apply-quickjs-patches.sh"
