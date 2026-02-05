@@ -150,6 +150,8 @@ pub const FunctionInfo = struct {
     is_self_recursive: bool,
     self_ref_var_idx: i16 = -1,
     closure_var_indices: []const u16 = &.{},
+    /// Actual closure variable count (from bytecode metadata, for bounds checking)
+    closure_var_count: u32 = 0,
     atom_strings: []const []const u8 = &.{},
     partial_freeze: bool = false,
     js_name: []const u8 = &.{},
@@ -533,8 +535,11 @@ pub const RelooperCodeGen = struct {
         // Check if this block is part of a switch comparison chain (not the first block)
         // If so, skip it - the switch statement handles the dispatch
         if (self.switch_chain_blocks.contains(block_idx)) {
-            // Still emit a case that jumps to proper handling (for unreachable paths)
-            try self.printLine("{d} => {{ next_block = {d}; continue :machine; }}, // switch chain", .{ block_idx, block_idx });
+            // Chain block's logic is handled by the parent switch.
+            // Jump to the false-branch successor (next case or default block)
+            // instead of self-looping, in case this block is reachable from convergence points.
+            const fallthrough_target = if (block.successors.items.len > 0) block.successors.items[0] else block_idx + 1;
+            try self.printLine("{d} => {{ next_block = {d}; continue :machine; }}, // switch chain fallthrough", .{ block_idx, fallthrough_target });
             return;
         }
 
@@ -742,13 +747,13 @@ pub const RelooperCodeGen = struct {
                     else => instr.operand.var_ref,
                 };
                 // Use vpush since closure var expression is self-contained (no stack refs)
-                try self.vpushFmt("CV.fromJSValue(zig_runtime.getClosureVarSafe(ctx, var_refs, {d}, closure_var_count))", .{bytecode_idx});
+                try self.vpushFmt("CV.fromJSValue(zig_runtime.getClosureVarSafe(ctx, var_refs, {d}, {d}))", .{ bytecode_idx, self.func.closure_var_count });
                 return;
             },
             .get_var_ref_check => {
                 const bytecode_idx = instr.operand.var_ref;
                 try self.flushVstack();
-                try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarCheckSafe(ctx, var_refs, {d}, closure_var_count)); sp += 1;", .{bytecode_idx});
+                try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarCheckSafe(ctx, var_refs, {d}, {d})); sp += 1;", .{ bytecode_idx, self.func.closure_var_count });
                 if (self.dispatch_mode) {
                     try self.writeLine("if (stack[sp-1].isException()) return .{ .return_value = stack[sp-1].toJSValueWithCtx(ctx) };");
                 } else {
@@ -1184,12 +1189,12 @@ pub const RelooperCodeGen = struct {
                     .get_var_ref3 => 3,
                     else => instr.operand.var_ref,
                 };
-                try self.vpushFmt("CV.fromJSValue(zig_runtime.getClosureVarSafe(ctx, var_refs, {d}, closure_var_count))", .{bytecode_idx});
+                try self.vpushFmt("CV.fromJSValue(zig_runtime.getClosureVarSafe(ctx, var_refs, {d}, {d}))", .{ bytecode_idx, self.func.closure_var_count });
             },
             .get_var_ref_check => {
                 const bytecode_idx = instr.operand.var_ref;
                 try self.flushVstack();
-                try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarCheckSafe(ctx, var_refs, {d}, closure_var_count)); sp += 1;", .{bytecode_idx});
+                try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarCheckSafe(ctx, var_refs, {d}, {d})); sp += 1;", .{ bytecode_idx, self.func.closure_var_count });
                 if (self.dispatch_mode) {
                     try self.writeLine("if (stack[sp-1].isException()) return .{ .return_value = stack[sp-1].toJSValueWithCtx(ctx) };");
                 } else {
@@ -1207,17 +1212,17 @@ pub const RelooperCodeGen = struct {
                     else => instr.operand.var_ref,
                 };
                 try self.flushVstack();
-                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
+                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, {d}, stack[sp].toJSValueWithCtx(ctx));", .{ bytecode_idx, self.func.closure_var_count });
             },
             .put_var_ref_check => {
                 const bytecode_idx = instr.operand.var_ref;
                 try self.flushVstack();
-                try self.printLine("sp -= 1; _ = zig_runtime.setClosureVarCheckSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
+                try self.printLine("sp -= 1; _ = zig_runtime.setClosureVarCheckSafe(ctx, var_refs, {d}, {d}, stack[sp].toJSValueWithCtx(ctx));", .{ bytecode_idx, self.func.closure_var_count });
             },
             .put_var_ref_check_init => {
                 const bytecode_idx = instr.operand.var_ref;
                 try self.flushVstack();
-                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
+                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, {d}, stack[sp].toJSValueWithCtx(ctx));", .{ bytecode_idx, self.func.closure_var_count });
             },
             .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3, .set_var_ref => {
                 const bytecode_idx: u16 = switch (instr.opcode) {
@@ -1228,7 +1233,7 @@ pub const RelooperCodeGen = struct {
                     else => instr.operand.var_ref,
                 };
                 try self.flushVstack();
-                try self.printLine("zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp-1].toJSValueWithCtx(ctx));", .{bytecode_idx});
+                try self.printLine("zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, {d}, stack[sp-1].toJSValueWithCtx(ctx));", .{ bytecode_idx, self.func.closure_var_count });
             },
 
             // New class-related opcodes
@@ -1796,17 +1801,55 @@ pub const RelooperCodeGen = struct {
 
     pub fn countStackRefs(self: *Self, expr: []const u8) usize {
         _ = self;
-        var count: usize = 0;
+        // Track unique offsets seen (up to 16 should be more than enough)
+        var seen_offsets: [16]u16 = .{0} ** 16;
+        var seen_count: usize = 0;
+
         var i: usize = 0;
         while (i < expr.len) {
-            if (std.mem.startsWith(u8, expr[i..], "stack[sp")) {
-                count += 1;
-                i += 8;
+            var offset: ?u16 = null;
+
+            // Check for "stack[sp-N]" (no spaces)
+            if (i + 9 <= expr.len and std.mem.eql(u8, expr[i .. i + 9], "stack[sp-")) {
+                i += 9;
+                var num: u16 = 0;
+                while (i < expr.len and expr[i] >= '0' and expr[i] <= '9') {
+                    num = num * 10 + @as(u16, @intCast(expr[i] - '0'));
+                    i += 1;
+                }
+                if (i < expr.len and expr[i] == ']') i += 1;
+                offset = num;
+            }
+            // Check for "stack[sp - N]" (with spaces)
+            else if (i + 11 <= expr.len and std.mem.eql(u8, expr[i .. i + 11], "stack[sp - ")) {
+                i += 11;
+                var num: u16 = 0;
+                while (i < expr.len and expr[i] >= '0' and expr[i] <= '9') {
+                    num = num * 10 + @as(u16, @intCast(expr[i] - '0'));
+                    i += 1;
+                }
+                if (i < expr.len and expr[i] == ']') i += 1;
+                offset = num;
             } else {
                 i += 1;
             }
+
+            // Add to seen_offsets if not already present
+            if (offset) |off| {
+                var already_seen = false;
+                for (seen_offsets[0..seen_count]) |seen| {
+                    if (seen == off) {
+                        already_seen = true;
+                        break;
+                    }
+                }
+                if (!already_seen and seen_count < 16) {
+                    seen_offsets[seen_count] = off;
+                    seen_count += 1;
+                }
+            }
         }
-        return count;
+        return seen_count;
     }
 
     // Output helpers
@@ -2033,7 +2076,9 @@ pub const RelooperCodeGen = struct {
 
         // Check if this block is a switch chain block
         if (self.switch_chain_blocks.contains(block_idx)) {
-            try self.printLineBlock("return .{{ .next_block = {d} }};", .{block_idx});
+            const blocks = self.func.cfg.blocks.items;
+            const fallthrough_target = if (block_idx < blocks.len and blocks[block_idx].successors.items.len > 0) blocks[block_idx].successors.items[0] else block_idx + 1;
+            try self.printLineBlock("return .{{ .next_block = {d} }};", .{fallthrough_target});
             self.popIndentBlock();
             try self.writeLineBlock("}");
             try self.writeLineBlock("");
@@ -2290,6 +2335,12 @@ pub const RelooperCodeGen = struct {
                 try self.switch_patterns.put(self.allocator, block_idx, pattern);
             } else {
                 // Clean up - not worth optimizing
+                // CRITICAL: Remove chain blocks that were prematurely added to switch_chain_blocks
+                // If we don't remove them, these blocks will generate infinite self-loops
+                var chain_it = pattern.chain_blocks.iterator();
+                while (chain_it.next()) |entry| {
+                    _ = self.switch_chain_blocks.remove(entry.key_ptr.*);
+                }
                 pattern.cases.deinit(self.allocator);
                 pattern.chain_blocks.deinit(self.allocator);
             }

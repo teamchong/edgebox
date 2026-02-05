@@ -533,8 +533,9 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         },
         .is_undefined_or_null => {
             // n_pop=1, n_push=1: This opcode REPLACES the value on stack with a boolean
-            try self.flushVstack();
-            try self.writeLine("stack[sp-1] = (if (stack[sp-1].isUndefined() or stack[sp-1].isNull()) CV.TRUE else CV.FALSE);");
+            const val = self.vpop() orelse "stack[sp-1]";
+            defer if (self.isAllocated(val)) self.allocator.free(val);
+            try self.vpushFmt("(if ({s}.isUndefined() or {s}.isNull()) CV.TRUE else CV.FALSE)", .{ val, val });
         },
 
         // ============================================================
