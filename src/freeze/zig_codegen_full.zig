@@ -6840,6 +6840,12 @@ pub const ZigCodeGen = struct {
             // Sync locals TO _locals_jsv before call (ensures current values for round-trip)
             try self.emitClosureVarSyncTo();
             try self.writeLine("const call_result = JSValue.call(ctx, func, JSValue.UNDEFINED, 0, @ptrCast(&no_args));");
+            // Check for exception and propagate it
+            if (self.dispatch_mode) {
+                try self.writeLine("if (call_result.isException()) return .exception;");
+            } else {
+                try self.writeLine("if (call_result.isException()) return JSValue.EXCEPTION;");
+            }
             // Free the func CV we're about to overwrite
             try self.writeLine("{ const v = stack[sp - 1]; if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); }");
             try self.writeLine("stack[sp - 1] = CV.fromJSValue(call_result);");
@@ -6864,6 +6870,12 @@ pub const ZigCodeGen = struct {
             try self.emitClosureVarSyncTo();
             // Call - JS_Call returns a new ref, no dup needed
             try self.printLine("const call_result = JSValue.call(ctx, func, JSValue.UNDEFINED, {d}, @ptrCast(&args));", .{argc});
+            // Check for exception and propagate it
+            if (self.dispatch_mode) {
+                try self.writeLine("if (call_result.isException()) return .exception;");
+            } else {
+                try self.writeLine("if (call_result.isException()) return JSValue.EXCEPTION;");
+            }
             try self.writeLine("const result = CV.fromJSValue(call_result);");
             // Free the CVs we're abandoning (collect-then-free to avoid g_return_slot corruption)
             try self.printLine("var _to_free: [{d}]JSValue = undefined;", .{argc + 1});
@@ -7376,6 +7388,12 @@ pub const ZigCodeGen = struct {
             // Sync locals TO _locals_jsv before call (ensures current values for round-trip)
             try self.emitClosureVarSyncTo();
             try self.writeLine("const call_result = JSValue.call(ctx, method, call_this, 0, @as([*]JSValue, undefined));");
+            // Check for exception and propagate it
+            if (self.dispatch_mode) {
+                try self.writeLine("if (call_result.isException()) return .exception;");
+            } else {
+                try self.writeLine("if (call_result.isException()) return JSValue.EXCEPTION;");
+            }
         } else {
             try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
             for (0..argc) |i| {
@@ -7384,6 +7402,12 @@ pub const ZigCodeGen = struct {
             // Sync locals TO _locals_jsv before call (ensures current values for round-trip)
             try self.emitClosureVarSyncTo();
             try self.printLine("const call_result = JSValue.call(ctx, method, call_this, {d}, &args);", .{argc});
+            // Check for exception and propagate it
+            if (self.dispatch_mode) {
+                try self.writeLine("if (call_result.isException()) return .exception;");
+            } else {
+                try self.writeLine("if (call_result.isException()) return JSValue.EXCEPTION;");
+            }
             // Note: Don't free args - CVs on stack still own the references
         }
         // Store result directly - JS_Call returns a new ref, no dup needed

@@ -1128,6 +1128,7 @@ pub const RelooperCodeGen = struct {
                 try self.writeLine("var _args: [32]zig_runtime.JSValue = undefined;");
                 try self.writeLine("for (0.._argc) |i| { _args[i] = JSValue.getPropertyUint32(ctx, _args_array, @intCast(i)); }");
                 try self.writeLine("const _result = JSValue.call(ctx, _func, _this_arg, @intCast(_argc), &_args);");
+                try self.writeLine("if (_result.isException()) return zig_runtime.JSValue.EXCEPTION;");
                 try self.writeLine("sp -= 3;");
                 try self.writeLine("stack[sp] = CV.fromJSValue(_result);");
                 try self.writeLine("sp += 1;");
@@ -1558,6 +1559,9 @@ pub const RelooperCodeGen = struct {
             try self.writeLine("const _result = JSValue.call(ctx, _fn, zig_runtime.JSValue.UNDEFINED, 0, @as([*]zig_runtime.JSValue, undefined));");
         }
 
+        // Check for exception and propagate it
+        try self.writeLine("if (_result.isException()) return zig_runtime.JSValue.EXCEPTION;");
+
         // Pop func + args, push result
         try self.printLine("sp -= {d};", .{argc + 1});
         try self.writeLine("stack[sp] = CV.fromJSValue(_result); sp += 1;");
@@ -1587,6 +1591,9 @@ pub const RelooperCodeGen = struct {
         } else {
             try self.writeLine("const _result = JSValue.call(ctx, _method, _obj, 0, @as([*]zig_runtime.JSValue, undefined));");
         }
+
+        // Check for exception and propagate it
+        try self.writeLine("if (_result.isException()) return zig_runtime.JSValue.EXCEPTION;");
 
         // Pop obj + method + args, push result
         try self.printLine("sp -= {d};", .{argc + 2});

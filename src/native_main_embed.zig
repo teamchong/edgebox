@@ -58,6 +58,10 @@ const frozen_module = @import("frozen_module");
 
 // Native arena allocator for QuickJS (faster than libc malloc for TSC workloads)
 const native_arena = @import("native_arena.zig");
+
+// Zig runtime for frozen functions (V8-style pointer compression)
+// Note: Use named module "zig_runtime" since it's provided via build.zig addModule
+const zig_runtime = @import("zig_runtime");
 comptime {
     _ = &frozen_module.frozen_init_c;
 }
@@ -110,6 +114,9 @@ pub fn main() !void {
     // Use arena allocator for TSC-like batch workloads (enabled via -Dqjs_arena=true)
     const rt = if (allocator_config.qjs_arena) blk: {
         native_arena.init();
+        // Initialize V8-style pointer compression with arena heap base
+        // This enables 32-bit offsets instead of 64-bit pointers in frozen functions
+        zig_runtime.initCompressedHeap(native_arena.getHeapBase());
         const malloc_funcs = qjs.JSMallocFunctions{
             .js_calloc = native_arena.js_calloc,
             .js_malloc = native_arena.js_malloc,

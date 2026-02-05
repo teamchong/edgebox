@@ -348,6 +348,12 @@ pub fn js_malloc_usable_size(ptr: ?*const anyopaque) callconv(.c) usize {
 // Debug / Stats exports
 // ============================================================================
 
+/// Get heap base address (for V8-style pointer compression)
+pub fn getHeapBase() usize {
+    if (!initialized) return 0;
+    return @intFromPtr(heap_base);
+}
+
 /// Print arena stats (for debugging)
 pub fn printStats() void {
     const s = getStats();

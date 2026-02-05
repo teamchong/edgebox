@@ -240,7 +240,7 @@ pub const ModuleParser = struct {
     /// QuickJS uses JS_ATOM_END (227) as the threshold for ALL bytecode versions.
     /// Atoms 0..226 are built-in (null, false, true, keywords, etc.)
     /// Atoms >= 227 are user-defined strings from the module's atom table.
-    fn getAtomByIndex(self: *const ModuleParser, raw_atom: u32) ?[]const u8 {
+    pub fn getAtomByIndex(self: *const ModuleParser, raw_atom: u32) ?[]const u8 {
         // Decode the atom reference (same as getAtomString)
         // Note: is_new flag (bit 0) indicates inline definition, but we look up either way
         const atom_idx = raw_atom >> 1;
