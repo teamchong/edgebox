@@ -1628,8 +1628,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         }
     } else {
         // Copy from build output with output name based on input
+        // build.zig derives output name from source_dir basename (e.g., _tsc.js -> _tsc)
         var native_path_buf: [4096]u8 = undefined;
-        const native_path = std.fmt.bufPrint(&native_path_buf, "{s}/bin/edgebox-native", .{out_prefix}) catch "zig-out/bin/edgebox-native";
+        const native_path = std.fmt.bufPrint(&native_path_buf, "{s}/bin/{s}", .{ out_prefix, output_base }) catch "zig-out/bin/edgebox-native";
         std.fs.cwd().copyFile(native_path, std.fs.cwd(), binary_path, .{}) catch |err| {
             std.debug.print("[warn] Failed to copy binary: {}\n", .{err});
         };
