@@ -508,7 +508,7 @@ pub fn main() !void {
     var no_bundle = false;
     var binary_only = false;
     var debug_build = false;
-    var allocator_type: AllocatorType = .c; // Default: c_allocator (fastest)
+    var allocator_type: AllocatorType = .gpa; // Default: GPA for debugging (use --allocator=c for production)
     var output_prefix: ?[]const u8 = null; // Custom output prefix (default: zig-out)
     var app_dir: ?[]const u8 = null;
 
@@ -614,7 +614,7 @@ fn printUsage() void {
         \\  --no-bundle      Skip Bun bundler (for simple JS without imports)
         \\  --binary-only    Only build native binary (skip WASM/AOT)
         \\  --debug          Use Debug optimization (faster compile, slower runtime)
-        \\  --allocator=X    Allocator for native binary: c (default), arena, gpa
+        \\  --allocator=X    Allocator for native binary: gpa (default), c, arena
         \\  --output-dir=X   Custom output directory (default: zig-out)
         \\  --minimal        All of the above (fastest, for test262)
         \\  -h, --help       Show this help
@@ -877,7 +877,7 @@ const BuildOptions = struct {
     no_bundle: bool = false, // Skip Bun bundler
     binary_only: bool = false, // Only build native binary (skip WASM/AOT)
     debug_build: bool = false, // Use Debug optimization (faster compile, slower runtime)
-    allocator_type: AllocatorType = .c, // Allocator for native binary (c=fastest, arena=batch, gpa=debug)
+    allocator_type: AllocatorType = .gpa, // Allocator for native binary (gpa=debug, c=fastest, arena=batch)
     output_prefix: ?[]const u8 = null, // Custom output prefix (default: zig-out)
 };
 
@@ -1139,6 +1139,16 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         }
         std.debug.print("\n", .{});
 
+        // Check if this is a TypeScript bundle (tsc.js runtime module is included)
+        var is_typescript_bundle = false;
+        for (required_runtime) |r| {
+            const basename = std.fs.path.basename(r);
+            if (std.mem.eql(u8, basename, "tsc.js")) {
+                is_typescript_bundle = true;
+                break;
+            }
+        }
+
         // Build list of runtime modules to include (sorted in dependency order)
         var runtime_list = try std.ArrayList([]const u8).initCapacity(allocator, 16);
         defer runtime_list.deinit(allocator);
@@ -1277,6 +1287,24 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             if (std.fs.cwd().access(mod_path, .{})) |_| {
                 try prependRuntimeModule(allocator, mod_path, bundle_js_path);
             } else |_| {}
+        }
+
+        // Step 5b: Patch TypeScript bundles to enable Native Shapes factory interception
+        // TypeScript bundles have createSourceFile as a local variable, not on globalThis.ts
+        // We inject code right before executeCommandLine() to export the necessary functions
+        // and call the factory interception hook
+        if (is_typescript_bundle) {
+            std.debug.print("[build] Patching TypeScript bundle for Native Shapes...\n", .{});
+            const bak_path_ts = try std.fmt.allocPrint(allocator, "{s}.bak", .{bundle_js_path});
+            defer allocator.free(bak_path_ts);
+            _ = try runCommand(allocator, &.{
+                "sed", "-i.bak",
+                // Export ts namespace to globalThis, call factory interception, then replace global createSourceFile
+                // The interception wraps globalThis.ts.createSourceFile, so we copy it back to the global variable
+                "s/executeCommandLine(sys, noop, sys.args);/globalThis.ts = { createSourceFile: createSourceFile, factory: factory, forEachChild: forEachChild }; if (typeof __edgebox_intercept_tsc_factory === \"function\") { __edgebox_intercept_tsc_factory(); createSourceFile = globalThis.ts.createSourceFile; } executeCommandLine(sys, noop, sys.args);/",
+                bundle_js_path,
+            });
+            std.fs.cwd().deleteFile(bak_path_ts) catch {};
         }
     } else {
         std.debug.print("[build] Skipping polyfills (--no-polyfill)\n", .{});

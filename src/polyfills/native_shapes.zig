@@ -26,13 +26,19 @@ extern fn native_debug_get_register32_called() c_int;
 
 
 /// Extract object pointer from JSValue for registry lookup
-/// In NaN boxing mode (WASM), JSValue is uint64_t with tag in high 32 bits and pointer in low 32 bits.
-/// JS_VALUE_GET_PTR does: (void*)(intptr_t)(v) which truncates to 32-bit pointer.
+/// Handles both NaN-boxing (WASM/32-bit) and native struct (64-bit) modes
 fn jsvalueToAddr(val: qjs.JSValue) u64 {
-    // In NaN boxing mode, the pointer is in the low 32 bits
-    // We extract it directly to avoid @cImport macro translation issues
-    const low32: u32 = @truncate(val);
-    return @as(u64, low32);
+    // Check if we're using NaN-boxed representation (u64) or struct representation
+    const js_is_nan_boxed = @sizeOf(qjs.JSValue) == 8;
+    if (comptime js_is_nan_boxed) {
+        // NaN boxing mode (WASM): JSValue is uint64_t with pointer in low 32 bits
+        const as_u64: u64 = @bitCast(val);
+        const low32: u32 = @truncate(as_u64);
+        return @as(u64, low32);
+    } else {
+        // Native struct mode: JSValue has u.ptr field
+        return @intFromPtr(val.u.ptr);
+    }
 }
 
 /// __edgebox_register_node(nodeObj, kind, flags, pos, end)

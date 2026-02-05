@@ -6,10 +6,12 @@
  */
 globalThis.__edgebox_intercept_tsc_factory = function() {
     if (typeof globalThis.ts === 'undefined') {
+        console.log('[tsc.js] globalThis.ts not defined yet');
         return false;
     }
 
     if (typeof __edgebox_register_node !== 'function') {
+        console.log('[tsc.js] __edgebox_register_node not available');
         return false;
     }
 
@@ -17,15 +19,23 @@ globalThis.__edgebox_intercept_tsc_factory = function() {
         return true;
     }
 
+    console.log('[tsc.js] Factory interception ACTIVATED');
     const ts = globalThis.ts;
 
+    var nodeCount = 0;
+    var fileCount = 0;
     const originalCreateSourceFile = ts.createSourceFile;
     if (typeof originalCreateSourceFile === 'function') {
         ts.createSourceFile = function(fileName, sourceText, languageVersion, setParentNodes, scriptKind) {
+            fileCount++;
+            if (fileCount <= 5 || fileCount % 100 === 0) {
+                console.log('[tsc.js] createSourceFile #' + fileCount + ':', fileName.substring(fileName.lastIndexOf('/') + 1));
+            }
             const result = originalCreateSourceFile.apply(this, arguments);
 
             function registerNode(node) {
                 if (node && typeof node.kind === 'number') {
+                    nodeCount++;
                     __edgebox_register_node(
                         node,
                         node.kind,
@@ -37,6 +47,10 @@ globalThis.__edgebox_intercept_tsc_factory = function() {
                 }
             }
             registerNode(result);
+
+            if (fileCount <= 5) {
+                console.log('[tsc.js] Total nodes registered so far:', nodeCount);
+            }
 
             return result;
         };

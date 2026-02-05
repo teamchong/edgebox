@@ -34,6 +34,7 @@ const crypto_polyfill = @import("polyfills/crypto.zig");
 const tty_polyfill = @import("polyfills/tty.zig");
 const assert_polyfill = @import("polyfills/assert.zig");
 const string_decoder_polyfill = @import("polyfills/string_decoder.zig");
+const native_shapes_polyfill = @import("polyfills/native_shapes.zig");
 const native_bindings = @import("native_bindings.zig");
 
 // Zig native registry (replaces C frozen_runtime.c registry)
@@ -92,6 +93,11 @@ fn getAllocator() std.mem.Allocator {
 }
 
 pub fn main() !void {
+    // Disable output buffering - ensures errors are printed immediately even if crash occurs
+    const c = @cImport(@cInclude("stdio.h"));
+    c.setbuf(c.__stdoutp, null);
+    c.setbuf(c.__stderrp, null);
+
     const allocator = getAllocator();
 
     // Cleanup arena on exit if used
@@ -129,6 +135,9 @@ pub fn main() !void {
 
     // Set memory limit (4GB)
     qjs.JS_SetMemoryLimit(rt, 4 * 1024 * 1024 * 1024);
+
+    // Set stack size limit (64MB - needed for deeply recursive compilers like TSC)
+    qjs.JS_SetMaxStackSize(rt, 64 * 1024 * 1024);
 
     // Create context
     const ctx = qjs.JS_NewContext(rt) orelse {
@@ -461,18 +470,19 @@ pub fn main() !void {
 
     // Set process.argv from command-line arguments
     {
-        const args = std.process.argsAlloc(allocator) catch &[_][:0]const u8{};
-        defer if (args.len > 0) allocator.free(args);
-        // args[0] is the executable path - pass it to setArgv for TSC/CLI tools
-        const exe_path: [:0]const u8 = if (args.len > 0) args[0] else "[embedded]";
+        const args = std.process.argsAlloc(allocator) catch null;
+        defer if (args) |a| std.process.argsFree(allocator, a);
+        const args_slice: []const [:0]const u8 = args orelse &[_][:0]const u8{};
+        // args_slice[0] is the executable path - pass it to setArgv for TSC/CLI tools
+        const exe_path: [:0]const u8 = if (args_slice.len > 0) args_slice[0] else "[embedded]";
         // Skip first arg (executable path), and skip "--" separator if present
         // The "--" is a Unix convention to separate tool args from script args
         var script_args_start: usize = 1;
-        if (args.len > 1 and std.mem.eql(u8, args[1], "--")) {
+        if (args_slice.len > 1 and std.mem.eql(u8, args_slice[1], "--")) {
             script_args_start = 2; // Skip the "--"
         }
-        if (args.len > script_args_start) {
-            process_polyfill.setArgv(ctx, exe_path, args[script_args_start..]);
+        if (args_slice.len > script_args_start) {
+            process_polyfill.setArgv(ctx, exe_path, args_slice[script_args_start..]);
         } else {
             process_polyfill.setArgv(ctx, exe_path, &[_][:0]const u8{});
         }
@@ -483,8 +493,8 @@ pub fn main() !void {
         defer qjs.JS_FreeValue(ctx, global);
 
         const script_args_array = qjs.JS_NewArray(ctx);
-        const script_args_slice = if (args.len > script_args_start) args[script_args_start..] else &[_][:0]const u8{};
-        for (script_args_slice, 0..) |arg, i| {
+        const script_args_for_compat = if (args_slice.len > script_args_start) args_slice[script_args_start..] else &[_][:0]const u8{};
+        for (script_args_for_compat, 0..) |arg, i| {
             _ = qjs.JS_SetPropertyUint32(ctx, script_args_array, @intCast(i), qjs.JS_NewString(ctx, arg.ptr));
         }
         _ = qjs.JS_SetPropertyStr(ctx, global, "scriptArgs", script_args_array);
@@ -578,6 +588,7 @@ fn registerPolyfills(ctx: *qjs.JSContext, allocator: std.mem.Allocator) void {
     tty_polyfill.register(@ptrCast(ctx));
     assert_polyfill.register(@ptrCast(ctx));
     string_decoder_polyfill.register(@ptrCast(ctx));
+    native_shapes_polyfill.register(@ptrCast(ctx));
 }
 
 fn printException(ctx: *qjs.JSContext) void {
