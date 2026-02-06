@@ -421,3 +421,12 @@ test "StringPool intern" {
     try std.testing.expectEqualStrings("hello", s1);
     try std.testing.expectEqualStrings("world", s3);
 }
+
+// ============================================================================
+// Debug: SP overflow detection
+// ============================================================================
+
+pub fn spOverflow(func_name: [*:0]const u8, block_id: u32, sp: usize) noreturn {
+    std.debug.print("\n!!! SP OVERFLOW: sp={d} in {s} block {d}\n", .{ sp, func_name, block_id });
+    @trap();
+}

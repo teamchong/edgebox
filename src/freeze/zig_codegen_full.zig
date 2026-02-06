@@ -1455,6 +1455,9 @@ pub const ZigCodeGen = struct {
         try self.writeLine("std.debug.assert(@sizeOf(CV) > 0);");
         try self.writeLine("");
 
+        // SP overflow detection for dispatch table blocks
+        try self.printLine("if (sp > 250) zig_runtime.spOverflow(\"{s}\", {d}, sp);", .{ self.getFuncPrefix(), block_idx });
+
         // Check if block is contaminated
         if (self.func.partial_freeze and block.is_contaminated) {
             const reason = block.contamination_reason orelse "unknown";
@@ -1590,6 +1593,10 @@ pub const ZigCodeGen = struct {
 
         try self.printLine("{d} => {{ // block_{d}", .{ block_idx, block_idx });
         self.pushIndent();
+
+        // SP overflow detection - emit bounds check at every block entry
+        const func_prefix = self.getFuncPrefix();
+        try self.printLine("if (sp > 250) zig_runtime.spOverflow(\"{s}\", {d}, sp);", .{ func_prefix, block_idx });
 
         // Check if block is contaminated (has never_freeze opcodes)
         if (self.func.partial_freeze and block.is_contaminated) {
@@ -2872,6 +2879,57 @@ pub const ZigCodeGen = struct {
                 if (!already_seen and seen_count < 16) {
                     seen_offsets[seen_count] = off;
                     seen_count += 1;
+                }
+            }
+        }
+        return seen_count;
+    }
+
+    /// Count unique stack references across multiple expressions.
+    /// Unlike countStackRefs (single expression), this deduplicates across ALL items.
+    fn countStackRefsMulti(_: *Self, exprs: []const []const u8) usize {
+        var seen_offsets: [16]u16 = .{0} ** 16;
+        var seen_count: usize = 0;
+
+        for (exprs) |expr| {
+            var i: usize = 0;
+            while (i < expr.len) {
+                var offset: ?u16 = null;
+
+                if (i + 9 <= expr.len and std.mem.eql(u8, expr[i .. i + 9], "stack[sp-")) {
+                    i += 9;
+                    var num: u16 = 0;
+                    while (i < expr.len and expr[i] >= '0' and expr[i] <= '9') {
+                        num = num * 10 + @as(u16, @intCast(expr[i] - '0'));
+                        i += 1;
+                    }
+                    if (i < expr.len and expr[i] == ']') i += 1;
+                    offset = num;
+                } else if (i + 11 <= expr.len and std.mem.eql(u8, expr[i .. i + 11], "stack[sp - ")) {
+                    i += 11;
+                    var num: u16 = 0;
+                    while (i < expr.len and expr[i] >= '0' and expr[i] <= '9') {
+                        num = num * 10 + @as(u16, @intCast(expr[i] - '0'));
+                        i += 1;
+                    }
+                    if (i < expr.len and expr[i] == ']') i += 1;
+                    offset = num;
+                } else {
+                    i += 1;
+                }
+
+                if (offset) |off| {
+                    var already_seen = false;
+                    for (seen_offsets[0..seen_count]) |seen| {
+                        if (seen == off) {
+                            already_seen = true;
+                            break;
+                        }
+                    }
+                    if (!already_seen and seen_count < 16) {
+                        seen_offsets[seen_count] = off;
+                        seen_count += 1;
+                    }
                 }
             }
         }
@@ -4216,12 +4274,12 @@ pub const ZigCodeGen = struct {
         const count = self.vstack.items.len;
         if (count == 0) return;
 
-        // Count total stack references consumed across all expressions
-        // This is needed to correctly adjust sp after materialization
-        var total_stack_refs_consumed: usize = 0;
-        for (self.vstack.items) |expr| {
-            total_stack_refs_consumed += self.countStackRefs(expr);
-        }
+        // Count total UNIQUE stack references consumed across ALL expressions
+        // This is needed to correctly adjust sp after materialization.
+        // CRITICAL: Must deduplicate across all vstack items, not just within each one.
+        // E.g., if vstack has [bitAnd(stack[sp-1], 4), bitAnd(stack[sp-1], 4)],
+        // both reference stack[sp-1] = 1 unique ref, not 2.
+        const total_stack_refs_consumed = self.countStackRefsMulti(self.vstack.items);
 
         try self.writeLine("{");
         self.pushIndent();

@@ -552,6 +552,9 @@ pub const RelooperCodeGen = struct {
         try self.printLine("{d} => {{ // block_{d}", .{ block_idx, block_idx });
         self.pushIndent();
 
+        // SP overflow detection at block entry
+        try self.printLine("if (sp > 250) zig_runtime.spOverflow(\"{s}\", {d}, sp);", .{ self.getFuncPrefix(), block_idx });
+
         // Clear vstack and reset base stack tracking for this block
         for (self.vstack.items) |expr| {
             if (self.isAllocated(expr)) self.allocator.free(expr);
@@ -2074,6 +2077,9 @@ pub const RelooperCodeGen = struct {
         try self.writeLineBlock("std.debug.assert(@sizeOf(CV) > 0);");
         try self.writeLineBlock("");
 
+        // SP overflow detection for dispatch table blocks
+        try self.printLineBlock("if (sp > 250) zig_runtime.spOverflow(\"{s}\", {d}, sp);", .{ self.getFuncPrefix(), block_idx });
+
         // Check if this block is a switch chain block
         if (self.switch_chain_blocks.contains(block_idx)) {
             const blocks = self.func.cfg.blocks.items;
@@ -2221,15 +2227,16 @@ pub const RelooperCodeGen = struct {
         try self.flushVstack();
 
         // Emit switch on discriminant
+        // IMPORTANT: Don't pop discriminant here - pop inside case arms.
+        // Default continuation block may need it on the stack.
         try self.writeLine("{");
         self.pushIndent();
-        try self.writeLine("const _switch_val = stack[sp - 1];");
-        try self.writeLine("sp -= 1;");
-        try self.writeLine("const _switch_jsv = _switch_val.toJSValue();");
+        try self.writeLine("const _switch_jsv = stack[sp - 1].toJSValue();");
         try self.writeLine("const _switch_int: i64 = if (_switch_jsv.isInt()) _switch_jsv.getInt() else @intFromFloat(_switch_jsv.getNumberAsFloat());");
         try self.writeLine("switch (_switch_int) {");
         self.pushIndent();
 
+        // IMPORTANT: Do NOT pop discriminant - case handler blocks expect it on the stack
         for (pattern.cases.items) |case| {
             try self.printLine("{d} => return .{{ .next_block = {d} }},", .{ case.value, case.target_block });
         }
@@ -2381,14 +2388,19 @@ pub const RelooperCodeGen = struct {
 
         // Emit the native switch
         // The discriminant is on top of stack, use toInt32() for integer switch
+        // IMPORTANT: Don't pop discriminant here - pop inside each case arm instead.
+        // The default continuation block may need the discriminant on the stack
+        // (e.g., for further if-else comparison chains).
         try self.writeLine("{");
         self.pushIndent();
         try self.writeLine("const _switch_val = stack[sp - 1].toInt32();");
-        try self.writeLine("sp -= 1; // Pop discriminant");
         try self.writeLine("switch (_switch_val) {");
         self.pushIndent();
 
         // Emit each case
+        // IMPORTANT: Do NOT pop the discriminant here. The case handler blocks and
+        // default continuation blocks were compiled with the discriminant on the stack
+        // (from the original dup+push+eq+if_false chain which has net-0 sp change).
         for (pattern.cases.items) |case| {
             try self.printLine("{d} => {{ next_block = {d}; continue :machine; }},", .{ case.value, case.target_block });
         }
