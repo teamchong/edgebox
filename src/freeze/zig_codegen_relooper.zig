@@ -162,6 +162,8 @@ pub const FunctionInfo = struct {
     is_async: bool = false,
     /// Constant pool values - used for fclosure bytecode registration
     constants: []const module_parser.ConstValue = &.{},
+    /// Stack size (from bytecode, for sizing the operand stack array)
+    stack_size: u32 = 256,
 };
 
 pub const CodeGenError = error{
@@ -214,6 +216,9 @@ pub const RelooperCodeGen = struct {
 
     // Dispatch table mode - use runtime dispatch instead of comptime switch
     dispatch_mode: bool = false,
+
+    // Closure support - function creates child closures (fclosure/fclosure8)
+    has_fclosure: bool = false,
 
     const Self = @This();
 
@@ -284,11 +289,24 @@ pub const RelooperCodeGen = struct {
         }
     }
 
+    /// Scan for fclosure/fclosure8 opcodes to enable V2 closure support
+    fn scanForFclosureOpcodes(self: *Self) void {
+        for (self.func.cfg.blocks.items) |block| {
+            for (block.instructions) |instr| {
+                if (instr.opcode == .fclosure or instr.opcode == .fclosure8) {
+                    self.has_fclosure = true;
+                    return;
+                }
+            }
+        }
+    }
+
     /// Generate Relooper-style Zig code for the function
     pub fn generate(self: *Self) ![]u8 {
-        // Scan for this_val usage and async opcodes
+        // Scan for this_val usage, async opcodes, and closure creation
         self.scanForThisUsage();
         self.scanForAsyncOpcodes();
+        self.scanForFclosureOpcodes();
 
         // Detect switch patterns for optimization
         try self.detectSwitchPatterns();
@@ -346,6 +364,16 @@ pub const RelooperCodeGen = struct {
         const min_locals = if (self.func.var_count >= 16) self.func.var_count else 16;
         try self.printLine("var locals: [{d}]CV = .{{CV.UNDEFINED}} ** {d};", .{ min_locals, min_locals });
         try self.writeLine("_ = &locals;");
+
+        // V2 closure support: JSValue shadow array and var_ref tracking list
+        // Enables closures to see updates to locals assigned after closure creation
+        if (self.has_fclosure and self.func.var_count > 0) {
+            try self.printLine("var _locals_jsv: [{d}]JSValue = .{{JSValue.UNDEFINED}} ** {d};", .{ self.func.var_count, self.func.var_count });
+            // Heap-allocate var_ref_list to isolate from stack corruption
+            try self.writeLine("const _var_ref_list: *zig_runtime.ListHead = @ptrCast(@alignCast(zig_runtime.quickjs.js_malloc(ctx, @sizeOf(zig_runtime.ListHead)) orelse return zig_runtime.JSValue.EXCEPTION));");
+            try self.writeLine("defer zig_runtime.quickjs.js_free(ctx, @ptrCast(_var_ref_list));");
+            try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_init(_var_ref_list);");
+        }
         try self.writeLine("");
 
         // Only create arg_shadow when function accesses arguments AND modifies them
@@ -360,8 +388,9 @@ pub const RelooperCodeGen = struct {
             try self.writeLine("");
         }
 
-        // Hoisted stack
-        try self.writeLine("var stack: [256]CV = .{CV.UNDEFINED} ** 256;");
+        // Hoisted stack - sized to max(var_count + stack_size, 256) for safety
+        const stack_array_size = @max(self.func.var_count + self.func.stack_size, 256);
+        try self.printLine("var stack: [{d}]CV = .{{CV.UNDEFINED}} ** {d};", .{ stack_array_size, stack_array_size });
         try self.writeLine("var sp: usize = 0;");
         // Track iterator positions for for-of loops (stack for nested loops)
         try self.writeLine("var for_of_iter_stack: [8]usize = .{0} ** 8;");
@@ -553,7 +582,10 @@ pub const RelooperCodeGen = struct {
         self.pushIndent();
 
         // SP overflow detection at block entry
-        try self.printLine("if (sp > 250) zig_runtime.spOverflow(\"{s}\", {d}, sp);", .{ self.getFuncPrefix(), block_idx });
+        {
+            const overflow_limit = @max(self.func.var_count + self.func.stack_size, 256) - 6;
+            try self.printLine("if (sp > {d}) zig_runtime.spOverflow(\"{s}\", {d}, sp);", .{ overflow_limit, self.getFuncPrefix(), block_idx });
+        }
 
         // Clear vstack and reset base stack tracking for this block
         for (self.vstack.items) |expr| {
@@ -646,6 +678,7 @@ pub const RelooperCodeGen = struct {
                     try self.printLine("next_block = {d}; continue :machine;", .{successors[0]});
                 }
             } else {
+                try self.emitClosureDetach();
                 if (self.dispatch_mode) {
                     try self.writeLine("return .return_undef;");
                 } else {
@@ -667,6 +700,8 @@ pub const RelooperCodeGen = struct {
             // No successors - this should be an exit block
             // Check if we have a value on vstack/stack
             try self.flushVstack();
+            // Detach V2 closure var_refs before returning
+            try self.emitClosureDetach();
             // Return with proper dup and cleanup (matches zig_codegen_full behavior)
             // Must dup ref types because cleanup may free the same object
             if (self.has_put_arg) {
@@ -715,6 +750,32 @@ pub const RelooperCodeGen = struct {
     /// Delegates to shared helper in opcode_emitter.zig.
     fn emitLocalsCleanup(self: *Self) !void {
         try opcode_emitter.emitLocalsCleanupShared(Self, self, self.func.var_count, "    ");
+    }
+
+    /// Emit var_ref detach for V2 closures before function return.
+    /// Syncs locals to _locals_jsv and detaches all tracked var_refs.
+    /// Skip in dispatch_mode - detach is handled in the dispatch loop.
+    fn emitClosureDetach(self: *Self) !void {
+        if (self.has_fclosure and self.func.var_count > 0 and !self.dispatch_mode) {
+            try self.printLine("for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{self.func.var_count});
+            try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, _var_ref_list);");
+        }
+    }
+
+    /// Emit a full exception return with cleanup (detach var_refs + free locals).
+    /// Used for inline exception checks that need to clean up before returning.
+    fn emitExceptionReturn(self: *Self) !void {
+        try self.emitClosureDetach();
+        try self.emitLocalsCleanup();
+        if (self.has_put_arg) {
+            const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+            try opcode_emitter.emitArgShadowCleanupShared(Self, self, arg_count, "");
+        }
+        if (self.dispatch_mode) {
+            try self.writeLine("return .exception;");
+        } else {
+            try self.writeLine("return zig_runtime.JSValue.EXCEPTION;");
+        }
     }
 
     fn emitInstruction(self: *Self, instr: Instruction, block: BasicBlock, idx: usize) !void {
@@ -768,20 +829,57 @@ pub const RelooperCodeGen = struct {
                 self.base_popped_count = 0;
                 return;
             },
-            // Override get_loc_check to use base_stack_depth instead of vstack
-            // This ensures correct stack refs when multiple checked ops write to real stack
+            // Override put_var_ref: use bytecode_idx directly (NOT findClosureVarPosition)
+            // The var_refs array from QuickJS dispatch is indexed by bytecode closure var index.
+            // The opcode emitter uses findClosureVarPosition which remaps indices - WRONG for
+            // frozen functions dispatched via JS_CallInternal where var_refs = p->u.func.var_refs.
+            .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3, .put_var_ref => {
+                const bytecode_idx: u16 = switch (instr.opcode) {
+                    .put_var_ref0 => 0,
+                    .put_var_ref1 => 1,
+                    .put_var_ref2 => 2,
+                    .put_var_ref3 => 3,
+                    else => instr.operand.var_ref,
+                };
+                try self.flushVstack();
+                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, {d}, stack[sp].toJSValueWithCtx(ctx));", .{ bytecode_idx, self.func.closure_var_count });
+                return;
+            },
+            .put_var_ref_check => {
+                const bytecode_idx = instr.operand.var_ref;
+                try self.flushVstack();
+                try self.printLine("sp -= 1; _ = zig_runtime.setClosureVarCheckSafe(ctx, var_refs, {d}, {d}, stack[sp].toJSValueWithCtx(ctx));", .{ bytecode_idx, self.func.closure_var_count });
+                return;
+            },
+            .put_var_ref_check_init => {
+                const bytecode_idx = instr.operand.var_ref;
+                try self.flushVstack();
+                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, {d}, stack[sp].toJSValueWithCtx(ctx));", .{ bytecode_idx, self.func.closure_var_count });
+                return;
+            },
+            .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3, .set_var_ref => {
+                const bytecode_idx: u16 = switch (instr.opcode) {
+                    .set_var_ref0 => 0,
+                    .set_var_ref1 => 1,
+                    .set_var_ref2 => 2,
+                    .set_var_ref3 => 3,
+                    else => instr.operand.var_ref,
+                };
+                try self.flushVstack();
+                // Must dup since set_var_ref keeps value on stack AND stores in var_ref
+                try self.printLine("zig_runtime.setClosureVarDupSafe(ctx, var_refs, {d}, {d}, stack[sp-1].toJSValueWithCtx(ctx));", .{ bytecode_idx, self.func.closure_var_count });
+                return;
+            },
+            // Override get_loc_check: emit the TDZ check as standalone, push value to vstack only
+            // This avoids sp-relative aliasing when multiple get_loc_checks appear in sequence
             .get_loc_check => {
                 const loc = instr.operand.loc;
-                try self.flushVstack();
                 if (self.dispatch_mode) {
-                    try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return .{{ .return_value = JSValue.throwReferenceError(ctx, \"Cannot access before initialization\") }}; stack[sp] = CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))); sp += 1; }}", .{loc});
+                    try self.printLine("if (locals[{d}].isUninitialized()) return .{{ .return_value = JSValue.throwReferenceError(ctx, \"Cannot access before initialization\") }};", .{loc});
                 } else {
-                    try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\"); stack[sp] = CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))); sp += 1; }}", .{loc});
+                    try self.printLine("if (locals[{d}].isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\");", .{loc});
                 }
-                // Track this value on base stack - vpop will compute correct offset when needed
-                // Reset base_popped_count because we're starting fresh tracking from this new item
-                self.base_stack_depth += 1;
-                self.base_popped_count = 0;
+                try self.vpushFmt("CV.fromJSValue(JSValue.dup(ctx, locals[{d}].toJSValueWithCtx(ctx)))", .{loc});
                 return;
             },
             // Override put_loc_check to handle dispatch mode return type
@@ -792,6 +890,10 @@ pub const RelooperCodeGen = struct {
                     try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return .{{ .return_value = JSValue.throwReferenceError(ctx, \"Cannot access before initialization\") }}; const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc, loc, loc });
                 } else {
                     try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\"); const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc, loc, loc });
+                }
+                // Sync JSValue shadow for shared var_refs
+                if (self.has_fclosure and self.func.var_count > 0 and loc < self.func.var_count) {
+                    try self.printLine("_locals_jsv[{d}] = CV.toJSValuePtr(&locals[{d}]);", .{ loc, loc });
                 }
                 return;
             },
@@ -811,13 +913,29 @@ pub const RelooperCodeGen = struct {
                         // since the obj expression doesn't contain stack refs
                         const obj = self.vpop().?;
                         try self.vpush(obj);
-                        try self.vpushFmt("CV.fromJSValue(JSValue.getPropertyStr(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\"))", .{ obj, escaped_prop });
+                        // Use catch return for inline exception propagation
+                        if (self.dispatch_mode) {
+                            try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\") catch return .exception)", .{ obj, escaped_prop });
+                        } else {
+                            try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\") catch return JSValue.EXCEPTION)", .{ obj, escaped_prop });
+                        }
                         if (self.isAllocated(obj)) self.allocator.free(obj);
                     } else {
                         // Object is on real stack - materialize directly to avoid double-consumption.
                         // Object stays at sp-1, method goes at sp, then sp += 1.
                         // This way the object reference is only evaluated once.
-                        try self.printLine("stack[sp] = CV.fromJSValue(JSValue.getPropertyStr(ctx, stack[sp-1].toJSValueWithCtx(ctx), \"{s}\")); sp += 1;", .{escaped_prop});
+                        try self.writeLine("{");
+                        self.pushIndent();
+                        try self.writeLine("const obj = stack[sp-1].toJSValueWithCtx(ctx);");
+                        try self.printLine("const _gf = JSValue.getPropertyStr(ctx, obj, \"{s}\");", .{escaped_prop});
+                        if (self.dispatch_mode) {
+                            try self.writeLine("if (_gf.isException()) return .exception;");
+                        } else {
+                            try self.writeLine("if (_gf.isException()) return JSValue.EXCEPTION;");
+                        }
+                        try self.writeLine("stack[sp] = CV.fromJSValue(_gf); sp += 1;");
+                        self.popIndent();
+                        try self.writeLine("}");
                         // Track that we've added one item to base stack (now have obj + method)
                         self.base_stack_depth += 1;
                     }
@@ -838,6 +956,8 @@ pub const RelooperCodeGen = struct {
                 try self.writeLine("    const _ret_val = if (_ret_cv.isRefType()) JSValue.dup(ctx, _ret_cv.toJSValueWithCtx(ctx)) else _ret_cv.toJSValueWithCtx(ctx);");
                 // Free the original stack value (the dup created a new ref)
                 try self.writeLine("    if (_ret_cv.isRefType()) JSValue.free(ctx, _ret_cv.toJSValueWithCtx(ctx));");
+                // Detach V2 closure var_refs before cleanup
+                try self.emitClosureDetach();
                 // Cleanup locals - free all ref-type values to prevent GC leaks
                 try self.emitLocalsCleanup();
                 // Free arg_shadow values if function modifies arguments (they were duped at function entry)
@@ -858,6 +978,8 @@ pub const RelooperCodeGen = struct {
                 return;
             },
             .return_undef => {
+                // Detach V2 closure var_refs before cleanup
+                try self.emitClosureDetach();
                 // Cleanup locals - free all ref-type values to prevent GC leaks
                 try self.emitLocalsCleanup();
                 // Free arg_shadow values if function modifies arguments
@@ -876,14 +998,16 @@ pub const RelooperCodeGen = struct {
                 self.block_terminated = true;
                 return;
             },
-            // Handle throw opcode specially for dispatch_mode
+            // Handle throw opcode specially - needs cleanup before returning
             .throw => {
                 try self.flushVstack();
-                if (self.dispatch_mode) {
-                    try self.writeLine("{ const exc = stack[sp-1]; sp -= 1; _ = JSValue.throw(ctx, exc.toJSValueWithCtx(ctx)); return .exception; }");
-                } else {
-                    try self.writeLine("{ const exc = stack[sp-1]; sp -= 1; return JSValue.throw(ctx, exc.toJSValueWithCtx(ctx)); }");
-                }
+                try self.writeLine("{");
+                self.pushIndent();
+                try self.writeLine("const exc = stack[sp-1]; sp -= 1;");
+                try self.writeLine("_ = JSValue.throw(ctx, exc.toJSValueWithCtx(ctx));");
+                try self.emitExceptionReturn();
+                self.popIndent();
+                try self.writeLine("}");
                 self.block_terminated = true;
                 return;
             },
@@ -902,6 +1026,22 @@ pub const RelooperCodeGen = struct {
 
         // Try the shared opcode emitter first
         if (try opcode_emitter.emitOpcode(Self, self, instr)) {
+            // Sync JSValue shadow for shared var_refs after put_loc/set_loc
+            if (self.has_fclosure and self.func.var_count > 0) {
+                switch (instr.opcode) {
+                    .put_loc0, .set_loc0 => try self.writeLine("_locals_jsv[0] = CV.toJSValuePtr(&locals[0]);"),
+                    .put_loc1, .set_loc1 => try self.writeLine("_locals_jsv[1] = CV.toJSValuePtr(&locals[1]);"),
+                    .put_loc2, .set_loc2 => try self.writeLine("_locals_jsv[2] = CV.toJSValuePtr(&locals[2]);"),
+                    .put_loc3, .set_loc3 => try self.writeLine("_locals_jsv[3] = CV.toJSValuePtr(&locals[3]);"),
+                    .put_loc, .put_loc8, .set_loc, .set_loc8 => {
+                        const loc_idx = instr.operand.loc;
+                        if (loc_idx < self.func.var_count) {
+                            try self.printLine("_locals_jsv[{d}] = CV.toJSValuePtr(&locals[{d}]);", .{ loc_idx, loc_idx });
+                        }
+                    },
+                    else => {},
+                }
+            }
             return;
         }
 
@@ -1074,9 +1214,16 @@ pub const RelooperCodeGen = struct {
                         else => {},
                     }
                 }
-                // Convert CompressedValue locals to JSValue array for closure creation
+                // Create closure - use V2 (shared var_refs) when function has closures
                 const var_count = self.func.var_count;
-                if (var_count > 0) {
+                if (self.has_fclosure and var_count > 0) {
+                    // Sync _locals_jsv with current locals before closure creation
+                    try self.printLine("for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{var_count});
+                    // In dispatch mode, var_ref_list and locals_jsv are accessed via bctx
+                    const vrl = if (self.dispatch_mode) "bctx.var_ref_list" else "_var_ref_list";
+                    const ljv = if (self.dispatch_mode) "_locals_jsv" else "&_locals_jsv";
+                    try self.printLine("const _closure = JSValue.createClosureV2(ctx, _bfunc, var_refs, {s}, {s}, {d}, argv[0..@intCast(argc)]);", .{ vrl, ljv, var_count });
+                } else if (var_count > 0) {
                     try self.printLine("var _locals_js: [{d}]JSValue = undefined;", .{var_count});
                     try self.printLine("for (0..{d}) |_i| {{ _locals_js[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{var_count});
                     try self.printLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, &_locals_js, {d}, argv[0..@intCast(argc)]);", .{var_count});
@@ -1107,9 +1254,14 @@ pub const RelooperCodeGen = struct {
                         else => {},
                     }
                 }
-                // Convert CompressedValue locals to JSValue array for closure creation
+                // Create closure - use V2 (shared var_refs) when function has closures
                 const var_count = self.func.var_count;
-                if (var_count > 0) {
+                if (self.has_fclosure and var_count > 0) {
+                    try self.printLine("for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{var_count});
+                    const vrl = if (self.dispatch_mode) "bctx.var_ref_list" else "_var_ref_list";
+                    const ljv = if (self.dispatch_mode) "_locals_jsv" else "&_locals_jsv";
+                    try self.printLine("const _closure = JSValue.createClosureV2(ctx, _bfunc, var_refs, {s}, {s}, {d}, argv[0..@intCast(argc)]);", .{ vrl, ljv, var_count });
+                } else if (var_count > 0) {
                     try self.printLine("var _locals_js: [{d}]JSValue = undefined;", .{var_count});
                     try self.printLine("for (0..{d}) |_i| {{ _locals_js[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{var_count});
                     try self.printLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, &_locals_js, {d}, argv[0..@intCast(argc)]);", .{var_count});
@@ -1136,7 +1288,11 @@ pub const RelooperCodeGen = struct {
                 try self.writeLine("var _args: [32]zig_runtime.JSValue = undefined;");
                 try self.writeLine("for (0.._argc) |i| { _args[i] = JSValue.getPropertyUint32(ctx, _args_array, @intCast(i)); }");
                 try self.writeLine("const _result = JSValue.call(ctx, _func, _this_arg, @intCast(_argc), &_args);");
-                try self.writeLine("if (_result.isException()) return zig_runtime.JSValue.EXCEPTION;");
+                try self.writeLine("if (_result.isException()) {");
+                self.pushIndent();
+                try self.emitExceptionReturn();
+                self.popIndent();
+                try self.writeLine("}");
                 try self.writeLine("sp -= 3;");
                 try self.writeLine("stack[sp] = CV.fromJSValue(_result);");
                 try self.writeLine("sp += 1;");
@@ -1313,11 +1469,11 @@ pub const RelooperCodeGen = struct {
                 }
                 // Pop constructor, new.target, and all args (argc + 2 total)
                 try self.printLine("sp -= {d};", .{argc + 2});
-                if (self.dispatch_mode) {
-                    try self.writeLine("if (_result.isException()) return .{ .return_value = _result };");
-                } else {
-                    try self.writeLine("if (_result.isException()) return _result;");
-                }
+                try self.writeLine("if (_result.isException()) {");
+                self.pushIndent();
+                try self.emitExceptionReturn();
+                self.popIndent();
+                try self.writeLine("}");
                 try self.writeLine("stack[sp] = CV.fromJSValue(_result);");
                 try self.writeLine("sp += 1;");
                 self.popIndent();
@@ -1568,7 +1724,11 @@ pub const RelooperCodeGen = struct {
         }
 
         // Check for exception and propagate it
-        try self.writeLine("if (_result.isException()) return zig_runtime.JSValue.EXCEPTION;");
+        try self.writeLine("if (_result.isException()) {");
+        self.pushIndent();
+        try self.emitExceptionReturn();
+        self.popIndent();
+        try self.writeLine("}");
 
         // Pop func + args, push result
         try self.printLine("sp -= {d};", .{argc + 1});
@@ -1601,7 +1761,11 @@ pub const RelooperCodeGen = struct {
         }
 
         // Check for exception and propagate it
-        try self.writeLine("if (_result.isException()) return zig_runtime.JSValue.EXCEPTION;");
+        try self.writeLine("if (_result.isException()) {");
+        self.pushIndent();
+        try self.emitExceptionReturn();
+        self.popIndent();
+        try self.writeLine("}");
 
         // Pop obj + method + args, push result
         try self.printLine("sp -= {d};", .{argc + 2});
@@ -1929,6 +2093,7 @@ pub const RelooperCodeGen = struct {
     fn emitBlockContextStruct(self: *Self) !void {
         const prefix = self.getFuncPrefix();
         const min_locals = if (self.func.var_count >= 16) self.func.var_count else 16;
+        const stack_array_size = @max(self.func.var_count + self.func.stack_size, 256);
         try self.printLineBlock("const __frozen_{s}_BlockContext = struct {{", .{prefix});
         self.pushIndentBlock();
         try self.writeLineBlock("ctx: *zig_runtime.JSContext,");
@@ -1938,7 +2103,7 @@ pub const RelooperCodeGen = struct {
         try self.writeLineBlock("var_refs: ?[*]*zig_runtime.JSVarRef,");
         try self.writeLineBlock("closure_var_count: c_int,");
         try self.writeLineBlock("cpool: ?[*]zig_runtime.JSValue,");
-        try self.writeLineBlock("stack: *[256]zig_runtime.CompressedValue,");
+        try self.printLineBlock("stack: *[{d}]zig_runtime.CompressedValue,", .{stack_array_size});
         try self.writeLineBlock("sp: *usize,");
         try self.printLineBlock("locals: *[{d}]zig_runtime.CompressedValue,", .{min_locals});
         try self.writeLineBlock("for_of_iter_stack: *[8]usize,");
@@ -1949,6 +2114,11 @@ pub const RelooperCodeGen = struct {
             if (arg_count > 0) {
                 try self.printLineBlock("arg_shadow: *[{d}]zig_runtime.CompressedValue,", .{arg_count});
             }
+        }
+        // Add _locals_jsv and _var_ref_list for V2 closure support
+        if (self.has_fclosure and self.func.var_count > 0) {
+            try self.printLineBlock("locals_jsv: *[{d}]zig_runtime.JSValue,", .{self.func.var_count});
+            try self.writeLineBlock("var_ref_list: *zig_runtime.ListHead,");
         }
         self.popIndentBlock();
         try self.writeLineBlock("};");
@@ -1992,6 +2162,7 @@ pub const RelooperCodeGen = struct {
     /// Emit the dispatch loop.
     fn emitDispatchLoop(self: *Self, block_count: usize) !void {
         const prefix = self.getFuncPrefix();
+        const needs_detach = self.has_fclosure and self.func.var_count > 0;
         try self.writeLine("var block_id: u32 = 0;");
         try self.writeLine("while (true) {");
         self.pushIndent();
@@ -1999,9 +2170,36 @@ pub const RelooperCodeGen = struct {
         try self.printLine("switch (__frozen_{s}_block_table[block_id](&bctx)) {{", .{prefix});
         self.pushIndent();
         try self.writeLine(".next_block => |n| block_id = n,");
-        try self.writeLine(".return_value => |v| return v,");
-        try self.writeLine(".return_undef => return zig_runtime.JSValue.UNDEFINED,");
-        try self.writeLine(".exception => return zig_runtime.JSValue.EXCEPTION,");
+        if (needs_detach) {
+            try self.writeLine(".return_value => |v| {");
+            self.pushIndent();
+            try self.printLine("for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{self.func.var_count});
+            try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, _var_ref_list);");
+            try self.writeLine("return v;");
+            self.popIndent();
+            try self.writeLine("},");
+            try self.writeLine(".return_undef => {");
+            self.pushIndent();
+            try self.printLine("for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{self.func.var_count});
+            try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, _var_ref_list);");
+            try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
+            self.popIndent();
+            try self.writeLine("},");
+        } else {
+            try self.writeLine(".return_value => |v| return v,");
+            try self.writeLine(".return_undef => return zig_runtime.JSValue.UNDEFINED,");
+        }
+        if (needs_detach) {
+            try self.writeLine(".exception => {");
+            self.pushIndent();
+            try self.printLine("for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{self.func.var_count});
+            try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, _var_ref_list);");
+            try self.writeLine("return zig_runtime.JSValue.EXCEPTION;");
+            self.popIndent();
+            try self.writeLine("},");
+        } else {
+            try self.writeLine(".exception => return zig_runtime.JSValue.EXCEPTION,");
+        }
         self.popIndent();
         try self.writeLine("}");
         self.popIndent();
@@ -2031,6 +2229,10 @@ pub const RelooperCodeGen = struct {
             if (arg_count > 0) {
                 try self.printLine(".arg_shadow = @as(*[{d}]zig_runtime.CompressedValue, &arg_shadow),", .{arg_count});
             }
+        }
+        if (self.has_fclosure and self.func.var_count > 0) {
+            try self.writeLine(".locals_jsv = &_locals_jsv,");
+            try self.writeLine(".var_ref_list = _var_ref_list,");
         }
         self.popIndent();
         try self.writeLine("};");
@@ -2074,11 +2276,17 @@ pub const RelooperCodeGen = struct {
                 try self.writeLineBlock("std.debug.assert(@intFromPtr(arg_shadow) != 0);");
             }
         }
+        if (self.has_fclosure and self.func.var_count > 0) {
+            try self.writeLineBlock("const _locals_jsv = bctx.locals_jsv;");
+        }
         try self.writeLineBlock("std.debug.assert(@sizeOf(CV) > 0);");
         try self.writeLineBlock("");
 
         // SP overflow detection for dispatch table blocks
-        try self.printLineBlock("if (sp > 250) zig_runtime.spOverflow(\"{s}\", {d}, sp);", .{ self.getFuncPrefix(), block_idx });
+        {
+            const overflow_limit = @max(self.func.var_count + self.func.stack_size, 256) - 6;
+            try self.printLineBlock("if (sp > {d}) zig_runtime.spOverflow(\"{s}\", {d}, sp);", .{ overflow_limit, self.getFuncPrefix(), block_idx });
+        }
 
         // Check if this block is a switch chain block
         if (self.switch_chain_blocks.contains(block_idx)) {

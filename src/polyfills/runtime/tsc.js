@@ -11,60 +11,11 @@ globalThis.__edgebox_intercept_tsc_factory = function() {
     }
 
     if (typeof __edgebox_register_node !== 'function') {
-        console.log('[tsc.js] __edgebox_register_node not available');
         return false;
     }
 
     if (globalThis.__edgebox_tsc_intercepted) {
         return true;
-    }
-
-    console.log('[tsc.js] Factory interception ACTIVATED');
-    const ts = globalThis.ts;
-
-    var nodeCount = 0;
-    var fileCount = 0;
-    const originalCreateSourceFile = ts.createSourceFile;
-    if (typeof originalCreateSourceFile === 'function') {
-        ts.createSourceFile = function(fileName, sourceText, languageVersion, setParentNodes, scriptKind) {
-            fileCount++;
-            if (fileCount <= 5 || fileCount % 100 === 0) {
-                console.log('[tsc.js] createSourceFile #' + fileCount + ':', fileName.substring(fileName.lastIndexOf('/') + 1));
-            }
-            const result = originalCreateSourceFile.apply(this, arguments);
-
-            function registerNode(node) {
-                if (node && typeof node.kind === 'number') {
-                    nodeCount++;
-                    __edgebox_register_node(
-                        node,
-                        node.kind,
-                        node.flags || 0,
-                        node.pos || 0,
-                        node.end || 0
-                    );
-                    ts.forEachChild(node, registerNode);
-                }
-            }
-            registerNode(result);
-
-            if (fileCount <= 5) {
-                console.log('[tsc.js] Total nodes registered so far:', nodeCount);
-            }
-
-            return result;
-        };
-    }
-
-    if (ts.factory && typeof ts.factory.createNode === 'function') {
-        const originalCreateNode = ts.factory.createNode;
-        ts.factory.createNode = function(kind, pos, end) {
-            const node = originalCreateNode.apply(this, arguments);
-            if (node && typeof __edgebox_register_node === 'function') {
-                __edgebox_register_node(node, kind, node.flags || 0, pos || 0, end || 0);
-            }
-            return node;
-        };
     }
 
     globalThis.__edgebox_tsc_intercepted = true;
@@ -73,122 +24,138 @@ globalThis.__edgebox_intercept_tsc_factory = function() {
 
 globalThis.__edgebox_intercept_tsc_factory();
 
-// TypeScript sys interface integration
-(function() {
-    'use strict';
-    var checkCount = 0;
-    var hooked = false;
+/**
+ * TSC sys object hook - called with the real sys object from inside the TSC bundle closure.
+ * This replaces the broken setTimeout-based polling that could never find the local sys variable.
+ */
+globalThis.__edgebox_hook_tsc_sys = function(sys) {
+    if (!sys) return;
 
-    function hookTypescriptSys() {
-        checkCount++;
-        if (typeof sys === 'undefined' || !sys) {
-            if (checkCount < 10) {
-                setTimeout(hookTypescriptSys, 50);
-            }
-            return false;
+    // Hook sys.write to use process.stdout.write (should already work via default implementation,
+    // but ensure it's properly bound)
+    var origWrite = sys.write;
+    sys.write = function(s) {
+        if (typeof process !== 'undefined' && process.stdout && typeof process.stdout.write === 'function') {
+            process.stdout.write(s);
+        } else if (origWrite) {
+            origWrite(s);
         }
+    };
 
-        if (hooked) return true;
-        hooked = true;
+    // Hook sys.writeOutputIsTTY to return false (pipe mode)
+    sys.writeOutputIsTTY = function() { return false; };
 
-        sys.writeFile = function(path, data, writeByteOrderMark) {
-            if (writeByteOrderMark) {
-                data = '\uFEFF' + data;
-            }
-            if (typeof globalThis.__edgebox_fs_write === 'function') {
-                globalThis.__edgebox_fs_write(path, data);
-            } else {
-                throw new Error('sys.writeFile: native binding not available');
-            }
-        };
+    // Hook sys.writeFile for output emission
+    sys.writeFile = function(path, data, writeByteOrderMark) {
+        if (writeByteOrderMark) {
+            data = '\uFEFF' + data;
+        }
+        if (typeof globalThis.__edgebox_fs_write === 'function') {
+            globalThis.__edgebox_fs_write(path, data);
+        } else if (typeof require === 'function') {
+            try { require('fs').writeFileSync(path, data); } catch(e) {}
+        }
+    };
 
-        if (sys.readFile) {
-            sys.readFile = function(path, encoding) {
-                if (typeof globalThis.__edgebox_fs_read === 'function') {
-                    try {
-                        return globalThis.__edgebox_fs_read(path);
-                    } catch(e) {
-                        return undefined;
-                    }
-                }
+    // Hook sys.readFile for file reading
+    var origReadFile = sys.readFile;
+    sys.readFile = function(path, encoding) {
+        if (typeof globalThis.__edgebox_fs_read === 'function') {
+            try {
+                return globalThis.__edgebox_fs_read(path);
+            } catch(e) {
                 return undefined;
-            };
+            }
         }
+        if (origReadFile) {
+            return origReadFile.call(sys, path, encoding);
+        }
+        return undefined;
+    };
 
-        sys.fileExists = function(path) {
-            if (typeof globalThis.__edgebox_fs_stat === 'function') {
+    // Hook sys.fileExists
+    var origFileExists = sys.fileExists;
+    sys.fileExists = function(path) {
+        if (typeof globalThis.__edgebox_fs_stat === 'function') {
+            try {
+                var stat = globalThis.__edgebox_fs_stat(path);
+                return stat && !stat.isDirectory;
+            } catch(e) {
+                return false;
+            }
+        }
+        if (origFileExists) {
+            return origFileExists.call(sys, path);
+        }
+        return false;
+    };
+
+    // Hook sys.directoryExists
+    var origDirectoryExists = sys.directoryExists;
+    sys.directoryExists = function(path) {
+        if (typeof globalThis.__edgebox_fs_stat === 'function') {
+            try {
+                var stat = globalThis.__edgebox_fs_stat(path);
+                return stat && stat.isDirectory;
+            } catch(e) {
+                return false;
+            }
+        }
+        if (origDirectoryExists) {
+            return origDirectoryExists.call(sys, path);
+        }
+        return false;
+    };
+
+    // Hook sys.createDirectory
+    sys.createDirectory = function(path) {
+        if (typeof globalThis.__edgebox_fs_mkdir === 'function') {
+            try {
+                globalThis.__edgebox_fs_mkdir(path, true);
+            } catch(e) {
+                // Ignore errors - directory may already exist
+            }
+        }
+    };
+
+    // Hook sys.getDirectories
+    if (sys.getDirectories) {
+        var origGetDirectories = sys.getDirectories;
+        sys.getDirectories = function(path) {
+            if (typeof globalThis.__edgebox_fs_readdir === 'function') {
                 try {
-                    var stat = globalThis.__edgebox_fs_stat(path);
-                    return stat && !stat.isDirectory;
+                    var entries = globalThis.__edgebox_fs_readdir(path);
+                    return entries.filter(function(e) { return e.isDirectory; }).map(function(e) { return e.name; });
                 } catch(e) {
-                    return false;
+                    return [];
                 }
             }
-            return false;
-        };
-
-        sys.directoryExists = function(path) {
-            if (typeof globalThis.__edgebox_fs_stat === 'function') {
-                try {
-                    var stat = globalThis.__edgebox_fs_stat(path);
-                    return stat && stat.isDirectory;
-                } catch(e) {
-                    return false;
-                }
+            if (origGetDirectories) {
+                return origGetDirectories.call(sys, path);
             }
-            return false;
+            return [];
         };
-
-        sys.createDirectory = function(path) {
-            if (typeof globalThis.__edgebox_fs_mkdir === 'function') {
-                try {
-                    globalThis.__edgebox_fs_mkdir(path, true);
-                } catch(e) {
-                    // Ignore errors - directory may already exist
-                }
-            }
-        };
-
-        if (sys.getDirectories) {
-            sys.getDirectories = function(path) {
-                if (typeof globalThis.__edgebox_fs_readdir === 'function') {
-                    try {
-                        var entries = globalThis.__edgebox_fs_readdir(path);
-                        return entries.filter(function(e) { return e.isDirectory; }).map(function(e) { return e.name; });
-                    } catch(e) {
-                        return [];
-                    }
-                }
-                return [];
-            };
-        }
-
-        if (sys.readDirectory) {
-            var origReadDirectory = sys.readDirectory;
-            sys.readDirectory = function(path, extensions, excludes, includes, depth) {
-                if (typeof globalThis.__edgebox_fs_readdir === 'function') {
-                    try {
-                        var entries = globalThis.__edgebox_fs_readdir(path);
-                        var files = entries.filter(function(e) { return !e.isDirectory; }).map(function(e) { return e.name; });
-                        if (extensions && extensions.length > 0) {
-                            files = files.filter(function(f) {
-                                return extensions.some(function(ext) { return f.endsWith(ext); });
-                            });
-                        }
-                        return files;
-                    } catch(e) {
-                        return origReadDirectory ? origReadDirectory.call(this, path, extensions, excludes, includes, depth) : [];
-                    }
-                }
-                return origReadDirectory ? origReadDirectory.call(this, path, extensions, excludes, includes, depth) : [];
-            };
-        }
-
-        return true;
     }
 
-    hookTypescriptSys();
-    if (!hooked) {
-        setTimeout(hookTypescriptSys, 10);
+    // Hook sys.readDirectory
+    if (sys.readDirectory) {
+        var origReadDirectory = sys.readDirectory;
+        sys.readDirectory = function(path, extensions, excludes, includes, depth) {
+            if (typeof globalThis.__edgebox_fs_readdir === 'function') {
+                try {
+                    var entries = globalThis.__edgebox_fs_readdir(path);
+                    var files = entries.filter(function(e) { return !e.isDirectory; }).map(function(e) { return e.name; });
+                    if (extensions && extensions.length > 0) {
+                        files = files.filter(function(f) {
+                            return extensions.some(function(ext) { return f.endsWith(ext); });
+                        });
+                    }
+                    return files;
+                } catch(e) {
+                    return origReadDirectory ? origReadDirectory.call(sys, path, extensions, excludes, includes, depth) : [];
+                }
+            }
+            return origReadDirectory ? origReadDirectory.call(sys, path, extensions, excludes, includes, depth) : [];
+        };
     }
-})();
+};

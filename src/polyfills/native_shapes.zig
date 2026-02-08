@@ -10,7 +10,7 @@ const std = @import("std");
 const quickjs = @import("../quickjs_core.zig");
 const qjs = quickjs.c;
 
-// Import the C native registry functions from frozen_runtime.c
+// Import the native registry functions from native_shapes.zig
 extern fn native_registry_init() void;
 extern fn native_registry_deinit() void;
 extern fn native_node_register(js_addr: u64, kind: i32, flags: i32, pos: i32, end: i32) ?*anyopaque;
@@ -23,6 +23,7 @@ extern fn native_debug_get_registered_addr() u64;
 extern fn native_debug_get_register_success() c_int;
 extern fn native_debug_get_register32_addr() u32;
 extern fn native_debug_get_register32_called() c_int;
+extern fn native_shapes_init_atoms(atom_kind: u32, atom_flags: u32, atom_pos: u32, atom_end: u32) void;
 
 
 /// Extract object pointer from JSValue for registry lookup
@@ -66,12 +67,15 @@ fn registerNode(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
     if (qjs.JS_ToInt32(ctx, &pos, argv[3]) < 0) return quickjs.jsException();
     if (qjs.JS_ToInt32(ctx, &end, argv[4]) < 0) return quickjs.jsException();
 
-    // Get the JSValue address for registry key (32-bit in WASM)
+    // Get the JSValue address for registry key
     const js_addr = jsvalueToAddr(obj);
-    const js_addr32: u32 = @truncate(js_addr);
 
-    // Register in native registry using 32-bit ABI-compatible version
-    const node = native_node_register32(js_addr32, kind, flags, pos, end);
+    // Use 64-bit address for native builds, 32-bit for WASM
+    const js_is_wasm = @sizeOf(usize) == 4;
+    const node = if (comptime js_is_wasm) blk: {
+        const js_addr32: u32 = @truncate(js_addr);
+        break :blk native_node_register32(js_addr32, kind, flags, pos, end);
+    } else native_node_register(js_addr, kind, flags, pos, end);
 
     // Return true if registered, false if failed
     return if (node != null) quickjs.jsTrue() else quickjs.jsFalse();
@@ -129,11 +133,27 @@ pub fn deinit() void {
     native_registry_deinit();
 }
 
+/// Initialize atoms for fast property lookup
+/// MUST be called AFTER bytecode is loaded to get correct atom values
+pub fn initAtoms(ctx: *qjs.JSContext) void {
+    // These atoms are looked up once here and cached in native_shapes.zig
+    // Must be called after bytecode loading so atoms match those in bytecode
+    const atom_kind = qjs.JS_NewAtom(ctx, "kind");
+    const atom_flags = qjs.JS_NewAtom(ctx, "flags");
+    const atom_pos = qjs.JS_NewAtom(ctx, "pos");
+    const atom_end = qjs.JS_NewAtom(ctx, "end");
+    native_shapes_init_atoms(atom_kind, atom_flags, atom_pos, atom_end);
+    // Don't free these atoms - they're cached and used throughout execution
+}
+
 /// Register native shape functions to globalThis
 /// Called ONCE at WASM initialization
 pub fn register(ctx: *qjs.JSContext) void {
     // Initialize the registry
     native_registry_init();
+
+    // NOTE: Don't init atoms here - must be done after bytecode loading
+    // Call initAtoms(ctx) separately after JS_ReadObject
 
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);

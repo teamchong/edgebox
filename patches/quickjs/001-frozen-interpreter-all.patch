@@ -43,18 +43,21 @@ index ae01300..587c949 100644
  }
  
 diff --git a/quickjs.c b/quickjs.c
-index 62f4381..3b420f7 100644
+index 62f4381..30bcfe2 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -25,6 +25,7 @@
-  * THE SOFTWARE.
-  */
- #include <stdlib.h>
-+#include <execinfo.h>
- #include <stdio.h>
+@@ -29,6 +29,10 @@
  #include <stdarg.h>
  #include <inttypes.h>
-@@ -702,7 +703,8 @@ typedef struct JSFunctionBytecode {
+ #include <string.h>
++#ifdef FROZEN_DEBUG_REFCOUNT
++#include <execinfo.h>
++#include <signal.h>
++#endif
+ #include <assert.h>
+ #if !defined(_MSC_VER)
+ #include <sys/time.h>
+@@ -702,7 +706,8 @@ typedef struct JSFunctionBytecode {
      uint8_t super_allowed : 1;
      uint8_t arguments_allowed : 1;
      uint8_t backtrace_barrier : 1; /* stop backtrace on this function */
@@ -64,7 +67,15 @@ index 62f4381..3b420f7 100644
      uint8_t *byte_code_buf; /* (self pointer) */
      int byte_code_len;
      JSAtom func_name;
-@@ -1291,7 +1293,21 @@ static void js_free_module_def(JSContext *ctx, JSModuleDef *m);
+@@ -723,6 +728,7 @@ typedef struct JSFunctionBytecode {
+     int pc2line_len;
+     uint8_t *pc2line_buf;
+     char *source;
++    void *frozen_impl; /* cached frozen function pointer: NULL=not looked up, 1=miss cached, other=frozen fn */
+ } JSFunctionBytecode;
+ 
+ typedef struct JSBoundFunction {
+@@ -1291,7 +1297,28 @@ static void js_free_module_def(JSContext *ctx, JSModuleDef *m);
  static void js_mark_module_def(JSRuntime *rt, JSModuleDef *m,
                                 JS_MarkFunc *mark_func);
  static JSValue js_import_meta(JSContext *ctx);
@@ -79,15 +90,22 @@ index 62f4381..3b420f7 100644
 +                                  JSValue *result_out);
 +
 +/* Bytecode-based frozen function dispatch - for closure/fclosure support */
++
 +extern int frozen_dispatch_lookup_bytecode(JSContext *ctx, void *bytecode_ptr,
 +                                           JSValue this_val, int argc, JSValue *argv,
 +                                           JSVarRef **var_refs, int closure_var_count,
 +                                           JSValue *cpool, JSValue *result_out);
 +
++/* Get frozen function pointer for caching in JSFunctionBytecode.frozen_impl */
++extern void *frozen_dispatch_get_impl(void *bytecode_ptr);
++
++/* Debug: frozen dispatch depth counter */
++static int _frozen_depth = 0;
++
  static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref);
  static JSValue js_new_promise_capability(JSContext *ctx,
                                           JSValue *resolving_funcs,
-@@ -5316,6 +5332,19 @@ static JSFunctionBytecode *JS_GetFunctionBytecode(JSValueConst val)
+@@ -5316,6 +5343,19 @@ static JSFunctionBytecode *JS_GetFunctionBytecode(JSValueConst val)
      return p->u.func.function_bytecode;
  }
  
@@ -107,7 +125,7 @@ index 62f4381..3b420f7 100644
  static void js_method_set_home_object(JSContext *ctx, JSValue func_obj,
                                        JSValue home_obj)
  {
-@@ -5341,6 +5370,14 @@ static void js_method_set_home_object(JSContext *ctx, JSValue func_obj,
+@@ -5341,6 +5381,14 @@ static void js_method_set_home_object(JSContext *ctx, JSValue func_obj,
      }
  }
  
@@ -122,7 +140,7 @@ index 62f4381..3b420f7 100644
  static JSValue js_get_function_name(JSContext *ctx, JSAtom name)
  {
      JSValue name_str;
-@@ -5723,8 +5760,16 @@ static force_inline JSShapeProperty *find_own_property(JSProperty **ppr,
+@@ -5723,8 +5771,16 @@ static force_inline JSShapeProperty *find_own_property(JSProperty **ppr,
  static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref)
  {
      if (var_ref) {
@@ -140,7 +158,27 @@ index 62f4381..3b420f7 100644
              if (var_ref->is_detached) {
                  JS_FreeValueRT(rt, var_ref->value);
                  remove_gc_object(&var_ref->header);
-@@ -6280,6 +6325,21 @@ static void gc_free_cycles(JSRuntime *rt)
+@@ -6023,6 +6079,19 @@ void JS_FreeValueRT(JSRuntime *rt, JSValue v)
+ {
+     if (JS_VALUE_HAS_REF_COUNT(v)) {
+         JSRefCountHeader *p = (JSRefCountHeader *)JS_VALUE_GET_PTR(v);
++#ifdef FROZEN_DEBUG_REFCOUNT
++        if (p->ref_count <= 0 || (unsigned)p->ref_count > 0x40000000) {
++            fprintf(stderr, "FROZEN_DEBUG: bad ref_count! ptr=%p ref_count=%d (0x%x) tag=%d\n",
++                    p, p->ref_count, (unsigned)p->ref_count, JS_VALUE_GET_TAG(v));
++            {
++                void *bt[20];
++                int n = backtrace(bt, 20);
++                backtrace_symbols_fd(bt, n, 2); /* fd 2 = stderr */
++            }
++            fflush(stderr);
++            signal(SIGABRT, SIG_DFL); abort();
++        }
++#endif
+         if (--p->ref_count <= 0) {
+             js_free_value_rt(rt, v);
+         }
+@@ -6280,6 +6349,21 @@ static void gc_free_cycles(JSRuntime *rt)
  #endif
              free_gc_object(rt, p);
              break;
@@ -162,7 +200,7 @@ index 62f4381..3b420f7 100644
          default:
              list_del(&p->link);
              list_add_tail(&p->link, &rt->gc_zero_ref_count_list);
-@@ -6290,6 +6350,12 @@ static void gc_free_cycles(JSRuntime *rt)
+@@ -6290,6 +6374,12 @@ static void gc_free_cycles(JSRuntime *rt)
  
      list_for_each_safe(el, el1, &rt->gc_zero_ref_count_list) {
          p = list_entry(el, JSGCObjectHeader, link);
@@ -175,7 +213,7 @@ index 62f4381..3b420f7 100644
          assert(p->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT ||
                 p->gc_obj_type == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
          js_free_rt(rt, p);
-@@ -10148,7 +10214,7 @@ static bool js_object_has_name(JSContext *ctx, JSValue obj)
+@@ -10148,7 +10238,7 @@ static bool js_object_has_name(JSContext *ctx, JSValue obj)
      return (p->len != 0);
  }
  
@@ -184,7 +222,7 @@ index 62f4381..3b420f7 100644
                                 JSAtom name, int flags)
  {
      if (name != JS_ATOM_NULL
-@@ -10160,7 +10226,7 @@ static int JS_DefineObjectName(JSContext *ctx, JSValue obj,
+@@ -10160,7 +10250,7 @@ static int JS_DefineObjectName(JSContext *ctx, JSValue obj,
      return 0;
  }
  
@@ -193,7 +231,7 @@ index 62f4381..3b420f7 100644
                                         JSValue str, int flags)
  {
      if (JS_IsObject(obj) &&
-@@ -15134,6 +15200,12 @@ static JSValue js_build_arguments(JSContext *ctx, int argc, JSValueConst *argv)
+@@ -15134,6 +15224,12 @@ static JSValue js_build_arguments(JSContext *ctx, int argc, JSValueConst *argv)
      return val;
  }
  
@@ -206,7 +244,7 @@ index 62f4381..3b420f7 100644
  #define GLOBAL_VAR_OFFSET 0x40000000
  #define ARGUMENT_VAR_OFFSET 0x20000000
  
-@@ -15598,6 +15670,959 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
+@@ -15598,6 +15694,947 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
      return 0;
  }
  
@@ -255,6 +293,7 @@ index 62f4381..3b420f7 100644
 +    return js_dup(*var_refs[idx]->pvalue);
 +}
 +
++
 +void js_frozen_set_var_ref(JSContext *ctx, JSVarRef **var_refs, int idx, JSValue val)
 +{
 +    if (var_refs && var_refs[idx]) {
@@ -270,18 +309,6 @@ index 62f4381..3b420f7 100644
 +        return JS_UNDEFINED;
 +    JSVarRef *var_ref = var_refs[idx];
 +    JSValue val = *var_ref->pvalue;
-+    /* Debug check for corrupted objects */
-+    if (JS_VALUE_GET_TAG(val) == JS_TAG_OBJECT) {
-+        JSObject *p = JS_VALUE_GET_OBJ(val);
-+        if (!p || !p->shape) {
-+            fprintf(stderr, "FROZEN DEBUG: corrupted object in var_ref[%d], pvalue=%p, is_detached=%d, val_tag=%d\n",
-+                    idx, (void*)var_ref->pvalue, var_ref->is_detached, JS_VALUE_GET_TAG(val));
-+            if (p) {
-+                fprintf(stderr, "  obj=%p, shape=%p\n", (void*)p, (void*)p->shape);
-+            }
-+            abort();
-+        }
-+    }
 +    return js_dup(val);
 +}
 +
@@ -442,6 +469,20 @@ index 62f4381..3b420f7 100644
 +            (*sp)--;
 +        }
 +        break;
++    case OP_pow:
++        {
++            double a, b, r;
++            JSValue va = stack[*sp - 2];
++            JSValue vb = stack[*sp - 1];
++            if (JS_ToFloat64(ctx, &a, va) || JS_ToFloat64(ctx, &b, vb))
++                return JS_EXCEPTION;
++            r = pow(a, b);
++            JS_FreeValue(ctx, va);
++            JS_FreeValue(ctx, vb);
++            stack[*sp - 2] = JS_NewFloat64(ctx, r);
++            (*sp)--;
++        }
++        break;
 +    default:
 +        /* Unknown opcode - return exception with helpful message */
 +        return JS_ThrowTypeError(ctx, "Unsupported opcode %d in frozen function fallback", opcode);
@@ -497,12 +538,6 @@ index 62f4381..3b420f7 100644
 +            goto fail;
 +        p->u.func.var_refs = var_refs;
 +
-+        int _trace_v1 = (b->line_num == 109008);
-+        if (_trace_v1) {
-+            fprintf(stderr, "[FROZEN_CLOSURE_V1] line=%d closure_var_count=%d locals=%p num_locals=%d cur_var_refs=%p\n",
-+                    b->line_num, b->closure_var_count, (void*)locals, num_locals, (void*)cur_var_refs);
-+        }
-+
 +        for(i = 0; i < b->closure_var_count; i++) {
 +            JSClosureVar *cv = &b->closure_var[i];
 +            JSVarRef *var_ref;
@@ -552,12 +587,6 @@ index 62f4381..3b420f7 100644
 +                }
 +            }
 +            var_refs[i] = var_ref;
-+            if (_trace_v1) {
-+                JSValue _tv = *var_ref->pvalue;
-+                fprintf(stderr, "  [V1_CV] i=%d is_local=%d var_idx=%d is_arg=%d -> vr=%p pvalue=%p tag=%d detached=%d\n",
-+                        i, cv->is_local, cv->var_idx, cv->is_arg, (void*)var_ref,
-+                        (void*)var_ref->pvalue, JS_VALUE_GET_TAG(_tv), var_ref->is_detached);
-+            }
 +        }
 +    }
 +
@@ -600,19 +629,9 @@ index 62f4381..3b420f7 100644
 +} JSFrozenVarRefEntry;
 +
 +/* Initialize frozen var_ref tracking list */
-+static unsigned long long g_init_count = 0;
-+static unsigned long long g_closure_count = 0;
-+
 +void js_frozen_var_ref_list_init(struct list_head *list)
 +{
 +    init_list_head(list);
-+    g_init_count++;
-+
-+    /* DEBUG: verify init worked */
-+    if (list->next != list || list->prev != list) {
-+        fprintf(stderr, "[BUG] js_frozen_var_ref_list_init FAILED after %llu inits: list=%p next=%p prev=%p\n",
-+                g_init_count, (void*)list, (void*)list->next, (void*)list->prev);
-+    }
 +}
 +
 +/* Debug: verify list is still valid (can be called from Zig) */
@@ -620,7 +639,6 @@ index 62f4381..3b420f7 100644
 +{
 +    (void)list;
 +    (void)label;
-+    /* Debug verification disabled - use for debugging list corruption issues */
 +}
 +
 +/* Get or create shared var_ref for a frozen function's local variable */
@@ -640,8 +658,6 @@ index 62f4381..3b420f7 100644
 +        JSFrozenVarRefEntry *entry = list_entry(el, JSFrozenVarRefEntry, link);
 +        /* Defensive: check for corrupted entry (NaN-boxed value instead of pointer) */
 +        if ((uintptr_t)entry->local_ptr > 0x7ff0000000000000ULL) {
-+            fprintf(stderr, "[BUG] Corrupted var_ref_list entry: local_ptr=%p (looks like JSValue)\n",
-+                    (void*)entry->local_ptr);
 +            goto create_new;
 +        }
 +        if (entry->local_ptr == local_ptr) {
@@ -690,6 +706,15 @@ index 62f4381..3b420f7 100644
 +{
 +    struct list_head *el, *el1;
 +
++    if (!list || !list->next || !list->prev)
++        return;
++
++    /* Detect corrupted list head - if next is a JSValue tag (e.g. 0xFFFFFFFFFFFFFFFF = JS_TAG_OBJECT),
++     * the list was overwritten by locals. Skip detach to avoid crash. */
++    if ((uintptr_t)list->next > 0xFFFF000000000000ULL || (uintptr_t)list->prev > 0xFFFF000000000000ULL) {
++        return;
++    }
++
 +    list_for_each_safe(el, el1, list) {
 +        JSFrozenVarRefEntry *entry = list_entry(el, JSFrozenVarRefEntry, link);
 +        JSVarRef *var_ref = entry->var_ref;
@@ -699,22 +724,19 @@ index 62f4381..3b420f7 100644
 +         * have been freed, ref_count could now be 1, so decrementing makes it 0. */
 +        int new_ref_count = --var_ref->header.ref_count;
 +
-+        if (!var_ref->is_detached) {
-+            /* Detach: copy value from live local slot to internal storage */
++        if (new_ref_count == 0) {
++            /* No closures reference this var_ref anymore. Skip detach entirely -
++             * don't read *pvalue (which may be stale) since nobody needs the value.
++             * Just free the var_ref struct directly. */
++            js_free(ctx, var_ref);
++        } else if (!var_ref->is_detached) {
++            /* Detach: copy value from live local slot to internal storage.
++             * Other closures still reference this var_ref, so we must preserve
++             * the value and add to GC list for proper cleanup. */
 +            var_ref->value = js_dup(*var_ref->pvalue);
 +            var_ref->pvalue = &var_ref->value;
 +            var_ref->is_detached = true;
-+
-+            if (new_ref_count > 0) {
-+                /* Other closures still reference this var_ref.
-+                 * Add to GC list so it will be freed when last closure is freed. */
-+                add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
-+            }
-+        }
-+
-+        if (new_ref_count == 0) {
-+            /* No more references - free directly without adding to GC */
-+            js_free(ctx, var_ref);
++            add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
 +        }
 +
 +        list_del(el);
@@ -736,25 +758,9 @@ index 62f4381..3b420f7 100644
 +    JSVarRef **var_refs;
 +    int i;
 +
-+    g_closure_count++;
-+    /* DEBUG: check if list is already corrupted on entry */
-+    if (local_var_ref_list) {
-+        uintptr_t next_val = (uintptr_t)local_var_ref_list->next;
-+        uintptr_t prev_val = (uintptr_t)local_var_ref_list->prev;
-+        int is_corrupted = (next_val > 0x7ff0000000000000ULL) ||
-+                          (prev_val > 0x7ff0000000000000ULL) ||
-+                          (next_val != (uintptr_t)local_var_ref_list && next_val < 0x100000000ULL);
-+        if (is_corrupted) {
-+            fprintf(stderr, "[BUG] js_frozen_create_closure_v2 #%llu (init=%llu): list CORRUPTED!\n",
-+                    g_closure_count, g_init_count);
-+            fprintf(stderr, "  list=%p next=%p prev=%p locals=%p num_locals=%d\n",
-+                    (void*)local_var_ref_list,
-+                    (void*)local_var_ref_list->next,
-+                    (void*)local_var_ref_list->prev,
-+                    (void*)locals, num_locals);
-+        }
++    if (JS_VALUE_GET_TAG(bfunc) != JS_TAG_FUNCTION_BYTECODE) {
++        return JS_ThrowTypeError(ctx, "not a function bytecode");
 +    }
-+
 +    b = JS_VALUE_GET_PTR(bfunc);
 +    /* Use correct class based on func_kind for async/generator support */
 +    func_obj = JS_NewObjectClass(ctx, frozen_func_kind_to_class_id(b->func_kind));
@@ -775,12 +781,6 @@ index 62f4381..3b420f7 100644
 +            goto fail_v2;
 +        p->u.func.var_refs = var_refs;
 +
-+        int _trace_v2 = (b->line_num == 109008);
-+        if (_trace_v2) {
-+            fprintf(stderr, "[FROZEN_CLOSURE_V2] line=%d closure_var_count=%d locals=%p num_locals=%d cur_var_refs=%p\n",
-+                    b->line_num, b->closure_var_count, (void*)locals, num_locals, (void*)cur_var_refs);
-+        }
-+
 +        for (i = 0; i < b->closure_var_count; i++) {
 +            JSClosureVar *cv = &b->closure_var[i];
 +            JSVarRef *var_ref;
@@ -797,13 +797,31 @@ index 62f4381..3b420f7 100644
 +                    var_ref->value = js_dup(val);
 +                    var_ref->pvalue = &var_ref->value;
 +                    add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
-+                } else {
++                } else if (cv->var_idx < num_locals) {
 +                    /* Local capture - use shared var_ref for deferred detachment.
 +                     * This allows closures to see final values of locals (e.g., classes
 +                     * defined after hoisted function declarations).
 +                     * The var_ref points to locals[i] and is detached at function return
 +                     * via js_frozen_var_ref_list_detach(), which copies the final value. */
 +                    var_ref = get_frozen_local_var_ref(ctx, local_var_ref_list, locals, cv->var_idx);
++                } else {
++                    /* var_idx >= num_locals: out of bounds for locals array.
++                     * Fall back to detached var_ref with undefined value. */
++                    {
++                        char parent_name[64], child_cv_name[64];
++                        JS_AtomGetStr(ctx, parent_name, sizeof(parent_name), b->func_name);
++                        JS_AtomGetStr(ctx, child_cv_name, sizeof(child_cv_name), cv->var_name);
++                        fprintf(stderr, "[CLOSURE] OOB local capture: child='%s' cv[%d]='%s' var_idx=%d >= num_locals=%d (is_arg=%d)\n",
++                                parent_name, i, child_cv_name, cv->var_idx, num_locals, cv->is_arg);
++                    }
++                    var_ref = js_malloc(ctx, sizeof(JSVarRef));
++                    if (!var_ref)
++                        goto fail_v2;
++                    var_ref->header.ref_count = 1;
++                    var_ref->is_detached = true;
++                    var_ref->value = JS_UNDEFINED;
++                    var_ref->pvalue = &var_ref->value;
++                    add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
 +                }
 +                if (!var_ref)
 +                    goto fail_v2;
@@ -813,8 +831,13 @@ index 62f4381..3b420f7 100644
 +                    var_ref = cur_var_refs[cv->var_idx];
 +                    var_ref->header.ref_count++;
 +                } else {
-+                    if (_trace_v2) {
-+                        fprintf(stderr, "  [V2_MISSING] i=%d var_idx=%d\n", i, cv->var_idx);
++                    /* Missing parent var_ref - create detached with UNDEFINED */
++                    {
++                        char parent_name[64], child_cv_name[64];
++                        JS_AtomGetStr(ctx, parent_name, sizeof(parent_name), b->func_name);
++                        JS_AtomGetStr(ctx, child_cv_name, sizeof(child_cv_name), cv->var_name);
++                        fprintf(stderr, "[CLOSURE] Missing parent var_ref: child='%s' cv[%d]='%s' var_idx=%d cur_var_refs=%p\n",
++                                parent_name, i, child_cv_name, cv->var_idx, (void*)cur_var_refs);
 +                    }
 +                    var_ref = js_malloc(ctx, sizeof(JSVarRef));
 +                    if (!var_ref)
@@ -827,13 +850,6 @@ index 62f4381..3b420f7 100644
 +                }
 +            }
 +            var_refs[i] = var_ref;
-+            if (_trace_v2) {
-+                JSValue _tv = *var_ref->pvalue;
-+                fprintf(stderr, "  [V2_CV] i=%d is_local=%d var_idx=%d is_arg=%d -> vr=%p pvalue=%p tag=%d detached=%d refcount=%d\n",
-+                        i, cv->is_local, cv->var_idx, cv->is_arg, (void*)var_ref,
-+                        (void*)var_ref->pvalue, JS_VALUE_GET_TAG(_tv),
-+                        var_ref->is_detached, var_ref->header.ref_count);
-+            }
 +        }
 +    }
 +
@@ -941,11 +957,21 @@ index 62f4381..3b420f7 100644
 +                    var_ref->value = js_dup(val);
 +                    var_ref->pvalue = &var_ref->value;
 +                    add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
-+                } else {
++                } else if (cv->var_idx < num_locals) {
 +                    /* Local capture - use shared var_ref for deferred detachment */
 +                    var_ref = get_frozen_local_var_ref(ctx, local_var_ref_list, locals, cv->var_idx);
 +                    if (!var_ref)
 +                        goto fail;
++                } else {
++                    /* var_idx >= num_locals: out of bounds - use detached undefined */
++                    var_ref = js_malloc(ctx, sizeof(JSVarRef));
++                    if (!var_ref)
++                        goto fail;
++                    var_ref->header.ref_count = 1;
++                    var_ref->is_detached = true;
++                    var_ref->value = JS_UNDEFINED;
++                    var_ref->pvalue = &var_ref->value;
++                    add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
 +                }
 +            } else {
 +                /* Parent closure reference */
@@ -1166,7 +1192,7 @@ index 62f4381..3b420f7 100644
  static JSValue JS_IteratorGetCompleteValue(JSContext *ctx, JSValue obj,
                                             int *pdone)
  {
-@@ -15853,7 +16878,7 @@ static __exception int JS_CopyDataProperties(JSContext *ctx,
+@@ -15853,7 +16890,7 @@ static __exception int JS_CopyDataProperties(JSContext *ctx,
  }
  
  /* only valid inside C functions */
@@ -1175,7 +1201,7 @@ index 62f4381..3b420f7 100644
  {
      return ctx->rt->current_stack_frame->cur_func;
  }
-@@ -15955,9 +16980,9 @@ static const uint16_t func_kind_to_class_id[] = {
+@@ -15955,15 +16992,16 @@ static const uint16_t func_kind_to_class_id[] = {
      [JS_FUNC_ASYNC_GENERATOR] = JS_CLASS_ASYNC_GENERATOR_FUNCTION,
  };
  
@@ -1188,67 +1214,98 @@ index 62f4381..3b420f7 100644
  {
      JSFunctionBytecode *b;
      JSValue func_obj;
-@@ -16422,6 +17447,43 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+     JSAtom name_atom;
+ 
+     b = JS_VALUE_GET_PTR(bfunc);
++
+     func_obj = JS_NewObjectClass(ctx, func_kind_to_class_id[b->func_kind]);
+     if (JS_IsException(func_obj)) {
+         JS_FreeValue(ctx, bfunc);
+@@ -16383,6 +17421,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+ 
+     if (js_poll_interrupts(caller_ctx))
+         return JS_EXCEPTION;
++
+     if (unlikely(JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT)) {
+         if (flags & JS_CALL_FLAG_GENERATOR) {
+             JSAsyncFunctionState *s = JS_VALUE_GET_PTR(func_obj);
+@@ -16422,6 +17461,65 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
      }
      b = p->u.func.function_bytecode;
  
-+    /* Check for frozen function dispatch by bytecode pointer (closure-aware) */
-+    /* This is the primary dispatch path - uses bytecode address as key */
-+    /* var_refs is extracted from the function object for proper closure access */
-+    /* cpool is passed for fclosure support (creating nested closures) */
++    /* Frozen function dispatch with inline caching in JSFunctionBytecode.frozen_impl */
++    /* NULL = not looked up yet, (void*)1 = miss cached, other = frozen function pointer */
++    #define FROZEN_IMPL_NONE ((void *)1)
 +    {
-+        JSValue frozen_result;
-+        JSVarRef **dispatch_var_refs = p->u.func.var_refs;
-+        if (frozen_dispatch_lookup_bytecode(caller_ctx, (void *)b,
-+                                            this_obj, argc, (JSValue *)argv,
-+                                            dispatch_var_refs, b->closure_var_count,
-+                                            b->cpool, &frozen_result)) {
-+            return frozen_result;
-+        }
-+    }
-+
-+    /* Fallback: Check for frozen function dispatch by name@line_num */
-+    /* This is kept for compatibility with functions registered by name */
-+    if (b->func_name != JS_ATOM_NULL && b->line_num > 0) {
-+        char func_name_buf[64];
-+        char dispatch_key_buf[128];
-+        const char *func_name = JS_AtomGetStr(caller_ctx, func_name_buf,
-+                                               sizeof(func_name_buf), b->func_name);
-+        if (func_name && func_name[0]) {
-+            /* Format: "name@line_num" - unique per function definition */
-+            snprintf(dispatch_key_buf, sizeof(dispatch_key_buf), "%s@%d",
-+                     func_name, b->line_num);
++        void *impl = b->frozen_impl;
++        if (likely(impl != NULL)) {
++            /* Fast path: already cached (hit or miss) */
++            if (impl != FROZEN_IMPL_NONE) {
++                /* Cached hit - call frozen function directly */
++                typedef JSValue (*FrozenFn)(JSContext *, JSValue, int, JSValue *,
++                                           JSVarRef **, int, JSValue *);
++                FrozenFn fn = (FrozenFn)impl;
++                return fn(caller_ctx, this_obj, argc, (JSValue *)argv,
++                         p->u.func.var_refs, b->closure_var_count, b->cpool);
++            }
++            /* Cached miss - skip to bytecode execution */
++        } else {
++            /* First call: do full lookup and cache result */
 +            JSValue frozen_result;
-+            /* Pass var_refs, closure_var_count, cpool, and bytecode_ptr for closure support */
-+            if (frozen_dispatch_lookup(caller_ctx, dispatch_key_buf,
-+                                       this_obj, argc, (JSValue *)argv,
-+                                       p->u.func.var_refs, b->closure_var_count,
-+                                       b->cpool, (void *)b, &frozen_result)) {
++            JSVarRef **dispatch_var_refs = p->u.func.var_refs;
++
++            /* Try bytecode pointer lookup first */
++            if (frozen_dispatch_lookup_bytecode(caller_ctx, (void *)b,
++                                                this_obj, argc, (JSValue *)argv,
++                                                dispatch_var_refs, b->closure_var_count,
++                                                b->cpool, &frozen_result)) {
++                /* Cache the frozen function pointer for future calls */
++                void *fn_ptr = frozen_dispatch_get_impl((void *)b);
++                if (fn_ptr) b->frozen_impl = fn_ptr;
 +                return frozen_result;
 +            }
++
++            /* Fallback: name@line_num lookup */
++            if (b->func_name != JS_ATOM_NULL && b->line_num > 0) {
++                char func_name_buf[64];
++                char dispatch_key_buf[128];
++                const char *func_name_str = JS_AtomGetStr(caller_ctx, func_name_buf,
++                                                          sizeof(func_name_buf), b->func_name);
++                if (func_name_str && func_name_str[0]) {
++                    snprintf(dispatch_key_buf, sizeof(dispatch_key_buf), "%s@%d",
++                             func_name_str, b->line_num);
++                    if (frozen_dispatch_lookup(caller_ctx, dispatch_key_buf,
++                                               this_obj, argc, (JSValue *)argv,
++                                               dispatch_var_refs, b->closure_var_count,
++                                               b->cpool, (void *)b, &frozen_result)) {
++                        /* Cache the frozen function pointer for future calls */
++                        void *fn_ptr = frozen_dispatch_get_impl((void *)b);
++                        if (fn_ptr) b->frozen_impl = fn_ptr;
++                        return frozen_result;
++                    }
++                }
++            }
++
++            /* Neither lookup found a frozen function - cache the miss */
++            b->frozen_impl = FROZEN_IMPL_NONE;
 +        }
 +    }
++    #undef FROZEN_IMPL_NONE
 +
      if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
          arg_allocated_size = b->arg_count;
      } else {
-@@ -17097,7 +18159,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
-                 pc += 4;
-                 sf->cur_pc = pc;
+@@ -16781,7 +17879,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  
-+                if (b->line_num == 109088) {
-+                    char _vn[64];
-+                    JS_AtomGetStr(ctx, _vn, sizeof(_vn), atom);
-+                    fprintf(stderr, "[ARROW_GET_VAR] name=%s atom=%u\n", _vn, atom);
-+                }
-                 val = JS_GetGlobalVar(ctx, atom, opcode - OP_get_var_undef);
-+                if (b->line_num == 109088) {
-+                    fprintf(stderr, "[ARROW_GET_VAR_RESULT] tag=%d\n", JS_VALUE_GET_TAG(val));
-+                }
-                 if (unlikely(JS_IsException(val)))
-                     goto exception;
-                 *sp++ = val;
-@@ -17265,7 +18335,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+         CASE(OP_fclosure):
+             {
+-                JSValue bfunc = js_dup(b->cpool[get_u32(pc)]);
++                uint32_t _fcl_idx = get_u32(pc);
++                JSValue bfunc = js_dup(b->cpool[_fcl_idx]);
+                 pc += 4;
+                 *sp++ = js_closure(ctx, bfunc, var_refs, sf);
+                 if (unlikely(JS_IsException(sp[-1])))
+@@ -17265,7 +18364,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          CASE(OP_set_arg1): set_value(ctx, &arg_buf[1], js_dup(sp[-1])); BREAK;
          CASE(OP_set_arg2): set_value(ctx, &arg_buf[2], js_dup(sp[-1])); BREAK;
          CASE(OP_set_arg3): set_value(ctx, &arg_buf[3], js_dup(sp[-1])); BREAK;
@@ -1259,7 +1316,7 @@ index 62f4381..3b420f7 100644
          CASE(OP_get_var_ref1): *sp++ = js_dup(*var_refs[1]->pvalue); BREAK;
          CASE(OP_get_var_ref2): *sp++ = js_dup(*var_refs[2]->pvalue); BREAK;
          CASE(OP_get_var_ref3): *sp++ = js_dup(*var_refs[3]->pvalue); BREAK;
-@@ -17281,11 +18353,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -17281,11 +18382,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          CASE(OP_get_var_ref):
              {
                  int idx;
@@ -1272,7 +1329,7 @@ index 62f4381..3b420f7 100644
                  sp++;
              }
              BREAK;
-@@ -29006,7 +30076,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
+@@ -29006,7 +30105,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
      return promise;
  }
  
@@ -1281,7 +1338,7 @@ index 62f4381..3b420f7 100644
                                       int argc, JSValueConst *argv)
  {
      JSValueConst *resolving_funcs = argv;
-@@ -29041,7 +30111,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
+@@ -29041,7 +30140,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
      return JS_UNDEFINED;
  }
  
@@ -1290,7 +1347,7 @@ index 62f4381..3b420f7 100644
  {
      JSAtom basename;
      JSValue promise, resolving_funcs[2], basename_val;
-@@ -33979,6 +35049,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+@@ -33979,6 +35078,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
      b->has_prototype = fd->has_prototype;
      b->has_simple_parameter_list = fd->has_simple_parameter_list;
      b->is_strict_mode = fd->is_strict_mode;
@@ -1298,7 +1355,7 @@ index 62f4381..3b420f7 100644
      b->is_derived_class_constructor = fd->is_derived_class_constructor;
      b->func_kind = fd->func_kind;
      b->need_home_object = (fd->home_object_var_idx >= 0 ||
-@@ -35616,6 +36687,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+@@ -35616,6 +36716,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
      assert(idx <= 16);
      bc_put_u16(s, flags);
      bc_put_u8(s, b->is_strict_mode);
@@ -1306,7 +1363,7 @@ index 62f4381..3b420f7 100644
      bc_put_atom(s, b->func_name);
  
      bc_put_leb128(s, b->arg_count);
-@@ -36552,6 +37624,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -36552,6 +37653,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
      if (bc_get_u8(s, &v8))
          goto fail;
      bc.is_strict_mode = (v8 > 0);

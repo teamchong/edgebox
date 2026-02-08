@@ -331,7 +331,7 @@ fn fsAppend(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callco
 const MAX_FDS = 256;
 var fd_table: [MAX_FDS]?std.fs.File = [_]?std.fs.File{null} ** MAX_FDS;
 var fd_paths: [MAX_FDS]?[]const u8 = [_]?[]const u8{null} ** MAX_FDS;
-var next_fd: usize = 10; // Start after stdin/stdout/stderr
+const FIRST_USER_FD: usize = 10; // After stdin/stdout/stderr
 
 /// Open file and return file descriptor
 fn fsOpen(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
@@ -413,8 +413,8 @@ fn fsOpen(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv
         };
     };
 
-    // Find free slot in fd table
-    var fd_slot: usize = next_fd;
+    // Find free slot in fd table (linear search allows FD reuse)
+    var fd_slot: usize = FIRST_USER_FD;
     while (fd_slot < MAX_FDS and fd_table[fd_slot] != null) {
         fd_slot += 1;
     }
@@ -427,7 +427,6 @@ fn fsOpen(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv
     // Store in fd table
     fd_table[fd_slot] = file;
     fd_paths[fd_slot] = resolved; // Keep path for fstat
-    next_fd = fd_slot + 1;
 
     // If append mode, seek to end
     if (is_append) {
@@ -999,9 +998,12 @@ fn fsLink(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv
         std.fs.cwd().makePath(parent) catch {};
     }
 
-    // Create hard link using std.fs.Dir
-    std.fs.cwd().symLink(resolved_existing, resolved_new, .{}) catch |err| {
-        // Try using rename as fallback (won't work, but gives proper error)
+    // Create hard link using POSIX link syscall
+    const existing_z = std.posix.toPosixPath(resolved_existing) catch
+        return qjs.JS_ThrowInternalError(ctx, "path too long");
+    const new_z = std.posix.toPosixPath(resolved_new) catch
+        return qjs.JS_ThrowInternalError(ctx, "path too long");
+    std.posix.linkat(std.posix.AT.FDCWD, &existing_z, std.posix.AT.FDCWD, &new_z, 0) catch |err| {
         return throwErrno(ctx, "link", err);
     };
 

@@ -456,6 +456,69 @@ pub export fn native_columnar_get(row: u32, col: u32) i64 {
 }
 
 // ============================================================================
+// QuickJS Interpreter Fast Path
+// Called directly from OP_get_field for AST property access
+// ============================================================================
+
+/// Cached atom values for fast comparison in interpreter
+/// These must match QuickJS's atom table (atoms >= 227 are user-defined)
+var cached_atom_kind: u32 = 0;
+var cached_atom_flags: u32 = 0;
+var cached_atom_pos: u32 = 0;
+var cached_atom_end: u32 = 0;
+var atoms_initialized: bool = false;
+
+
+/// Initialize cached atoms - called from JS at startup
+pub export fn native_shapes_init_atoms(atom_kind: u32, atom_flags: u32, atom_pos: u32, atom_end: u32) void {
+    cached_atom_kind = atom_kind;
+    cached_atom_flags = atom_flags;
+    cached_atom_pos = atom_pos;
+    cached_atom_end = atom_end;
+    atoms_initialized = true;
+}
+
+/// Fast property access for QuickJS interpreter
+/// Called from OP_get_field for every property access
+/// Returns 1 if value was found in registry, 0 otherwise
+/// If found, writes the int32 value to value_out
+pub export fn native_shapes_get_property(obj_addr: u64, atom: u32, value_out: *i32) c_int {
+    // Quick reject: atoms not initialized or not our target atoms
+    if (!atoms_initialized) return 0;
+
+    // Check if this is one of our cached atoms
+    var field_type: u32 = 0; // 0=not ours, 1=kind, 2=flags, 3=pos, 4=end
+    if (atom == cached_atom_kind) {
+        field_type = 1;
+    } else if (atom == cached_atom_flags) {
+        field_type = 2;
+    } else if (atom == cached_atom_pos) {
+        field_type = 3;
+    } else if (atom == cached_atom_end) {
+        field_type = 4;
+    } else {
+        return 0; // Not an AST property
+    }
+
+    // Look up in registry
+    if (native_node_lookup(obj_addr)) |node| {
+        value_out.* = switch (field_type) {
+            1 => node.kind,
+            2 => node.flags,
+            3 => node.pos,
+            4 => node.end,
+            else => return 0,
+        };
+        return 1; // Found
+    }
+
+    return 0; // Not in registry
+}
+
+/// Debug statistics (no-op in production, can be enabled for profiling)
+pub export fn native_shapes_debug_stats() void {}
+
+// ============================================================================
 // Shape Detection Helpers
 // ============================================================================
 

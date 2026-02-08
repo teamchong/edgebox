@@ -744,6 +744,12 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         return newFloat(@mod(fa, fb));
     }
 
+    pub inline fn pow(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+        const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+        return newFloat(std.math.pow(f64, fa, fb));
+    }
+
     pub inline fn lt(a: CompressedValue, b: CompressedValue) CompressedValue {
         if (a.isInt() and b.isInt()) {
             return if (a.getInt() < b.getInt()) TRUE else FALSE;
@@ -978,11 +984,11 @@ pub const CompressedValue = if (is_wasm32) extern struct {
             const js_b = b.toJSValueWithCtx(ctx);
             const str_a = quickjs.JS_ToString(ctx, js_a);
             const str_b = quickjs.JS_ToString(ctx, js_b);
+            // Free intermediate ToString results but NOT the original inputs.
+            // addWithCtx is non-consuming: callers are responsible for freeing inputs.
             defer {
                 quickjs.JS_FreeValue(ctx, str_a);
                 quickjs.JS_FreeValue(ctx, str_b);
-                if (js_a.hasRefCount()) quickjs.JS_FreeValue(ctx, js_a);
-                if (js_b.hasRefCount()) quickjs.JS_FreeValue(ctx, js_b);
             }
             var len_a: usize = 0;
             var len_b: usize = 0;
@@ -1007,12 +1013,9 @@ pub const CompressedValue = if (is_wasm32) extern struct {
             return fromJSValue(result);
         }
         // For other types, convert to primitive and retry
+        // Non-consuming: do NOT free js_a/js_b - callers handle that.
         const js_a = a.toJSValueWithCtx(ctx);
         const js_b = b.toJSValueWithCtx(ctx);
-        defer {
-            if (js_a.hasRefCount()) quickjs.JS_FreeValue(ctx, js_a);
-            if (js_b.hasRefCount()) quickjs.JS_FreeValue(ctx, js_b);
-        }
         var fa: f64 = 0;
         var fb: f64 = 0;
         if (quickjs.JS_ToFloat64(ctx, &fa, js_a) == 0 and quickjs.JS_ToFloat64(ctx, &fb, js_b) == 0) {
@@ -1485,11 +1488,11 @@ pub const CompressedValue = if (is_wasm32) extern struct {
             // Convert both to strings
             const str_a = quickjs.JS_ToString(ctx, js_a);
             const str_b = quickjs.JS_ToString(ctx, js_b);
+            // Free intermediate ToString results but NOT the original inputs.
+            // addWithCtx is non-consuming: callers are responsible for freeing inputs.
             defer {
                 quickjs.JS_FreeValue(ctx, str_a);
                 quickjs.JS_FreeValue(ctx, str_b);
-                if (js_a.hasRefCount()) quickjs.JS_FreeValue(ctx, js_a);
-                if (js_b.hasRefCount()) quickjs.JS_FreeValue(ctx, js_b);
             }
             // Get C strings
             var len_a: usize = 0;
@@ -1518,13 +1521,9 @@ pub const CompressedValue = if (is_wasm32) extern struct {
             return fromJSValue(result);
         }
         // For other types (objects, etc.), convert to primitive and retry
-        // This is a fallback - in practice, frozen code rarely hits this path
+        // Non-consuming: do NOT free js_a/js_b - callers handle that.
         const js_a = a.toJSValueWithCtx(ctx);
         const js_b = b.toJSValueWithCtx(ctx);
-        defer {
-            if (js_a.hasRefCount()) quickjs.JS_FreeValue(ctx, js_a);
-            if (js_b.hasRefCount()) quickjs.JS_FreeValue(ctx, js_b);
-        }
         // Try to convert to numbers
         var fa: f64 = 0;
         var fb: f64 = 0;
@@ -1864,6 +1863,12 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
         const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
         return newFloat(@mod(fa, fb));
+    }
+
+    pub inline fn pow(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+        const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+        return newFloat(std.math.pow(f64, fa, fb));
     }
 
     /// JavaScript truthy/falsy conversion

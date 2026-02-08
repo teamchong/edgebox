@@ -213,6 +213,8 @@ pub const FunctionInfo = struct {
     is_async: bool = false,
     /// Constant pool values - used for fclosure bytecode registration
     constants: []const module_parser.ConstValue = &.{},
+    /// Stack size (from bytecode, for sizing the operand stack array)
+    stack_size: u32 = 256,
 };
 
 /// Full Zig code generator
@@ -240,6 +242,9 @@ pub const ZigCodeGen = struct {
     vstack: std.ArrayListUnmanaged([]const u8) = .{},
     /// Force stack-based codegen after a fallback (to avoid vstack/stack mismatches)
     force_stack_mode: bool = false,
+    /// Track that shouldSkipForNativeMath skipped get_var/get_field2 instructions,
+    /// so call_method must still use tryEmitNativeMathCall even in force_stack_mode
+    native_math_skipped: bool = false,
     /// Block terminated by return/throw - skip remaining instructions
     block_terminated: bool = false,
     /// Function returned (not just break/continue) - don't clear block_terminated
@@ -588,7 +593,8 @@ pub const ZigCodeGen = struct {
         self.pushIndent();
 
         // Convert frozen stack to JSValue array for interpreter
-        try self.writeLine("var _interp_stack: [256]zig_runtime.JSValue = undefined;");
+        const interp_stack_size = @max(self.func.var_count + self.func.stack_size, 256);
+        try self.printLine("var _interp_stack: [{d}]zig_runtime.JSValue = undefined;", .{interp_stack_size});
         try self.writeLine("for (0..sp) |_i| { _interp_stack[_i] = stack[_i].toJSValueWithCtx(ctx); }");
 
         // Convert locals to JSValue array
@@ -715,13 +721,7 @@ pub const ZigCodeGen = struct {
     /// - For exception: return .exception
     /// - For regular value: return .{ .return_value = VALUE }
     fn emitReturnException(self: *Self) !void {
-        // Sync _locals_jsv from locals and detach var_refs before returning
-        // This ensures closures see the final values of all local variables
-        // Skip in dispatch_mode - cleanup is done in the dispatch loop instead
-        if (self.has_fclosure and self.func.var_count > 0 and !self.dispatch_mode) {
-            try self.printLine("for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{self.func.var_count});
-            try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
-        }
+        try self.emitVarRefDetach();
         // Free arg_shadow values before returning (they were duped at function entry)
         if (self.has_put_arg) {
             const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
@@ -741,13 +741,7 @@ pub const ZigCodeGen = struct {
     }
 
     fn emitReturnValueFmt(self: *Self, comptime fmt: []const u8, args: anytype) !void {
-        // Sync _locals_jsv from locals and detach var_refs before returning
-        // This ensures closures see the final values of all local variables
-        // Skip in dispatch_mode - cleanup is done in the dispatch loop instead
-        if (self.has_fclosure and self.func.var_count > 0 and !self.dispatch_mode) {
-            try self.printLine("for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{self.func.var_count});
-            try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
-        }
+        try self.emitVarRefDetach();
         // Free arg_shadow values before returning (they were duped at function entry)
         if (self.has_put_arg) {
             const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
@@ -767,13 +761,7 @@ pub const ZigCodeGen = struct {
     }
 
     fn emitReturnValue(self: *Self, expr: []const u8) !void {
-        // Sync _locals_jsv from locals and detach var_refs before returning
-        // This ensures closures see the final values of all local variables
-        // Skip in dispatch_mode - cleanup is done in the dispatch loop instead
-        if (self.has_fclosure and self.func.var_count > 0 and !self.dispatch_mode) {
-            try self.printLine("for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{self.func.var_count});
-            try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
-        }
+        try self.emitVarRefDetach();
         // Free arg_shadow values before returning (they were duped at function entry)
         if (self.has_put_arg) {
             const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
@@ -790,6 +778,28 @@ pub const ZigCodeGen = struct {
         } else {
             try self.printLine("return {s};", .{expr});
         }
+    }
+
+    /// Emit var_ref detach with required _locals_jsv sync.
+    /// MUST be used instead of emitting js_frozen_var_ref_list_detach directly.
+    /// Syncs locals → _locals_jsv first so var_refs see current values, then detaches.
+    /// Skips in dispatch_mode (cleanup done in dispatch loop).
+    fn emitVarRefDetach(self: *Self) !void {
+        if (self.has_fclosure and self.func.var_count > 0 and !self.dispatch_mode) {
+            try self.printLine("for (0..{d}) |_i| {{ {s}[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{ self.func.var_count, self.getLocalsJsvExpr() });
+            try self.printLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, {s});", .{self.getVarRefListPtr()});
+        }
+    }
+
+    /// Emit an inline exception check with proper cleanup.
+    /// Replaces bare `if (x.isException()) return JSValue.EXCEPTION;` patterns
+    /// with code that detaches _var_ref_list and frees locals before returning.
+    fn emitInlineExceptionReturn(self: *Self, condition_var: []const u8) !void {
+        try self.printLine("if ({s}.isException()) {{", .{condition_var});
+        self.pushIndent();
+        try self.emitReturnException();
+        self.popIndent();
+        try self.writeLine("}");
     }
 
     // ========================================================================
@@ -887,7 +897,8 @@ pub const ZigCodeGen = struct {
             try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
         } else {
             // For all other functions, emit stack and instructions using CompressedValue (8-byte)
-            try self.writeLine("var stack: [256]CV = .{CV.UNDEFINED} ** 256;");
+            const stack_array_size = @max(self.func.var_count + self.func.stack_size, 256);
+            try self.printLine("var stack: [{d}]CV = .{{CV.UNDEFINED}} ** {d};", .{ stack_array_size, stack_array_size });
             try self.writeLine("var sp: usize = 0;");
             // Track iterator positions for for-of loops (stack for nested loops)
             try self.writeLine("var for_of_iter_stack: [8]usize = .{0} ** 8;");
@@ -1193,6 +1204,11 @@ pub const ZigCodeGen = struct {
                     try self.writeLine("}");
                 } else {
                     // Clean single block - emit instructions directly
+                    // CRITICAL: Clear vstack after each instruction to prevent stale entries.
+                    // emitInstruction has mixed vstack behavior: some handlers push (emitCall,
+                    // fclosure's vpushStackRef) but others don't pop (drop, put_loc). Without
+                    // clearing, stale vstack entries accumulate and corrupt materializeVStack
+                    // when a later opcode (like set_name) triggers materialization.
                     for (block.instructions, 0..) |instr, idx| {
                         // Check if this should be skipped for native Array.push optimization
                         if (self.shouldSkipForNativeArrayPush(block.instructions, idx)) {
@@ -1203,6 +1219,12 @@ pub const ZigCodeGen = struct {
                             continue; // Skip - native Math fast path will handle it
                         }
                         const continues = try self.emitInstruction(instr, block.instructions, idx);
+                        // Clear vstack after emitInstruction to prevent stale entries
+                        // (matches force_stack_mode cleanup in emitInstructionExpr)
+                        for (self.vstack.items) |expr| {
+                            if (self.isAllocated(expr)) self.allocator.free(expr);
+                        }
+                        self.vstack.clearRetainingCapacity();
                         if (!continues) break; // Stop after terminating instruction
                     }
                 }
@@ -1315,7 +1337,8 @@ pub const ZigCodeGen = struct {
         try self.writeLineBlock("var_refs: ?[*]*zig_runtime.JSVarRef,");
         try self.writeLineBlock("closure_var_count: c_int,");
         try self.writeLineBlock("cpool: ?[*]zig_runtime.JSValue,");
-        try self.writeLineBlock("stack: *[256]zig_runtime.CompressedValue,");
+        const block_stack_size = @max(self.func.var_count + self.func.stack_size, 256);
+        try self.printLineBlock("stack: *[{d}]zig_runtime.CompressedValue,", .{block_stack_size});
         try self.writeLineBlock("sp: *usize,");
         const min_locals = if (self.func.var_count >= 16) self.func.var_count else 16;
         try self.printLineBlock("locals: *[{d}]zig_runtime.CompressedValue,", .{min_locals});
@@ -1382,9 +1405,9 @@ pub const ZigCodeGen = struct {
         try self.writeLine(".next_block => |n| block_id = n,");
         // Do var_ref_list cleanup before returning from dispatch loop
         if (needs_var_ref_cleanup) {
-            try self.writeLine(".return_value => |v| { zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list); return v; },");
-            try self.writeLine(".return_undef => { zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list); return zig_runtime.JSValue.UNDEFINED; },");
-            try self.writeLine(".exception => { zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list); return zig_runtime.JSValue.EXCEPTION; },");
+            try self.printLine(".return_value => |v| {{ for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }} zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list); return v; }},", .{self.func.var_count});
+            try self.printLine(".return_undef => {{ for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }} zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list); return zig_runtime.JSValue.UNDEFINED; }},", .{self.func.var_count});
+            try self.printLine(".exception => {{ for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }} zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list); return zig_runtime.JSValue.EXCEPTION; }},", .{self.func.var_count});
         } else {
             try self.writeLine(".return_value => |v| return v,");
             try self.writeLine(".return_undef => return zig_runtime.JSValue.UNDEFINED,");
@@ -2821,6 +2844,15 @@ pub const ZigCodeGen = struct {
     }
 
     /// Check if a string was heap-allocated (vs a literal fallback)
+    /// Check if a vstack expression references live storage (locals, arg_cache)
+    /// that must not be consumed by operations like addWithCtx.
+    fn isStorageRef(self: *Self, expr: []const u8) bool {
+        _ = self;
+        if (std.mem.startsWith(u8, expr, "locals[")) return true;
+        if (std.mem.startsWith(u8, expr, "(if (") and std.mem.indexOf(u8, expr, "arg_cache[") != null) return true;
+        return false;
+    }
+
     fn isAllocated(self: *Self, str: []const u8) bool {
         _ = self;
         // Known literal fallbacks - compare pointer addresses
@@ -3027,6 +3059,7 @@ pub const ZigCodeGen = struct {
         // force_stack_mode is also reset (fallback within a block doesn't affect other blocks)
         self.block_terminated = false;
         self.force_stack_mode = false;
+        self.native_math_skipped = false;
 
         if (CODEGEN_DEBUG) {
             std.debug.print("[emitBlockExpr] block {d}: {d} instructions\n", .{ block.id, block.instructions.len });
@@ -3066,11 +3099,7 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("{ const _ret_cv = stack[sp - 1]; const _ret_val = if (_ret_cv.isRefType()) JSValue.dup(ctx, _ret_cv.toJSValueWithCtx(ctx)) else _ret_cv.toJSValueWithCtx(ctx);");
                 // Free the original stack value to avoid GC leaks (dup created a new reference)
                 try self.writeLine("if (_ret_cv.isRefType()) JSValue.free(ctx, _ret_cv.toJSValueWithCtx(ctx));");
-                // Detach var_refs BEFORE freeing locals (var_refs point to _locals_jsv)
-                // Skip in dispatch_mode - cleanup is done in the dispatch loop instead
-                if (self.has_fclosure and self.func.var_count > 0 and !self.dispatch_mode) {
-                    try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
-                }
+                try self.emitVarRefDetach();
                 try self.emitLocalsCleanup();
                 if (self.dispatch_mode) {
                     try self.writeLine("return .{ .return_value = _ret_val }; }");
@@ -3081,11 +3110,7 @@ pub const ZigCodeGen = struct {
                 return;
             }
             if (instr.opcode == .return_undef) {
-                // Detach var_refs BEFORE freeing locals (var_refs point to _locals_jsv)
-                // Skip in dispatch_mode - cleanup is done in the dispatch loop instead
-                if (self.has_fclosure and self.func.var_count > 0 and !self.dispatch_mode) {
-                    try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
-                }
+                try self.emitVarRefDetach();
                 try self.emitLocalsCleanup();
                 if (self.dispatch_mode) {
                     try self.writeLine("return .return_undef;");
@@ -3207,6 +3232,8 @@ pub const ZigCodeGen = struct {
         // Check if this instruction should be skipped for native Math optimization
         if (self.shouldSkipForNativeMath(block.instructions, idx)) |_| {
             // Skip this get_var("Math") or get_field2("method") - native fast path will handle it
+            // Track that we skipped so call_method uses native math even if force_stack_mode gets set later
+            self.native_math_skipped = true;
             return;
         }
 
@@ -3835,11 +3862,10 @@ pub const ZigCodeGen = struct {
                 // Track that value is on real stack via base_stack_depth
                 // Don't use vpushStackRef - it adds a vstack entry that gets duplicated later
                 self.base_stack_depth += 1;
-                // CRITICAL: Reset base_popped_count after stack modifications are committed
-                // This ensures subsequent operations compute correct offsets relative to new sp
-                if (base_consumed > 0) {
-                    self.base_popped_count = 0;
-                }
+                // CRITICAL: Always reset base_popped_count when pushing to base stack.
+                // The push generates sp += 1, so the new value is at stack[sp-1].
+                // Previous pops already adjusted sp, so base_popped_count must restart from 0.
+                self.base_popped_count = 0;
             },
 
             // get_array_el2: pop idx, pop arr, push arr, push arr[idx]
@@ -3891,39 +3917,21 @@ pub const ZigCodeGen = struct {
                 // Track that 2 values are on real stack via base_stack_depth
                 // Don't use vpushStackRef - it adds vstack entries that get duplicated later
                 self.base_stack_depth += 2;
+                self.base_popped_count = 0;
             },
 
             // Stack operations
             .dup => {
-                // IMPORTANT: Check vstack.items.len, NOT vpeek()
-                // vpeek() returns "stack[sp-1]" when base_stack_depth > 0 but vstack is empty,
-                // which would incorrectly push a stack reference to vstack that gets
-                // counted as "consuming" a stack value during materializeVStack
+                // Always materialize vstack before dup to avoid double-evaluation.
+                // Re-pushing computed expressions causes them to be evaluated twice during
+                // materializeVStack, which can produce incorrect results or side effects.
+                // Stack references also can't be re-pushed (sp accounting issues).
                 if (self.vstack.items.len > 0) {
-                    const expr = self.vstack.items[self.vstack.items.len - 1];
-                    // IMPORTANT: If the expression is a stack reference (stack[sp-N]),
-                    // DON'T push it again to vstack. This causes materializeVStack to
-                    // miscalculate stack consumption (both refs consume the same slot but
-                    // get counted separately). Instead, materialize vstack and emit real dup.
-                    if (std.mem.startsWith(u8, expr, "stack[sp")) {
-                        // Materialize vstack first, then emit real dup
-                        try self.materializeVStack();
-                        try self.writeLine("{ const v = stack[sp - 1]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
-                        self.base_stack_depth += 1;
-                        self.base_popped_count = 0;
-                    } else {
-                        // Safe to push non-stack-reference expression
-                        try self.vpush(expr);
-                    }
-                } else {
-                    // vstack empty - emit real stack dup (regardless of base_stack_depth)
-                    // This correctly increments sp and keeps the original value
-                    try self.writeLine("{ const v = stack[sp - 1]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
-                    // Track the duplicated value via base_stack_depth, not vstack
-                    // This avoids double-push when vstack is later materialized
-                    self.base_stack_depth += 1;
-                    self.base_popped_count = 0; // Reset - fresh value at stack top
+                    try self.materializeVStack();
                 }
+                try self.writeLine("{ const v = stack[sp - 1]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
+                self.base_stack_depth += 1;
+                self.base_popped_count = 0;
             },
             .drop => {
                 if (self.vpop()) |expr| {
@@ -4170,11 +4178,7 @@ pub const ZigCodeGen = struct {
                 if (is_stack_value) {
                     try self.writeLine("if (_ret_cv.isRefType()) JSValue.free(ctx, _ret_cv.toJSValueWithCtx(ctx));");
                 }
-                // Detach var_refs before returning if function creates closures
-                // Skip in dispatch_mode - cleanup is done in the dispatch loop instead
-                if (self.has_fclosure and self.func.var_count > 0 and !self.dispatch_mode) {
-                    try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
-                }
+                try self.emitVarRefDetach();
                 // Free arg_shadow values before returning (they were duped at function entry)
                 if (self.has_put_arg) {
                     const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
@@ -4207,11 +4211,7 @@ pub const ZigCodeGen = struct {
                 if (CODEGEN_DEBUG) std.debug.print("[return] block_terminated={}, function_returned={}, if_body_depth={}\n", .{ self.block_terminated, self.function_returned, self.if_body_depth });
             },
             .return_undef => {
-                // Detach var_refs before returning if function creates closures
-                // Skip in dispatch_mode - cleanup is done in the dispatch loop instead
-                if (self.has_fclosure and self.func.var_count > 0 and !self.dispatch_mode) {
-                    try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
-                }
+                try self.emitVarRefDetach();
                 // Free arg_shadow values before returning (they were duped at function entry)
                 if (self.has_put_arg) {
                     const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
@@ -4535,9 +4535,13 @@ pub const ZigCodeGen = struct {
             // Arguments - use cached values if available (prevents repeated dup leaks in loops)
             // Use arg_cache_js directly to avoid CV→JSValue reconstruction issues
             // In dispatch_mode, use argv directly as arg_cache_js is not accessible from block functions
+            // CRITICAL: When has_put_arg is true, must use arg_shadow to reflect default parameter values
             .get_arg => {
                 const arg_idx = instr.operand.arg;
-                if (self.uses_arg_cache and arg_idx <= self.max_loop_arg_idx and !self.dispatch_mode) {
+                if (self.has_put_arg) {
+                    // Argument may be reassigned - must use arg_shadow, matches get_arg0-3
+                    try self.printLine("{{ const v = arg_shadow[{d}]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }}", .{arg_idx});
+                } else if (self.uses_arg_cache and arg_idx <= self.max_loop_arg_idx and !self.dispatch_mode) {
                     // Dup from arg_cache_js (original JSValue) to avoid CV reconstruction
                     try self.printLine("stack[sp] = if ({d} < argc) CV.fromJSValue(JSValue.dup(ctx, arg_cache_js[{d}])) else CV.UNDEFINED; sp += 1;", .{ arg_idx, arg_idx });
                 } else {
@@ -4624,11 +4628,7 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("{ const _ret_cv = stack[sp - 1]; const _ret_val = if (_ret_cv.isRefType()) JSValue.dup(ctx, _ret_cv.toJSValueWithCtx(ctx)) else _ret_cv.toJSValueWithCtx(ctx);");
                 // Free the original stack value to avoid GC leaks (dup created a new reference)
                 try self.writeLine("if (_ret_cv.isRefType()) JSValue.free(ctx, _ret_cv.toJSValueWithCtx(ctx));");
-                // Detach var_refs BEFORE freeing locals (var_refs point to _locals_jsv)
-                // Skip in dispatch_mode - cleanup is done in the dispatch loop instead
-                if (self.has_fclosure and self.func.var_count > 0 and !self.dispatch_mode) {
-                    try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
-                }
+                try self.emitVarRefDetach();
                 // Free arg_shadow values before returning (they were duped at function entry)
                 if (self.has_put_arg) {
                     const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
@@ -4645,11 +4645,7 @@ pub const ZigCodeGen = struct {
                 return false; // Control terminates
             },
             .return_undef => {
-                // Detach var_refs BEFORE freeing locals (var_refs point to _locals_jsv)
-                // Skip in dispatch_mode - cleanup is done in the dispatch loop instead
-                if (self.has_fclosure and self.func.var_count > 0 and !self.dispatch_mode) {
-                    try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
-                }
+                try self.emitVarRefDetach();
                 // Free arg_shadow values before returning (they were duped at function entry)
                 if (self.has_put_arg) {
                     const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
@@ -4772,7 +4768,18 @@ pub const ZigCodeGen = struct {
                         // Free old CV if it's a ref type since we're replacing it
                         const escaped_prop = escapeZigString(self.allocator, prop_name) catch prop_name;
                         defer if (escaped_prop.ptr != prop_name.ptr) self.allocator.free(escaped_prop);
-                        try self.printLine("{{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); const prop = JSValue.getPropertyStr(ctx, obj, \"{s}\"); stack[sp-1] = CV.fromJSValue(prop); if (cv.isRefType()) JSValue.free(ctx, obj); }}", .{escaped_prop});
+                        try self.writeLine("{");
+                        self.pushIndent();
+                        try self.writeLine("const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx);");
+                        try self.printLine("const _gf = JSValue.getPropertyStr(ctx, obj, \"{s}\");", .{escaped_prop});
+                        try self.writeLine("if (_gf.isException()) {");
+                        self.pushIndent();
+                        try self.emitReturnException();
+                        self.popIndent();
+                        try self.writeLine("}");
+                        try self.writeLine("stack[sp-1] = CV.fromJSValue(_gf); if (cv.isRefType()) JSValue.free(ctx, obj);");
+                        self.popIndent();
+                        try self.writeLine("}");
                     }
                     // NOTE: Do NOT manipulate vstack here - emitInstruction is stack-based only.
                     // The old vpop/vpush pattern polluted vstack with stale references.
@@ -4837,7 +4844,14 @@ pub const ZigCodeGen = struct {
                         // Standard property access via QuickJS - convert CV <-> JSValue
                         const escaped_prop = escapeZigString(self.allocator, prop_name) catch prop_name;
                         defer if (escaped_prop.ptr != prop_name.ptr) self.allocator.free(escaped_prop);
-                        try self.printLine("{{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(JSValue.getPropertyStr(ctx, obj, \"{s}\")); sp += 1; }}", .{escaped_prop});
+                        try self.writeLine("{");
+                        self.pushIndent();
+                        try self.writeLine("const obj = stack[sp-1].toJSValueWithCtx(ctx);");
+                        try self.printLine("const _gf = JSValue.getPropertyStr(ctx, obj, \"{s}\");", .{escaped_prop});
+                        try self.emitInlineExceptionReturn("_gf");
+                        try self.writeLine("stack[sp] = CV.fromJSValue(_gf); sp += 1;");
+                        self.popIndent();
+                        try self.writeLine("}");
                     }
                     // NOTE: Do NOT call vpush here - emitInstruction is stack-based only.
                     // Calling vpush pollutes vstack with stale references that cause
@@ -4972,9 +4986,11 @@ pub const ZigCodeGen = struct {
             .call_method => {
                 const argc = instr.operand.u16;
                 // Check for Math.method pattern and emit native code if possible
-                // NOTE: Don't use native Math in force_stack_mode because get_var/get_field2
-                // weren't skipped, so the stack has Math object and method on it
-                if (!self.force_stack_mode and try self.tryEmitNativeMathCall(argc, block_instrs, instr_idx)) {
+                // Use native Math if: (a) not in force_stack_mode (normal path), OR
+                // (b) native_math_skipped is set (shouldSkipForNativeMath already skipped
+                //     get_var/get_field2 before force_stack_mode was triggered by a later opcode)
+                if ((self.native_math_skipped or !self.force_stack_mode) and try self.tryEmitNativeMathCall(argc, block_instrs, instr_idx)) {
+                    self.native_math_skipped = false;
                     // Native math emitted - sync vstack
                     // Math.method(arg) replaces stack[sp-1] in-place
                     // Pop the arg from vstack and push result reference
@@ -5105,11 +5121,11 @@ pub const ZigCodeGen = struct {
                 self.pushIndent();
                 try self.writeLine("sp -= 1;");
                 try self.printLine("const err = zig_runtime.setClosureVarCheckSafe(ctx, var_refs, {d}, {d}, stack[sp].toJSValueWithCtx(ctx));", .{ bytecode_idx, self.func.closure_var_count });
-                if (self.dispatch_mode) {
-                    try self.writeLine("if (err) return .exception;");
-                } else {
-                    try self.writeLine("if (err) return JSValue.EXCEPTION;");
-                }
+                try self.writeLine("if (err) {");
+                self.pushIndent();
+                try self.emitReturnException();
+                self.popIndent();
+                try self.writeLine("}");
                 self.popIndent();
                 try self.writeLine("}");
             },
@@ -5353,11 +5369,7 @@ pub const ZigCodeGen = struct {
                 const argc = instr.operand.u16;
                 // Emit as regular call_method followed by return
                 try self.emitCallMethod(argc);
-                // Detach var_refs before returning if function creates closures
-                // Skip in dispatch_mode - cleanup is done in the dispatch loop instead
-                if (self.has_fclosure and self.func.var_count > 0 and !self.dispatch_mode) {
-                    try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
-                }
+                try self.emitVarRefDetach();
                 // Cleanup locals before returning (skip in dispatch_mode - done in dispatch loop)
                 if (!self.dispatch_mode) {
                     try self.emitLocalsCleanup();
@@ -5448,11 +5460,13 @@ pub const ZigCodeGen = struct {
 
             // throw: throw exception
             .throw => {
-                if (self.dispatch_mode) {
-                    try self.writeLine("{ const exc = stack[sp-1]; sp -= 1; _ = JSValue.throw(ctx, exc.toJSValueWithCtx(ctx)); return .exception; }");
-                } else {
-                    try self.writeLine("{ const exc = stack[sp-1]; sp -= 1; return JSValue.throw(ctx, exc.toJSValueWithCtx(ctx)); }");
-                }
+                try self.writeLine("{");
+                self.pushIndent();
+                try self.writeLine("const exc = stack[sp-1]; sp -= 1;");
+                try self.writeLine("_ = JSValue.throw(ctx, exc.toJSValueWithCtx(ctx));");
+                try self.emitReturnException();
+                self.popIndent();
+                try self.writeLine("}");
             },
 
             // typeof: get type string - CV to JSValue conversion
@@ -5592,11 +5606,7 @@ pub const ZigCodeGen = struct {
                 }
                 // Non-self tail call - fall back to regular call + return
                 try self.emitCall(argc);
-                // Detach var_refs before returning if function creates closures
-                // Skip in dispatch_mode - cleanup is done in the dispatch loop instead
-                if (self.has_fclosure and self.func.var_count > 0 and !self.dispatch_mode) {
-                    try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
-                }
+                try self.emitVarRefDetach();
                 // Cleanup locals before returning (skip in dispatch_mode - done in dispatch loop)
                 if (!self.dispatch_mode) {
                     try self.emitLocalsCleanup();
@@ -5712,6 +5722,7 @@ pub const ZigCodeGen = struct {
             },
 
             // add_loc: add to local variable - CV.add inline
+            // addWithCtx is non-consuming, so we must explicitly free the old local and stack values.
             .add_loc => {
                 const loc_idx = instr.operand.loc;
                 try self.printLine("locals[{d}] = CV.addWithCtx(ctx, locals[{d}], stack[sp-1]); sp -= 1;", .{ loc_idx, loc_idx });
@@ -5750,11 +5761,11 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("const atom = zig_runtime.quickjs.JS_ValueToAtom(ctx, prop);");
                 try self.writeLine("const result = zig_runtime.quickjs.JS_HasProperty(ctx, obj, atom);");
                 try self.writeLine("zig_runtime.quickjs.JS_FreeAtom(ctx, atom);");
-                if (self.dispatch_mode) {
-                    try self.writeLine("if (result < 0) return .exception;");
-                } else {
-                    try self.writeLine("if (result < 0) return JSValue.EXCEPTION;");
-                }
+                try self.writeLine("if (result < 0) {");
+                self.pushIndent();
+                try self.emitReturnException();
+                self.popIndent();
+                try self.writeLine("}");
                 try self.writeLine("stack[sp-2] = CV.fromJSValue(JSValue.newBool(result > 0));");
                 try self.writeLine("sp -= 1;");
                 self.popIndent();
@@ -5934,11 +5945,7 @@ pub const ZigCodeGen = struct {
                 // Check for error
                 try self.writeLine("if (_res < 0) {");
                 self.pushIndent();
-                if (self.dispatch_mode) {
-                    try self.writeLine("return .exception;");
-                } else {
-                    try self.writeLine("return JSValue.EXCEPTION;");
-                }
+                try self.emitReturnException();
                 self.popIndent();
                 try self.writeLine("}");
 
@@ -5969,11 +5976,7 @@ pub const ZigCodeGen = struct {
                 self.pushIndent();
                 try self.writeLine("const obj = stack[sp-1].toJSValueWithCtx(ctx);");
                 try self.writeLine("const proto = zig_runtime.quickjs.JS_GetPrototype(ctx, obj);");
-                if (self.dispatch_mode) {
-                    try self.writeLine("if (proto.isException()) return .exception;");
-                } else {
-                    try self.writeLine("if (proto.isException()) return JSValue.EXCEPTION;");
-                }
+                try self.emitInlineExceptionReturn("proto");
                 try self.writeLine("stack[sp-1] = CV.fromJSValue(proto);");
                 self.popIndent();
                 try self.writeLine("}");
@@ -5986,11 +5989,7 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("const proto = JSValue.getPropertyStr(ctx, this_val, \"prototype\");");
                 try self.writeLine("const this_obj = zig_runtime.quickjs.JS_NewObjectProtoClass(ctx, proto, zig_runtime.quickjs.JS_CLASS_OBJECT);");
                 try self.writeLine("JSValue.free(ctx, proto);");
-                if (self.dispatch_mode) {
-                    try self.writeLine("if (this_obj.isException()) return .exception;");
-                } else {
-                    try self.writeLine("if (this_obj.isException()) return JSValue.EXCEPTION;");
-                }
+                try self.emitInlineExceptionReturn("this_obj");
                 try self.writeLine("stack[sp] = CV.fromJSValue(this_obj); sp += 1;");
                 self.popIndent();
                 try self.writeLine("}");
@@ -6008,11 +6007,7 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("var args = [2]JSValue{ pattern, flags };");
                 try self.writeLine("const rx = JSValue.callConstructor(ctx, RegExpCtor, 2, &args);");
                 try self.writeLine("JSValue.free(ctx, RegExpCtor);");
-                if (self.dispatch_mode) {
-                    try self.writeLine("if (rx.isException()) return .exception;");
-                } else {
-                    try self.writeLine("if (rx.isException()) return JSValue.EXCEPTION;");
-                }
+                try self.emitInlineExceptionReturn("rx");
                 try self.writeLine("stack[sp-2] = CV.fromJSValue(rx); sp -= 1;");
                 self.popIndent();
                 try self.writeLine("}");
@@ -6060,18 +6055,18 @@ pub const ZigCodeGen = struct {
                 try self.printLine("locals[{d}] = CV.sub(locals[{d}], CV.newInt(1));", .{ loc_idx, loc_idx });
             },
 
-            // put_arg: put argument (generic with index) - CV to JSValue conversion
-            // Note: Don't free old argv value - it belongs to the caller
+            // put_arg: put argument (generic with index) - use arg_shadow
+            // has_put_arg is always true when put_arg exists, use arg_shadow to match put_arg0-3
             .put_arg => {
                 const idx = instr.operand.arg;
-                try self.printLine("{{ if (argc > {d}) {{ argv[{d}] = stack[sp-1].toJSValueWithCtx(ctx); }} sp -= 1; }}", .{ idx, idx });
+                try self.printLine("{{ const old = arg_shadow[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); arg_shadow[{d}] = stack[sp-1]; sp -= 1; }}", .{ idx, idx });
             },
 
-            // set_arg: set argument (generic with index)
-            // Note: Don't free old argv value - it belongs to the caller
+            // set_arg: set argument (generic with index) - use arg_shadow
+            // has_put_arg is always true when set_arg exists, use arg_shadow to match set_arg0-3
             .set_arg => {
                 const idx = instr.operand.arg;
-                try self.printLine("{{ if (argc > {d}) {{ argv[{d}] = JSValue.dup(ctx, stack[sp-1].toJSValueWithCtx(ctx)); }} }}", .{ idx, idx });
+                try self.printLine("{{ const old = arg_shadow[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); const v = stack[sp-1]; arg_shadow[{d}] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; }}", .{ idx, idx });
             },
 
             // delete: delete property with proper reference handling
@@ -6242,11 +6237,11 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("for_of_buf[0] = stack[sp - 1].toJSValueWithCtx(ctx);");
                 try self.writeLine("for_of_buf[1] = JSValue.UNDEFINED;");
                 try self.writeLine("const rc = zig_runtime.quickjs.js_frozen_for_of_start(ctx, @ptrCast(&for_of_buf[1]), 0);");
-                if (self.dispatch_mode) {
-                    try self.writeLine("if (rc != 0) return .exception;");
-                } else {
-                    try self.writeLine("if (rc != 0) return JSValue.EXCEPTION;");
-                }
+                try self.writeLine("if (rc != 0) {");
+                self.pushIndent();
+                try self.emitReturnException();
+                self.popIndent();
+                try self.writeLine("}");
                 try self.writeLine("stack[sp - 1] = CV.fromJSValue(for_of_buf[0]);  // iterator replaces obj");
                 try self.writeLine("stack[sp] = CV.fromJSValue(for_of_buf[1]); sp += 1;  // next_method");
                 try self.writeLine("stack[sp] = CV.fromJSValue(zig_runtime.newCatchOffset(0)); sp += 1;");
@@ -6272,11 +6267,11 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("for_of_buf[3] = JSValue.UNDEFINED;                // value (output)");
                 try self.writeLine("for_of_buf[4] = JSValue.UNDEFINED;                // done (output)");
                 try self.writeLine("const rc = zig_runtime.quickjs.js_frozen_for_of_next(ctx, @ptrCast(&for_of_buf[3]), -3);");
-                if (self.dispatch_mode) {
-                    try self.writeLine("if (rc != 0) return .exception;");
-                } else {
-                    try self.writeLine("if (rc != 0) return JSValue.EXCEPTION;");
-                }
+                try self.writeLine("if (rc != 0) {");
+                self.pushIndent();
+                try self.emitReturnException();
+                self.popIndent();
+                try self.writeLine("}");
                 // Write iterator back - js_frozen_for_of_next may have freed it and set to UNDEFINED
                 try self.writeLine("stack[iter_idx] = CV.fromJSValue(for_of_buf[0]);");
                 try self.writeLine("stack[sp] = CV.fromJSValue(for_of_buf[3]); sp += 1;  // value");
@@ -6296,11 +6291,11 @@ pub const ZigCodeGen = struct {
                 // Buffer: [source, UNUSED] - pass &buf[1] so sp[-1] = buf[0]
                 try self.writeLine("var for_in_buf: [2]JSValue = .{stack[sp - 1].toJSValueWithCtx(ctx), JSValue.UNDEFINED};");
                 try self.writeLine("const rc = zig_runtime.quickjs.js_frozen_for_in_start(ctx, @ptrCast(&for_in_buf[1]));");
-                if (self.dispatch_mode) {
-                    try self.writeLine("if (rc < 0) return .exception;");
-                } else {
-                    try self.writeLine("if (rc < 0) return JSValue.EXCEPTION;");
-                }
+                try self.writeLine("if (rc < 0) {");
+                self.pushIndent();
+                try self.emitReturnException();
+                self.popIndent();
+                try self.writeLine("}");
                 try self.writeLine("stack[sp - 1] = CV.fromJSValue(for_in_buf[0]);  // iterator replaces object");
                 self.popIndent();
                 try self.writeLine("}");
@@ -6316,11 +6311,11 @@ pub const ZigCodeGen = struct {
                 // Buffer: [iterator, property, done] - pass &buf[1] so sp[-1] = buf[0]
                 try self.writeLine("var for_in_buf: [3]JSValue = .{stack[sp - 1].toJSValueWithCtx(ctx), JSValue.UNDEFINED, JSValue.UNDEFINED};");
                 try self.writeLine("const rc = zig_runtime.quickjs.js_frozen_for_in_next(ctx, @ptrCast(&for_in_buf[1]));");
-                if (self.dispatch_mode) {
-                    try self.writeLine("if (rc < 0) return .exception;");
-                } else {
-                    try self.writeLine("if (rc < 0) return JSValue.EXCEPTION;");
-                }
+                try self.writeLine("if (rc < 0) {");
+                self.pushIndent();
+                try self.emitReturnException();
+                self.popIndent();
+                try self.writeLine("}");
                 try self.writeLine("stack[sp - 1] = CV.fromJSValue(for_in_buf[0]);  // iterator (unchanged)");
                 try self.writeLine("stack[sp] = CV.fromJSValue(for_in_buf[1]); sp += 1;  // property name");
                 try self.writeLine("stack[sp] = CV.fromJSValue(for_in_buf[2]); sp += 1;  // done flag");
@@ -6416,11 +6411,7 @@ pub const ZigCodeGen = struct {
                 // Sync locals TO _locals_jsv before call (ensures current values for round-trip)
                 try self.emitClosureVarSyncTo();
                 try self.writeLine("const _apply_result = JSValue.call(ctx, _apply_func, _apply_this_obj, 0, &_apply_empty_args);");
-                if (self.dispatch_mode) {
-                    try self.writeLine("if (_apply_result.isException()) return .exception;");
-                } else {
-                    try self.writeLine("if (_apply_result.isException()) return JSValue.EXCEPTION;");
-                }
+                try self.emitInlineExceptionReturn("_apply_result");
                 try self.writeLine("stack[sp] = CV.fromJSValue(_apply_result);");
                 try self.writeLine("sp += 1;");
                 // Sync closure variables back from _locals_jsv (closure may have written to them)
@@ -6462,11 +6453,7 @@ pub const ZigCodeGen = struct {
                 self.popIndent();
                 try self.writeLine("}");
                 try self.writeLine("");
-                if (self.dispatch_mode) {
-                    try self.writeLine("if (_apply_result.isException()) return .exception;");
-                } else {
-                    try self.writeLine("if (_apply_result.isException()) return JSValue.EXCEPTION;");
-                }
+                try self.emitInlineExceptionReturn("_apply_result");
                 try self.writeLine("stack[sp] = CV.fromJSValue(_apply_result);");
                 try self.writeLine("sp += 1;");
                 // Sync closure variables back from _locals_jsv (closure may have written to them)
@@ -6515,11 +6502,7 @@ pub const ZigCodeGen = struct {
                 try self.printLine("const _awaited_cv = {s};", .{awaited_expr});
                 try self.writeLine("const _awaited = _awaited_cv.toJSValueWithCtx(ctx);");
                 try self.writeLine("const _promise = zig_runtime.js_value.toPromise(ctx, _awaited);");
-                // Detach var_refs before returning if function creates closures
-                // Skip in dispatch_mode - cleanup is done in the dispatch loop instead
-                if (self.has_fclosure and self.func.var_count > 0 and !self.dispatch_mode) {
-                    try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
-                }
+                try self.emitVarRefDetach();
                 if (self.dispatch_mode) {
                     try self.writeLine("return .{ .return_value = _promise };");
                 } else {
@@ -6540,11 +6523,7 @@ pub const ZigCodeGen = struct {
                 defer if (should_free) self.allocator.free(result);
 
                 try self.printLine("{{ const _ret_cv = {s}; const _ret_val = _ret_cv.toJSValueWithCtx(ctx);", .{result});
-                // Detach var_refs before returning if function creates closures
-                // Skip in dispatch_mode - cleanup is done in the dispatch loop instead
-                if (self.has_fclosure and self.func.var_count > 0 and !self.dispatch_mode) {
-                    try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
-                }
+                try self.emitVarRefDetach();
                 // Free arg_shadow values before returning (they were duped at function entry)
                 if (self.has_put_arg) {
                     const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
@@ -6923,11 +6902,7 @@ pub const ZigCodeGen = struct {
             try self.emitClosureVarSyncTo();
             try self.writeLine("const call_result = JSValue.call(ctx, func, JSValue.UNDEFINED, 0, @ptrCast(&no_args));");
             // Check for exception and propagate it
-            if (self.dispatch_mode) {
-                try self.writeLine("if (call_result.isException()) return .exception;");
-            } else {
-                try self.writeLine("if (call_result.isException()) return JSValue.EXCEPTION;");
-            }
+            try self.emitInlineExceptionReturn("call_result");
             // Free the func CV we're about to overwrite
             try self.writeLine("{ const v = stack[sp - 1]; if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); }");
             try self.writeLine("stack[sp - 1] = CV.fromJSValue(call_result);");
@@ -6953,11 +6928,7 @@ pub const ZigCodeGen = struct {
             // Call - JS_Call returns a new ref, no dup needed
             try self.printLine("const call_result = JSValue.call(ctx, func, JSValue.UNDEFINED, {d}, @ptrCast(&args));", .{argc});
             // Check for exception and propagate it
-            if (self.dispatch_mode) {
-                try self.writeLine("if (call_result.isException()) return .exception;");
-            } else {
-                try self.writeLine("if (call_result.isException()) return JSValue.EXCEPTION;");
-            }
+            try self.emitInlineExceptionReturn("call_result");
             try self.writeLine("const result = CV.fromJSValue(call_result);");
             // Free the CVs we're abandoning (collect-then-free to avoid g_return_slot corruption)
             try self.printLine("var _to_free: [{d}]JSValue = undefined;", .{argc + 1});
@@ -7226,9 +7197,12 @@ pub const ZigCodeGen = struct {
                 // Not push - stop searching
                 break;
             }
-            // Stop at any other field access or call
+            // Stop at any other call or mutation - but NOT get_field since it
+            // just transforms the stack top (obj → obj.field) without changing depth.
+            // The forward search in shouldSkipForNativeArrayPush doesn't stop at get_field
+            // either, so both searches must be consistent.
             if (instr.opcode == .call or instr.opcode == .call_method or
-                instr.opcode == .get_field or instr.opcode == .put_field)
+                instr.opcode == .put_field)
             {
                 break;
             }
@@ -7256,6 +7230,10 @@ pub const ZigCodeGen = struct {
             }
 
             try self.printLine("const new_len = JSValue.newInt64(ctx, len + {d});", .{argc});
+            // Free arg values (they were duped for setPropertyUint32, originals still on stack)
+            for (0..argc) |arg_idx| {
+                try self.printLine("{{ const _arg_cv = stack[sp - {d}]; if (_arg_cv.isRefType()) JSValue.free(ctx, _arg_cv.toJSValueWithCtx(ctx)); }}", .{argc - arg_idx});
+            }
             // Free the array reference (it was duped when read from local)
             try self.printLine("{{ const arr_cv = stack[sp - 1 - {d}]; if (arr_cv.isRefType()) JSValue.free(ctx, arr_cv.toJSValueWithCtx(ctx)); }}", .{argc});
             try self.printLine("sp -= {d};", .{argc + 1}); // Pop arr and all args (no method)
@@ -7283,6 +7261,10 @@ pub const ZigCodeGen = struct {
             }
 
             try self.printLine("const new_len = JSValue.newInt64(ctx, len + {d});", .{argc});
+            // Free arg values (they were duped for setPropertyUint32, originals still on stack)
+            for (0..argc) |arg_idx| {
+                try self.printLine("{{ const _arg_cv = stack[sp - {d}]; if (_arg_cv.isRefType()) JSValue.free(ctx, _arg_cv.toJSValueWithCtx(ctx)); }}", .{argc - arg_idx});
+            }
             // Free method (arr.push function) and the array reference (it was duped when read from local)
             try self.printLine("JSValue.free(ctx, stack[sp - 1 - {d}].toJSValueWithCtx(ctx));", .{argc});
             try self.printLine("{{ const arr_cv = stack[sp - 2 - {d}]; if (arr_cv.isRefType()) JSValue.free(ctx, arr_cv.toJSValueWithCtx(ctx)); }}", .{argc});
@@ -7377,10 +7359,17 @@ pub const ZigCodeGen = struct {
                 const atom = instr.operand.atom;
                 if (self.getAtomString(atom)) |name| {
                     if (std.mem.eql(u8, name, "slice") or std.mem.eql(u8, name, "substring")) {
-                        // Found str.slice(start, end?) pattern - emit native code
-                        try self.printLine("{{ // Native String.{s} inline ({d} args)", .{ name, argc });
+                        // Found .slice(start, end?) pattern - emit native code with runtime type guard
+                        // IMPORTANT: .slice() can be called on strings OR arrays. Only inline for strings;
+                        // fall back to generic call_method for arrays and other types.
+                        try self.printLine("{{ // Guarded String.{s} inline ({d} args)", .{ name, argc });
                         self.pushIndent();
-                        try self.printLine("const str_val = stack[sp - 2 - {d}].toJSValueWithCtx(ctx);", .{argc});
+                        try self.printLine("const _so = stack[sp - 2 - {d}].toJSValueWithCtx(ctx);", .{argc});
+                        try self.writeLine("if (_so.isString()) {");
+                        self.pushIndent();
+
+                        // === FAST PATH: inline string slice ===
+                        try self.writeLine("const str_val = _so;");
                         try self.writeLine("var str_len: usize = 0;");
                         try self.writeLine("const str_ptr = zig_runtime.quickjs.JS_ToCStringLen(ctx, &str_len, str_val);");
                         try self.writeLine("var start_raw: i32 = 0;");
@@ -7438,6 +7427,36 @@ pub const ZigCodeGen = struct {
                         try self.printLine("sp -= {d};", .{argc + 2});
                         try self.writeLine("stack[sp] = CV.fromJSValue(result);");
                         try self.writeLine("sp += 1;");
+
+                        self.popIndent();
+                        try self.writeLine("} else {");
+                        self.pushIndent();
+
+                        // === FALLBACK: generic call_method for non-string types (arrays, etc.) ===
+                        try self.printLine("const _m = stack[sp - 1 - {d}].toJSValueWithCtx(ctx);", .{argc});
+                        try self.writeLine("const _ct = _so;");
+                        try self.printLine("var _args: [{d}]JSValue = undefined;", .{argc});
+                        for (0..argc) |arg_i| {
+                            try self.printLine("_args[{d}] = CV.toJSValuePtr(&stack[sp - {d}]);", .{ arg_i, argc - arg_i });
+                        }
+                        try self.printLine("const _cr = JSValue.call(ctx, _m, _ct, {d}, &_args);", .{argc});
+                        // Check for exception and propagate
+                        try self.emitInlineExceptionReturn("_cr");
+                        // Free method, args, and this (collect-then-free pattern)
+                        try self.printLine("var _tf: [{d}]JSValue = undefined;", .{argc + 2});
+                        try self.writeLine("var _fc: usize = 0;");
+                        for (0..argc) |arg_i| {
+                            try self.printLine("{{ const _v = stack[sp - {d}]; if (_v.isRefType()) {{ _tf[_fc] = _v.toJSValueWithCtx(ctx); _fc += 1; }} }}", .{argc - arg_i});
+                        }
+                        try self.printLine("{{ const _v = stack[sp - 1 - {d}]; if (_v.isRefType()) {{ _tf[_fc] = _v.toJSValueWithCtx(ctx); _fc += 1; }} }}", .{argc}); // method
+                        try self.printLine("{{ const _v = stack[sp - 2 - {d}]; if (_v.isRefType()) {{ _tf[_fc] = _v.toJSValueWithCtx(ctx); _fc += 1; }} }}", .{argc}); // this
+                        try self.writeLine("for (0.._fc) |_fi| { JSValue.free(ctx, _tf[_fi]); }");
+                        try self.printLine("sp -= {d};", .{argc + 2});
+                        try self.writeLine("stack[sp] = CV.fromJSValue(_cr);");
+                        try self.writeLine("sp += 1;");
+
+                        self.popIndent();
+                        try self.writeLine("}");
                         self.popIndent();
                         try self.writeLine("}");
                         return true;
@@ -7471,11 +7490,7 @@ pub const ZigCodeGen = struct {
             try self.emitClosureVarSyncTo();
             try self.writeLine("const call_result = JSValue.call(ctx, method, call_this, 0, @as([*]JSValue, undefined));");
             // Check for exception and propagate it
-            if (self.dispatch_mode) {
-                try self.writeLine("if (call_result.isException()) return .exception;");
-            } else {
-                try self.writeLine("if (call_result.isException()) return JSValue.EXCEPTION;");
-            }
+            try self.emitInlineExceptionReturn("call_result");
         } else {
             try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
             for (0..argc) |i| {
@@ -7485,11 +7500,7 @@ pub const ZigCodeGen = struct {
             try self.emitClosureVarSyncTo();
             try self.printLine("const call_result = JSValue.call(ctx, method, call_this, {d}, &args);", .{argc});
             // Check for exception and propagate it
-            if (self.dispatch_mode) {
-                try self.writeLine("if (call_result.isException()) return .exception;");
-            } else {
-                try self.writeLine("if (call_result.isException()) return JSValue.EXCEPTION;");
-            }
+            try self.emitInlineExceptionReturn("call_result");
             // Note: Don't free args - CVs on stack still own the references
         }
         // Store result directly - JS_Call returns a new ref, no dup needed
@@ -8117,7 +8128,8 @@ pub const ZigCodeGen = struct {
         try self.writeLine("");
 
         // Emit stack (for complex operations)
-        try self.writeLine("var stack: [256]CV = .{CV.UNDEFINED} ** 256;");
+        const stack_array_size2 = @max(self.func.var_count + self.func.stack_size, 256);
+        try self.printLine("var stack: [{d}]CV = .{{CV.UNDEFINED}} ** {d};", .{ stack_array_size2, stack_array_size2 });
         try self.writeLine("var sp: usize = 0;");
         // Track iterator positions for for-of loops (stack for nested loops)
         try self.writeLine("var for_of_iter_stack: [8]usize = .{0} ** 8;");

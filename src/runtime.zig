@@ -1299,9 +1299,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             defer allocator.free(bak_path_ts);
             _ = try runCommand(allocator, &.{
                 "sed", "-i.bak",
-                // Export ts namespace to globalThis, call factory interception, then replace global createSourceFile
+                // Export ts namespace to globalThis, call factory interception, hook sys for I/O, then execute
                 // The interception wraps globalThis.ts.createSourceFile, so we copy it back to the global variable
-                "s/executeCommandLine(sys, noop, sys.args);/globalThis.ts = { createSourceFile: createSourceFile, factory: factory, forEachChild: forEachChild }; if (typeof __edgebox_intercept_tsc_factory === \"function\") { __edgebox_intercept_tsc_factory(); createSourceFile = globalThis.ts.createSourceFile; } executeCommandLine(sys, noop, sys.args);/",
+                // __edgebox_hook_tsc_sys modifies sys.write/readFile/etc. for proper stdout and file I/O
+                "s/executeCommandLine(sys, noop, sys.args);/globalThis.ts = { createSourceFile: createSourceFile, factory: factory, forEachChild: forEachChild }; if (typeof __edgebox_intercept_tsc_factory === \"function\") { __edgebox_intercept_tsc_factory(); createSourceFile = globalThis.ts.createSourceFile; } if (typeof __edgebox_hook_tsc_sys === \"function\") { __edgebox_hook_tsc_sys(sys); } executeCommandLine(sys, noop, sys.args);/",
                 bundle_js_path,
             });
             std.fs.cwd().deleteFile(bak_path_ts) catch {};

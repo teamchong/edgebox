@@ -206,6 +206,8 @@ pub const AnalyzedFunction = struct {
     arg_count: u32,
     /// Local variable count
     var_count: u32,
+    /// Stack size (from bytecode, for sizing the operand stack array)
+    stack_size: u32 = 256,
     /// Whether function calls itself recursively
     is_self_recursive: bool,
     /// Index of self-reference in closure vars (-1 if none)
@@ -379,6 +381,7 @@ pub fn analyzeModule(
             .instructions = instructions,
             .arg_count = func_info.arg_count,
             .var_count = func_info.var_count,
+            .stack_size = func_info.stack_size,
             .is_self_recursive = is_self_recursive,
             .self_ref_var_idx = self_ref_var_idx,
             .can_freeze = can_freeze_final,
@@ -622,6 +625,7 @@ fn generateFrozenZigGeneral(
             .is_self_recursive = func.is_self_recursive,
             .self_ref_var_idx = func.self_ref_var_idx,
             .closure_var_indices = closure_var_indices, // CRITICAL: Pass closure indices for proper var_ref handling
+            .closure_var_count = @intCast(func.closure_vars.len),
             .atom_strings = func.atom_strings,
             .partial_freeze = partial_freeze,
             .js_name = func.name,
@@ -629,6 +633,7 @@ fn generateFrozenZigGeneral(
             .has_use_strict = func.has_use_strict, // For proper 'this' handling
             .is_async = func.func_kind >= 2, // async or async_generator
             .constants = func.constants, // For fclosure bytecode registration
+            .stack_size = func.stack_size,
         }) catch |err| {
             std.debug.print("[freeze] Relooper codegen error for '{s}': {}\n", .{ func.name, err });
             return null;
@@ -648,9 +653,11 @@ fn generateFrozenZigGeneral(
         .js_name = func.name, // Original JS name for fallback registration
         .is_pure_int32 = is_pure_int32, // Enable int32 specialization for fib-like functions
         .closure_var_indices = closure_var_indices, // Pass closure indices for proper var_ref handling
+        .closure_var_count = @intCast(func.closure_vars.len),
         .has_use_strict = func.has_use_strict, // For proper 'this' handling
         .is_async = func.func_kind >= 2, // async or async_generator
         .constants = func.constants, // For fclosure bytecode registration
+        .stack_size = func.stack_size,
     });
     defer gen.deinit();
 
@@ -829,26 +836,19 @@ pub fn generateModuleZigSharded(
     std.debug.print("[freeze] Generated {d} functions across {d} shards\n", .{ generated_funcs.items.len, actual_num_shards });
     zig_codegen_full.printUnsupportedOpcodeReport();
 
-    // Count ALL function names in the module (not just frozen ones)
-    // This prevents name collision: if there are 2 functions named "foo",
-    // one frozen and one not, we'd intercept calls to both with our frozen version
-    var name_counts = hashmap_helper.StringHashMap(u32).init(allocator);
-    defer name_counts.deinit();
-    // Also track anonymous function line numbers for collision detection
-    var anon_line_counts = std.AutoHashMap(u32, u32).init(allocator);
-    defer anon_line_counts.deinit();
+    // Count ALL function dispatch keys (name@line_num) in the module (not just frozen ones)
+    // This prevents name collision: if there are 2 functions with the same dispatch key,
+    // we'd intercept calls to both with our frozen version
+    // Note: functions with the same name but different line numbers have unique dispatch keys
+    var dispatch_key_counts = hashmap_helper.StringHashMap(u32).init(allocator);
+    defer dispatch_key_counts.deinit();
     for (analysis.functions.items) |func| {
-        if (std.mem.eql(u8, func.name, "anonymous")) {
-            const entry = try anon_line_counts.getOrPut(func.line_num);
-            if (entry.found_existing) {
-                entry.value_ptr.* += 1;
-            } else {
-                entry.value_ptr.* = 1;
-            }
-            continue;
-        }
-        const entry = try name_counts.getOrPut(func.name);
+        // Build dispatch key: "name@line_num" (same format used for registration)
+        const dispatch_key = try std.fmt.allocPrint(allocator, "{s}@{d}", .{ func.name, func.line_num });
+        const entry = try dispatch_key_counts.getOrPut(dispatch_key);
         if (entry.found_existing) {
+            // Key already in map, free the duplicate
+            allocator.free(dispatch_key);
             entry.value_ptr.* += 1;
         } else {
             entry.value_ptr.* = 1;
@@ -863,12 +863,10 @@ pub fn generateModuleZigSharded(
         var shard_reg_count: usize = 0;
         for (generated_funcs.items) |gf| {
             if (gf.shard != shard_idx) continue;
-            const is_anonymous = std.mem.eql(u8, gf.name, "anonymous");
-            if (is_anonymous) {
-                if ((anon_line_counts.get(gf.line_num) orelse 0) > 1) continue;
-            } else {
-                if ((name_counts.get(gf.name) orelse 0) > 1) continue;
-            }
+            // Check dispatch key collision using name@line_num format
+            var key_buf: [512]u8 = undefined;
+            const dispatch_key = std.fmt.bufPrint(&key_buf, "{s}@{d}", .{ gf.name, gf.line_num }) catch continue;
+            if ((dispatch_key_counts.get(dispatch_key) orelse 0) > 1) continue;
             shard_reg_count += 1;
         }
 
@@ -902,14 +900,10 @@ pub fn generateModuleZigSharded(
             for (generated_funcs.items) |gf| {
                 if (gf.shard != shard_idx) continue;
 
-                const is_anonymous = std.mem.eql(u8, gf.name, "anonymous");
-
-                // Skip if collides with another function of same name (named) or same line (anonymous)
-                if (is_anonymous) {
-                    if ((anon_line_counts.get(gf.line_num) orelse 0) > 1) continue;
-                } else {
-                    if ((name_counts.get(gf.name) orelse 0) > 1) continue;
-                }
+                // Skip if dispatch key collides with another function
+                var reg_key_buf: [512]u8 = undefined;
+                const reg_dispatch_key = std.fmt.bufPrint(&reg_key_buf, "{s}@{d}", .{ gf.name, gf.line_num }) catch continue;
+                if ((dispatch_key_counts.get(reg_dispatch_key) orelse 0) > 1) continue;
 
                 var reg_buf: [512]u8 = undefined;
                 const reg_line = std.fmt.bufPrint(&reg_buf,
@@ -1129,26 +1123,17 @@ pub fn generateModuleZig(
     // Print report of any unsupported opcodes encountered
     zig_codegen_full.printUnsupportedOpcodeReport();
 
-    // Count ALL function names (not just freezable ones) to prevent name collision
-    // If there are 2 functions named "foo", one freezable and one not,
-    // we'd intercept calls to both with our frozen version - must skip both
-    var name_counts = hashmap_helper.StringHashMap(u32).init(allocator);
-    defer name_counts.deinit();
-    // Also track anonymous function line numbers for collision detection
-    var anon_line_counts = std.AutoHashMap(u32, u32).init(allocator);
-    defer anon_line_counts.deinit();
+    // Count ALL function dispatch keys (name@line_num) to prevent collision
+    // If there are 2 functions with the same dispatch key, we'd intercept
+    // calls to both with our frozen version - must skip both
+    // Note: functions with the same name but different line numbers have unique dispatch keys
+    var dispatch_key_counts2 = hashmap_helper.StringHashMap(u32).init(allocator);
+    defer dispatch_key_counts2.deinit();
     for (analysis.functions.items) |func| {
-        if (std.mem.eql(u8, func.name, "anonymous")) {
-            const entry = try anon_line_counts.getOrPut(func.line_num);
-            if (entry.found_existing) {
-                entry.value_ptr.* += 1;
-            } else {
-                entry.value_ptr.* = 1;
-            }
-            continue;
-        }
-        const entry = try name_counts.getOrPut(func.name);
+        const dk = try std.fmt.allocPrint(allocator, "{s}@{d}", .{ func.name, func.line_num });
+        const entry = try dispatch_key_counts2.getOrPut(dk);
         if (entry.found_existing) {
+            allocator.free(dk);
             entry.value_ptr.* += 1;
         } else {
             entry.value_ptr.* = 1;
@@ -1216,17 +1201,12 @@ pub fn generateModuleZig(
         if (!generated_indices.contains(idx)) continue;
         if (!func.can_freeze) continue;
 
-        const is_anonymous = std.mem.eql(u8, func.name, "anonymous");
-
-        // Skip if collides with another function of same name (named) or same line (anonymous)
-        if (is_anonymous) {
-            if ((anon_line_counts.get(func.line_num) orelse 0) > 1) {
-                if (FREEZE_DEBUG) std.debug.print("[freeze] Skipping duplicate anonymous at line: {d}\n", .{func.line_num});
-                continue;
-            }
-        } else {
-            if ((name_counts.get(func.name) orelse 0) > 1) {
-                if (FREEZE_DEBUG) std.debug.print("[freeze] Skipping duplicate name: '{s}'\n", .{func.name});
+        // Skip if dispatch key collides with another function
+        {
+            var dk_buf: [512]u8 = undefined;
+            const dk = std.fmt.bufPrint(&dk_buf, "{s}@{d}", .{ func.name, func.line_num }) catch continue;
+            if ((dispatch_key_counts2.get(dk) orelse 0) > 1) {
+                if (FREEZE_DEBUG) std.debug.print("[freeze] Skipping duplicate dispatch key: '{s}'\n", .{dk});
                 continue;
             }
         }

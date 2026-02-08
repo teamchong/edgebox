@@ -43,6 +43,9 @@ comptime {
     _ = native_shapes_registry.native_registry_init;
     _ = native_shapes_registry.native_node_register;
     _ = native_shapes_registry.native_node_lookup;
+    _ = native_shapes_registry.native_shapes_get_property;
+    _ = native_shapes_registry.native_shapes_init_atoms;
+    _ = native_shapes_registry.native_shapes_debug_stats;
 }
 
 // Native dispatch for frozen functions - must be linked even with --no-freeze
@@ -536,6 +539,10 @@ pub fn main() !void {
         return error.BytecodeLoadFailed;
     }
 
+    // Initialize native shapes atoms AFTER bytecode loading
+    // This ensures atoms match those in the loaded bytecode
+    native_shapes_polyfill.initAtoms(@ptrCast(ctx));
+
     // Execute
     const tag = qjs.JS_VALUE_GET_TAG(obj);
     var result: qjs.JSValue = undefined;
@@ -561,7 +568,32 @@ pub fn main() !void {
     }
 
     if (qjs.JS_IsException(result)) {
-        printException(ctx);
+        // Check if the exception is null (e.g., from process.exit() in async modules)
+        // JS_GetException consumes the exception from the context
+        const exc = qjs.JS_GetException(ctx);
+        if (qjs.JS_IsNull(exc)) {
+            // Null exception = clean exit (e.g., process.exit(0) in async context)
+            qjs.JS_FreeValue(ctx, result);
+            return;
+        }
+
+        // Real exception - print it
+        const str = qjs.JS_ToCString(ctx, exc);
+        if (str != null) {
+            std.debug.print("Exception: {s}\n", .{str});
+            qjs.JS_FreeCString(ctx, str);
+        }
+        // Print stack trace if available
+        const stack = qjs.JS_GetPropertyStr(ctx, exc, "stack");
+        if (!qjs.JS_IsUndefined(stack)) {
+            const stack_str = qjs.JS_ToCString(ctx, stack);
+            if (stack_str != null) {
+                std.debug.print("Stack: {s}\n", .{stack_str});
+                qjs.JS_FreeCString(ctx, stack_str);
+            }
+        }
+        qjs.JS_FreeValue(ctx, stack);
+        qjs.JS_FreeValue(ctx, exc);
         qjs.JS_FreeValue(ctx, result);
         return error.ExecutionFailed;
     }

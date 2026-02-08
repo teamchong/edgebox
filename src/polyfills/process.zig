@@ -208,6 +208,11 @@ fn processHrtimeBigint(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qj
 fn stdoutWrite(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return quickjs.jsFalse();
 
+    // Skip undefined/null - don't write "undefined" or "null" strings
+    if (qjs.JS_IsUndefined(argv[0]) or qjs.JS_IsNull(argv[0])) {
+        return quickjs.jsTrue();
+    }
+
     const str = qjs.JS_ToCString(ctx, argv[0]);
     if (str == null) return quickjs.jsFalse();
     defer qjs.JS_FreeCString(ctx, str);
@@ -221,6 +226,11 @@ fn stdoutWrite(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
 /// stderr.write(str) - Write to stderr
 fn stderrWrite(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return quickjs.jsFalse();
+
+    // Skip undefined/null - don't write "undefined" or "null" strings
+    if (qjs.JS_IsUndefined(argv[0]) or qjs.JS_IsNull(argv[0])) {
+        return quickjs.jsTrue();
+    }
 
     const str = qjs.JS_ToCString(ctx, argv[0]);
     if (str == null) return quickjs.jsFalse();

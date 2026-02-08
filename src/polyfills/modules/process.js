@@ -8,10 +8,15 @@
         columns: 80,
         rows: 24,
         write: function(data) {
+            // Handle null/undefined - return true without writing (Node.js throws but we're lenient)
+            if (data === null || data === undefined) {
+                return true;
+            }
+            var str = String(data);
             if (typeof __edgebox_stdout_write === 'function') {
-                __edgebox_stdout_write(String(data));
+                __edgebox_stdout_write(str);
             } else {
-                print(String(data).replace(/\n$/, '')); // print adds newline
+                print(str.replace(/\n$/, '')); // print adds newline
             }
             return true;
         },

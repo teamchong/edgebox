@@ -276,6 +276,21 @@ pub const iteratorGetValue = frozen_helpers.iteratorGetValue;
 pub const copyDataProperties = frozen_helpers.copyDataProperties;
 
 // ============================================================================
+// Property Access Helper (with exception propagation)
+// ============================================================================
+
+pub const GetFieldError = error{JsException};
+
+/// Get a property by name, returning an error if the property access throws.
+/// Used by frozen codegen to propagate exceptions from get_field operations
+/// (e.g., accessing a property on undefined/null).
+pub inline fn getFieldChecked(ctx: *JSContext, obj: JSValue, name: [*:0]const u8) GetFieldError!JSValue {
+    const result = JSValue.getPropertyStr(ctx, obj, name);
+    if (result.isException()) return error.JsException;
+    return result;
+}
+
+// ============================================================================
 // Rest Parameter Helper
 // ============================================================================
 

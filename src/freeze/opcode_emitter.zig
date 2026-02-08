@@ -98,10 +98,17 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         // ============================================================
         .add => {
             // Use addWithCtx for proper JS + semantics (string concat or numeric add)
-            const b = self.vpop() orelse "stack[sp-1]";
+            const b_from_vstack = self.vpop();
+            const b = b_from_vstack orelse "stack[sp-1]";
             const free_b = self.isAllocated(b);
             defer if (free_b) self.allocator.free(b);
-            const a = self.vpop() orelse "stack[sp-2]";
+            const b_consumes: usize = if (b_from_vstack == null) 1 else self.countStackRefs(b);
+            const a_from_vstack = self.vpop();
+            const a = a_from_vstack orelse switch (b_consumes) {
+                0 => "stack[sp-1]",
+                1 => "stack[sp-2]",
+                else => "stack[sp-3]",
+            };
             const free_a = self.isAllocated(a);
             defer if (free_a) self.allocator.free(a);
             try self.vpushFmt("CV.addWithCtx(ctx, {s}, {s})", .{ a, b });
@@ -110,6 +117,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         .mul => try emitBinaryOp(CodeGen, self, "CV.mul"),
         .div => try emitBinaryOp(CodeGen, self, "CV.div"),
         .mod => try emitBinaryOp(CodeGen, self, "CV.mod"),
+        .pow => try emitBinaryOp(CodeGen, self, "CV.pow"),
         .neg => {
             const a = self.vpop() orelse "stack[sp-1]";
             defer if (self.isAllocated(a)) self.allocator.free(a);
@@ -272,7 +280,16 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
                 if (std.mem.eql(u8, prop_name, "kind")) {
                     try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetKind(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
                 } else if (std.mem.eql(u8, prop_name, "flags")) {
-                    try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetFlags(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
+                    // NOTE: Do NOT use nativeGetFlags here - "flags" is shared between
+                    // AST nodes (NodeFlags), Type objects (TypeFlags), and Symbol objects
+                    // (SymbolFlags). The native cache is keyed by address and only contains
+                    // AST nodes, so GC'd node addresses reused by Type/Symbol objects
+                    // return stale NodeFlags (ABA problem).
+                    if (self.dispatch_mode) {
+                        try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"flags\") catch return .exception)", .{obj});
+                    } else {
+                        try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"flags\") catch return JSValue.EXCEPTION)", .{obj});
+                    }
                 } else if (std.mem.eql(u8, prop_name, "pos")) {
                     try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetPos(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
                 } else if (std.mem.eql(u8, prop_name, "end")) {
@@ -310,8 +327,12 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
                 } else if (std.mem.eql(u8, prop_name, "arguments")) {
                     try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetArguments(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
                 } else {
-                    // Standard path for other properties
-                    try self.vpushFmt("CV.fromJSValue(JSValue.getField(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\"))", .{ obj, prop_name });
+                    // Standard path for other properties - with exception propagation
+                    if (self.dispatch_mode) {
+                        try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\") catch return .exception)", .{ obj, prop_name });
+                    } else {
+                        try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\") catch return JSValue.EXCEPTION)", .{ obj, prop_name });
+                    }
                 }
             } else {
                 return false;
@@ -325,8 +346,12 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
                 const obj = self.vpop() orelse "stack[sp-1]";
                 // Push the object back first (for use as 'this' in call_method)
                 try self.vpush(obj);
-                // Then push the method/property
-                try self.vpushFmt("CV.fromJSValue(JSValue.getField(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\"))", .{ obj, prop_name });
+                // Then push the method/property - with exception propagation
+                if (self.dispatch_mode) {
+                    try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\") catch return .exception)", .{ obj, prop_name });
+                } else {
+                    try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\") catch return JSValue.EXCEPTION)", .{ obj, prop_name });
+                }
                 // Free the obj string after both vpushes if it was allocated
                 if (self.isAllocated(obj)) self.allocator.free(obj);
             } else {
@@ -336,9 +361,16 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         .put_field => {
             const atom_idx = instr.operand.atom;
             if (self.getAtomString(atom_idx)) |prop_name| {
-                const val = self.vpop() orelse "stack[sp-1]";
+                const val_from_vstack = self.vpop();
+                const val = val_from_vstack orelse "stack[sp-1]";
                 defer if (self.isAllocated(val)) self.allocator.free(val);
-                const obj = self.vpop() orelse "stack[sp-2]";
+                const val_consumes: usize = if (val_from_vstack == null) 1 else self.countStackRefs(val);
+                const obj_from_vstack = self.vpop();
+                const obj = obj_from_vstack orelse switch (val_consumes) {
+                    0 => "stack[sp-1]",
+                    1 => "stack[sp-2]",
+                    else => "stack[sp-3]",
+                };
                 defer if (self.isAllocated(obj)) self.allocator.free(obj);
                 // CRITICAL: Dup value before passing to setField - JS_SetProperty consumes the value
                 try self.printLine("_ = JSValue.setField(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\", JSValue.dup(ctx, {s}.toJSValueWithCtx(ctx)));", .{ obj, prop_name, val });
@@ -347,9 +379,16 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
             }
         },
         .get_array_el => {
-            const idx = self.vpop() orelse "stack[sp-1]";
+            const idx_from_vstack = self.vpop();
+            const idx = idx_from_vstack orelse "stack[sp-1]";
             defer if (self.isAllocated(idx)) self.allocator.free(idx);
-            const arr = self.vpop() orelse "stack[sp-2]";
+            const idx_consumes: usize = if (idx_from_vstack == null) 1 else self.countStackRefs(idx);
+            const arr_from_vstack = self.vpop();
+            const arr = arr_from_vstack orelse switch (idx_consumes) {
+                0 => "stack[sp-1]",
+                1 => "stack[sp-2]",
+                else => "stack[sp-3]",
+            };
             defer if (self.isAllocated(arr)) self.allocator.free(arr);
             // Use getPropertyValue which handles both integer and string keys
             try self.vpushFmt("CV.fromJSValue(JSValue.getPropertyValue(ctx, {s}.toJSValueWithCtx(ctx), JSValue.dup(ctx, {s}.toJSValueWithCtx(ctx))))", .{ arr, idx });
@@ -377,7 +416,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
                 else => "stack[sp-4]",
             };
             defer if (self.isAllocated(idx)) self.allocator.free(idx);
-            const idx_consumes: usize = if (idx_from_vstack == null) 1 else 0;
+            const idx_consumes: usize = if (idx_from_vstack == null) 1 else self.countStackRefs(idx);
 
             const arr_from_vstack = self.vpop();
             // arr is positioned after val's AND idx's consumed positions
@@ -390,7 +429,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
                 else => "stack[sp-5]",
             };
             defer if (self.isAllocated(arr)) self.allocator.free(arr);
-            const arr_consumes: usize = if (arr_from_vstack == null) 1 else 0;
+            const arr_consumes: usize = if (arr_from_vstack == null) 1 else self.countStackRefs(arr);
 
             // Total stack values consumed
             const total_consumed = val_consumes + idx_consumes + arr_consumes;
@@ -515,9 +554,16 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
             try self.vpushFmt("CV.fromJSValue(JSValue.typeOf(ctx, {s}.toJSValueWithCtx(ctx)))", .{val});
         },
         .instanceof => {
-            const ctor = self.vpop() orelse "stack[sp-1]";
+            const ctor_from_vstack = self.vpop();
+            const ctor = ctor_from_vstack orelse "stack[sp-1]";
             defer if (self.isAllocated(ctor)) self.allocator.free(ctor);
-            const obj = self.vpop() orelse "stack[sp-2]";
+            const ctor_consumes: usize = if (ctor_from_vstack == null) 1 else self.countStackRefs(ctor);
+            const obj_from_vstack = self.vpop();
+            const obj = obj_from_vstack orelse switch (ctor_consumes) {
+                0 => "stack[sp-1]",
+                1 => "stack[sp-2]",
+                else => "stack[sp-3]",
+            };
             defer if (self.isAllocated(obj)) self.allocator.free(obj);
             try self.vpushFmt("(if (JSValue.isInstanceOf(ctx, {s}.toJSValueWithCtx(ctx), {s}.toJSValueWithCtx(ctx))) CV.TRUE else CV.FALSE)", .{ obj, ctor });
         },
@@ -632,9 +678,11 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         // ============================================================
         .get_array_el2 => {
             try self.flushVstack();
+            // Replaces stack[sp-1] (idx) with arr[idx], keeps arr at stack[sp-2].
+            // Values are already materialized on real stack - do NOT push to vstack.
+            // Pushing stack refs to vstack causes flushVstack to corrupt values
+            // (the sp-=1/sp+=1 pattern overwrites adjacent stack slots).
             try self.writeLine("{ const idx = stack[sp-1]; const arr = stack[sp-2]; var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx.toJSValueWithCtx(ctx)); stack[sp-1] = CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr.toJSValueWithCtx(ctx), @intCast(idx_i32))); }");
-            try self.vpush("stack[sp - 2]");
-            try self.vpush("stack[sp - 1]");
         },
 
         // ============================================================
@@ -929,8 +977,10 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         // ============================================================
         .get_loc_check => {
             const loc = instr.operand.loc;
-            try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\"); stack[sp] = CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))); sp += 1; }}", .{loc});
-            try self.vpush("stack[sp - 1]");
+            // Emit TDZ check as standalone, push value to vstack only
+            // Avoids sp-relative aliasing when multiple get_loc_checks appear in sequence
+            try self.printLine("if (locals[{d}].isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\");", .{loc});
+            try self.vpushFmt("CV.fromJSValue(JSValue.dup(ctx, locals[{d}].toJSValueWithCtx(ctx)))", .{loc});
         },
         .put_loc_check => {
             const loc = instr.operand.loc;
@@ -1032,11 +1082,17 @@ fn emitBinaryOp(comptime CodeGen: type, self: *CodeGen, op: []const u8) !void {
     const free_b = self.isAllocated(b);
     defer if (free_b) self.allocator.free(b);
 
-    // If b came from vstack, a is at sp-1; if b came from physical stack, a is at sp-2
-    const b_consumes: usize = if (b_from_vstack == null) 1 else 0;
+    // If b came from physical stack, it consumes 1 slot.
+    // If b came from vstack but its expression references physical stack slots
+    // (e.g., "CV.band(stack[sp-1], CV.newInt(458752))"), those slots are consumed too.
+    const b_consumes: usize = if (b_from_vstack == null) 1 else self.countStackRefs(b);
 
     const a_from_vstack = self.vpop();
-    const a = a_from_vstack orelse if (b_consumes == 0) "stack[sp-1]" else "stack[sp-2]";
+    const a = a_from_vstack orelse switch (b_consumes) {
+        0 => "stack[sp-1]",
+        1 => "stack[sp-2]",
+        else => "stack[sp-3]",
+    };
     const free_a = self.isAllocated(a);
     defer if (free_a) self.allocator.free(a);
 
@@ -1051,11 +1107,17 @@ fn emitBinaryOpWithCtx(comptime CodeGen: type, self: *CodeGen, op: []const u8) !
     const free_b = self.isAllocated(b);
     defer if (free_b) self.allocator.free(b);
 
-    // If b came from vstack, a is at sp-1; if b came from physical stack, a is at sp-2
-    const b_consumes: usize = if (b_from_vstack == null) 1 else 0;
+    // If b came from physical stack, it consumes 1 slot.
+    // If b came from vstack but its expression references physical stack slots,
+    // those slots are consumed too.
+    const b_consumes: usize = if (b_from_vstack == null) 1 else self.countStackRefs(b);
 
     const a_from_vstack = self.vpop();
-    const a = a_from_vstack orelse if (b_consumes == 0) "stack[sp-1]" else "stack[sp-2]";
+    const a = a_from_vstack orelse switch (b_consumes) {
+        0 => "stack[sp-1]",
+        1 => "stack[sp-2]",
+        else => "stack[sp-3]",
+    };
     const free_a = self.isAllocated(a);
     defer if (free_a) self.allocator.free(a);
 
