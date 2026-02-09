@@ -395,8 +395,8 @@ pub const RelooperCodeGen = struct {
             try self.writeLine("");
         }
 
-        // Hoisted stack - sized to max(var_count + stack_size, 256) for safety
-        const stack_array_size = @max(self.func.var_count + self.func.stack_size, 256);
+        // Hoisted stack - sized to var_count + stack_size from bytecode metadata
+        const stack_array_size = @max(self.func.var_count + self.func.stack_size, 16);
         try self.printLine("var stack: [{d}]CV = .{{CV.UNDEFINED}} ** {d};", .{ stack_array_size, stack_array_size });
         try self.writeLine("var sp: usize = 0;");
         // Track iterator positions for for-of loops (stack for nested loops)
@@ -590,7 +590,7 @@ pub const RelooperCodeGen = struct {
 
         // SP overflow detection at block entry
         {
-            const overflow_limit = @max(self.func.var_count + self.func.stack_size, 256) - 6;
+            const overflow_limit = @max(self.func.var_count + self.func.stack_size, 16) - 6;
             try self.printLine("if (sp > {d}) zig_runtime.spOverflow(\"{s}\", {d}, sp);", .{ overflow_limit, self.getFuncPrefix(), block_idx });
         }
 
@@ -886,7 +886,7 @@ pub const RelooperCodeGen = struct {
                 } else {
                     try self.printLine("if (locals[{d}].isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\");", .{loc});
                 }
-                try self.vpushFmt("CV.fromJSValue(JSValue.dup(ctx, locals[{d}].toJSValueWithCtx(ctx)))", .{loc});
+                try self.vpushFmt("(if (locals[{d}].isRefType()) CV.fromJSValue(JSValue.dup(ctx, locals[{d}].toJSValueWithCtx(ctx))) else locals[{d}])", .{ loc, loc, loc });
                 return;
             },
             // Override put_loc_check to handle dispatch mode return type
@@ -2162,7 +2162,7 @@ pub const RelooperCodeGen = struct {
     fn emitBlockContextStruct(self: *Self) !void {
         const prefix = self.getFuncPrefix();
         const min_locals = if (self.func.var_count >= 16) self.func.var_count else 16;
-        const stack_array_size = @max(self.func.var_count + self.func.stack_size, 256);
+        const stack_array_size = @max(self.func.var_count + self.func.stack_size, 16);
         try self.printLineBlock("const __frozen_{s}_BlockContext = struct {{", .{prefix});
         self.pushIndentBlock();
         try self.writeLineBlock("ctx: *zig_runtime.JSContext,");
@@ -2353,7 +2353,7 @@ pub const RelooperCodeGen = struct {
 
         // SP overflow detection for dispatch table blocks
         {
-            const overflow_limit = @max(self.func.var_count + self.func.stack_size, 256) - 6;
+            const overflow_limit = @max(self.func.var_count + self.func.stack_size, 16) - 6;
             try self.printLineBlock("if (sp > {d}) zig_runtime.spOverflow(\"{s}\", {d}, sp);", .{ overflow_limit, self.getFuncPrefix(), block_idx });
         }
 

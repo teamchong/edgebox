@@ -593,7 +593,7 @@ pub const ZigCodeGen = struct {
         self.pushIndent();
 
         // Convert frozen stack to JSValue array for interpreter
-        const interp_stack_size = @max(self.func.var_count + self.func.stack_size, 256);
+        const interp_stack_size = @max(self.func.var_count + self.func.stack_size, 16);
         try self.printLine("var _interp_stack: [{d}]zig_runtime.JSValue = undefined;", .{interp_stack_size});
         try self.writeLine("for (0..sp) |_i| { _interp_stack[_i] = stack[_i].toJSValueWithCtx(ctx); }");
 
@@ -897,7 +897,7 @@ pub const ZigCodeGen = struct {
             try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
         } else {
             // For all other functions, emit stack and instructions using CompressedValue (8-byte)
-            const stack_array_size = @max(self.func.var_count + self.func.stack_size, 256);
+            const stack_array_size = @max(self.func.var_count + self.func.stack_size, 16);
             try self.printLine("var stack: [{d}]CV = .{{CV.UNDEFINED}} ** {d};", .{ stack_array_size, stack_array_size });
             try self.writeLine("var sp: usize = 0;");
             // Track iterator positions for for-of loops (stack for nested loops)
@@ -1337,7 +1337,7 @@ pub const ZigCodeGen = struct {
         try self.writeLineBlock("var_refs: ?[*]*zig_runtime.JSVarRef,");
         try self.writeLineBlock("closure_var_count: c_int,");
         try self.writeLineBlock("cpool: ?[*]zig_runtime.JSValue,");
-        const block_stack_size = @max(self.func.var_count + self.func.stack_size, 256);
+        const block_stack_size = @max(self.func.var_count + self.func.stack_size, 16);
         try self.printLineBlock("stack: *[{d}]zig_runtime.CompressedValue,", .{block_stack_size});
         try self.writeLineBlock("sp: *usize,");
         const min_locals = if (self.func.var_count >= 16) self.func.var_count else 16;
@@ -5024,9 +5024,9 @@ pub const ZigCodeGen = struct {
             .get_loc_check => {
                 const loc_idx = instr.operand.loc;
                 if (self.dispatch_mode) {
-                    try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return .{{ .return_value = JSValue.throwReferenceError(ctx, \"Cannot access before initialization\") }}; stack[sp] = CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))); sp += 1; }}", .{loc_idx});
+                    try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return .{{ .return_value = JSValue.throwReferenceError(ctx, \"Cannot access before initialization\") }}; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }}", .{loc_idx});
                 } else {
-                    try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\"); stack[sp] = CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))); sp += 1; }}", .{loc_idx});
+                    try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\"); stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }}", .{loc_idx});
                 }
                 // Track result on real stack via base_stack_depth (NOT vstack)
                 // Using vpush("stack[sp-1]") causes double-tracking: both vstack AND real stack
@@ -8133,7 +8133,7 @@ pub const ZigCodeGen = struct {
         try self.writeLine("");
 
         // Emit stack (for complex operations)
-        const stack_array_size2 = @max(self.func.var_count + self.func.stack_size, 256);
+        const stack_array_size2 = @max(self.func.var_count + self.func.stack_size, 16);
         try self.printLine("var stack: [{d}]CV = .{{CV.UNDEFINED}} ** {d};", .{ stack_array_size2, stack_array_size2 });
         try self.writeLine("var sp: usize = 0;");
         // Track iterator positions for for-of loops (stack for nested loops)

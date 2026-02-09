@@ -446,3 +446,23 @@ pub fn spOverflow(func_name: [*:0]const u8, block_id: u32, sp: usize) noreturn {
     std.debug.print("\n!!! SP OVERFLOW: sp={d} in {s} block {d}\n", .{ sp, func_name, block_id });
     @trap();
 }
+
+// ============================================================================
+// Exception cleanup: free ref-type locals (noinline to reduce code size)
+// ============================================================================
+
+pub noinline fn cleanupLocals(ctx: *JSContext, locals_ptr: [*]CompressedValue, count: usize) void {
+    // Collect-then-free pattern to avoid g_return_slot corruption
+    var to_free: [512]JSValue = undefined;
+    var free_count: usize = 0;
+    for (0..count) |i| {
+        const v = locals_ptr[i];
+        if (v.isRefType()) {
+            to_free[free_count] = v.toJSValueWithCtx(ctx);
+            free_count += 1;
+        }
+    }
+    for (0..free_count) |i| {
+        JSValue.free(ctx, to_free[i]);
+    }
+}

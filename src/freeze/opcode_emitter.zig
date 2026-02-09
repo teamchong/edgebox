@@ -980,7 +980,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
             // Emit TDZ check as standalone, push value to vstack only
             // Avoids sp-relative aliasing when multiple get_loc_checks appear in sequence
             try self.printLine("if (locals[{d}].isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\");", .{loc});
-            try self.vpushFmt("CV.fromJSValue(JSValue.dup(ctx, locals[{d}].toJSValueWithCtx(ctx)))", .{loc});
+            try self.vpushFmt("(if (locals[{d}].isRefType()) CV.fromJSValue(JSValue.dup(ctx, locals[{d}].toJSValueWithCtx(ctx))) else locals[{d}])", .{ loc, loc, loc });
         },
         .put_loc_check => {
             const loc = instr.operand.loc;
@@ -1246,14 +1246,8 @@ fn findClosureVarPosition(comptime CodeGen: type, self: *CodeGen, bytecode_idx: 
 /// @param indent - indentation prefix for generated code (e.g., "" or "    ")
 pub fn emitLocalsCleanupShared(comptime CodeGen: type, self: *CodeGen, var_count: u16, indent: []const u8) !void {
     if (var_count == 0) return;
-    // Free all locals that might hold ref types
-    // Collect phase: gather all JSValues first (each toJSValueWithCtx call is safe before any free)
-    // Free phase: then free them all (g_return_slot no longer in use during frees)
-    try self.printLine("{s}// Cleanup locals before return (collect-then-free to avoid g_return_slot corruption)", .{indent});
-    try self.printLine("{s}var _locals_to_free: [{d}]JSValue = undefined;", .{ indent, var_count });
-    try self.printLine("{s}var _locals_free_count: usize = 0;", .{indent});
-    try self.printLine("{s}for (0..{d}) |_loc_i| {{ const _loc_v = locals[_loc_i]; if (_loc_v.isRefType()) {{ _locals_to_free[_locals_free_count] = _loc_v.toJSValueWithCtx(ctx); _locals_free_count += 1; }} }}", .{ indent, var_count });
-    try self.printLine("{s}for (0.._locals_free_count) |_lfi| {{ JSValue.free(ctx, _locals_to_free[_lfi]); }}", .{indent});
+    // Call noinline runtime helper to free ref-type locals (reduces code size at exception sites)
+    try self.printLine("{s}zig_runtime.cleanupLocals(ctx, &locals, {d});", .{ indent, var_count });
 }
 
 /// Emit cleanup code for arg_shadow array before function return.

@@ -482,7 +482,7 @@ pub fn build(b: *std.Build) void {
                 const shard_mod = b.createModule(.{
                     .root_source_file = .{ .cwd_relative = shard_path },
                     .target = wasm_target,
-                    .optimize = .ReleaseSmall,
+                    .optimize = frozen_optimize,
                 });
                 shard_mod.addImport("zig_runtime", zig_runtime_mod);
                 shard_mod.addImport("math_polyfill", math_polyfill_mod);
@@ -672,11 +672,11 @@ pub fn build(b: *std.Build) void {
 
             // Check if shard file exists
             if (std.fs.cwd().access(shard_path, .{})) |_| {
-                // Create module for shard with ReleaseSmall for fast compilation
+                // Create module for shard with frozen_optimize for inlining CV helpers
                 const shard_mod = b.createModule(.{
                     .root_source_file = .{ .cwd_relative = shard_path },
                     .target = target,
-                    .optimize = .ReleaseSmall,
+                    .optimize = frozen_optimize,
                 });
                 shard_mod.addImport("zig_runtime", native_zig_runtime_mod);
                 shard_mod.addImport("math_polyfill", native_math_polyfill_mod);
@@ -899,7 +899,7 @@ pub fn build(b: *std.Build) void {
                 const shard_mod = b.createModule(.{
                     .root_source_file = .{ .cwd_relative = shard_path },
                     .target = target,
-                    .optimize = .ReleaseSmall,
+                    .optimize = frozen_optimize,
                 });
                 shard_mod.addImport("zig_runtime", embed_zig_runtime_mod);
                 shard_mod.addImport("math_polyfill", embed_math_polyfill_mod);
