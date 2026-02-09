@@ -226,7 +226,17 @@ pub const RelooperCodeGen = struct {
     // Used to gate reverse sync (_locals_jsv → locals) after function calls.
     closure_created: bool = false,
 
+    // Inline cache slot counter - tracks how many IC slots this function needs
+    ic_count: u32 = 0,
+
     const Self = @This();
+
+    /// Allocate the next IC slot index for a property access site
+    pub fn nextIcSlot(self: *Self) u32 {
+        const idx = self.ic_count;
+        self.ic_count += 1;
+        return idx;
+    }
 
     /// Tracks an await point for state machine generation
     const AwaitPoint = struct {
@@ -307,12 +317,33 @@ pub const RelooperCodeGen = struct {
         }
     }
 
+    /// Count IC-eligible property access sites (all get_field/get_field2)
+    fn scanForIcSlots(self: *Self) u32 {
+        var count: u32 = 0;
+        for (self.func.cfg.blocks.items) |block| {
+            for (block.instructions) |instr| {
+                switch (instr.opcode) {
+                    .get_field, .get_field2 => {
+                        if (self.getAtomString(instr.operand.atom)) |_| {
+                            count += 1;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+        return count;
+    }
+
     /// Generate Relooper-style Zig code for the function
     pub fn generate(self: *Self) ![]u8 {
         // Scan for this_val usage, async opcodes, and closure creation
         self.scanForThisUsage();
         self.scanForAsyncOpcodes();
         self.scanForFclosureOpcodes();
+
+        // Pre-scan for inline cache slot count
+        const total_ic_slots = self.scanForIcSlots();
 
         // Detect switch patterns for optimization
         try self.detectSwitchPatterns();
@@ -403,6 +434,11 @@ pub const RelooperCodeGen = struct {
         try self.writeLine("var for_of_iter_stack: [8]usize = .{0} ** 8;");
         try self.writeLine("var for_of_depth: usize = 0;");
         try self.writeLine("_ = &stack; _ = &sp; _ = &for_of_iter_stack; _ = &for_of_depth;");
+
+        // Inline cache slots for property access (persistent across calls via comptime struct)
+        if (total_ic_slots > 0) {
+            try self.printLine("const _IC = struct {{ var s: [{d}]zig_runtime.ICSlot = .{{zig_runtime.ICSlot.ZERO}} ** {d}; }};", .{ total_ic_slots, total_ic_slots });
+        }
         try self.writeLine("");
 
         if (self.dispatch_mode) {
@@ -920,25 +956,25 @@ pub const RelooperCodeGen = struct {
                         // since the obj expression doesn't contain stack refs
                         const obj = self.vpop().?;
                         try self.vpush(obj);
-                        // Use catch return for inline exception propagation
+                        const ic_idx = self.nextIcSlot();
                         if (self.dispatch_mode) {
-                            try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\") catch return .exception)", .{ obj, escaped_prop });
+                            try self.vpushFmt("CV.fromJSValue(zig_runtime.icLoad(ctx, {s}.toJSValueWithCtx(ctx), &_IC.s[{d}], \"{s}\") catch return .exception)", .{ obj, ic_idx, escaped_prop });
                         } else {
-                            try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\") catch return JSValue.EXCEPTION)", .{ obj, escaped_prop });
+                            try self.vpushFmt("CV.fromJSValue(zig_runtime.icLoad(ctx, {s}.toJSValueWithCtx(ctx), &_IC.s[{d}], \"{s}\") catch return JSValue.EXCEPTION)", .{ obj, ic_idx, escaped_prop });
                         }
                         if (self.isAllocated(obj)) self.allocator.free(obj);
                     } else {
                         // Object is on real stack - materialize directly to avoid double-consumption.
                         // Object stays at sp-1, method goes at sp, then sp += 1.
                         // This way the object reference is only evaluated once.
+                        const ic_idx = self.nextIcSlot();
                         try self.writeLine("{");
                         self.pushIndent();
                         try self.writeLine("const obj = stack[sp-1].toJSValueWithCtx(ctx);");
-                        try self.printLine("const _gf = JSValue.getPropertyStr(ctx, obj, \"{s}\");", .{escaped_prop});
                         if (self.dispatch_mode) {
-                            try self.writeLine("if (_gf.isException()) return .exception;");
+                            try self.printLine("const _gf = zig_runtime.icLoad(ctx, obj, &_IC.s[{d}], \"{s}\") catch return .exception;", .{ ic_idx, escaped_prop });
                         } else {
-                            try self.writeLine("if (_gf.isException()) return JSValue.EXCEPTION;");
+                            try self.printLine("const _gf = zig_runtime.icLoad(ctx, obj, &_IC.s[{d}], \"{s}\") catch return JSValue.EXCEPTION;", .{ ic_idx, escaped_prop });
                         }
                         try self.writeLine("stack[sp] = CV.fromJSValue(_gf); sp += 1;");
                         self.popIndent();

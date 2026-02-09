@@ -291,6 +291,50 @@ pub inline fn getFieldChecked(ctx: *JSContext, obj: JSValue, name: [*:0]const u8
 }
 
 // ============================================================================
+// Inline Cache for Property Access
+// ============================================================================
+
+/// Inline cache slot for a single property access site.
+/// Stores cached shape pointer, property offset, and resolved atom.
+/// Must be initialized to zeroes (null shape, 0 offset, 0 atom).
+pub const ICSlot = extern struct {
+    shape: ?*anyopaque = null,
+    offset: u32 = 0,
+    atom: u32 = 0,
+
+    pub const ZERO = ICSlot{ .shape = null, .offset = 0, .atom = 0 };
+};
+
+/// Load a property using an inline cache slot.
+/// Fast path (IC hit): O(1) direct property read entirely in Zig — no C FFI call.
+/// Slow path (IC miss): C function resolves atom, populates cache, returns value.
+///
+/// JSObject layout on 64-bit native (from quickjs.c):
+///   offset 24: JSShape *shape
+///   offset 32: JSProperty *prop (array, each entry = 16 bytes = sizeof(JSValue))
+pub inline fn icLoad(ctx: *JSContext, obj: JSValue, ic: *ICSlot, name: [*:0]const u8) GetFieldError!JSValue {
+    // IC fast path: check shape match and read property directly (zero FFI calls)
+    if (!is_wasm32 and obj.tag == JS_TAG_OBJECT) {
+        if (ic.shape) |cached_shape| {
+            const obj_bytes: [*]const u8 = @ptrCast(obj.u.ptr.?);
+            // Read shape pointer at offset 24
+            const shape_ptr: *const ?*anyopaque = @ptrCast(@alignCast(obj_bytes + 24));
+            if (shape_ptr.* == cached_shape) {
+                // Read prop base pointer at offset 32
+                const prop_base: *const [*]const u8 = @ptrCast(@alignCast(obj_bytes + 32));
+                // Read JSValue at prop[offset] (each JSProperty = 16 bytes)
+                const prop_value: *const JSValue = @ptrCast(@alignCast(prop_base.* + @as(usize, ic.offset) * 16));
+                return JSValue.dup(ctx, prop_value.*);
+            }
+        }
+    }
+    // Slow path: C function handles atom resolution, cache population, and proto chain
+    const result = quickjs.js_frozen_ic_load(ctx, obj, &ic.shape, &ic.offset, &ic.atom, name);
+    if (result.isException()) return error.JsException;
+    return result;
+}
+
+// ============================================================================
 // Rest Parameter Helper
 // ============================================================================
 

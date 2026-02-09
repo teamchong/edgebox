@@ -43,7 +43,7 @@ index ae01300..587c949 100644
  }
  
 diff --git a/quickjs.c b/quickjs.c
-index 62f4381..fa4f992 100644
+index 62f4381..eff84d4 100644
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -29,6 +29,10 @@
@@ -244,7 +244,7 @@ index 62f4381..fa4f992 100644
  #define GLOBAL_VAR_OFFSET 0x40000000
  #define ARGUMENT_VAR_OFFSET 0x20000000
  
-@@ -15598,6 +15694,947 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
+@@ -15598,6 +15694,993 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
      return 0;
  }
  
@@ -1130,6 +1130,52 @@ index 62f4381..fa4f992 100644
 +    return args;
 +}
 +
++/* ========================================================================
++ * Frozen Inline Cache (IC) for property access
++ *
++ * Each IC slot caches (shape, offset, atom) for a specific property access
++ * site. On cache hit (object has same shape as cached), we read the property
++ * directly from obj->prop[offset] in O(1) without any hash lookup.
++ * On miss, we resolve the atom (once), do a hash lookup, and update the cache.
++ * ======================================================================== */
++
++JSValue js_frozen_ic_load(JSContext *ctx, JSValueConst obj,
++                          void **ic_shape, uint32_t *ic_offset,
++                          uint32_t *ic_atom, const char *name)
++{
++    if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
++        JSObject *p = JS_VALUE_GET_OBJ(obj);
++
++        /* Fast path: shape matches cache → direct property read */
++        if (likely(p->shape == (JSShape *)*ic_shape)) {
++            return js_dup(p->prop[*ic_offset].u.value);
++        }
++    }
++
++    /* Resolve atom once per call site (saves JS_NewAtom + JS_FreeAtom on every call) */
++    JSAtom atom = (JSAtom)*ic_atom;
++    if (unlikely(atom == 0)) {
++        atom = JS_NewAtom(ctx, name);
++        *ic_atom = (uint32_t)atom;
++
++        /* First access: try to populate IC cache for future fast-path hits */
++        if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
++            JSObject *p = JS_VALUE_GET_OBJ(obj);
++            JSShapeProperty *prs;
++            JSProperty *pr;
++            prs = find_own_property(&pr, p, atom);
++            if (prs && likely((prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL)) {
++                *ic_shape = p->shape;
++                *ic_offset = (uint32_t)(prs - get_shape_prop(p->shape));
++                return js_dup(pr->u.value);
++            }
++        }
++    }
++
++    /* Use cached atom for standard lookup (avoids JS_NewAtom/JS_FreeAtom per call) */
++    return JS_GetProperty(ctx, obj, atom);
++}
++
 +/* Private field wrappers */
 +JSValue JS_NewPrivateSymbol(JSContext *ctx, JSAtom atom)
 +{
@@ -1192,7 +1238,7 @@ index 62f4381..fa4f992 100644
  static JSValue JS_IteratorGetCompleteValue(JSContext *ctx, JSValue obj,
                                             int *pdone)
  {
-@@ -15853,7 +16890,7 @@ static __exception int JS_CopyDataProperties(JSContext *ctx,
+@@ -15853,7 +16936,7 @@ static __exception int JS_CopyDataProperties(JSContext *ctx,
  }
  
  /* only valid inside C functions */
@@ -1201,7 +1247,7 @@ index 62f4381..fa4f992 100644
  {
      return ctx->rt->current_stack_frame->cur_func;
  }
-@@ -15955,15 +16992,16 @@ static const uint16_t func_kind_to_class_id[] = {
+@@ -15955,15 +17038,16 @@ static const uint16_t func_kind_to_class_id[] = {
      [JS_FUNC_ASYNC_GENERATOR] = JS_CLASS_ASYNC_GENERATOR_FUNCTION,
  };
  
@@ -1221,7 +1267,7 @@ index 62f4381..fa4f992 100644
      func_obj = JS_NewObjectClass(ctx, func_kind_to_class_id[b->func_kind]);
      if (JS_IsException(func_obj)) {
          JS_FreeValue(ctx, bfunc);
-@@ -16383,6 +17421,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16383,6 +17467,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  
      if (js_poll_interrupts(caller_ctx))
          return JS_EXCEPTION;
@@ -1229,7 +1275,7 @@ index 62f4381..fa4f992 100644
      if (unlikely(JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT)) {
          if (flags & JS_CALL_FLAG_GENERATOR) {
              JSAsyncFunctionState *s = JS_VALUE_GET_PTR(func_obj);
-@@ -16422,6 +17461,66 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16422,6 +17507,66 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
      }
      b = p->u.func.function_bytecode;
  
@@ -1296,7 +1342,7 @@ index 62f4381..fa4f992 100644
      if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
          arg_allocated_size = b->arg_count;
      } else {
-@@ -16781,7 +17880,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16781,7 +17926,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  
          CASE(OP_fclosure):
              {
@@ -1306,7 +1352,7 @@ index 62f4381..fa4f992 100644
                  pc += 4;
                  *sp++ = js_closure(ctx, bfunc, var_refs, sf);
                  if (unlikely(JS_IsException(sp[-1])))
-@@ -17265,7 +18365,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -17265,7 +18411,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          CASE(OP_set_arg1): set_value(ctx, &arg_buf[1], js_dup(sp[-1])); BREAK;
          CASE(OP_set_arg2): set_value(ctx, &arg_buf[2], js_dup(sp[-1])); BREAK;
          CASE(OP_set_arg3): set_value(ctx, &arg_buf[3], js_dup(sp[-1])); BREAK;
@@ -1317,7 +1363,7 @@ index 62f4381..fa4f992 100644
          CASE(OP_get_var_ref1): *sp++ = js_dup(*var_refs[1]->pvalue); BREAK;
          CASE(OP_get_var_ref2): *sp++ = js_dup(*var_refs[2]->pvalue); BREAK;
          CASE(OP_get_var_ref3): *sp++ = js_dup(*var_refs[3]->pvalue); BREAK;
-@@ -17281,11 +18383,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -17281,11 +18429,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          CASE(OP_get_var_ref):
              {
                  int idx;
@@ -1330,7 +1376,7 @@ index 62f4381..fa4f992 100644
                  sp++;
              }
              BREAK;
-@@ -29006,7 +30106,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
+@@ -29006,7 +30152,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
      return promise;
  }
  
@@ -1339,7 +1385,7 @@ index 62f4381..fa4f992 100644
                                       int argc, JSValueConst *argv)
  {
      JSValueConst *resolving_funcs = argv;
-@@ -29041,7 +30141,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
+@@ -29041,7 +30187,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
      return JS_UNDEFINED;
  }
  
@@ -1348,7 +1394,7 @@ index 62f4381..fa4f992 100644
  {
      JSAtom basename;
      JSValue promise, resolving_funcs[2], basename_val;
-@@ -33979,6 +35079,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+@@ -33979,6 +35125,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
      b->has_prototype = fd->has_prototype;
      b->has_simple_parameter_list = fd->has_simple_parameter_list;
      b->is_strict_mode = fd->is_strict_mode;
@@ -1356,7 +1402,7 @@ index 62f4381..fa4f992 100644
      b->is_derived_class_constructor = fd->is_derived_class_constructor;
      b->func_kind = fd->func_kind;
      b->need_home_object = (fd->home_object_var_idx >= 0 ||
-@@ -35616,6 +36717,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+@@ -35616,6 +36763,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
      assert(idx <= 16);
      bc_put_u16(s, flags);
      bc_put_u8(s, b->is_strict_mode);
@@ -1364,7 +1410,7 @@ index 62f4381..fa4f992 100644
      bc_put_atom(s, b->func_name);
  
      bc_put_leb128(s, b->arg_count);
-@@ -36552,6 +37654,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -36552,6 +37700,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
      if (bc_get_u8(s, &v8))
          goto fail;
      bc.is_strict_mode = (v8 > 0);
@@ -1375,7 +1421,7 @@ index 62f4381..fa4f992 100644
          goto fail;
      if (bc_get_leb128_u16(s, &bc.arg_count))
 diff --git a/quickjs.h b/quickjs.h
-index 3165256..1499271 100644
+index 3165256..c235c8f 100644
 --- a/quickjs.h
 +++ b/quickjs.h
 @@ -851,6 +851,7 @@ JS_EXTERN bool JS_IsWeakMap(JSValueConst val);
@@ -1396,7 +1442,7 @@ index 3165256..1499271 100644
  
  /* C function definition */
  typedef enum JSCFunctionEnum {  /* XXX: should rename for namespace isolation */
-@@ -1291,6 +1295,94 @@ JS_EXTERN const char* JS_GetVersion(void);
+@@ -1291,6 +1295,99 @@ JS_EXTERN const char* JS_GetVersion(void);
  /* Integration point for quickjs-libc.c, not for public use. */
  JS_EXTERN uintptr_t js_std_cmd(int cmd, ...);
  
@@ -1487,6 +1533,11 @@ index 3165256..1499271 100644
 +
 +/* Frozen interpreter support - method home object for super calls */
 +JS_EXTERN void JS_SetHomeObject(JSContext *ctx, JSValue func_obj, JSValue home_obj);
++
++/* Frozen interpreter support - inline cache for property access */
++JS_EXTERN JSValue js_frozen_ic_load(JSContext *ctx, JSValueConst obj,
++                                    void **ic_shape, uint32_t *ic_offset,
++                                    uint32_t *ic_atom, const char *name);
 +
  #undef JS_EXTERN
  #undef js_force_inline

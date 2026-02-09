@@ -276,58 +276,17 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
                 const obj = self.vpop() orelse "stack[sp-1]";
                 defer if (self.isAllocated(obj)) self.allocator.free(obj);
 
-                // Use native fast path for known AST node properties
-                if (std.mem.eql(u8, prop_name, "kind")) {
-                    try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetKind(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
-                } else if (std.mem.eql(u8, prop_name, "flags")) {
-                    // NOTE: Do NOT use nativeGetFlags here - "flags" is shared between
-                    // AST nodes (NodeFlags), Type objects (TypeFlags), and Symbol objects
-                    // (SymbolFlags). The native cache is keyed by address and only contains
-                    // AST nodes, so GC'd node addresses reused by Type/Symbol objects
-                    // return stale NodeFlags (ABA problem).
+                // IC-accelerated property access for all properties.
+                // Shape-based IC provides O(1) direct read on cache hit (inlined in Zig).
+                // Falls back to atom-cached JS_GetProperty on miss (handles proto chain, getters).
+                if (@hasDecl(CodeGen, "nextIcSlot")) {
+                    const ic_idx = self.nextIcSlot();
                     if (self.dispatch_mode) {
-                        try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"flags\") catch return .exception)", .{obj});
+                        try self.vpushFmt("CV.fromJSValue(zig_runtime.icLoad(ctx, {s}.toJSValueWithCtx(ctx), &_IC.s[{d}], \"{s}\") catch return .exception)", .{ obj, ic_idx, prop_name });
                     } else {
-                        try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"flags\") catch return JSValue.EXCEPTION)", .{obj});
+                        try self.vpushFmt("CV.fromJSValue(zig_runtime.icLoad(ctx, {s}.toJSValueWithCtx(ctx), &_IC.s[{d}], \"{s}\") catch return JSValue.EXCEPTION)", .{ obj, ic_idx, prop_name });
                     }
-                } else if (std.mem.eql(u8, prop_name, "pos")) {
-                    try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetPos(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
-                } else if (std.mem.eql(u8, prop_name, "end")) {
-                    try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetEnd(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
-                } else if (std.mem.eql(u8, prop_name, "parent")) {
-                    try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetParent(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
-                } else if (std.mem.eql(u8, prop_name, "symbol")) {
-                    try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetSymbol(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
-                } else if (std.mem.eql(u8, prop_name, "escapedName")) {
-                    try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetEscapedName(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
-                } else if (std.mem.eql(u8, prop_name, "declarations")) {
-                    try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetDeclarations(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
-                } else if (std.mem.eql(u8, prop_name, "valueDeclaration")) {
-                    try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetValueDeclaration(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
-                } else if (std.mem.eql(u8, prop_name, "members")) {
-                    try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetMembers(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
-                } else if (std.mem.eql(u8, prop_name, "properties")) {
-                    try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetProperties(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
-                } else if (std.mem.eql(u8, prop_name, "target")) {
-                    try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetTarget(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
-                } else if (std.mem.eql(u8, prop_name, "constraint")) {
-                    try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetConstraint(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
-                } else if (std.mem.eql(u8, prop_name, "modifiers")) {
-                    try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetModifiers(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
-                } else if (std.mem.eql(u8, prop_name, "name")) {
-                    try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetName(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
-                } else if (std.mem.eql(u8, prop_name, "text")) {
-                    try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetText(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
-                } else if (std.mem.eql(u8, prop_name, "type")) {
-                    try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetType(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
-                } else if (std.mem.eql(u8, prop_name, "checker")) {
-                    try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetChecker(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
-                } else if (std.mem.eql(u8, prop_name, "typeArguments")) {
-                    try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetTypeArguments(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
-                } else if (std.mem.eql(u8, prop_name, "arguments")) {
-                    try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetArguments(ctx, {s}.toJSValueWithCtx(ctx)))", .{obj});
                 } else {
-                    // Standard path for other properties - with exception propagation
                     if (self.dispatch_mode) {
                         try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\") catch return .exception)", .{ obj, prop_name });
                     } else {
@@ -347,10 +306,19 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
                 // Push the object back first (for use as 'this' in call_method)
                 try self.vpush(obj);
                 // Then push the method/property - with exception propagation
-                if (self.dispatch_mode) {
-                    try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\") catch return .exception)", .{ obj, prop_name });
+                if (@hasDecl(CodeGen, "nextIcSlot")) {
+                    const ic_idx = self.nextIcSlot();
+                    if (self.dispatch_mode) {
+                        try self.vpushFmt("CV.fromJSValue(zig_runtime.icLoad(ctx, {s}.toJSValueWithCtx(ctx), &_IC.s[{d}], \"{s}\") catch return .exception)", .{ obj, ic_idx, prop_name });
+                    } else {
+                        try self.vpushFmt("CV.fromJSValue(zig_runtime.icLoad(ctx, {s}.toJSValueWithCtx(ctx), &_IC.s[{d}], \"{s}\") catch return JSValue.EXCEPTION)", .{ obj, ic_idx, prop_name });
+                    }
                 } else {
-                    try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\") catch return JSValue.EXCEPTION)", .{ obj, prop_name });
+                    if (self.dispatch_mode) {
+                        try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\") catch return .exception)", .{ obj, prop_name });
+                    } else {
+                        try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\") catch return JSValue.EXCEPTION)", .{ obj, prop_name });
+                    }
                 }
                 // Free the obj string after both vpushes if it was allocated
                 if (self.isAllocated(obj)) self.allocator.free(obj);

@@ -3171,6 +3171,9 @@ pub const quickjs = struct {
     // Class constructor creation (for define_class opcode)
     pub extern fn js_frozen_define_class(ctx: *JSContext, bfunc: JSValue, parent_class: JSValue, class_flags: c_int, class_name: u32, cur_var_refs: ?[*]*JSVarRef, local_var_ref_list: ?*ListHead, locals: ?[*]JSValue, num_locals: c_int, args: ?[*]JSValue, num_args: c_int, out_ctor: *JSValue, out_proto: *JSValue) c_int;
 
+    // Inline cache for property access
+    pub extern fn js_frozen_ic_load(ctx: *JSContext, obj: JSValue, ic_shape: *?*anyopaque, ic_offset: *u32, ic_atom: *u32, name: [*:0]const u8) JSValue;
+
     // Runtime access
     pub extern fn JS_GetRuntime(ctx: *JSContext) *JSRuntime;
     pub extern fn JS_NewContext(rt: *JSRuntime) ?*JSContext;
