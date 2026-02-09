@@ -330,6 +330,7 @@ pub const jsvalueToAddr = frozen_helpers.jsvalueToAddr;
 pub const native_node_lookup = frozen_helpers.native_node_lookup;
 pub const nativeGetKind = frozen_helpers.nativeGetKind;
 pub const nativeGetFlags = frozen_helpers.nativeGetFlags;
+pub const nativeSetFlags = frozen_helpers.nativeSetFlags;
 pub const nativeGetPos = frozen_helpers.nativeGetPos;
 pub const nativeGetEnd = frozen_helpers.nativeGetEnd;
 pub const nativeGetParent = frozen_helpers.nativeGetParent;

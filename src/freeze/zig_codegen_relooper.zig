@@ -164,6 +164,9 @@ pub const FunctionInfo = struct {
     constants: []const module_parser.ConstValue = &.{},
     /// Stack size (from bytecode, for sizing the operand stack array)
     stack_size: u32 = 256,
+    /// Local indices captured by child closures (for targeted reverse sync)
+    /// Only these indices need to be synced from _locals_jsv after calls.
+    captured_local_indices: []const u16 = &.{},
 };
 
 pub const CodeGenError = error{
@@ -219,6 +222,9 @@ pub const RelooperCodeGen = struct {
 
     // Closure support - function creates child closures (fclosure/fclosure8)
     has_fclosure: bool = false,
+    // Tracks whether a closure has been created in the generated code so far.
+    // Used to gate reverse sync (_locals_jsv → locals) after function calls.
+    closure_created: bool = false,
 
     const Self = @This();
 
@@ -369,6 +375,7 @@ pub const RelooperCodeGen = struct {
         // Enables closures to see updates to locals assigned after closure creation
         if (self.has_fclosure and self.func.var_count > 0) {
             try self.printLine("var _locals_jsv: [{d}]JSValue = .{{JSValue.UNDEFINED}} ** {d};", .{ self.func.var_count, self.func.var_count });
+            try self.writeLine("var _closure_alive: bool = false;");
             // Heap-allocate var_ref_list to isolate from stack corruption
             try self.writeLine("const _var_ref_list: *zig_runtime.ListHead = @ptrCast(@alignCast(zig_runtime.quickjs.js_malloc(ctx, @sizeOf(zig_runtime.ListHead)) orelse return zig_runtime.JSValue.EXCEPTION));");
             try self.writeLine("defer zig_runtime.quickjs.js_free(ctx, @ptrCast(_var_ref_list));");
@@ -1223,6 +1230,7 @@ pub const RelooperCodeGen = struct {
                     const vrl = if (self.dispatch_mode) "bctx.var_ref_list" else "_var_ref_list";
                     const ljv = if (self.dispatch_mode) "_locals_jsv" else "&_locals_jsv";
                     try self.printLine("const _closure = JSValue.createClosureV2(ctx, _bfunc, var_refs, {s}, {s}, {d}, argv[0..@intCast(argc)]);", .{ vrl, ljv, var_count });
+                    try self.writeLine("_closure_alive = true;");
                 } else if (var_count > 0) {
                     try self.printLine("var _locals_js: [{d}]JSValue = undefined;", .{var_count});
                     try self.printLine("for (0..{d}) |_i| {{ _locals_js[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{var_count});
@@ -1232,6 +1240,9 @@ pub const RelooperCodeGen = struct {
                 }
                 try self.writeLine("stack[sp] = CV.fromJSValue(_closure);");
                 try self.writeLine("sp += 1;");
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    self.closure_created = true;
+                }
                 self.popIndent();
                 try self.writeLine("}");
             },
@@ -1261,6 +1272,7 @@ pub const RelooperCodeGen = struct {
                     const vrl = if (self.dispatch_mode) "bctx.var_ref_list" else "_var_ref_list";
                     const ljv = if (self.dispatch_mode) "_locals_jsv" else "&_locals_jsv";
                     try self.printLine("const _closure = JSValue.createClosureV2(ctx, _bfunc, var_refs, {s}, {s}, {d}, argv[0..@intCast(argc)]);", .{ vrl, ljv, var_count });
+                    try self.writeLine("_closure_alive = true;");
                 } else if (var_count > 0) {
                     try self.printLine("var _locals_js: [{d}]JSValue = undefined;", .{var_count});
                     try self.printLine("for (0..{d}) |_i| {{ _locals_js[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{var_count});
@@ -1270,6 +1282,9 @@ pub const RelooperCodeGen = struct {
                 }
                 try self.writeLine("stack[sp] = CV.fromJSValue(_closure);");
                 try self.writeLine("sp += 1;");
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    self.closure_created = true;
+                }
                 self.popIndent();
                 try self.writeLine("}");
             },
@@ -1287,6 +1302,8 @@ pub const RelooperCodeGen = struct {
                 try self.writeLine("const _argc: u32 = @intCast(@min(_len, 32));");
                 try self.writeLine("var _args: [32]zig_runtime.JSValue = undefined;");
                 try self.writeLine("for (0.._argc) |i| { _args[i] = JSValue.getPropertyUint32(ctx, _args_array, @intCast(i)); }");
+                // Sync locals TO _locals_jsv before call
+                try self.emitClosureVarSyncTo();
                 try self.writeLine("const _result = JSValue.call(ctx, _func, _this_arg, @intCast(_argc), &_args);");
                 try self.writeLine("if (_result.isException()) {");
                 self.pushIndent();
@@ -1296,6 +1313,8 @@ pub const RelooperCodeGen = struct {
                 try self.writeLine("sp -= 3;");
                 try self.writeLine("stack[sp] = CV.fromJSValue(_result);");
                 try self.writeLine("sp += 1;");
+                // Sync closure variables back from _locals_jsv (closure may have written to them)
+                try self.emitClosureVarSyncFrom();
                 self.popIndent();
                 try self.writeLine("}");
             },
@@ -1463,8 +1482,12 @@ pub const RelooperCodeGen = struct {
                     for (0..argc) |i| {
                         try self.printLine("_args[{d}] = stack[sp - {d}].toJSValueWithCtx(ctx);", .{ i, argc - i });
                     }
+                    // Sync locals TO _locals_jsv before call
+                    try self.emitClosureVarSyncTo();
                     try self.printLine("const _result = JSValue.callConstructor(ctx, _ctor, &_args);", .{});
                 } else {
+                    // Sync locals TO _locals_jsv before call
+                    try self.emitClosureVarSyncTo();
                     try self.writeLine("const _result = JSValue.callConstructor(ctx, _ctor, &[_]zig_runtime.JSValue{});");
                 }
                 // Pop constructor, new.target, and all args (argc + 2 total)
@@ -1476,6 +1499,8 @@ pub const RelooperCodeGen = struct {
                 try self.writeLine("}");
                 try self.writeLine("stack[sp] = CV.fromJSValue(_result);");
                 try self.writeLine("sp += 1;");
+                // Sync closure variables back from _locals_jsv (closure may have written to them)
+                try self.emitClosureVarSyncFrom();
                 self.popIndent();
                 try self.writeLine("}");
             },
@@ -1701,6 +1726,38 @@ pub const RelooperCodeGen = struct {
         try self.vpushFmt("{s}({s}, {s})", .{ op, a, b });
     }
 
+    /// Forward sync (locals → _locals_jsv) before calls is NOT needed because:
+    /// 1. Full sync happens at closure creation (fclosure/fclosure8 handlers)
+    /// 2. Every put_loc/set_loc individually syncs the written local to _locals_jsv
+    /// So _locals_jsv is always up to date and no pre-call sync is required.
+    fn emitClosureVarSyncTo(self: *Self) !void {
+        _ = self;
+    }
+
+    /// Emit sync code to copy closure variable updates from _locals_jsv back to locals.
+    /// Needed after any call that might execute a closure that writes to captured variables.
+    /// Guarded by runtime _closure_alive flag to avoid syncing before any closure exists
+    /// (which would overwrite locals with UNDEFINED since _locals_jsv starts as UNDEFINED).
+    /// Only syncs the specific local indices captured by child closures for performance.
+    fn emitClosureVarSyncFrom(self: *Self) !void {
+        if (self.has_fclosure and self.func.var_count > 0 and self.closure_created) {
+            const captured = self.func.captured_local_indices;
+            if (captured.len > 0) {
+                // Targeted sync: only sync the specific captured locals
+                try self.writeLine("if (_closure_alive) {");
+                self.pushIndent();
+                for (captured) |idx| {
+                    try self.printLine("locals[{d}] = CV.fromJSValue(_locals_jsv[{d}]);", .{ idx, idx });
+                }
+                self.popIndent();
+                try self.writeLine("}");
+            } else {
+                // Fallback: sync all locals if captured indices unknown
+                try self.printLine("if (_closure_alive) {{ for (0..{d}) |_i| {{ locals[_i] = CV.fromJSValue(_locals_jsv[_i]); }} }}", .{self.func.var_count});
+            }
+        }
+    }
+
     fn emitCall(self: *Self, argc: u16) !void {
         // For Relooper, always flush vstack first, then use real stack positions
         // This handles cross-block values correctly
@@ -1718,8 +1775,12 @@ pub const RelooperCodeGen = struct {
             // Build args array from real stack positions
             try self.printLine("var _args: [{d}]JSValue = undefined;", .{argc});
             try self.printLine("for (0..{d}) |_i| {{ _args[_i] = CV.toJSValuePtr(&stack[sp - {d} + _i]); }}", .{ argc, argc });
+            // Sync locals TO _locals_jsv before call
+            try self.emitClosureVarSyncTo();
             try self.writeLine("const _result = JSValue.call(ctx, _fn, zig_runtime.JSValue.UNDEFINED, @intCast(_args.len), &_args);");
         } else {
+            // Sync locals TO _locals_jsv before call
+            try self.emitClosureVarSyncTo();
             try self.writeLine("const _result = JSValue.call(ctx, _fn, zig_runtime.JSValue.UNDEFINED, 0, @as([*]zig_runtime.JSValue, undefined));");
         }
 
@@ -1733,6 +1794,8 @@ pub const RelooperCodeGen = struct {
         // Pop func + args, push result
         try self.printLine("sp -= {d};", .{argc + 1});
         try self.writeLine("stack[sp] = CV.fromJSValue(_result); sp += 1;");
+        // Sync closure variables back from _locals_jsv (closure may have written to them)
+        try self.emitClosureVarSyncFrom();
         self.popIndent();
         try self.writeLine("}");
     }
@@ -1755,8 +1818,12 @@ pub const RelooperCodeGen = struct {
             // Build args array from real stack positions
             try self.printLine("var _args: [{d}]JSValue = undefined;", .{argc});
             try self.printLine("for (0..{d}) |_i| {{ _args[_i] = CV.toJSValuePtr(&stack[sp - {d} + _i]); }}", .{ argc, argc });
+            // Sync locals TO _locals_jsv before call
+            try self.emitClosureVarSyncTo();
             try self.writeLine("const _result = JSValue.call(ctx, _method, _obj, @intCast(_args.len), &_args);");
         } else {
+            // Sync locals TO _locals_jsv before call
+            try self.emitClosureVarSyncTo();
             try self.writeLine("const _result = JSValue.call(ctx, _method, _obj, 0, @as([*]zig_runtime.JSValue, undefined));");
         }
 
@@ -1770,6 +1837,8 @@ pub const RelooperCodeGen = struct {
         // Pop obj + method + args, push result
         try self.printLine("sp -= {d};", .{argc + 2});
         try self.writeLine("stack[sp] = CV.fromJSValue(_result); sp += 1;");
+        // Sync closure variables back from _locals_jsv (closure may have written to them)
+        try self.emitClosureVarSyncFrom();
         self.popIndent();
         try self.writeLine("}");
     }

@@ -494,6 +494,20 @@ pub fn nativeGetFlags(ctx: *JSContext, obj: JSValue) JSValue {
     return JSValue.getPropertyStr(ctx, obj, "flags");
 }
 
+/// Set node.flags with native cache update
+/// Updates the native shape cache AND the JS object property.
+/// val is consumed by setPropertyStr (caller must dup before calling).
+pub fn nativeSetFlags(ctx: *JSContext, obj: JSValue, val: JSValue) void {
+    // Update native cache if node is registered
+    if (native_node_lookup(jsvalueToAddr(obj))) |node| {
+        var flags: i32 = 0;
+        _ = JSValue.toInt32(ctx, &flags, val);
+        node.flags = flags;
+    }
+    // Set on JS object (consumes val)
+    _ = JSValue.setPropertyStr(ctx, obj, "flags", val);
+}
+
 /// Get node.pos with native fast path
 pub inline fn nativeGetPos(ctx: *JSContext, obj: JSValue) JSValue {
     if (native_node_lookup(jsvalueToAddr(obj))) |node| {

@@ -4874,7 +4874,12 @@ pub const ZigCodeGen = struct {
                     try self.writeLine("{");
                     try self.writeLine("  const val = JSValue.dup(ctx, stack[sp-1].toJSValueWithCtx(ctx));");
                     try self.writeLine("  const obj = stack[sp-2].toJSValueWithCtx(ctx);");
-                    try self.printLine("  _ = JSValue.setPropertyStr(ctx, obj, \"{s}\", val);", .{escaped_prop});
+                    if (std.mem.eql(u8, prop_name, "flags")) {
+                        // Use nativeSetFlags to update both JS property AND native shape cache
+                        try self.writeLine("  zig_runtime.nativeSetFlags(ctx, obj, val);");
+                    } else {
+                        try self.printLine("  _ = JSValue.setPropertyStr(ctx, obj, \"{s}\", val);", .{escaped_prop});
+                    }
                     try self.writeLine("  sp -= 2;");
                     try self.writeLine("}");
                     // Sync vstack: pops 2 (val, obj)

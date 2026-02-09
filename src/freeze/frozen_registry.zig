@@ -228,6 +228,8 @@ pub const AnalyzedFunction = struct {
     has_use_strict: bool = false,
     /// Function kind: 0=normal, 1=generator, 2=async, 3=async generator
     func_kind: u2 = 0,
+    /// Local indices captured by child closures (for targeted reverse sync in relooper)
+    captured_local_indices: []const u16 = &.{},
 };
 
 /// Result of analyzing a module for freezable functions
@@ -372,8 +374,35 @@ pub fn analyzeModule(
                 .var_idx = cv.var_idx,
                 .is_const = cv.is_const,
                 .is_lexical = cv.is_lexical,
+                .is_local = cv.is_local,
             };
         }
+
+        // Compute which local indices are captured by child closures
+        // This enables targeted reverse sync (only captured locals, not all) in the relooper.
+        var captured_set = std.AutoHashMapUnmanaged(u16, void){};
+        defer captured_set.deinit(allocator);
+        for (func_info.constants) |c| {
+            switch (c) {
+                .child_func => |child| {
+                    if (child.func_idx < parser.functions.items.len) {
+                        const child_func = parser.functions.items[child.func_idx];
+                        for (child_func.closure_vars) |cv| {
+                            if (cv.is_local and cv.var_idx < func_info.var_count) {
+                                captured_set.put(allocator, @intCast(cv.var_idx), {}) catch {};
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+        var captured_list = std.ArrayListUnmanaged(u16){};
+        var cap_it = captured_set.keyIterator();
+        while (cap_it.next()) |key| {
+            captured_list.append(allocator, key.*) catch {};
+        }
+        const captured_local_indices_slice = captured_list.toOwnedSlice(allocator) catch &.{};
 
         try result.functions.append(allocator, .{
             .name = name,
@@ -392,6 +421,7 @@ pub fn analyzeModule(
             .line_num = func_info.line_num, // For name@line_num dispatch key
             .has_use_strict = func_info.has_use_strict, // For proper 'this' handling
             .func_kind = func_info.func_kind, // 0=normal, 1=generator, 2=async, 3=async_generator
+            .captured_local_indices = captured_local_indices_slice,
         });
 
         if (can_freeze_final) {
@@ -634,6 +664,7 @@ fn generateFrozenZigGeneral(
             .is_async = func.func_kind >= 2, // async or async_generator
             .constants = func.constants, // For fclosure bytecode registration
             .stack_size = func.stack_size,
+            .captured_local_indices = func.captured_local_indices,
         }) catch |err| {
             std.debug.print("[freeze] Relooper codegen error for '{s}': {}\n", .{ func.name, err });
             return null;

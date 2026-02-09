@@ -132,6 +132,7 @@ pub const ClosureVarInfo = struct {
     var_idx: u32, // Index in closure array
     is_const: bool, // Is it a const variable
     is_lexical: bool, // Is it let/const (vs var)
+    is_local: bool, // Captures parent's local variable (vs parent's closure variable)
 };
 
 /// Parsed function metadata from bytecode
@@ -461,6 +462,7 @@ pub const ModuleParser = struct {
             const closure_flags = self.readU8() orelse return error.UnexpectedEof;
             // Flags bits from QuickJS bc_set_flags:
             // bit 0: is_local, bit 1: is_arg, bit 2: is_const, bit 3: is_lexical, bits 4-7: var_kind
+            const is_local = (closure_flags & 0x01) != 0; // bit 0
             const is_const = (closure_flags & 0x04) != 0; // bit 2
             const is_lexical = (closure_flags & 0x08) != 0; // bit 3
             // Look up the variable name from atom table (needed for self-recursion detection)
@@ -470,6 +472,7 @@ pub const ModuleParser = struct {
                 .var_idx = var_idx,
                 .is_const = is_const,
                 .is_lexical = is_lexical,
+                .is_local = is_local,
             });
         }
 
