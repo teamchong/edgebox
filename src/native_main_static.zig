@@ -576,6 +576,10 @@ pub fn main() !void {
         _ = qjs.js_std_loop(ctx);
     }
 
+    // Print profiling stats
+    const zig_runtime = @import("zig_runtime");
+    if (zig_runtime.PROFILE) zig_runtime.printProfile();
+
     if (qjs.JS_IsException(result)) {
         printException(ctx);
         qjs.JS_FreeValue(ctx, result);

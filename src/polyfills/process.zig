@@ -110,6 +110,9 @@ fn processExit(_: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JS
         _ = qjs.JS_ToInt32(null, &code, argv[0]);
         exit_code = if (code >= 0 and code <= 255) @intCast(code) else 1;
     }
+    // Print profiling stats before exit
+    const zig_runtime = @import("zig_runtime");
+    if (zig_runtime.PROFILE) zig_runtime.printProfile();
     std.process.exit(exit_code);
 }
 

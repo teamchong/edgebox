@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const types = @import("js_types.zig");
+const profile = @import("profile.zig");
 
 // Re-export types for convenience
 pub const JSContext = types.JSContext;
@@ -1294,6 +1295,7 @@ pub const CompressedValue = if (is_wasm32) extern struct {
     /// (ctx parameter exists for API compatibility with WASM32 version)
     pub inline fn toJSValueWithCtx(self: CompressedValue, ctx: *JSContext) JSValue {
         _ = ctx; // Not needed on native, just use standard conversion
+        if (profile.PROFILE) profile.vinc(profile.prof.cv_to_jsvalue(), 1);
         return self.toJSValue();
     }
 
@@ -1412,6 +1414,7 @@ pub const CompressedValue = if (is_wasm32) extern struct {
 
     pub inline fn fromJSValue(val: JSValue) CompressedValue {
         @setEvalBranchQuota(1000000); // Increased for large codebases (date-fns, etc.)
+        if (profile.PROFILE) profile.vinc(profile.prof.jsvalue_to_cv(), 1);
         if (val.isException()) {
             return EXCEPTION;
         } else if (val.isInt()) {
@@ -2615,6 +2618,7 @@ const JSValueNative = extern struct {
     }
 
     pub inline fn dup(ctx: *JSContext, val: JSValueNative) JSValueNative {
+        if (profile.PROFILE) profile.vinc(profile.prof.ref_dups(), 1);
         if (val.hasRefCount()) {
             return quickjs.JS_DupValue(ctx, val);
         }
@@ -2622,6 +2626,7 @@ const JSValueNative = extern struct {
     }
 
     pub inline fn free(ctx: *JSContext, val: JSValueNative) void {
+        if (profile.PROFILE) profile.vinc(profile.prof.ref_frees(), 1);
         if (val.hasRefCount()) {
             quickjs.JS_FreeValue(ctx, val);
         }
@@ -2629,7 +2634,11 @@ const JSValueNative = extern struct {
 
     // FFI wrappers
     pub inline fn call(ctx: *JSContext, func: JSValueNative, this: JSValueNative, argc: c_int, argv: [*]JSValueNative) JSValueNative {
-        return quickjs.JS_Call(ctx, func, this, argc, argv);
+        if (profile.PROFILE) profile.vinc(profile.prof.call_count(), 1);
+        const t0 = if (profile.PROFILE) profile.cycles() else 0;
+        const result = quickjs.JS_Call(ctx, func, this, argc, argv);
+        if (profile.PROFILE) profile.vinc(profile.prof.call_cycles(), profile.cycles() - t0);
+        return result;
     }
 
     pub inline fn setPropertyStr(ctx: *JSContext, this: JSValueNative, name: [*:0]const u8, val: JSValueNative) c_int {

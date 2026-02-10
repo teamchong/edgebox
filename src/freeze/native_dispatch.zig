@@ -21,7 +21,7 @@ const qjs = zig_runtime.quickjs;
 const is_wasm32 = @sizeOf(*anyopaque) == 4;
 
 // Debug flag for fclosure registration logging
-const FCLOSURE_DEBUG = false;
+const FCLOSURE_DEBUG = true;
 
 // Note: Cpool traversal FFI functions removed (js_frozen_get_cpool_info, js_frozen_get_cpool_func_bytecode,
 // js_frozen_get_bytecode_name_line) - they caused bytecode collisions when multiple functions had the
@@ -215,6 +215,10 @@ pub fn disableDispatch() void {
 var dispatch_hits: usize = 0;
 var dispatch_misses: usize = 0;
 
+// Debug: log first N dispatched function names
+const DISPATCH_LOG_COUNT: usize = 50;
+var dispatch_log_idx: usize = 0;
+
 pub export fn frozen_dispatch_lookup(
     ctx: *JSContext,
     func_name: [*:0]const u8,
@@ -240,6 +244,14 @@ pub export fn frozen_dispatch_lookup(
     };
 
     dispatch_hits += 1;
+
+    // Debug: log first N dispatched function names
+    if (dispatch_log_idx < DISPATCH_LOG_COUNT) {
+        var len: usize = 0;
+        while (func_name[len] != 0) : (len += 1) {}
+        std.debug.print("[dispatch] {s}\n", .{func_name[0..len]});
+        dispatch_log_idx += 1;
+    }
 
     // Register this function by bytecode pointer for future bytecode-based dispatch
     // Only registers this specific function, NOT cpool entries (to avoid bytecode collisions)
@@ -298,6 +310,11 @@ pub export fn frozen_dispatch_lookup_bytecode(
     };
 
     bytecode_dispatch_hits += 1;
+
+    // Debug: log first N bytecode dispatch hits
+    if (bytecode_dispatch_hits <= DISPATCH_LOG_COUNT) {
+        std.debug.print("[bc_dispatch] Hit #{d}: bytecode {*}\n", .{ bytecode_dispatch_hits, bytecode_ptr });
+    }
 
     // Call the frozen function with var_refs, closure_var_count, and cpool for closure/fclosure support
     if (is_wasm32) {

@@ -276,6 +276,24 @@ pub const iteratorGetValue = frozen_helpers.iteratorGetValue;
 pub const copyDataProperties = frozen_helpers.copyDataProperties;
 
 // ============================================================================
+// Profiling Counters (shared with js_value.zig via profile.zig)
+// ============================================================================
+
+const profile = @import("profile.zig");
+pub const PROFILE = profile.PROFILE;
+pub const prof = profile.prof;
+pub const cycles = profile.cycles;
+pub const vinc = profile.vinc;
+
+extern fn frozen_dispatch_stats() void;
+
+pub fn printProfile() void {
+    profile.prof.print();
+    // Also print dispatch stats
+    frozen_dispatch_stats();
+}
+
+// ============================================================================
 // Property Access Helper (with exception propagation)
 // ============================================================================
 
@@ -285,7 +303,10 @@ pub const GetFieldError = error{JsException};
 /// Used by frozen codegen to propagate exceptions from get_field operations
 /// (e.g., accessing a property on undefined/null).
 pub inline fn getFieldChecked(ctx: *JSContext, obj: JSValue, name: [*:0]const u8) GetFieldError!JSValue {
+    if (PROFILE) vinc(prof.getfield_calls(), 1);
+    const t0 = if (PROFILE) cycles() else 0;
     const result = JSValue.getPropertyStr(ctx, obj, name);
+    if (PROFILE) vinc(prof.getfield_cycles(), cycles() - t0);
     if (result.isException()) return error.JsException;
     return result;
 }
@@ -313,6 +334,8 @@ pub const ICSlot = extern struct {
 ///   offset 24: JSShape *shape
 ///   offset 32: JSProperty *prop (array, each entry = 16 bytes = sizeof(JSValue))
 pub inline fn icLoad(ctx: *JSContext, obj: JSValue, ic: *ICSlot, name: [*:0]const u8) GetFieldError!JSValue {
+    if (PROFILE) vinc(prof.getfield_calls(), 1);
+    const t0 = if (PROFILE) cycles() else 0;
     // IC fast path: check shape match and read property directly (zero FFI calls)
     if (!is_wasm32 and obj.tag == JS_TAG_OBJECT) {
         if (ic.shape) |cached_shape| {
@@ -320,6 +343,8 @@ pub inline fn icLoad(ctx: *JSContext, obj: JSValue, ic: *ICSlot, name: [*:0]cons
             // Read shape pointer at offset 24
             const shape_ptr: *const ?*anyopaque = @ptrCast(@alignCast(obj_bytes + 24));
             if (shape_ptr.* == cached_shape) {
+                if (PROFILE) vinc(prof.ic_hits(), 1);
+                if (PROFILE) vinc(prof.getfield_cycles(), cycles() - t0);
                 // Read prop base pointer at offset 32
                 const prop_base: *const [*]const u8 = @ptrCast(@alignCast(obj_bytes + 32));
                 // Read JSValue at prop[offset] (each JSProperty = 16 bytes)
@@ -328,8 +353,10 @@ pub inline fn icLoad(ctx: *JSContext, obj: JSValue, ic: *ICSlot, name: [*:0]cons
             }
         }
     }
+    if (PROFILE) vinc(prof.ic_misses(), 1);
     // Slow path: C function handles atom resolution, cache population, and proto chain
     const result = quickjs.js_frozen_ic_load(ctx, obj, &ic.shape, &ic.offset, &ic.atom, name);
+    if (PROFILE) vinc(prof.getfield_cycles(), cycles() - t0);
     if (result.isException()) return error.JsException;
     return result;
 }

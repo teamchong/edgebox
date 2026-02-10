@@ -532,6 +532,12 @@ pub fn build(b: *std.Build) void {
         .files = quickjs_wasm_files,
         .flags = quickjs_wasm_flags,
     });
+
+    // Add profile counter storage (single definition shared by all frozen shards)
+    wasm_static_exe.root_module.addCSourceFile(.{
+        .file = b.path("src/freeze/profile_counters.c"),
+        .flags = &.{"-O2"},
+    });
     wasm_static_exe.linkLibC();
     wasm_static_exe.step.dependOn(&apply_patches.step); // Apply patches before compiling
 
@@ -740,6 +746,12 @@ pub fn build(b: *std.Build) void {
         .root = b.path(quickjs_dir),
         .files = quickjs_c_files,
         .flags = quickjs_c_flags,
+    });
+
+    // Add profile counter storage (single definition shared by all frozen shards)
+    native_static_exe.root_module.addCSourceFile(.{
+        .file = b.path("src/freeze/profile_counters.c"),
+        .flags = &.{"-O2"},
     });
 
     // Add libdeflate for real compression support (native builds only)
@@ -951,6 +963,12 @@ pub fn build(b: *std.Build) void {
             .flags = quickjs_c_flags,
         });
 
+        // Add profile counter storage (single definition shared by all frozen shards)
+        native_exe.root_module.addCSourceFile(.{
+            .file = b.path("src/freeze/profile_counters.c"),
+            .flags = &.{"-O2"},
+        });
+
         // Add libdeflate for real compression support (native builds only)
         native_exe.root_module.addIncludePath(b.path("vendor/libdeflate"));
         const native_is_x86 = target.result.cpu.arch == .x86_64 or target.result.cpu.arch == .x86;
@@ -1151,6 +1169,12 @@ pub fn build(b: *std.Build) void {
             .root = b.path(quickjs_dir),
             .files = quickjs_wasm_files,
             .flags = quickjs_wasm_flags,
+        });
+
+        // Add profile counter storage (single definition shared by all frozen shards)
+        wasm_standalone_exe.root_module.addCSourceFile(.{
+            .file = b.path("src/freeze/profile_counters.c"),
+            .flags = &.{"-O2"},
         });
         wasm_standalone_exe.linkLibC();
         wasm_standalone_exe.step.dependOn(&apply_patches.step);
