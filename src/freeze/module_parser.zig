@@ -573,7 +573,11 @@ pub const ModuleParser = struct {
                 const func = try self.parseFunctionBytecode();
                 try self.functions.append(self.allocator, func);
                 // Get child function's name from atom table and duplicate it
-                const child_name_ref = self.getAtomString(func.name_atom) orelse "anonymous";
+                // CRITICAL: Use getAtomByIndex (not getAtomString) to match the naming convention
+                // in frozen_registry.zig:327 which also uses getAtomByIndex for AnalyzedFunction.name.
+                // getAtomString returns null for built-in atoms (anonymous funcs), causing fallback to
+                // "anonymous" which mismatches the "" used in dispatch registration (e.g., "@66372" vs "anonymous@66372").
+                const child_name_ref = self.getAtomByIndex(func.name_atom) orelse "";
                 const child_name = try self.allocator.dupe(u8, child_name_ref);
                 return .{ .child_func = .{
                     .func_idx = func_idx,

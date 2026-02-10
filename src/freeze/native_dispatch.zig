@@ -110,32 +110,46 @@ pub export fn registerCpoolBytecodeByName(bfunc: JSValue, name: [*:0]const u8) c
     // Skip if dispatch is not enabled yet
     if (!dispatch_enabled) return;
 
-    // Look up the frozen function by name
-    const func = lookup(name) orelse {
+    // Convert to slice
+    var len: usize = 0;
+    while (name[len] != 0) : (len += 1) {}
+    const name_slice = name[0..len];
+
+    // Look up the frozen function by name, handling naming convention mismatch:
+    // Old shards use "anonymous@lineNum" but registration uses "@lineNum" (empty name).
+    // Try the exact name first, then strip "anonymous" prefix if needed.
+    const func = lookup(name) orelse blk: {
+        // If name starts with "anonymous@", try looking up with just "@lineNum"
+        if (std.mem.startsWith(u8, name_slice, "anonymous@")) {
+            const stripped = name_slice["anonymous".len..]; // "@lineNum"
+            if (name_registry) |*reg| {
+                break :blk reg.get(stripped);
+            }
+        }
+        break :blk null;
+    };
+
+    if (func == null) {
         // Debug: name not found
         if (FCLOSURE_DEBUG) {
-            var len: usize = 0;
-            while (name[len] != 0) : (len += 1) {}
-            std.debug.print("[fclosure] Name not found: {s}\n", .{name[0..len]});
+            std.debug.print("[fclosure] Name not found: {s}\n", .{name_slice});
         }
         return;
-    };
+    }
 
     // Extract bytecode pointer from JSValue and register
     const bytecode_ptr = qjs.js_get_function_bytecode_ptr(bfunc);
     if (bytecode_ptr) |ptr| {
         // Only register if not already registered
         if (lookupByBytecode(ptr) == null) {
-            registerByBytecode(ptr, func);
+            registerByBytecode(ptr, func.?);
             if (FCLOSURE_DEBUG) {
-                var len: usize = 0;
-                while (name[len] != 0) : (len += 1) {}
-                std.debug.print("[fclosure] Registered bytecode {*} -> {s}\n", .{ ptr, name[0..len] });
+                std.debug.print("[fclosure] Registered bytecode {*} -> {s}\n", .{ ptr, name_slice });
             }
         }
     } else {
         if (FCLOSURE_DEBUG) {
-            std.debug.print("[fclosure] Could not get bytecode ptr for {s}\n", .{name});
+            std.debug.print("[fclosure] Could not get bytecode ptr for {s}\n", .{name_slice});
         }
     }
 }
