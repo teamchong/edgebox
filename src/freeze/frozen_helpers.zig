@@ -63,72 +63,70 @@ pub fn frozen_reset_call_depth_zig() void {
 // The closure_var_indices map bytecode indices to var_refs array positions
 // ============================================================================
 
-/// Get closure variable from var_refs array (safe version with bounds checking)
-/// @param ctx - JSContext for memory management
-/// @param var_refs - array of closure variable references from QuickJS
-/// @param position - index into var_refs array
-/// @param closure_var_count - size of var_refs array for bounds checking
+/// Inline dup for closure var access - increments ref_count directly without C FFI
+/// ref_count is at offset 0 of any GC object (JSRefCountHeader)
+inline fn inlineDup(val: JSValue) JSValue {
+    if (val.hasRefCount()) {
+        if (val.getPtr()) |ptr| {
+            const ref_count: *i32 = @ptrCast(@alignCast(ptr));
+            ref_count.* += 1;
+        }
+    }
+    return val;
+}
+
+/// Inline set_value for closure var - writes new value, frees old via C
+/// Matches C set_value(ctx, pval, new_val) semantics
+inline fn inlineSetValue(ctx: *JSContext, pval: *JSValue, new_val: JSValue) void {
+    const old_val = pval.*;
+    pval.* = new_val;
+    JSValue.free(ctx, old_val);
+}
+
+/// Get closure variable - pure Zig, no C FFI (safe version with bounds checking)
 pub inline fn getClosureVarSafe(ctx: *JSContext, var_refs: ?[*]*JSVarRef, position: u32, closure_var_count: c_int) JSValue {
-    // Use C FFI for correct struct layout handling with bounds checking
-    if (var_refs != null and closure_var_count > 0) {
-        return quickjs.js_frozen_get_var_ref_safe(ctx, @ptrCast(var_refs), @intCast(position), closure_var_count);
+    _ = ctx;
+    if (var_refs) |refs| {
+        if (closure_var_count > 0 and position < @as(u32, @intCast(closure_var_count))) {
+            const var_ref = refs[position];
+            return inlineDup(var_ref.pvalue.*);
+        }
     }
     return JSValue.UNDEFINED;
 }
 
-/// Get closure variable from var_refs array (legacy version - no bounds checking)
-/// @param ctx - JSContext for memory management
-/// @param var_refs - array of closure variable references from QuickJS
-/// @param position - index into var_refs array
+/// Get closure variable - pure Zig, no C FFI (legacy, no bounds checking)
 pub inline fn getClosureVar(ctx: *JSContext, var_refs: ?[*]*JSVarRef, position: u32) JSValue {
-    // Use C FFI for correct struct layout handling
-    // The JSVarRef struct layout in C doesn't match Zig's extern struct due to
-    // GC header union alignment differences
-    if (var_refs != null) {
-        return quickjs.js_frozen_get_var_ref(ctx, @ptrCast(var_refs), @intCast(position));
+    _ = ctx;
+    if (var_refs) |refs| {
+        const var_ref = refs[position];
+        return inlineDup(var_ref.pvalue.*);
     }
     return JSValue.UNDEFINED;
 }
 
-/// Set closure variable in var_refs array (safe version with bounds checking)
-/// @param ctx - JSContext for memory management
-/// @param var_refs - array of closure variable references from QuickJS
-/// @param position - index into var_refs array
-/// @param closure_var_count - size of var_refs array for bounds checking
-/// @param val - value to set (ownership transferred)
+/// Set closure variable - pure Zig, no C FFI (safe version with bounds checking)
 pub inline fn setClosureVarSafe(ctx: *JSContext, var_refs: ?[*]*JSVarRef, position: u32, closure_var_count: c_int, val: JSValue) void {
-    // Use C FFI for correct struct layout handling with bounds checking
-    if (var_refs != null and closure_var_count > 0) {
-        quickjs.js_frozen_set_var_ref_safe(ctx, @ptrCast(var_refs), @intCast(position), closure_var_count, val);
+    if (var_refs) |refs| {
+        if (closure_var_count > 0 and position < @as(u32, @intCast(closure_var_count))) {
+            inlineSetValue(ctx, refs[position].pvalue, val);
+        }
     }
 }
 
-/// Set closure variable with dup (for set_var_ref which keeps value on stack)
-/// Unlike setClosureVarSafe, this duplicates the value before storing since
-/// the original stays on the stack. Used for expressions like ++x where the
-/// incremented value is both stored and used.
-/// @param ctx - JSContext for memory management
-/// @param var_refs - array of closure variable references from QuickJS
-/// @param position - index into var_refs array
-/// @param closure_var_count - size of var_refs array for bounds checking
-/// @param val - value to store (will be duplicated, original ownership retained by caller)
+/// Set closure variable with dup (value stays on stack)
 pub inline fn setClosureVarDupSafe(ctx: *JSContext, var_refs: ?[*]*JSVarRef, position: u32, closure_var_count: c_int, val: JSValue) void {
-    // Use C FFI for correct struct layout handling with bounds checking
-    // Must dup because original stays on stack
-    if (var_refs != null and closure_var_count > 0) {
-        quickjs.js_frozen_set_var_ref_safe(ctx, @ptrCast(var_refs), @intCast(position), closure_var_count, JSValue.dup(ctx, val));
+    if (var_refs) |refs| {
+        if (closure_var_count > 0 and position < @as(u32, @intCast(closure_var_count))) {
+            inlineSetValue(ctx, refs[position].pvalue, inlineDup(val));
+        }
     }
 }
 
-/// Set closure variable in var_refs array (legacy version - no bounds checking)
-/// @param ctx - JSContext for memory management
-/// @param var_refs - array of closure variable references from QuickJS
-/// @param position - index into var_refs array
-/// @param val - value to set (ownership transferred)
+/// Set closure variable - pure Zig, no C FFI (legacy, no bounds checking)
 pub inline fn setClosureVar(ctx: *JSContext, var_refs: ?[*]*JSVarRef, position: u32, val: JSValue) void {
-    // Use C FFI for correct struct layout handling
-    if (var_refs != null) {
-        quickjs.js_frozen_set_var_ref(ctx, @ptrCast(var_refs), @intCast(position), val);
+    if (var_refs) |refs| {
+        inlineSetValue(ctx, refs[position].pvalue, val);
     }
 }
 

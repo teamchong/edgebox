@@ -2997,11 +2997,17 @@ const JSValueNative = extern struct {
 // ============================================================================
 
 /// JSVarRef - QuickJS closure variable reference
-/// We only need access to pvalue (pointer to JSValue) for reading closure variables
+/// Layout must match C: union{JSGCObjectHeader(24 bytes)}(24) + pvalue(8) + value(16) = 48 bytes
+/// JSGCObjectHeader = ref_count(4) + gc_bits(1) + dummy1(1) + dummy2(2) + list_head(16) = 24 bytes
 pub const JSVarRef = extern struct {
-    header: u64, // GC header (8 bytes) - contains ref_count and gc flags
-    pvalue: *JSValue, // Pointer to the closure variable value
-    value: JSValue, // Used when variable is no longer on stack
+    ref_count: i32, // offset 0: GC ref count
+    gc_bits: u8, // offset 4: gc_obj_type:4 + mark:4
+    is_detached: u8, // offset 5
+    dummy2: u16, // offset 6
+    link_next: ?*anyopaque, // offset 8: list_head.next
+    link_prev: ?*anyopaque, // offset 16: list_head.prev
+    pvalue: *JSValue, // offset 24: pointer to the closure variable value
+    value: JSValue, // offset 32: used when variable is no longer on stack
 };
 
 // ============================================================================
