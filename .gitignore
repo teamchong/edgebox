@@ -139,6 +139,10 @@ test/test_zod_*.js
 # Patch marker files (generated at build time)
 vendor/**/.patches-applied
 
+# Large compiled binaries (should not be in git)
+/edgebox-native-embed
+/tsc_standalone_frozen
+
 # Temporary binaries at root (no extension)
 /check_size
 /root
