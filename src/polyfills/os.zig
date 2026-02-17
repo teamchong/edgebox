@@ -111,7 +111,7 @@ fn osHostname(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue
         return qjs.JS_NewString(ctx, "edgebox");
     }
 
-    var hostname_buf: [72]u8 = undefined;
+    var hostname_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
     if (std.posix.gethostname(&hostname_buf)) |hostname| {
         return qjs.JS_NewStringLen(ctx, hostname.ptr, hostname.len);
     } else |_| {

@@ -1086,9 +1086,12 @@ fn fsLstat(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callcon
     _ = qjs.JS_SetPropertyStr(ctx, obj, "_isSymlink", jsBool(is_symlink));
 
     // Timestamps from the stat structure (mtimespec/atimespec on macOS, mtim/atim on Linux)
-    const mtime_ms: i64 = @as(i64, stat.mtimespec.sec) * 1000 + @divFloor(stat.mtimespec.nsec, 1_000_000);
-    const atime_ms: i64 = @as(i64, stat.atimespec.sec) * 1000 + @divFloor(stat.atimespec.nsec, 1_000_000);
-    const ctime_ms: i64 = @as(i64, stat.ctimespec.sec) * 1000 + @divFloor(stat.ctimespec.nsec, 1_000_000);
+    const mtime = if (comptime @hasField(@TypeOf(stat), "mtimespec")) stat.mtimespec else stat.mtim;
+    const atime = if (comptime @hasField(@TypeOf(stat), "atimespec")) stat.atimespec else stat.atim;
+    const ctime = if (comptime @hasField(@TypeOf(stat), "ctimespec")) stat.ctimespec else stat.ctim;
+    const mtime_ms: i64 = @as(i64, mtime.sec) * 1000 + @divFloor(mtime.nsec, 1_000_000);
+    const atime_ms: i64 = @as(i64, atime.sec) * 1000 + @divFloor(atime.nsec, 1_000_000);
+    const ctime_ms: i64 = @as(i64, ctime.sec) * 1000 + @divFloor(ctime.nsec, 1_000_000);
 
     _ = qjs.JS_SetPropertyStr(ctx, obj, "mtimeMs", qjs.JS_NewInt64(ctx, mtime_ms));
     _ = qjs.JS_SetPropertyStr(ctx, obj, "atimeMs", qjs.JS_NewInt64(ctx, atime_ms));

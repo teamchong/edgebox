@@ -102,8 +102,8 @@ fn getAllocator() std.mem.Allocator {
 pub fn main() !void {
     // Disable output buffering - ensures errors are printed immediately even if crash occurs
     const c = @cImport(@cInclude("stdio.h"));
-    c.setbuf(c.__stdoutp, null);
-    c.setbuf(c.__stderrp, null);
+    c.setbuf(if (comptime @hasDecl(c, "__stdoutp")) c.__stdoutp else c.stdout, null);
+    c.setbuf(if (comptime @hasDecl(c, "__stderrp")) c.__stderrp else c.stderr, null);
 
     const allocator = getAllocator();
 
