@@ -9,7 +9,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 /// Flip to false for zero-overhead production builds.
-pub const PROFILE = true;
+pub const PROFILE = false;
 
 /// Counter indices for the raw array
 const COUNTER_IC_HITS = 0;
