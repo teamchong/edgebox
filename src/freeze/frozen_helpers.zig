@@ -75,12 +75,27 @@ inline fn inlineDup(val: JSValue) JSValue {
     return val;
 }
 
-/// Inline set_value for closure var - writes new value, frees old via C
-/// Matches C set_value(ctx, pval, new_val) semantics
+/// Inline free for JSValueNative - fast path decrements ref_count in Zig,
+/// only calls C for actual destruction (ref_count reaches 0)
+inline fn inlineFree(ctx: *JSContext, val: JSValue) void {
+    if (val.hasRefCount()) {
+        if (val.getPtr()) |ptr| {
+            const ref_count: *i32 = @ptrCast(@alignCast(ptr));
+            if (ref_count.* > 1) {
+                ref_count.* -= 1;
+            } else {
+                quickjs.JS_FreeValue(ctx, val);
+            }
+        }
+    }
+}
+
+/// Inline set_value for closure var - writes new value, frees old
+/// Fast path: ref_count decrement in Zig. Slow path: C for destruction.
 inline fn inlineSetValue(ctx: *JSContext, pval: *JSValue, new_val: JSValue) void {
     const old_val = pval.*;
     pval.* = new_val;
-    JSValue.free(ctx, old_val);
+    inlineFree(ctx, old_val);
 }
 
 /// Get closure variable - pure Zig, no C FFI (safe version with bounds checking)

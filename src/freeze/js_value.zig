@@ -2652,9 +2652,13 @@ const JSValueNative = extern struct {
     }
 
     pub inline fn dup(ctx: *JSContext, val: JSValueNative) JSValueNative {
+        _ = ctx;
         if (profile.PROFILE) profile.vinc(profile.prof.ref_dups(), 1);
         if (val.hasRefCount()) {
-            return quickjs.JS_DupValue(ctx, val);
+            if (val.getPtr()) |ptr| {
+                const ref_count: *i32 = @ptrCast(@alignCast(ptr));
+                ref_count.* += 1;
+            }
         }
         return val;
     }
@@ -2662,7 +2666,14 @@ const JSValueNative = extern struct {
     pub inline fn free(ctx: *JSContext, val: JSValueNative) void {
         if (profile.PROFILE) profile.vinc(profile.prof.ref_frees(), 1);
         if (val.hasRefCount()) {
-            quickjs.JS_FreeValue(ctx, val);
+            if (val.getPtr()) |ptr| {
+                const ref_count: *i32 = @ptrCast(@alignCast(ptr));
+                if (ref_count.* > 1) {
+                    ref_count.* -= 1;
+                } else {
+                    quickjs.JS_FreeValue(ctx, val);
+                }
+            }
         }
     }
 
