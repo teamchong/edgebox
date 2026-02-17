@@ -555,7 +555,8 @@ pub fn build(b: *std.Build) void {
     native_static_exe.stack_size = 64 * 1024 * 1024; // 64MB stack for deep recursion
     // Use LLVM backend (Zig native backend causes OOM on large codebases)
     native_static_exe.use_llvm = true;
-    native_static_exe.want_lto = false;
+    // LTO: auto-enable on Linux/ELF (LLD supports it), disabled on macOS (LLD can't link Mach-O)
+    native_static_exe.want_lto = target.result.os.tag == .linux;
     native_static_exe.root_module.addIncludePath(b.path(quickjs_dir));
 
     // Check for LTO-optimized frozen module object (built externally with llvm opt)
@@ -838,7 +839,8 @@ pub fn build(b: *std.Build) void {
         native_exe.stack_size = 64 * 1024 * 1024; // 64MB stack for deep recursion
         // Use LLVM backend (Zig native backend causes OOM on large codebases)
         native_exe.use_llvm = true;
-        native_exe.want_lto = false;
+        // LTO: auto-enable on Linux/ELF (LLD supports it), disabled on macOS (LLD can't link Mach-O)
+        native_exe.want_lto = target.result.os.tag == .linux;
 
         // Add bytecode module
         native_exe.root_module.addImport("bytecode", native_bytecode_mod);
