@@ -171,6 +171,10 @@ pub fn main() !void {
     const mem_limit: usize = if (is_wasm32) 2 * 1024 * 1024 * 1024 else 4 * 1024 * 1024 * 1024;
     qjs.JS_SetMemoryLimit(rt, mem_limit);
 
+    // Raise GC threshold to reduce GC frequency — avoid cache pollution from frequent GC
+    // Default is 256KB which triggers GC too often; 256MB defers GC until memory pressure
+    qjs.JS_SetGCThreshold(rt, 256 * 1024 * 1024);
+
     // Create context
     const ctx = qjs.JS_NewContext(rt) orelse {
         std.debug.print("Failed to create QuickJS context\n", .{});

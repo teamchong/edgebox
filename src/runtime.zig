@@ -1549,9 +1549,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
     const cache_prefix_arg = std.fmt.bufPrint(&cache_prefix_arg_buf, "-Dcache-prefix={s}/cache", .{out_prefix}) catch "-Dcache-prefix=zig-out/cache";
 
     const optimize_arg = if (options.debug_build) "-Doptimize=Debug" else "-Doptimize=ReleaseFast";
-    // Use ReleaseSafe for frozen modules to reduce LLVM memory/time pressure
-    // TSC has 138MB+ of frozen code that crashes LLVM with ReleaseFast
-    const frozen_optimize_arg = "-Dfrozen-optimize=ReleaseSafe";
+    const frozen_optimize_arg = "-Dfrozen-optimize=ReleaseFast";
 
     // Step 7: Build WASM static (with host imports for edgebox daemon AOT)
     if (!options.binary_only) {

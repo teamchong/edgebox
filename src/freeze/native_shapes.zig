@@ -303,15 +303,9 @@ pub export fn native_node_register32(js_addr32: u32, kind: i32, flags: i32, pos:
 
 /// Fast lookup for native node
 pub export fn native_node_lookup(js_addr: u64) ?*AstNode {
-    debug_last_lookup_addr = js_addr;
-    debug_lookup_call_count += 1;
-
     if (global_registry) |*reg| {
-        const node = reg.lookup(js_addr);
-        debug_lookup_found = (node != null);
-        return node;
+        return reg.lookup(js_addr);
     }
-    debug_lookup_found = false;
     return null;
 }
 

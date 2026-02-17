@@ -222,6 +222,8 @@ pub const RelooperCodeGen = struct {
 
     // Closure support - function creates child closures (fclosure/fclosure8)
     has_fclosure: bool = false,
+    // For-of loop support - only allocate for-of vars when needed
+    has_for_of: bool = false,
     // Tracks whether a closure has been created in the generated code so far.
     // Used to gate reverse sync (_locals_jsv → locals) after function calls.
     closure_created: bool = false,
@@ -305,13 +307,15 @@ pub const RelooperCodeGen = struct {
         }
     }
 
-    /// Scan for fclosure/fclosure8 opcodes to enable V2 closure support
+    /// Scan for fclosure/fclosure8 and for_of opcodes
     fn scanForFclosureOpcodes(self: *Self) void {
         for (self.func.cfg.blocks.items) |block| {
             for (block.instructions) |instr| {
                 if (instr.opcode == .fclosure or instr.opcode == .fclosure8) {
                     self.has_fclosure = true;
-                    return;
+                }
+                if (instr.opcode == .for_of_start) {
+                    self.has_for_of = true;
                 }
             }
         }
@@ -397,8 +401,8 @@ pub const RelooperCodeGen = struct {
         try self.writeLine("_ = &CV;");
         // JSValue is already declared at module level, just use it directly
 
-        // Hoisted locals
-        const min_locals = if (self.func.var_count >= 16) self.func.var_count else 16;
+        // Hoisted locals - sized to actual var_count (minimum 1 to avoid zero-sized array)
+        const min_locals = @max(self.func.var_count, 1);
         try self.printLine("var locals: [{d}]CV = .{{CV.UNDEFINED}} ** {d};", .{ min_locals, min_locals });
         try self.writeLine("_ = &locals;");
 
@@ -426,14 +430,18 @@ pub const RelooperCodeGen = struct {
             try self.writeLine("");
         }
 
-        // Hoisted stack - sized to var_count + stack_size from bytecode metadata
-        const stack_array_size = @max(self.func.var_count + self.func.stack_size, 16);
+        // Hoisted stack - sized to actual needs from bytecode metadata
+        const stack_array_size = @max(self.func.var_count + self.func.stack_size, 4);
         try self.printLine("var stack: [{d}]CV = .{{CV.UNDEFINED}} ** {d};", .{ stack_array_size, stack_array_size });
         try self.writeLine("var sp: usize = 0;");
-        // Track iterator positions for for-of loops (stack for nested loops)
-        try self.writeLine("var for_of_iter_stack: [8]usize = .{0} ** 8;");
-        try self.writeLine("var for_of_depth: usize = 0;");
-        try self.writeLine("_ = &stack; _ = &sp; _ = &for_of_iter_stack; _ = &for_of_depth;");
+        if (self.has_for_of) {
+            // Track iterator positions for for-of loops (stack for nested loops)
+            try self.writeLine("var for_of_iter_stack: [8]usize = .{0} ** 8;");
+            try self.writeLine("var for_of_depth: usize = 0;");
+            try self.writeLine("_ = &stack; _ = &sp; _ = &for_of_iter_stack; _ = &for_of_depth;");
+        } else {
+            try self.writeLine("_ = &stack; _ = &sp;");
+        }
 
         // Inline cache slots for property access (persistent across calls via comptime struct)
         if (total_ic_slots > 0) {

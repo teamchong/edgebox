@@ -1194,7 +1194,7 @@ pub const CompressedValue = if (is_wasm32) extern struct {
     /// Fast ref count increment via direct pointer arithmetic.
     /// Avoids the CV→JSValue→JS_DupValue→JSValue→CV roundtrip.
     /// Returns the same CV unchanged (ref count on underlying object is incremented).
-    /// Noinline to reduce code size at call sites (replaces ~50 inlined instructions with 1 call).
+    /// Noinline to keep frozen shard code size small (better I-cache).
     pub noinline fn dupRef(v: CompressedValue) CompressedValue {
         if (v.isRefType()) {
             if (profile.PROFILE) profile.vinc(profile.prof.ref_dups(), 1);
@@ -1209,7 +1209,7 @@ pub const CompressedValue = if (is_wasm32) extern struct {
     /// Fast ref count decrement via direct pointer arithmetic.
     /// Fast path (ref_count > 1): pure Zig pointer decrement, no C FFI.
     /// Slow path (ref_count <= 1): falls back to JS_FreeValue for actual object destruction.
-    /// Noinline to reduce code size at call sites.
+    /// Noinline to keep frozen shard code size small (better I-cache).
     pub noinline fn freeRef(ctx: *JSContext, v: CompressedValue) void {
         if (v.isRefType()) {
             if (profile.PROFILE) profile.vinc(profile.prof.ref_frees(), 1);

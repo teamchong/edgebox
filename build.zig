@@ -85,9 +85,6 @@ pub fn build(b: *std.Build) void {
         "dtoa.c",
     };
 
-    // LLVM compile speed optimization: disable vectorization and loop unrolling
-    // TSC is logic-heavy (branching, object lookups) - SIMD/unrolling don't help
-    // This gives 30-50% faster compile times with negligible runtime impact
     // ASan flag for debugging heap corruption
     const enable_asan = b.option(bool, "asan", "Enable AddressSanitizer for heap corruption debugging") orelse false;
 
@@ -99,9 +96,6 @@ pub fn build(b: *std.Build) void {
     } else &[_][]const u8{
         "-D_GNU_SOURCE",
         "-fno-sanitize=undefined",
-        "-fno-vectorize", // Disable auto-vectorization (30-50% compile speedup)
-        "-fno-slp-vectorize", // Disable SLP vectorization
-        "-fno-unroll-loops", // Disable loop unrolling (10-20% compile speedup)
     };
 
     // WASM-specific flags (disable OS features not available in WASI)

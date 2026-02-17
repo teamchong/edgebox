@@ -21,7 +21,7 @@ const qjs = zig_runtime.quickjs;
 const is_wasm32 = @sizeOf(*anyopaque) == 4;
 
 // Debug flag for fclosure registration logging
-const FCLOSURE_DEBUG = true;
+const FCLOSURE_DEBUG = false;
 
 // Note: Cpool traversal FFI functions removed (js_frozen_get_cpool_info, js_frozen_get_cpool_func_bytecode,
 // js_frozen_get_bytecode_name_line) - they caused bytecode collisions when multiple functions had the
@@ -225,13 +225,10 @@ pub fn disableDispatch() void {
 ///
 /// This is the hot path - must be as fast as possible
 /// Uses name@line_num format to disambiguate functions with the same name in different scopes
-// Debug counters for frozen dispatch
+// Debug counters for frozen dispatch (disabled in production)
+const ENABLE_DISPATCH_COUNTERS = false;
 var dispatch_hits: usize = 0;
 var dispatch_misses: usize = 0;
-
-// Debug: log first N dispatched function names
-const DISPATCH_LOG_COUNT: usize = 50;
-var dispatch_log_idx: usize = 0;
 
 pub export fn frozen_dispatch_lookup(
     ctx: *JSContext,
@@ -248,24 +245,13 @@ pub export fn frozen_dispatch_lookup(
     // Skip if dispatch is not enabled yet (during initialization)
     if (!dispatch_enabled) return 0;
 
-    // Quick check: if registry not initialized, skip lookup entirely
-    if (name_registry == null) return 0;
-
     // Lookup frozen function by name@line_num key
     const func = lookup(func_name) orelse {
-        dispatch_misses += 1;
+        if (ENABLE_DISPATCH_COUNTERS) dispatch_misses += 1;
         return 0;
     };
 
-    dispatch_hits += 1;
-
-    // Debug: log first N dispatched function names
-    if (dispatch_log_idx < DISPATCH_LOG_COUNT) {
-        var len: usize = 0;
-        while (func_name[len] != 0) : (len += 1) {}
-        std.debug.print("[dispatch] {s}\n", .{func_name[0..len]});
-        dispatch_log_idx += 1;
-    }
+    if (ENABLE_DISPATCH_COUNTERS) dispatch_hits += 1;
 
     // Register this function by bytecode pointer for future bytecode-based dispatch
     // Only registers this specific function, NOT cpool entries (to avoid bytecode collisions)
@@ -314,21 +300,13 @@ pub export fn frozen_dispatch_lookup_bytecode(
     // Skip if dispatch is not enabled yet (during initialization)
     if (!dispatch_enabled) return 0;
 
-    // Quick check: if registry not initialized, skip lookup entirely
-    if (bytecode_registry == null) return 0;
-
     // Lookup frozen function by bytecode pointer
     const func = lookupByBytecode(bytecode_ptr) orelse {
-        bytecode_dispatch_misses += 1;
+        if (ENABLE_DISPATCH_COUNTERS) bytecode_dispatch_misses += 1;
         return 0;
     };
 
-    bytecode_dispatch_hits += 1;
-
-    // Debug: log first N bytecode dispatch hits
-    if (bytecode_dispatch_hits <= DISPATCH_LOG_COUNT) {
-        std.debug.print("[bc_dispatch] Hit #{d}: bytecode {*}\n", .{ bytecode_dispatch_hits, bytecode_ptr });
-    }
+    if (ENABLE_DISPATCH_COUNTERS) bytecode_dispatch_hits += 1;
 
     // Call the frozen function with var_refs, closure_var_count, and cpool for closure/fclosure support
     if (is_wasm32) {
@@ -363,6 +341,11 @@ pub export fn frozen_dispatch_count() callconv(.c) c_int {
         return @intCast(reg.count());
     }
     return 0;
+}
+
+/// Print dispatch stats (callable from Zig)
+pub fn printDispatchStats() void {
+    frozen_dispatch_stats();
 }
 
 /// Debug: print dispatch stats (remove after debugging)
