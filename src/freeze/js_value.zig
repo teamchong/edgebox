@@ -1191,6 +1191,40 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         return tag == (QNAN | TAG_PTR) or tag == (QNAN | TAG_STR);
     }
 
+    /// Fast ref count increment via direct pointer arithmetic.
+    /// Avoids the CV→JSValue→JS_DupValue→JSValue→CV roundtrip.
+    /// Returns the same CV unchanged (ref count on underlying object is incremented).
+    /// Noinline to reduce code size at call sites (replaces ~50 inlined instructions with 1 call).
+    pub noinline fn dupRef(v: CompressedValue) CompressedValue {
+        if (v.isRefType()) {
+            if (profile.PROFILE) profile.vinc(profile.prof.ref_dups(), 1);
+            const ptr = v.decompressPtr() orelse return v;
+            // JSRefCountHeader.ref_count is an i32 at offset 0 of JSObject/JSString
+            const ref_count: *i32 = @ptrCast(@alignCast(ptr));
+            ref_count.* += 1;
+        }
+        return v;
+    }
+
+    /// Fast ref count decrement via direct pointer arithmetic.
+    /// Fast path (ref_count > 1): pure Zig pointer decrement, no C FFI.
+    /// Slow path (ref_count <= 1): falls back to JS_FreeValue for actual object destruction.
+    /// Noinline to reduce code size at call sites.
+    pub noinline fn freeRef(ctx: *JSContext, v: CompressedValue) void {
+        if (v.isRefType()) {
+            if (profile.PROFILE) profile.vinc(profile.prof.ref_frees(), 1);
+            const ptr = v.decompressPtr() orelse return;
+            const ref_count: *i32 = @ptrCast(@alignCast(ptr));
+            if (ref_count.* > 1) {
+                // Fast path: just decrement, no freeing needed
+                ref_count.* -= 1;
+            } else {
+                // Slow path: object may need destruction, delegate to C
+                quickjs.JS_FreeValue(ctx, v.toJSValue());
+            }
+        }
+    }
+
     pub inline fn isPtr(self: CompressedValue) bool {
         return (self.bits & TAG_MASK) == (QNAN | TAG_PTR);
     }
@@ -1300,7 +1334,7 @@ pub const CompressedValue = if (is_wasm32) extern struct {
     }
 
     /// Pointer-based toJSValue for generated code - avoids pass-by-value corruption on wasm32
-    /// Uses only u32 operations to avoid LLVM FastISel bug
+    /// noinline: inline caused +4% regression due to icache pressure across 881 shards
     pub noinline fn toJSValuePtr(self_ptr: *const CompressedValue) JSValue {
         // Read bits as two u32s
         const words: *const [2]u32 = @ptrCast(@alignCast(self_ptr));
@@ -3003,6 +3037,7 @@ pub const quickjs = struct {
 
     // Function calls
     pub extern fn JS_Call(ctx: *JSContext, func: JSValue, this: JSValue, argc: c_int, argv: [*]const JSValue) JSValue;
+    pub extern fn js_frozen_try_call(ctx: *JSContext, func: JSValue, this: JSValue, argc: c_int, argv: [*]const JSValue, result_out: *JSValue) c_int;
 
     // Atom management
     pub extern fn JS_NewAtom(ctx: *JSContext, str: [*:0]const u8) u32;

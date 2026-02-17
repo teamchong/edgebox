@@ -286,11 +286,15 @@ pub const cycles = profile.cycles;
 pub const vinc = profile.vinc;
 
 extern fn frozen_dispatch_stats() void;
+extern fn js_frozen_try_call_stats() void;
+extern fn js_frozen_dump_offsets() void;
 
 pub fn printProfile() void {
     profile.prof.print();
     // Also print dispatch stats
     frozen_dispatch_stats();
+    js_frozen_try_call_stats();
+    js_frozen_dump_offsets();
 }
 
 // ============================================================================
@@ -523,17 +527,16 @@ pub fn spOverflow(func_name: [*:0]const u8, block_id: u32, sp: usize) noreturn {
 // ============================================================================
 
 pub noinline fn cleanupLocals(ctx: *JSContext, locals_ptr: [*]CompressedValue, count: usize) void {
-    // Collect-then-free pattern to avoid g_return_slot corruption
-    var to_free: [512]JSValue = undefined;
-    var free_count: usize = 0;
     for (0..count) |i| {
         const v = locals_ptr[i];
         if (v.isRefType()) {
-            to_free[free_count] = v.toJSValueWithCtx(ctx);
-            free_count += 1;
+            const ptr = v.decompressPtr() orelse continue;
+            const ref_count: *i32 = @ptrCast(@alignCast(ptr));
+            if (ref_count.* > 1) {
+                ref_count.* -= 1;
+            } else {
+                quickjs.JS_FreeValue(ctx, v.toJSValue());
+            }
         }
-    }
-    for (0..free_count) |i| {
-        JSValue.free(ctx, to_free[i]);
     }
 }

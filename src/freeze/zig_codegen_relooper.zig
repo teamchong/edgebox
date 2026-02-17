@@ -755,7 +755,7 @@ pub const RelooperCodeGen = struct {
                 try self.writeLine("    const _ret_val = if (_ret_cv.isRefType()) JSValue.dup(ctx, _ret_cv.toJSValueWithCtx(ctx)) else _ret_cv.toJSValueWithCtx(ctx);");
                 // Free arg_shadow
                 for (0..arg_count) |i| {
-                    try self.printLine("    if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
+                    try self.printLine("    CV.freeRef(ctx, arg_shadow[{d}]);", .{i});
                 }
                 if (self.dispatch_mode) {
                     try self.writeLine("    return .{ .return_value = _ret_val };");
@@ -765,7 +765,7 @@ pub const RelooperCodeGen = struct {
                 try self.writeLine("}");
                 // Return undefined with cleanup
                 for (0..arg_count) |i| {
-                    try self.printLine("if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
+                    try self.printLine("CV.freeRef(ctx, arg_shadow[{d}]);", .{i});
                 }
             } else {
                 if (self.dispatch_mode) {
@@ -836,7 +836,7 @@ pub const RelooperCodeGen = struct {
                 };
                 if (self.has_put_arg) {
                     // Function modifies arguments - read from arg_shadow (has updated values)
-                    try self.vpushFmt("(blk: {{ const v = arg_shadow[{d}]; break :blk if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; }})", .{arg_idx});
+                    try self.vpushFmt("(blk: {{ const v = arg_shadow[{d}]; break :blk CV.dupRef(v); }})", .{arg_idx});
                 } else {
                     // Read-only access - read directly from argv (faster, no upfront dup)
                     try self.vpushFmt("CV.fromJSValue(if ({d} < argc) JSValue.dup(ctx, argv[{d}]) else JSValue.UNDEFINED)", .{ arg_idx, arg_idx });
@@ -922,7 +922,7 @@ pub const RelooperCodeGen = struct {
                 } else {
                     try self.printLine("if (locals[{d}].isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\");", .{loc});
                 }
-                try self.vpushFmt("(if (locals[{d}].isRefType()) CV.fromJSValue(JSValue.dup(ctx, locals[{d}].toJSValueWithCtx(ctx))) else locals[{d}])", .{ loc, loc, loc });
+                try self.vpushFmt("CV.dupRef(locals[{d}])", .{loc});
                 return;
             },
             // Override put_loc_check to handle dispatch mode return type
@@ -930,9 +930,9 @@ pub const RelooperCodeGen = struct {
                 const loc = instr.operand.loc;
                 try self.flushVstack();
                 if (self.dispatch_mode) {
-                    try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return .{{ .return_value = JSValue.throwReferenceError(ctx, \"Cannot access before initialization\") }}; const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc, loc, loc });
+                    try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return .{{ .return_value = JSValue.throwReferenceError(ctx, \"Cannot access before initialization\") }}; const old = locals[{d}]; CV.freeRef(ctx, old); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc, loc, loc });
                 } else {
-                    try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\"); const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc, loc, loc });
+                    try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\"); const old = locals[{d}]; CV.freeRef(ctx, old); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc, loc, loc });
                 }
                 // Sync JSValue shadow for shared var_refs
                 if (self.has_fclosure and self.func.var_count > 0 and loc < self.func.var_count) {
@@ -998,7 +998,7 @@ pub const RelooperCodeGen = struct {
                 try self.writeLine("    const _ret_cv = stack[sp - 1];");
                 try self.writeLine("    const _ret_val = if (_ret_cv.isRefType()) JSValue.dup(ctx, _ret_cv.toJSValueWithCtx(ctx)) else _ret_cv.toJSValueWithCtx(ctx);");
                 // Free the original stack value (the dup created a new ref)
-                try self.writeLine("    if (_ret_cv.isRefType()) JSValue.free(ctx, _ret_cv.toJSValueWithCtx(ctx));");
+                try self.writeLine("    CV.freeRef(ctx, _ret_cv);");
                 // Detach V2 closure var_refs before cleanup
                 try self.emitClosureDetach();
                 // Cleanup locals - free all ref-type values to prevent GC leaks
@@ -1171,9 +1171,9 @@ pub const RelooperCodeGen = struct {
                 // Use saved iterator position and free iterator + next_method
                 try self.writeLine("    const _iter_base = for_of_iter_stack[for_of_depth - 1];");
                 try self.writeLine("    const _iter = stack[_iter_base];");
-                try self.writeLine("    if (_iter.isRefType()) JSValue.free(ctx, _iter.toJSValueWithCtx(ctx));");
+                try self.writeLine("    CV.freeRef(ctx, _iter);");
                 try self.writeLine("    const _next = stack[_iter_base + 1];");
-                try self.writeLine("    if (_next.isRefType()) JSValue.free(ctx, _next.toJSValueWithCtx(ctx));");
+                try self.writeLine("    CV.freeRef(ctx, _next);");
                 try self.writeLine("    sp = _iter_base;");
                 try self.writeLine("    for_of_depth -= 1;");
                 try self.writeLine("}");
@@ -1556,7 +1556,7 @@ pub const RelooperCodeGen = struct {
                 // arg_shadow is our own local storage for modified arguments.
                 // Must free old value first to prevent memory leaks when arguments are reassigned in loops
                 if (self.has_put_arg) {
-                    try self.printLine("{{ const old = arg_shadow[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); arg_shadow[{d}] = stack[sp-1]; sp -= 1; }}", .{ arg_idx, arg_idx });
+                    try self.printLine("{{ const old = arg_shadow[{d}]; CV.freeRef(ctx, old); arg_shadow[{d}] = stack[sp-1]; sp -= 1; }}", .{ arg_idx, arg_idx });
                 } else {
                     try self.writeLine("sp -= 1; // put_arg without shadow - value discarded");
                 }
@@ -1577,7 +1577,7 @@ pub const RelooperCodeGen = struct {
                 // Must free old value first to prevent memory leaks
                 if (self.has_put_arg) {
                     // Free old, dup new (since we're keeping it on stack AND in arg_shadow)
-                    try self.printLine("{{ const old = arg_shadow[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); const _v = stack[sp-1]; arg_shadow[{d}] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }}", .{ arg_idx, arg_idx });
+                    try self.printLine("{{ const old = arg_shadow[{d}]; CV.freeRef(ctx, old); const _v = stack[sp-1]; arg_shadow[{d}] = CV.dupRef(_v); }}", .{ arg_idx, arg_idx });
                 }
                 // set_arg keeps the value on the stack. Push to vstack so subsequent
                 // operations know there's a value available. Use arg_shadow since
@@ -1701,7 +1701,7 @@ pub const RelooperCodeGen = struct {
                     try self.writeLine("    const _ret_cv = stack[sp - 1];");
                     try self.writeLine("    const _ret_val = if (_ret_cv.isRefType()) JSValue.dup(ctx, _ret_cv.toJSValueWithCtx(ctx)) else _ret_cv.toJSValueWithCtx(ctx);");
                     for (0..arg_count) |i| {
-                        try self.printLine("    if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
+                        try self.printLine("    CV.freeRef(ctx, arg_shadow[{d}]);", .{i});
                     }
                     if (self.dispatch_mode) {
                         try self.writeLine("    return .{ .return_value = _ret_val };");

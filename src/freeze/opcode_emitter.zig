@@ -1223,6 +1223,6 @@ pub fn emitLocalsCleanupShared(comptime CodeGen: type, self: *CodeGen, var_count
 /// @param indent - indentation prefix for generated code
 pub fn emitArgShadowCleanupShared(comptime CodeGen: type, self: *CodeGen, arg_count: anytype, indent: []const u8) !void {
     for (0..arg_count) |i| {
-        try self.printLine("{s}if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ indent, i, i });
+        try self.printLine("{s}CV.freeRef(ctx, arg_shadow[{d}]);", .{ indent, i });
     }
 }
