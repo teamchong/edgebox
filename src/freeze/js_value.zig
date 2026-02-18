@@ -43,15 +43,10 @@ const JS_TAG_FLOAT64 = types.JS_TAG_FLOAT64;
 // CompressedValue - 8-byte NaN-boxed JSValue for frozen function stacks
 // ============================================================================
 
-/// Heap base for pointer compression. Initialized to 0, which is correct when the
-/// arena is allocated in the low 44-bit address range (< 0x100_0000_0000). LLVM
-/// constant-folds this to 0 in each frozen shard, eliminating the entire base-offset
-/// check and reducing compressPtr to a single AND instruction — same as macOS ARM64.
+/// Heap base for pointer compression. Must be 0 — the low-address arena allocates
+/// below 0x100_0000_0000 so all pointers fit in 44 bits without base-offset encoding.
+/// compress/decompressPtr are now unconditional (no runtime base check).
 pub var compressed_heap_base: usize = 0;
-
-pub inline fn getCompressedHeapBase() usize {
-    return compressed_heap_base;
-}
 
 pub fn initCompressedHeap(base: usize) void {
     if (base != 0) {
@@ -1253,39 +1248,22 @@ pub const CompressedValue = if (is_wasm32) extern struct {
 
     // Pointer compression/decompression
     // Note: extra_tag is used for PTR_SUBTYPE_* values to distinguish Symbol/BigInt/etc
+    /// Compress a pointer into 44 bits using low-address arena layout.
+    /// The arena is always allocated below 0x100_0000_0000 (44-bit range),
+    /// so addr & PTR_ADDR_MASK is lossless — no base offset needed.
     pub inline fn compressPtr(ptr: ?*anyopaque, extra_tag: u64) CompressedValue {
         const addr = @intFromPtr(ptr);
-        const base = getCompressedHeapBase();
-        if (base != 0 and addr >= base) {
-            const offset = addr - base;
-            if (offset <= PTR_ADDR_MASK) {
-                return .{ .bits = QNAN | TAG_PTR | extra_tag | offset };
-            }
-        }
-        // Fallback: store low bits (works for most heap layouts)
         return .{ .bits = QNAN | TAG_PTR | extra_tag | (addr & PTR_ADDR_MASK) };
     }
 
     pub inline fn compressPtrWithTag(ptr: ?*anyopaque, tag: u64) CompressedValue {
         const addr = @intFromPtr(ptr);
-        const base = getCompressedHeapBase();
-        if (base != 0 and addr >= base) {
-            const offset = addr - base;
-            if (offset <= PTR_ADDR_MASK) {
-                return .{ .bits = QNAN | tag | offset };
-            }
-        }
         return .{ .bits = QNAN | tag | (addr & PTR_ADDR_MASK) };
     }
 
     pub inline fn decompressPtr(self: CompressedValue) ?*anyopaque {
-        // Mask out subtype bits (44-47) when extracting pointer
         const offset: usize = @truncate(self.bits & PTR_ADDR_MASK);
-        const base = getCompressedHeapBase();
-        if (base != 0) {
-            return @ptrFromInt(base + offset);
-        }
-        return @ptrFromInt(offset);
+        return if (offset == 0) null else @ptrFromInt(offset);
     }
 
     /// Get the PTR subtype bits (for Symbol/BigInt/Object discrimination)
@@ -1433,8 +1411,7 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         // Reconstruct bits as u64 and extract with PTR_ADDR_MASK
         const bits: u64 = @as(u64, hi) << 32 | @as(u64, lo);
         const ptr_offset: usize = @truncate(bits & PTR_ADDR_MASK);
-        const base = getCompressedHeapBase();
-        const ptr_addr: usize = if (base != 0) base + ptr_offset else ptr_offset;
+        const ptr_addr: usize = ptr_offset;
 
         // Object/Function/Symbol/BigInt pointer: QNAN_HI | TAG_PTR_HI = 0x7FFD0000
         if (tag_bits == 0x7FFD0000) {
