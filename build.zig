@@ -780,8 +780,10 @@ pub fn build(b: *std.Build) void {
     });
 
     // libbrotli for native_static Brotli compression support
-    native_static_exe.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-    native_static_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    if (target.result.os.tag == .macos) {
+        native_static_exe.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+        native_static_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    }
     native_static_exe.linkSystemLibrary("brotlienc");
     native_static_exe.linkSystemLibrary("brotlidec");
     native_static_exe.linkSystemLibrary("brotlicommon");
@@ -998,8 +1000,10 @@ pub fn build(b: *std.Build) void {
         // NOTE: frozen_runtime.c removed - using pure Zig registry from native_shapes.zig
 
         // libbrotli for Brotli compression support
-        native_exe.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-        native_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+        if (target.result.os.tag == .macos) {
+            native_exe.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+            native_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+        }
         native_exe.linkSystemLibrary("brotlienc");
         native_exe.linkSystemLibrary("brotlidec");
         native_exe.linkSystemLibrary("brotlicommon");
@@ -1347,8 +1351,10 @@ pub fn build(b: *std.Build) void {
     });
 
     // libbrotli for Brotli compression support
-    run_exe.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-    run_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    if (target.result.os.tag == .macos) {
+        run_exe.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+        run_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    }
     run_exe.linkSystemLibrary("brotlienc");
     run_exe.linkSystemLibrary("brotlidec");
     run_exe.linkSystemLibrary("brotlicommon");
@@ -1468,8 +1474,10 @@ pub fn build(b: *std.Build) void {
     });
 
     // libbrotli for ARM64 Brotli compression support
-    run_arm64_exe.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-    run_arm64_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    if (target.result.os.tag == .macos) {
+        run_arm64_exe.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+        run_arm64_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    }
     run_arm64_exe.linkSystemLibrary("brotlienc");
     run_arm64_exe.linkSystemLibrary("brotlidec");
     run_arm64_exe.linkSystemLibrary("brotlicommon");
