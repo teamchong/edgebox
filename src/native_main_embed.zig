@@ -118,7 +118,7 @@ pub fn main() !void {
     const rt = if (allocator_config.qjs_arena) blk: {
         native_arena.init();
         // Initialize V8-style pointer compression with arena heap base
-        // This enables 32-bit offsets instead of 64-bit pointers in frozen functions
+        // If arena is in low 44-bit range, heap_base=0 and fast path is used
         zig_runtime.initCompressedHeap(native_arena.getHeapBase());
         const malloc_funcs = qjs.JSMallocFunctions{
             .js_calloc = native_arena.js_calloc,
