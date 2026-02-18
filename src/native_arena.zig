@@ -81,16 +81,31 @@ pub fn init() void {
     initialized = true;
 }
 
-/// Reserve a large contiguous virtual address space and commit initial pages
+/// Reserve a large contiguous virtual address space and commit initial pages.
+/// Tries to allocate in the low 44-bit address range (< 0x100_0000_0000 = 1TB)
+/// so that pointer compression can use the fast path (addr & MASK) without
+/// needing base-offset encoding. Falls back to any address if low range is full.
 fn initContiguous() bool {
     const linux = std.os.linux;
 
-    // Reserve virtual address space with PROT_NONE (no physical memory used)
-    const result = linux.mmap(null, RESERVED_SIZE, linux.PROT.NONE, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
-    const addr = @as(usize, @bitCast(result));
-    // mmap returns MAP_FAILED (-1 cast to usize) on error
-    if (addr == @as(usize, @bitCast(@as(isize, -1)))) {
-        return false;
+    // Try to reserve in the low address range (below 44-bit limit).
+    // Hint at 0x10_0000_0000 (64GB) — high enough to avoid conflicts with
+    // the program text/data/stack, low enough to fit in 44 bits.
+    const LOW_HINT: usize = 0x10_0000_0000; // 64GB
+    var result = linux.mmap(@ptrFromInt(LOW_HINT), RESERVED_SIZE, linux.PROT.NONE, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    var addr = @as(usize, @bitCast(result));
+
+    // Check if we got a low address (within 44-bit range)
+    if (addr == @as(usize, @bitCast(@as(isize, -1))) or addr + RESERVED_SIZE > 0xFFF_FFFF_FFFF) {
+        // Low hint failed or returned high address — try without hint
+        if (addr != @as(usize, @bitCast(@as(isize, -1)))) {
+            _ = linux.munmap(@ptrFromInt(addr), RESERVED_SIZE);
+        }
+        result = linux.mmap(null, RESERVED_SIZE, linux.PROT.NONE, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+        addr = @as(usize, @bitCast(result));
+        if (addr == @as(usize, @bitCast(@as(isize, -1)))) {
+            return false;
+        }
     }
 
     // Commit initial pages with PROT_READ | PROT_WRITE
@@ -444,5 +459,10 @@ pub fn js_malloc_usable_size(ptr: ?*const anyopaque) callconv(.c) usize {
 
 pub fn getHeapBase() usize {
     if (!initialized) return 0;
-    return @intFromPtr(heap_base);
+    const base = @intFromPtr(heap_base);
+    // If arena is in the low 44-bit range, return 0 so CompressedValue uses
+    // the fast path (addr & PTR_ADDR_MASK) without base-offset encoding.
+    // This matches macOS ARM64 behavior where addresses are naturally low.
+    if (base + RESERVED_SIZE <= 0xFFF_FFFF_FFFF) return 0;
+    return base;
 }

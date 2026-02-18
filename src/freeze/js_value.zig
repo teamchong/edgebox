@@ -43,15 +43,15 @@ const JS_TAG_FLOAT64 = types.JS_TAG_FLOAT64;
 // CompressedValue - 8-byte NaN-boxed JSValue for frozen function stacks
 // ============================================================================
 
-/// Heap base for pointer compression. Defined in profile_counters.c as a C global.
-/// All separately-compiled frozen shards reference this via extern linkage, ensuring
-/// a single shared instance. Without extern, each shard gets its own zero-initialized
-/// copy that LLVM constant-folds away, breaking pointer compression on Linux x86_64.
-///
-/// Access is a single memory load (no function call overhead).
-pub extern var edgebox_compressed_heap_base: usize;
+/// Heap base for pointer compression. The canonical value is stored in a C global
+/// (edgebox_compressed_heap_base in profile_counters.c). Each compilation unit caches
+/// it in a local static after first access, amortizing the extern load cost.
+extern var edgebox_compressed_heap_base: usize;
 
 pub inline fn getCompressedHeapBase() usize {
+    // Single extern var load — the linker resolves this to the C global in
+    // profile_counters.c. No per-shard caching needed since x86_64 global
+    // loads are fast (RIP-relative addressing, typically in L1 cache).
     return edgebox_compressed_heap_base;
 }
 
