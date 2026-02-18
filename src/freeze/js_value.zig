@@ -43,10 +43,20 @@ const JS_TAG_FLOAT64 = types.JS_TAG_FLOAT64;
 // CompressedValue - 8-byte NaN-boxed JSValue for frozen function stacks
 // ============================================================================
 
+/// Heap base for pointer compression. Uses volatile to prevent the compiler from
+/// constant-folding to 0 in separately-compiled frozen shards. Without volatile,
+/// each shard sees the initial value 0 and LLVM eliminates the arena compression path,
+/// causing 44-bit pointer truncation on Linux x86_64.
 pub var compressed_heap_base: usize = 0;
 
+/// Read the heap base through a volatile load to prevent constant folding.
+/// All compress/decompress operations must use this function.
+pub inline fn getCompressedHeapBase() usize {
+    return @as(*volatile usize, @ptrCast(&compressed_heap_base)).*;
+}
+
 pub fn initCompressedHeap(base: usize) void {
-    compressed_heap_base = base;
+    @as(*volatile usize, @ptrCast(&compressed_heap_base)).* = base;
 }
 
 // Global return slots for WASM32 to avoid LLVM u64 return corruption
@@ -1244,8 +1254,9 @@ pub const CompressedValue = if (is_wasm32) extern struct {
     // Note: extra_tag is used for PTR_SUBTYPE_* values to distinguish Symbol/BigInt/etc
     pub inline fn compressPtr(ptr: ?*anyopaque, extra_tag: u64) CompressedValue {
         const addr = @intFromPtr(ptr);
-        if (compressed_heap_base != 0 and addr >= compressed_heap_base) {
-            const offset = addr - compressed_heap_base;
+        const base = getCompressedHeapBase();
+        if (base != 0 and addr >= base) {
+            const offset = addr - base;
             if (offset <= PTR_ADDR_MASK) {
                 return .{ .bits = QNAN | TAG_PTR | extra_tag | offset };
             }
@@ -1256,8 +1267,9 @@ pub const CompressedValue = if (is_wasm32) extern struct {
 
     pub inline fn compressPtrWithTag(ptr: ?*anyopaque, tag: u64) CompressedValue {
         const addr = @intFromPtr(ptr);
-        if (compressed_heap_base != 0 and addr >= compressed_heap_base) {
-            const offset = addr - compressed_heap_base;
+        const base = getCompressedHeapBase();
+        if (base != 0 and addr >= base) {
+            const offset = addr - base;
             if (offset <= PTR_ADDR_MASK) {
                 return .{ .bits = QNAN | tag | offset };
             }
@@ -1268,8 +1280,9 @@ pub const CompressedValue = if (is_wasm32) extern struct {
     pub inline fn decompressPtr(self: CompressedValue) ?*anyopaque {
         // Mask out subtype bits (44-47) when extracting pointer
         const offset: usize = @truncate(self.bits & PTR_ADDR_MASK);
-        if (compressed_heap_base != 0) {
-            return @ptrFromInt(compressed_heap_base + offset);
+        const base = getCompressedHeapBase();
+        if (base != 0) {
+            return @ptrFromInt(base + offset);
         }
         return @ptrFromInt(offset);
     }
@@ -1419,7 +1432,8 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         // Reconstruct bits as u64 and extract with PTR_ADDR_MASK
         const bits: u64 = @as(u64, hi) << 32 | @as(u64, lo);
         const ptr_offset: usize = @truncate(bits & PTR_ADDR_MASK);
-        const ptr_addr: usize = if (compressed_heap_base != 0) compressed_heap_base + ptr_offset else ptr_offset;
+        const base = getCompressedHeapBase();
+        const ptr_addr: usize = if (base != 0) base + ptr_offset else ptr_offset;
 
         // Object/Function/Symbol/BigInt pointer: QNAN_HI | TAG_PTR_HI = 0x7FFD0000
         if (tag_bits == 0x7FFD0000) {
