@@ -18,14 +18,11 @@ uint64_t g_frozen_profile_counters[10] = {0};
  * Without a single C definition, each Zig compilation unit gets its own copy
  * initialized to 0, and LLVM constant-folds it, breaking Linux x86_64 pointers.
  */
-static size_t _compressed_heap_base = 0;
-
-size_t edgebox_get_compressed_heap_base(void) {
-    return _compressed_heap_base;
-}
+/* NOT static — Zig shards reference this directly via extern var */
+size_t edgebox_compressed_heap_base = 0;
 
 void edgebox_set_compressed_heap_base(size_t base) {
-    _compressed_heap_base = base;
+    edgebox_compressed_heap_base = base;
 }
 
 /* Noinline increment to prevent optimizer elision in shard objects */

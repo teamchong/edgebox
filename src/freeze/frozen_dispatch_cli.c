@@ -5,14 +5,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// Compressed heap base for pointer compression - shared across all Zig compilation units.
-// Frozen Zig shards call edgebox_get/set_compressed_heap_base() to access this,
-// preventing each shard from getting its own zero-initialized copy that LLVM constant-folds.
-static size_t edgebox_compressed_heap_base = 0;
-
-size_t edgebox_get_compressed_heap_base(void) {
-    return edgebox_compressed_heap_base;
-}
+// Compressed heap base - also defined in profile_counters.c for native binary.
+// CLI doesn't use it but needs the symbols for linking.
+size_t edgebox_compressed_heap_base = 0;
 
 void edgebox_set_compressed_heap_base(size_t base) {
     edgebox_compressed_heap_base = base;
