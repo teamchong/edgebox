@@ -43,23 +43,21 @@ const JS_TAG_FLOAT64 = types.JS_TAG_FLOAT64;
 // CompressedValue - 8-byte NaN-boxed JSValue for frozen function stacks
 // ============================================================================
 
-/// Heap base for pointer compression. The canonical value is stored in a C global
-/// (edgebox_compressed_heap_base in profile_counters.c). Each compilation unit caches
-/// it in a local static after first access, amortizing the extern load cost.
-extern var edgebox_compressed_heap_base: usize;
+/// Heap base for pointer compression. Initialized to 0, which is correct when the
+/// arena is allocated in the low 44-bit address range (< 0x100_0000_0000). LLVM
+/// constant-folds this to 0 in each frozen shard, eliminating the entire base-offset
+/// check and reducing compressPtr to a single AND instruction — same as macOS ARM64.
+pub var compressed_heap_base: usize = 0;
 
 pub inline fn getCompressedHeapBase() usize {
-    // Single extern var load — the linker resolves this to the C global in
-    // profile_counters.c. No per-shard caching needed since x86_64 global
-    // loads are fast (RIP-relative addressing, typically in L1 cache).
-    return edgebox_compressed_heap_base;
+    return compressed_heap_base;
 }
 
-/// Set via C function to avoid linker issues with extern var assignment.
-extern fn edgebox_set_compressed_heap_base(base: usize) void;
-
 pub fn initCompressedHeap(base: usize) void {
-    edgebox_set_compressed_heap_base(base);
+    if (base != 0) {
+        @panic("frozen mode requires low-address arena (within 44-bit range)");
+    }
+    compressed_heap_base = base;
 }
 
 // Global return slots for WASM32 to avoid LLVM u64 return corruption
