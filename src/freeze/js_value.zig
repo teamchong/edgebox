@@ -43,22 +43,30 @@ const JS_TAG_FLOAT64 = types.JS_TAG_FLOAT64;
 // CompressedValue - 8-byte NaN-boxed JSValue for frozen function stacks
 // ============================================================================
 
-/// Heap base for pointer compression. Declared as C extern so all compilation units
-/// (including separately-compiled frozen shards) reference the SAME global variable.
-/// Without extern, each Zig compilation unit gets its own copy initialized to 0,
-/// and LLVM constant-folds away the arena compression path on Linux x86_64.
-extern var edgebox_compressed_heap_base: usize;
+/// Heap base for pointer compression on native 64-bit platforms.
+/// On Linux x86_64, CompressedValue uses 44-bit NaN-boxed pointers stored as
+/// (address - heap_base). Without a shared heap base, pointers above 44 bits
+/// get truncated, causing segfaults.
+///
+/// IMPORTANT: This is accessed from separately-compiled frozen shards via inline
+/// functions (compressPtr/decompressPtr). The inline functions read this variable
+/// through a pointer obtained from the zig_runtime module, which ensures all
+/// compilation units share the same address. The variable itself lives in the
+/// main binary's BSS, and the shards get a pointer to it at link time.
+/// Heap base for pointer compression on native 64-bit.
+/// Defined in frozen_dispatch_cli.c as a C global. All Zig compilation units
+/// (including separately-compiled frozen shards) reference this single instance
+/// via extern linkage. Without extern, each shard gets its own copy initialized
+/// to 0, and LLVM inlines the zero, breaking pointer compression on Linux x86_64.
+pub extern fn edgebox_get_compressed_heap_base() usize;
+pub extern fn edgebox_set_compressed_heap_base(base: usize) void;
 
-/// Legacy alias for code that references compressed_heap_base directly.
-pub const compressed_heap_base_ptr = &edgebox_compressed_heap_base;
-
-/// Read the heap base. Uses the extern C variable shared across all compilation units.
 pub inline fn getCompressedHeapBase() usize {
-    return edgebox_compressed_heap_base;
+    return edgebox_get_compressed_heap_base();
 }
 
 pub fn initCompressedHeap(base: usize) void {
-    edgebox_compressed_heap_base = base;
+    edgebox_set_compressed_heap_base(base);
 }
 
 // Global return slots for WASM32 to avoid LLVM u64 return corruption
@@ -1262,6 +1270,11 @@ pub const CompressedValue = if (is_wasm32) extern struct {
             if (offset <= PTR_ADDR_MASK) {
                 return .{ .bits = QNAN | TAG_PTR | extra_tag | offset };
             }
+        }
+        // DEBUG: detect truncation on Linux x86_64
+        if (addr > PTR_ADDR_MASK) {
+            std.debug.print("[COMPRESS TRUNCATION] addr=0x{x} base=0x{x} mask=0x{x}\n", .{ addr, base, PTR_ADDR_MASK });
+            @panic("compressPtr: pointer truncation detected - compressed_heap_base not set or pointer outside arena");
         }
         // Fallback: store low bits (works for most heap layouts)
         return .{ .bits = QNAN | TAG_PTR | extra_tag | (addr & PTR_ADDR_MASK) };
