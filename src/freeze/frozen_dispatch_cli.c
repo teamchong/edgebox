@@ -5,6 +5,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Compressed heap base for pointer compression - shared across all Zig compilation units.
+// Frozen Zig shards declare this as 'extern var edgebox_compressed_heap_base' to reference
+// this single global instance, preventing each shard from getting its own zero-initialized copy.
+size_t edgebox_compressed_heap_base = 0;
+
 // Forward declaration of JSContext and JSValue (opaque types)
 typedef struct JSContext JSContext;
 typedef uint64_t JSValue;

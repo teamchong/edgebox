@@ -43,20 +43,22 @@ const JS_TAG_FLOAT64 = types.JS_TAG_FLOAT64;
 // CompressedValue - 8-byte NaN-boxed JSValue for frozen function stacks
 // ============================================================================
 
-/// Heap base for pointer compression. Uses volatile to prevent the compiler from
-/// constant-folding to 0 in separately-compiled frozen shards. Without volatile,
-/// each shard sees the initial value 0 and LLVM eliminates the arena compression path,
-/// causing 44-bit pointer truncation on Linux x86_64.
-pub var compressed_heap_base: usize = 0;
+/// Heap base for pointer compression. Declared as C extern so all compilation units
+/// (including separately-compiled frozen shards) reference the SAME global variable.
+/// Without extern, each Zig compilation unit gets its own copy initialized to 0,
+/// and LLVM constant-folds away the arena compression path on Linux x86_64.
+extern var edgebox_compressed_heap_base: usize;
 
-/// Read the heap base through a volatile load to prevent constant folding.
-/// All compress/decompress operations must use this function.
+/// Legacy alias for code that references compressed_heap_base directly.
+pub const compressed_heap_base_ptr = &edgebox_compressed_heap_base;
+
+/// Read the heap base. Uses the extern C variable shared across all compilation units.
 pub inline fn getCompressedHeapBase() usize {
-    return @as(*volatile usize, @ptrCast(&compressed_heap_base)).*;
+    return edgebox_compressed_heap_base;
 }
 
 pub fn initCompressedHeap(base: usize) void {
-    @as(*volatile usize, @ptrCast(&compressed_heap_base)).* = base;
+    edgebox_compressed_heap_base = base;
 }
 
 // Global return slots for WASM32 to avoid LLVM u64 return corruption

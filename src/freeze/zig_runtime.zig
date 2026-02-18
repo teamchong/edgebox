@@ -62,7 +62,7 @@ pub const JSVarRef = js_value.JSVarRef;
 pub const ListHead = js_value.ListHead;
 pub const CompressedValue = js_value.CompressedValue;
 pub const quickjs = js_value.quickjs;
-pub const compressed_heap_base = &js_value.compressed_heap_base;
+pub const compressed_heap_base = js_value.compressed_heap_base_ptr;
 pub const initCompressedHeap = js_value.initCompressedHeap;
 // Promise helpers for async/await support
 pub const isThenable = js_value.isThenable;
