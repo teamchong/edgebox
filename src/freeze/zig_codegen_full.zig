@@ -262,6 +262,8 @@ pub const ZigCodeGen = struct {
     if_fall_through_blocks: std.ArrayListUnmanaged(u32) = .{},
     /// Track which blocks have been emitted (for if-closing logic)
     emitted_blocks: std.AutoHashMapUnmanaged(u32, void) = .{},
+    /// Inline cache slot counter for property access optimization
+    ic_count: u32 = 0,
     /// Blocks to skip during normal iteration (for inverted if targets)
     /// When target < fall_through, we need to defer the target block
     deferred_blocks: std.AutoHashMapUnmanaged(u32, void) = .{},
@@ -310,6 +312,13 @@ pub const ZigCodeGen = struct {
     has_unsupported_opcodes: bool = false,
 
     const Self = @This();
+
+    /// Allocate the next IC slot index for a property access site
+    pub fn nextIcSlot(self: *Self) u32 {
+        const idx = self.ic_count;
+        self.ic_count += 1;
+        return idx;
+    }
 
     pub fn init(allocator: Allocator, func: FunctionInfo) Self {
         return .{
@@ -665,6 +674,24 @@ pub const ZigCodeGen = struct {
         return null;
     }
 
+    /// Pre-scan instructions to count how many IC slots are needed
+    fn scanForIcSlots(self: *Self) u32 {
+        var count: u32 = 0;
+        for (self.func.cfg.blocks.items) |block| {
+            for (block.instructions) |instr| {
+                switch (instr.opcode) {
+                    .get_field, .get_field2 => {
+                        if (self.getAtomString(instr.operand.atom)) |_| {
+                            count += 1;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+        return count;
+    }
+
     fn writeIndent(self: *Self) !void {
         for (0..self.indent) |_| {
             try self.output.appendSlice(self.allocator, "    ");
@@ -847,6 +874,11 @@ pub const ZigCodeGen = struct {
             self.dispatch_mode = true;
         }
 
+        // Pre-scan for inline cache slot count (property access optimization)
+        self.ic_count = 0;
+        const total_ic_slots = self.scanForIcSlots();
+        self.ic_count = 0; // Reset for actual codegen pass
+
         // Function signature
         try self.emitSignature();
 
@@ -905,6 +937,11 @@ pub const ZigCodeGen = struct {
             try self.writeLine("var for_of_depth: usize = 0;");
             // Silence "unused" warnings in ReleaseFast when early return happens
             try self.writeLine("_ = &stack; _ = &sp; _ = &for_of_iter_stack; _ = &for_of_depth;");
+
+            // Inline cache slots for property access (persistent across calls via comptime struct)
+            if (total_ic_slots > 0) {
+                try self.printLine("const _IC = struct {{ var s: [{d}]zig_runtime.ICSlot = .{{zig_runtime.ICSlot.ZERO}} ** {d}; }};", .{ total_ic_slots, total_ic_slots });
+            }
             try self.writeLine("");
 
             // Emit argument cache for functions with loops that access arguments
