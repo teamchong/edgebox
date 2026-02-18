@@ -6,6 +6,10 @@
 /// - O(1) free: reclaims space if at top (LIFO pattern)
 /// - Reset: instant cleanup after compilation
 ///
+/// On Linux x86_64, uses a single large virtual address reservation (mmap PROT_NONE)
+/// to keep all allocations contiguous. This is critical for CompressedValue pointer
+/// encoding which requires all pointers to be within 44 bits of the heap base.
+///
 /// For TSC compilation, this avoids millions of malloc/free calls
 /// by using fast pointer bumping and bulk reset at the end.
 const std = @import("std");
@@ -20,7 +24,7 @@ const Header = extern struct {
     _pad: usize = 0, // Ensure 16-byte alignment
 };
 
-// Arena block for chained allocation
+// Arena block for chained allocation (used in fallback mode only)
 const Block = struct {
     data: []align(16) u8,
     next: ?*Block,
@@ -29,17 +33,26 @@ const Block = struct {
 // Global state
 var heap_base: [*]align(16) u8 = undefined;
 var heap_ptr: usize = 0;
-var heap_end: usize = 0;
+var heap_end: usize = 0; // committed bytes
 var heap_mark: usize = 0;
 var initialized: bool = false;
 
-// Block chain for large arenas
+// Virtual reservation (Linux contiguous mode)
+var reserved_size: usize = 0; // total reserved virtual address space
+var using_reservation: bool = false; // true if using contiguous reservation
+
+// Block chain for fallback mode (non-Linux or reservation failure)
 var first_block: ?*Block = null;
 var current_block: ?*Block = null;
 
-// Initial arena size (64MB - good for TSC)
-const INITIAL_SIZE: usize = 64 * 1024 * 1024;
-// Growth size when arena is full
+// Virtual reservation size: 8GB — covers even huge TSC-like workloads.
+// Only virtual address space is reserved (no physical memory until committed).
+const RESERVED_SIZE: usize = 8 * 1024 * 1024 * 1024;
+// Initial commit size
+const INITIAL_COMMIT: usize = 64 * 1024 * 1024;
+// Commit growth granularity
+const COMMIT_GRANULARITY: usize = 64 * 1024 * 1024;
+// Growth size for fallback block chain mode
 const GROW_SIZE: usize = 32 * 1024 * 1024;
 
 // Stats for debugging
@@ -53,16 +66,59 @@ var stats_grow_count: usize = 0;
 pub fn init() void {
     if (initialized) return;
 
-    // Allocate initial arena using page allocator
-    const data = std.heap.page_allocator.alignedAlloc(u8, .@"16", INITIAL_SIZE) catch {
+    // On Linux, try to reserve a large contiguous virtual address range.
+    // This ensures all arena pointers are within a single base+offset range,
+    // which is required for CompressedValue's 44-bit pointer encoding.
+    if (comptime builtin.os.tag == .linux) {
+        if (initContiguous()) {
+            initialized = true;
+            return;
+        }
+    }
+
+    // Fallback: use page_allocator (block chain mode — may break CompressedValue on Linux x86_64)
+    initFallback();
+    initialized = true;
+}
+
+/// Reserve a large contiguous virtual address space and commit initial pages
+fn initContiguous() bool {
+    const linux = std.os.linux;
+
+    // Reserve virtual address space with PROT_NONE (no physical memory used)
+    const result = linux.mmap(null, RESERVED_SIZE, linux.PROT.NONE, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    const addr = @as(usize, @bitCast(result));
+    // mmap returns MAP_FAILED (-1 cast to usize) on error
+    if (addr == @as(usize, @bitCast(@as(isize, -1)))) {
+        return false;
+    }
+
+    // Commit initial pages with PROT_READ | PROT_WRITE
+    const commit_result = linux.mprotect(@ptrFromInt(addr), INITIAL_COMMIT, linux.PROT.READ | linux.PROT.WRITE);
+    if (commit_result != 0) {
+        _ = linux.munmap(@ptrFromInt(addr), RESERVED_SIZE);
+        return false;
+    }
+
+    heap_base = @ptrFromInt(addr);
+    heap_ptr = 0;
+    heap_end = INITIAL_COMMIT;
+    heap_mark = 0;
+    reserved_size = RESERVED_SIZE;
+    using_reservation = true;
+    return true;
+}
+
+/// Fallback initialization using page_allocator
+fn initFallback() void {
+    const data = std.heap.page_allocator.alignedAlloc(u8, .@"16", INITIAL_COMMIT) catch {
         @panic("Failed to allocate native arena");
     };
 
     heap_base = data.ptr;
     heap_ptr = 0;
-    heap_end = INITIAL_SIZE;
+    heap_end = INITIAL_COMMIT;
     heap_mark = 0;
-    initialized = true;
 
     // Track block for cleanup
     const block = std.heap.page_allocator.create(Block) catch {
@@ -105,15 +161,23 @@ pub fn resetAll() void {
 pub fn deinit() void {
     if (!initialized) return;
 
-    var block = first_block;
-    while (block) |b| {
-        const next = b.next;
-        std.heap.page_allocator.free(b.data);
-        std.heap.page_allocator.destroy(b);
-        block = next;
+    if (using_reservation) {
+        // Single munmap for the entire reservation
+        const linux = std.os.linux;
+        _ = linux.munmap(@ptrCast(heap_base), reserved_size);
+        using_reservation = false;
+        reserved_size = 0;
+    } else {
+        var block = first_block;
+        while (block) |b| {
+            const next = b.next;
+            std.heap.page_allocator.free(b.data);
+            std.heap.page_allocator.destroy(b);
+            block = next;
+        }
+        first_block = null;
+        current_block = null;
     }
-    first_block = null;
-    current_block = null;
     initialized = false;
 }
 
@@ -136,7 +200,42 @@ pub fn getStats() struct {
     };
 }
 
+/// Grow the arena. In contiguous mode, commit more pages from the reservation.
+/// In fallback mode, allocate a new block.
 fn grow(required: usize) bool {
+    if (using_reservation) {
+        return growContiguous(required);
+    } else {
+        return growFallback(required);
+    }
+}
+
+/// Commit more pages from the contiguous reservation
+fn growContiguous(required: usize) bool {
+    const linux = std.os.linux;
+    const needed = heap_ptr + required;
+    if (needed <= heap_end) return true; // Already have enough
+
+    // Round up to COMMIT_GRANULARITY
+    const new_commit = ((needed + COMMIT_GRANULARITY - 1) / COMMIT_GRANULARITY) * COMMIT_GRANULARITY;
+    if (new_commit > reserved_size) {
+        // Exceeded virtual reservation — this would require > 8GB heap
+        @panic("Arena exceeded 8GB virtual reservation");
+    }
+
+    // Commit new pages
+    const commit_start = @intFromPtr(heap_base) + heap_end;
+    const commit_size = new_commit - heap_end;
+    const result = linux.mprotect(@ptrFromInt(commit_start), commit_size, linux.PROT.READ | linux.PROT.WRITE);
+    if (result != 0) return false;
+
+    heap_end = new_commit;
+    stats_grow_count += 1;
+    return true;
+}
+
+/// Fallback: allocate a new block (breaks CompressedValue on Linux x86_64)
+fn growFallback(required: usize) bool {
     const size = @max(GROW_SIZE, required + HEADER_SIZE);
 
     const data = std.heap.page_allocator.alignedAlloc(u8, .@"16", size) catch {
@@ -178,12 +277,19 @@ fn bump_alloc(size: usize) ?[*]align(16) u8 {
 
     if (new_ptr > heap_end) {
         if (!grow(aligned)) return null;
-        // After grow, heap_ptr is reset to 0
-        const after_grow = heap_ptr + aligned;
-        if (after_grow > heap_end) return null;
-        const result: [*]align(16) u8 = @alignCast(heap_base + heap_ptr);
-        heap_ptr = after_grow;
-        return result;
+        if (using_reservation) {
+            // Contiguous mode: heap_ptr hasn't changed, just more pages committed
+            const result: [*]align(16) u8 = @alignCast(heap_base + heap_ptr);
+            heap_ptr = heap_ptr + aligned;
+            return result;
+        } else {
+            // Fallback mode: heap_ptr reset to 0 after grow
+            const after_grow = heap_ptr + aligned;
+            if (after_grow > heap_end) return null;
+            const result: [*]align(16) u8 = @alignCast(heap_base + heap_ptr);
+            heap_ptr = after_grow;
+            return result;
+        }
     }
 
     const result: [*]align(16) u8 = @alignCast(heap_base + heap_ptr);
@@ -220,9 +326,15 @@ pub fn js_calloc(ctx: ?*anyopaque, count: usize, size: usize) callconv(.c) ?*any
     return ptr;
 }
 
-/// Check if a pointer belongs to any of our arena blocks
+/// Check if a pointer belongs to our arena
 fn isArenaPointer(ptr: *anyopaque) bool {
     const addr = @intFromPtr(ptr);
+    if (using_reservation) {
+        // Contiguous mode: single range check
+        const base = @intFromPtr(heap_base);
+        return addr >= base and addr < base + reserved_size;
+    }
+    // Fallback mode: check all blocks
     var block = first_block;
     while (block) |b| {
         const block_start = @intFromPtr(b.data.ptr);
@@ -243,13 +355,11 @@ pub fn js_free(ctx: ?*anyopaque, ptr: ?*anyopaque) callconv(.c) void {
     // Guard: ignore pointers not from our arena (e.g., frozen/static data)
     if (!isArenaPointer(ptr.?)) return;
 
-    // LIFO optimization only works if pointer is in the CURRENT block
-    // (not an older block from before a grow)
+    // LIFO optimization: reclaim if this is the most recent allocation
     const addr = @intFromPtr(ptr.?);
     const current_block_start = @intFromPtr(heap_base);
     const current_block_end = current_block_start + heap_end;
 
-    // Only attempt LIFO reclaim if pointer is in current block
     if (addr >= current_block_start + HEADER_SIZE and addr < current_block_end) {
         const p: [*]u8 = @ptrCast(ptr.?);
         const header_ptr = p - HEADER_SIZE;
@@ -279,55 +389,43 @@ pub fn js_realloc(ctx: ?*anyopaque, ptr: ?*anyopaque, new_size: usize) callconv(
         return js_malloc(null, new_size);
     }
 
-    // Check if pointer is in CURRENT block (for LIFO optimizations)
+    // Check if pointer is in the active region (for LIFO optimizations)
     const addr = @intFromPtr(ptr.?);
     const current_block_start = @intFromPtr(heap_base);
-    const current_block_end = current_block_start + heap_end;
-    const in_current_block = (addr >= current_block_start + HEADER_SIZE and addr < current_block_end);
 
+    // Read old size from header
     const p: [*]u8 = @ptrCast(ptr.?);
     const header_ptr = p - HEADER_SIZE;
     const header: *Header = @ptrCast(@alignCast(header_ptr));
     const old_size = header.size;
 
-    // Case B: Shrinking -> just update size
+    // Case B: shrink - always in-place
     if (new_size <= old_size) {
-        // If in current block and at top of arena, reclaim the extra space
-        if (in_current_block) {
-            const old_end = @intFromPtr(header_ptr) - @intFromPtr(heap_base) + HEADER_SIZE + alignUp(old_size);
-            if (old_end == heap_ptr) {
-                heap_ptr = @intFromPtr(header_ptr) - @intFromPtr(heap_base) + HEADER_SIZE + alignUp(new_size);
-            }
-        }
         header.size = new_size;
         return ptr;
     }
 
-    // Case C: Growing - check if at top of arena (LIFO optimization) - only for current block
-    if (in_current_block) {
-        const old_end = @intFromPtr(header_ptr) - @intFromPtr(heap_base) + HEADER_SIZE + alignUp(old_size);
-        if (old_end == heap_ptr) {
-            // This is the last allocation! We can grow in-place (zero copy)
-            const extra = alignUp(new_size) - alignUp(old_size);
-            const new_end = heap_ptr + extra;
-
-            // Ensure capacity
-            if (new_end <= heap_end) {
-                heap_ptr = new_end;
+    // Case C: grow — try in-place if this is the last allocation in the current region
+    if (addr >= current_block_start + HEADER_SIZE) {
+        const alloc_end = @intFromPtr(header_ptr) - @intFromPtr(heap_base) + HEADER_SIZE + alignUp(old_size);
+        if (alloc_end == heap_ptr) {
+            // Last allocation - try to extend
+            const needed = HEADER_SIZE + alignUp(new_size);
+            const base_offset = @intFromPtr(header_ptr) - @intFromPtr(heap_base);
+            if (base_offset + needed <= heap_end or grow(base_offset + needed)) {
+                heap_ptr = base_offset + needed;
                 header.size = new_size;
                 stats_realloc_inplace += 1;
-                return ptr; // Same pointer, no copy!
+                return ptr;
             }
-            // Fall through to copy path if we can't grow current block
         }
     }
 
-    // Case D: Not at top or block full or in old block, must copy to new location
+    // Case D: copy to new location
     const new_ptr = js_malloc(null, new_size) orelse return null;
-    const new_slice: [*]u8 = @ptrCast(new_ptr);
-    const copy_size = @min(old_size, new_size);
-    @memcpy(new_slice[0..copy_size], p[0..copy_size]);
-
+    const dest: [*]u8 = @ptrCast(new_ptr);
+    const src: [*]const u8 = @ptrCast(ptr.?);
+    @memcpy(dest[0..old_size], src[0..old_size]);
     stats_realloc_copy += 1;
     return new_ptr;
 }
@@ -344,25 +442,7 @@ pub fn js_malloc_usable_size(ptr: ?*const anyopaque) callconv(.c) usize {
     return header.size;
 }
 
-// ============================================================================
-// Debug / Stats exports
-// ============================================================================
-
-/// Get heap base address (for V8-style pointer compression)
 pub fn getHeapBase() usize {
     if (!initialized) return 0;
     return @intFromPtr(heap_base);
-}
-
-/// Print arena stats (for debugging)
-pub fn printStats() void {
-    const s = getStats();
-    std.debug.print("[arena] malloc={d} realloc_inplace={d} realloc_copy={d} free_reclaimed={d} used={d}MB grows={d}\n", .{
-        s.malloc_count,
-        s.realloc_inplace,
-        s.realloc_copy,
-        s.free_reclaimed,
-        s.used_bytes / (1024 * 1024),
-        s.grow_count,
-    });
 }

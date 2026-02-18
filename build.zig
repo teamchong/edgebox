@@ -1622,10 +1622,11 @@ pub fn build(b: *std.Build) void {
         build_exe.root_module.addIncludePath(.{ .cwd_relative = "/usr/lib/llvm-20/include" });
         build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/llvm-20/lib" });
         build_exe.linkSystemLibrary("LLVM-20");
-        // WAMR AOT libs reference compiler-rt/libgcc builtins on Linux.
-        build_exe.linkSystemLibrary("gcc");
+        // WAMR AOT libs compiled with GCC need libstdc++ and libgcc.
+        // Link them as object files to prevent Zig from substituting libc++.
+        build_exe.addObjectFile(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/libstdc++.so.6" });
+        build_exe.addObjectFile(.{ .cwd_relative = "/usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a" });
         build_exe.linkSystemLibrary("gcc_s");
-        build_exe.linkSystemLibrary("stdc++");
     } else {
         // Use vendored static library on other platforms
         build_exe.root_module.addIncludePath(b.path("vendor/llvm-lto/include"));
@@ -1633,7 +1634,13 @@ pub fn build(b: *std.Build) void {
         build_exe.addObjectFile(b.path("vendor/llvm-lto/lib/libzstd.a"));
     }
     build_exe.linkSystemLibrary("z"); // System zlib (universal on macOS)
-    build_exe.linkSystemLibrary("ncurses"); // Terminal functions for LLVM
+    if (target.result.os.tag == .linux) {
+        // On Linux, libncurses.so is a linker script that Zig can't parse.
+        // Link the actual versioned .so directly instead.
+        build_exe.addObjectFile(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/libncurses.so.6" });
+    } else {
+        build_exe.linkSystemLibrary("ncurses"); // Terminal functions for LLVM
+    }
 
     b.installArtifact(build_exe);
 

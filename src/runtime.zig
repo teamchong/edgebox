@@ -509,6 +509,7 @@ pub fn main() !void {
     var binary_only = false;
     var debug_build = false;
     var allocator_type: AllocatorType = .gpa; // Default: GPA for debugging (use --allocator=c for production)
+    var allocator_explicitly_set = false;
     var output_prefix: ?[]const u8 = null; // Custom output prefix (default: zig-out)
     var app_dir: ?[]const u8 = null;
 
@@ -537,6 +538,7 @@ pub fn main() !void {
             debug_build = true;
         } else if (std.mem.startsWith(u8, arg, "--allocator=")) {
             const value = arg[12..];
+            allocator_explicitly_set = true;
             if (std.mem.eql(u8, value, "arena")) {
                 allocator_type = .arena;
             } else if (std.mem.eql(u8, value, "gpa")) {
@@ -574,6 +576,14 @@ pub fn main() !void {
         printUsage();
         std.process.exit(1);
     };
+
+    // On Linux, frozen builds require the arena allocator for contiguous memory.
+    // CompressedValue's 44-bit pointer encoding breaks with scattered heap addresses.
+    if (comptime builtin.os.tag == .linux) {
+        if (!no_freeze and !allocator_explicitly_set) {
+            allocator_type = .arena;
+        }
+    }
 
     if (force_rebuild) {
         cleanBuildOutputs();
