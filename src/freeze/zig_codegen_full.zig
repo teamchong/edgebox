@@ -941,6 +941,7 @@ pub const ZigCodeGen = struct {
             // Inline cache slots for property access (persistent across calls via comptime struct)
             if (total_ic_slots > 0) {
                 try self.printLine("const _IC = struct {{ var s: [{d}]zig_runtime.ICSlot = .{{zig_runtime.ICSlot.ZERO}} ** {d}; }};", .{ total_ic_slots, total_ic_slots });
+                try self.writeLine("_ = &_IC;");
             }
             try self.writeLine("");
 
@@ -4801,19 +4802,18 @@ pub const ZigCodeGen = struct {
                     } else if (std.mem.eql(u8, prop_name, "arguments")) {
                         try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetArguments(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else {
-                        // Standard property access via QuickJS - convert CV <-> JSValue
-                        // Free old CV if it's a ref type since we're replacing it
+                        // IC-accelerated property access (shape-based inline cache)
                         const escaped_prop = escapeZigString(self.allocator, prop_name) catch prop_name;
                         defer if (escaped_prop.ptr != prop_name.ptr) self.allocator.free(escaped_prop);
+                        const ic_idx = self.nextIcSlot();
                         try self.writeLine("{");
                         self.pushIndent();
                         try self.writeLine("const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx);");
-                        try self.printLine("const _gf = JSValue.getPropertyStr(ctx, obj, \"{s}\");", .{escaped_prop});
-                        try self.writeLine("if (_gf.isException()) {");
+                        try self.printLine("const _gf = zig_runtime.icLoad(ctx, obj, &_IC.s[{d}], \"{s}\") catch {{", .{ ic_idx, escaped_prop });
                         self.pushIndent();
                         try self.emitReturnException();
                         self.popIndent();
-                        try self.writeLine("}");
+                        try self.writeLine("};");
                         try self.writeLine("stack[sp-1] = CV.fromJSValue(_gf); if (cv.isRefType()) JSValue.free(ctx, obj);");
                         self.popIndent();
                         try self.writeLine("}");
@@ -4878,14 +4878,18 @@ pub const ZigCodeGen = struct {
                     } else if (std.mem.eql(u8, prop_name, "arguments")) {
                         try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetArguments(ctx, obj)); sp += 1; }");
                     } else {
-                        // Standard property access via QuickJS - convert CV <-> JSValue
+                        // IC-accelerated property access (shape-based inline cache)
                         const escaped_prop = escapeZigString(self.allocator, prop_name) catch prop_name;
                         defer if (escaped_prop.ptr != prop_name.ptr) self.allocator.free(escaped_prop);
+                        const ic_idx = self.nextIcSlot();
                         try self.writeLine("{");
                         self.pushIndent();
                         try self.writeLine("const obj = stack[sp-1].toJSValueWithCtx(ctx);");
-                        try self.printLine("const _gf = JSValue.getPropertyStr(ctx, obj, \"{s}\");", .{escaped_prop});
-                        try self.emitInlineExceptionReturn("_gf");
+                        try self.printLine("const _gf = zig_runtime.icLoad(ctx, obj, &_IC.s[{d}], \"{s}\") catch {{", .{ ic_idx, escaped_prop });
+                        self.pushIndent();
+                        try self.emitReturnException();
+                        self.popIndent();
+                        try self.writeLine("};");
                         try self.writeLine("stack[sp] = CV.fromJSValue(_gf); sp += 1;");
                         self.popIndent();
                         try self.writeLine("}");
