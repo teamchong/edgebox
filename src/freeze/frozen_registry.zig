@@ -728,6 +728,8 @@ pub fn generateModuleZigSharded(
     module_name: []const u8,
     manifest_json: ?[]const u8,
     bytes_per_shard: usize,
+    max_functions: u32,
+    profile_path: ?[]const u8,
 ) !ShardedOutput {
     _ = module_name;
 
@@ -754,6 +756,71 @@ pub fn generateModuleZigSharded(
         if (result) |zig_code| {
             try generated_all.append(allocator, .{ .func = func, .idx = idx, .code = zig_code });
         }
+    }
+
+    // Selective freezing: keep only the top N functions
+    // Profile-guided: sort by call frequency if profile data available, else by code size
+    if (max_functions > 0 and generated_all.items.len > max_functions) {
+        const total_before = generated_all.items.len;
+
+        if (profile_path) |pp| {
+            // PGO: sort by weighted score = call_count × code_size
+            // This maximizes total interpreter work eliminated:
+            //   - A huge function called 100 times scores high (lots of bytecode per call)
+            //   - A tiny function called 1M times also scores high (huge aggregate work)
+            //   - A tiny function called 10 times scores low (almost no work to save)
+            const call_profile = @import("call_profile.zig");
+            if (call_profile.parseProfileJson(allocator, pp)) |profile_map| {
+                std.debug.print("[freeze] PGO: sorting {d} functions by calls×size score\n", .{total_before});
+                const SortCtx = struct { profile: std.StringHashMapUnmanaged(u64) };
+                const ctx = SortCtx{ .profile = profile_map };
+                std.mem.sort(GeneratedFunc, generated_all.items, ctx, struct {
+                    fn lessThan(c: SortCtx, a: GeneratedFunc, b: GeneratedFunc) bool {
+                        const a_score = score(c.profile, a);
+                        const b_score = score(c.profile, b);
+                        if (a_score != b_score) return a_score > b_score; // descending by weighted score
+                        return a.code.len > b.code.len; // tie-break by code size
+                    }
+
+                    fn score(profile: std.StringHashMapUnmanaged(u64), gf: GeneratedFunc) u64 {
+                        const call_count = lookupProfile(profile, gf.func) orelse 1;
+                        return call_count * gf.code.len; // weighted: calls × code_size
+                    }
+
+                    fn lookupProfile(profile: std.StringHashMapUnmanaged(u64), func: AnalyzedFunction) ?u64 {
+                        // Build "name@line_num" key to match profile JSON format
+                        var key_buf: [320]u8 = undefined;
+                        const key = std.fmt.bufPrint(&key_buf, "{s}@{d}", .{ func.name, func.line_num }) catch return null;
+                        return profile.get(key);
+                    }
+                }.lessThan);
+            } else {
+                // Profile load failed — fall back to code size
+                std.debug.print("[freeze] PGO: profile load failed, falling back to code size\n", .{});
+                std.mem.sort(GeneratedFunc, generated_all.items, {}, struct {
+                    fn lessThan(_: void, a: GeneratedFunc, b: GeneratedFunc) bool {
+                        return a.code.len > b.code.len;
+                    }
+                }.lessThan);
+            }
+        } else {
+            // No profile: sort by code size descending (original heuristic)
+            std.mem.sort(GeneratedFunc, generated_all.items, {}, struct {
+                fn lessThan(_: void, a: GeneratedFunc, b: GeneratedFunc) bool {
+                    return a.code.len > b.code.len;
+                }
+            }.lessThan);
+        }
+
+        // Free discarded functions' code
+        for (generated_all.items[max_functions..]) |gf| {
+            allocator.free(gf.code);
+        }
+        generated_all.items.len = max_functions;
+        std.debug.print("[freeze] Selective: keeping {d}, discarding {d} functions\n", .{
+            max_functions,
+            total_before - max_functions,
+        });
     }
 
     // Calculate total size and number of shards needed

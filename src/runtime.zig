@@ -511,6 +511,8 @@ pub fn main() !void {
     var allocator_type: AllocatorType = .gpa; // Default: GPA for debugging (use --allocator=c for production)
     var allocator_explicitly_set = false;
     var output_prefix: ?[]const u8 = null; // Custom output prefix (default: zig-out)
+    var freeze_max_functions: u32 = 0; // 0 = freeze all, N = freeze only top N largest
+    var freeze_profile_path: ?[]const u8 = null; // PGO: path to call profile JSON
     var app_dir: ?[]const u8 = null;
 
     var i: usize = 1;
@@ -551,6 +553,14 @@ pub fn main() !void {
             }
         } else if (std.mem.startsWith(u8, arg, "--output-dir=")) {
             output_prefix = arg[13..];
+        } else if (std.mem.startsWith(u8, arg, "--freeze-max-functions=")) {
+            const prefix_len = "--freeze-max-functions=".len;
+            freeze_max_functions = std.fmt.parseInt(u32, arg[prefix_len..], 10) catch {
+                std.debug.print("Invalid --freeze-max-functions value: {s}\n", .{arg[prefix_len..]});
+                std.process.exit(1);
+            };
+        } else if (std.mem.startsWith(u8, arg, "--freeze-profile=")) {
+            freeze_profile_path = arg["--freeze-profile=".len..];
         } else if (std.mem.eql(u8, arg, "--minimal")) {
             // Shortcut for test262: skip polyfills, freeze, bundler, and WASM/AOT
             no_polyfill = true;
@@ -601,6 +611,8 @@ pub fn main() !void {
             .debug_build = debug_build,
             .allocator_type = allocator_type,
             .output_prefix = output_prefix,
+            .freeze_max_functions = freeze_max_functions,
+            .freeze_profile_path = freeze_profile_path,
         });
     }
 }
@@ -626,6 +638,8 @@ fn printUsage() void {
         \\  --debug          Use Debug optimization (faster compile, slower runtime)
         \\  --allocator=X    Allocator for native binary: gpa (default), c, arena
         \\  --output-dir=X   Custom output directory (default: zig-out)
+        \\  --freeze-max-functions=N  Freeze only top N largest functions (0=all)
+        \\  --freeze-profile=PATH    PGO: sort functions by call profile (from --profile-out)
         \\  --minimal        All of the above (fastest, for test262)
         \\  -h, --help       Show this help
         \\  -v, --version    Show version
@@ -889,6 +903,8 @@ const BuildOptions = struct {
     debug_build: bool = false, // Use Debug optimization (faster compile, slower runtime)
     allocator_type: AllocatorType = .gpa, // Allocator for native binary (gpa=debug, c=fastest, arena=batch)
     output_prefix: ?[]const u8 = null, // Custom output prefix (default: zig-out)
+    freeze_max_functions: u32 = 0, // 0 = freeze all, N = freeze only top N largest functions
+    freeze_profile_path: ?[]const u8 = null, // PGO: path to call profile JSON from --profile-out
 };
 
 /// Static build: compile JS to C bytecode with qjsc, embed in WASM
@@ -1434,7 +1450,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             // Use size-based sharding for even distribution (200KB per shard)
             // Smaller shards prevent LLVM hang/thrashing on large files
             const BYTES_PER_SHARD = 200 * 1024;
-            var sharded = freeze.generateModuleZigSharded(allocator, &analysis, "frozen", manifest_content, BYTES_PER_SHARD) catch |err| {
+            var sharded = freeze.generateModuleZigSharded(allocator, &analysis, "frozen", manifest_content, BYTES_PER_SHARD, options.freeze_max_functions, options.freeze_profile_path) catch |err| {
                 std.debug.print("[warn] Zig codegen failed: {}\n", .{err});
                 break :zig_gen;
             };

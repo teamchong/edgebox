@@ -113,6 +113,9 @@ fn processExit(_: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JS
     // Print profiling stats before exit
     const zig_runtime = @import("zig_runtime");
     if (zig_runtime.PROFILE) zig_runtime.printProfile();
+    // Flush PGO call profile before exit (no-op if profiling not enabled)
+    const flush = @extern(*const fn () callconv(.c) void, .{ .name = "edgebox_call_profile_flush" });
+    flush();
     std.process.exit(exit_code);
 }
 

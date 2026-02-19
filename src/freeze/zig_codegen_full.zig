@@ -284,6 +284,8 @@ pub const ZigCodeGen = struct {
     max_arg_idx_used: u32 = 0,
     /// Track if function creates closures (fclosure/fclosure8) - needs shared var_ref tracking
     has_fclosure: bool = false,
+    /// Track if function uses for-of/for-in loops (needs for_of_iter_stack/for_of_depth)
+    has_for_of: bool = false,
     /// Track if a closure has been created yet in the current block
     /// Only emit closure var sync after this is true
     closure_created_in_block: bool = false,
@@ -391,6 +393,7 @@ pub const ZigCodeGen = struct {
         self.uses_argc_argv = false;
         self.uses_this_val = false;
         self.has_put_arg = false;
+        self.has_for_of = false;
         self.max_arg_idx_used = 0;
         // Scan all blocks for parameter usage
         for (self.func.cfg.blocks.items) |block| {
@@ -457,6 +460,10 @@ pub const ZigCodeGen = struct {
                     // Check for closure creation - needs shared var_ref tracking for function hoisting
                     .fclosure, .fclosure8 => {
                         self.has_fclosure = true;
+                    },
+                    // Check for for-of/for-in loops - needs iter_stack/depth tracking
+                    .for_of_start, .for_of_next, .for_in_start, .for_in_next, .iterator_close => {
+                        self.has_for_of = true;
                     },
                     else => {},
                 }
@@ -748,63 +755,67 @@ pub const ZigCodeGen = struct {
     /// - For exception: return .exception
     /// - For regular value: return .{ .return_value = VALUE }
     fn emitReturnException(self: *Self) !void {
-        try self.emitVarRefDetach();
-        // Free arg_shadow values before returning (they were duped at function entry)
-        if (self.has_put_arg) {
-            const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
-            for (0..arg_count) |i| {
-                try self.printLine("CV.freeRef(ctx, arg_shadow[{d}]);", .{i});
-            }
-        }
-        // Cleanup locals before returning (skip in dispatch_mode - done in dispatch loop)
-        if (!self.dispatch_mode) {
-            try self.emitLocalsCleanup();
-        }
         if (self.dispatch_mode) {
+            // In dispatch mode, var_ref_list and locals cleanup is done in the dispatch loop.
+            // Only arg_shadow cleanup is needed here.
+            if (self.has_put_arg) {
+                const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+                for (0..arg_count) |i| {
+                    try self.printLine("CV.freeRef(ctx, arg_shadow[{d}]);", .{i});
+                }
+            }
             try self.writeLine("return .exception;");
-        } else {
-            try self.writeLine("return JSValue.EXCEPTION;");
+            return;
         }
+        // Non-dispatch mode: single call to shared runtime helper
+        try self.emitExceptionCleanupCall();
     }
 
-    fn emitReturnValueFmt(self: *Self, comptime fmt: []const u8, args: anytype) !void {
-        try self.emitVarRefDetach();
-        // Free arg_shadow values before returning (they were duped at function entry)
-        if (self.has_put_arg) {
-            const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
-            for (0..arg_count) |i| {
-                try self.printLine("CV.freeRef(ctx, arg_shadow[{d}]);", .{i});
-            }
-        }
-        // Cleanup locals before returning (skip in dispatch_mode - done in dispatch loop)
-        if (!self.dispatch_mode) {
-            try self.emitLocalsCleanup();
-        }
-        if (self.dispatch_mode) {
-            try self.printLine("return .{{ .return_value = " ++ fmt ++ " }};", args);
-        } else {
-            try self.printLine("return " ++ fmt ++ ";", args);
-        }
+    /// Emit the one-line call to zig_runtime.exceptionCleanup() with the correct arguments
+    /// for this function's cleanup state (fclosure, put_arg, var_count).
+    fn emitExceptionCleanupCall(self: *Self) !void {
+        const has_fclosure = self.has_fclosure and self.func.var_count > 0;
+        const has_args = self.has_put_arg;
+        const arg_count = if (has_args) @max(self.func.arg_count, self.max_arg_idx_used) else 0;
+        try self.printLine("return zig_runtime.exceptionCleanup(ctx, &locals, {s}, {d}, {s}, {s}, {d});", .{
+            if (has_fclosure) @as([]const u8, "&_locals_jsv") else @as([]const u8, "null"),
+            self.func.var_count,
+            if (has_fclosure) @as([]const u8, "&_var_ref_list") else @as([]const u8, "null"),
+            if (has_args and arg_count > 0) @as([]const u8, "&arg_shadow") else @as([]const u8, "null"),
+            arg_count,
+        });
     }
 
     fn emitReturnValue(self: *Self, expr: []const u8) !void {
-        try self.emitVarRefDetach();
-        // Free arg_shadow values before returning (they were duped at function entry)
-        if (self.has_put_arg) {
-            const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
-            for (0..arg_count) |i| {
-                try self.printLine("CV.freeRef(ctx, arg_shadow[{d}]);", .{i});
-            }
-        }
-        // Cleanup locals before returning (skip in dispatch_mode - done in dispatch loop)
-        if (!self.dispatch_mode) {
-            try self.emitLocalsCleanup();
-        }
         if (self.dispatch_mode) {
+            // In dispatch mode, cleanup is done in dispatch loop
+            try self.emitVarRefDetach();
+            if (self.has_put_arg) {
+                const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+                for (0..arg_count) |i| {
+                    try self.printLine("CV.freeRef(ctx, arg_shadow[{d}]);", .{i});
+                }
+            }
             try self.printLine("return .{{ .return_value = {s} }};", .{expr});
-        } else {
-            try self.printLine("return {s};", .{expr});
+            return;
         }
+        // Non-dispatch mode: single call to shared runtime helper
+        try self.emitValueReturnCleanupCall(expr);
+    }
+
+    /// Emit a one-line call to zig_runtime.valueReturnCleanup() with the return value expression.
+    fn emitValueReturnCleanupCall(self: *Self, return_expr: []const u8) !void {
+        const has_fclosure = self.has_fclosure and self.func.var_count > 0;
+        const has_args = self.has_put_arg;
+        const arg_count = if (has_args) @max(self.func.arg_count, self.max_arg_idx_used) else 0;
+        try self.printLine("return zig_runtime.valueReturnCleanup(ctx, &locals, {s}, {d}, {s}, {s}, {d}, {s});", .{
+            if (has_fclosure) @as([]const u8, "&_locals_jsv") else @as([]const u8, "null"),
+            self.func.var_count,
+            if (has_fclosure) @as([]const u8, "&_var_ref_list") else @as([]const u8, "null"),
+            if (has_args and arg_count > 0) @as([]const u8, "&arg_shadow") else @as([]const u8, "null"),
+            arg_count,
+            return_expr,
+        });
     }
 
     /// Emit var_ref detach with required _locals_jsv sync.
@@ -819,14 +830,29 @@ pub const ZigCodeGen = struct {
     }
 
     /// Emit an inline exception check with proper cleanup.
-    /// Replaces bare `if (x.isException()) return JSValue.EXCEPTION;` patterns
-    /// with code that detaches _var_ref_list and frees locals before returning.
+    /// In non-dispatch mode: emits a single line using the shared runtime helper.
+    /// In dispatch mode: emits a block with arg_shadow cleanup + return .exception.
     fn emitInlineExceptionReturn(self: *Self, condition_var: []const u8) !void {
-        try self.printLine("if ({s}.isException()) {{", .{condition_var});
-        self.pushIndent();
-        try self.emitReturnException();
-        self.popIndent();
-        try self.writeLine("}");
+        if (self.dispatch_mode) {
+            try self.printLine("if ({s}.isException()) {{", .{condition_var});
+            self.pushIndent();
+            try self.emitReturnException();
+            self.popIndent();
+            try self.writeLine("}");
+            return;
+        }
+        // Non-dispatch mode: single line with shared runtime helper
+        const has_fclosure = self.has_fclosure and self.func.var_count > 0;
+        const has_args = self.has_put_arg;
+        const arg_count = if (has_args) @max(self.func.arg_count, self.max_arg_idx_used) else 0;
+        try self.printLine("if ({s}.isException()) return zig_runtime.exceptionCleanup(ctx, &locals, {s}, {d}, {s}, {s}, {d});", .{
+            condition_var,
+            if (has_fclosure) @as([]const u8, "&_locals_jsv") else @as([]const u8, "null"),
+            self.func.var_count,
+            if (has_fclosure) @as([]const u8, "&_var_ref_list") else @as([]const u8, "null"),
+            if (has_args and arg_count > 0) @as([]const u8, "&arg_shadow") else @as([]const u8, "null"),
+            arg_count,
+        });
     }
 
     // ========================================================================
@@ -932,11 +958,15 @@ pub const ZigCodeGen = struct {
             const stack_array_size = @max(self.func.var_count + self.func.stack_size, 16);
             try self.printLine("var stack: [{d}]CV = .{{CV.UNDEFINED}} ** {d};", .{ stack_array_size, stack_array_size });
             try self.writeLine("var sp: usize = 0;");
-            // Track iterator positions for for-of loops (stack for nested loops)
-            try self.writeLine("var for_of_iter_stack: [8]usize = .{0} ** 8;");
-            try self.writeLine("var for_of_depth: usize = 0;");
             // Silence "unused" warnings in ReleaseFast when early return happens
-            try self.writeLine("_ = &stack; _ = &sp; _ = &for_of_iter_stack; _ = &for_of_depth;");
+            if (self.has_for_of) {
+                // Track iterator positions for for-of loops (stack for nested loops)
+                try self.writeLine("var for_of_iter_stack: [8]usize = .{0} ** 8;");
+                try self.writeLine("var for_of_depth: usize = 0;");
+                try self.writeLine("_ = &stack; _ = &sp; _ = &for_of_iter_stack; _ = &for_of_depth;");
+            } else {
+                try self.writeLine("_ = &stack; _ = &sp;");
+            }
 
             // Inline cache slots for property access (persistent across calls via comptime struct)
             if (total_ic_slots > 0) {
@@ -1123,8 +1153,10 @@ pub const ZigCodeGen = struct {
                     try self.writeLine(".stack = &stack,");
                     try self.writeLine(".sp = &sp,");
                     try self.printLine(".locals = @as(*[{d}]zig_runtime.CompressedValue, &locals),", .{min_locals});
-                    try self.writeLine(".for_of_iter_stack = &for_of_iter_stack,");
-                    try self.writeLine(".for_of_depth = &for_of_depth,");
+                    if (self.has_for_of) {
+                        try self.writeLine(".for_of_iter_stack = &for_of_iter_stack,");
+                        try self.writeLine(".for_of_depth = &for_of_depth,");
+                    }
                     if (self.uses_arg_cache) {
                         try self.writeLine(".arg_cache = &arg_cache,");
                     }
@@ -1380,8 +1412,10 @@ pub const ZigCodeGen = struct {
         try self.writeLineBlock("sp: *usize,");
         const min_locals = if (self.func.var_count >= 16) self.func.var_count else 16;
         try self.printLineBlock("locals: *[{d}]zig_runtime.CompressedValue,", .{min_locals});
-        try self.writeLineBlock("for_of_iter_stack: *[8]usize,");
-        try self.writeLineBlock("for_of_depth: *usize,");
+        if (self.has_for_of) {
+            try self.writeLineBlock("for_of_iter_stack: *[8]usize,");
+            try self.writeLineBlock("for_of_depth: *usize,");
+        }
         // Add optional arg_cache if function uses it
         if (self.uses_arg_cache) {
             const cache_size = self.max_loop_arg_idx + 1;
@@ -1485,19 +1519,25 @@ pub const ZigCodeGen = struct {
         try self.writeLine("const stack = bctx.stack;");
         try self.writeLine("var sp = bctx.sp.*;");
         try self.writeLine("const locals = bctx.locals;");
-        try self.writeLine("const for_of_iter_stack = bctx.for_of_iter_stack;");
-        try self.writeLine("var for_of_depth = bctx.for_of_depth.*;");
         try self.writeLine("defer bctx.sp.* = sp;");
-        try self.writeLine("defer bctx.for_of_depth.* = for_of_depth;");
+        if (self.has_for_of) {
+            try self.writeLine("const for_of_iter_stack = bctx.for_of_iter_stack;");
+            try self.writeLine("var for_of_depth = bctx.for_of_depth.*;");
+            try self.writeLine("defer bctx.for_of_depth.* = for_of_depth;");
+        }
         // CV alias for CompressedValue (JSValue is already imported at module level)
         try self.writeLine("const CV = zig_runtime.CompressedValue;");
         // Silence unused warnings using std.debug.assert - references all vars without "pointless discard"
         // In release builds, the assert is optimized away completely
-        try self.writeLine("std.debug.assert(@intFromPtr(ctx) | @intFromPtr(&this_val) | @intFromPtr(argv) | @intFromPtr(var_refs) | @intFromPtr(cpool) | @intFromPtr(stack) | @intFromPtr(locals) | @intFromPtr(for_of_iter_stack) != 0);");
+        if (self.has_for_of) {
+            try self.writeLine("std.debug.assert(@intFromPtr(ctx) | @intFromPtr(&this_val) | @intFromPtr(argv) | @intFromPtr(var_refs) | @intFromPtr(cpool) | @intFromPtr(stack) | @intFromPtr(locals) | @intFromPtr(for_of_iter_stack) != 0);");
+            try self.writeLine("std.debug.assert(sp < 256 and for_of_depth < 8);");
+            try self.writeLine("sp = sp; for_of_depth = for_of_depth;");
+        } else {
+            try self.writeLine("std.debug.assert(@intFromPtr(ctx) | @intFromPtr(&this_val) | @intFromPtr(argv) | @intFromPtr(var_refs) | @intFromPtr(cpool) | @intFromPtr(stack) | @intFromPtr(locals) != 0);");
+            try self.writeLine("sp = sp;");
+        }
         try self.writeLine("std.debug.assert(argc >= 0 and closure_var_count >= 0);");
-        try self.writeLine("std.debug.assert(sp < 256 and for_of_depth < 8);");
-        // Prevent "never mutated" warnings for variables that may or may not be mutated
-        try self.writeLine("sp = sp; for_of_depth = for_of_depth;");
 
         if (self.uses_arg_cache) {
             try self.writeLine("const arg_cache = bctx.arg_cache;");
@@ -1516,8 +1556,7 @@ pub const ZigCodeGen = struct {
         try self.writeLine("std.debug.assert(@sizeOf(CV) > 0);");
         try self.writeLine("");
 
-        // SP overflow detection for dispatch table blocks
-        try self.printLine("if (sp > 250) zig_runtime.spOverflow(\"{s}\", {d}, sp);", .{ self.getFuncPrefix(), block_idx });
+        // SP overflow: removed per-block checks. Stack is sized from bytecode stack_size.
 
         // Check if block is contaminated
         if (self.func.partial_freeze and block.is_contaminated) {
@@ -1655,9 +1694,8 @@ pub const ZigCodeGen = struct {
         try self.printLine("{d} => {{ // block_{d}", .{ block_idx, block_idx });
         self.pushIndent();
 
-        // SP overflow detection - emit bounds check at every block entry
-        const func_prefix = self.getFuncPrefix();
-        try self.printLine("if (sp > 250) zig_runtime.spOverflow(\"{s}\", {d}, sp);", .{ func_prefix, block_idx });
+        // SP overflow: removed per-block checks. The stack array is sized from bytecode's
+        // pre-computed stack_size at compile time, so overflow is structurally impossible.
 
         // Check if block is contaminated (has never_freeze opcodes)
         if (self.func.partial_freeze and block.is_contaminated) {
@@ -4802,24 +4840,16 @@ pub const ZigCodeGen = struct {
                     } else if (std.mem.eql(u8, prop_name, "arguments")) {
                         try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetArguments(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else {
-                        // IC-accelerated property access (shape-based inline cache)
+                        // IC-accelerated property access via shared runtime helper
                         const escaped_prop = escapeZigString(self.allocator, prop_name) catch prop_name;
                         defer if (escaped_prop.ptr != prop_name.ptr) self.allocator.free(escaped_prop);
                         const ic_idx = self.nextIcSlot();
-                        try self.writeLine("{");
+                        try self.printLine("zig_runtime.frozenGetField(ctx, &stack, sp, &_IC.s[{d}], \"{s}\") catch", .{ ic_idx, escaped_prop });
                         self.pushIndent();
-                        try self.writeLine("const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx);");
-                        try self.printLine("const _gf = zig_runtime.icLoad(ctx, obj, &_IC.s[{d}], \"{s}\") catch {{", .{ ic_idx, escaped_prop });
-                        self.pushIndent();
-                        try self.emitReturnException();
+                        try self.emitExceptionCleanupCall();
                         self.popIndent();
-                        try self.writeLine("};");
-                        try self.writeLine("stack[sp-1] = CV.fromJSValue(_gf); if (cv.isRefType()) JSValue.free(ctx, obj);");
-                        self.popIndent();
-                        try self.writeLine("}");
                     }
                     // NOTE: Do NOT manipulate vstack here - emitInstruction is stack-based only.
-                    // The old vpop/vpush pattern polluted vstack with stale references.
                     // get_field replaces stack[sp-1] in place, sp doesn't change.
                 } else {
                     try self.writeLine("// get_field: atom index out of range");
@@ -4878,25 +4908,16 @@ pub const ZigCodeGen = struct {
                     } else if (std.mem.eql(u8, prop_name, "arguments")) {
                         try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetArguments(ctx, obj)); sp += 1; }");
                     } else {
-                        // IC-accelerated property access (shape-based inline cache)
+                        // IC-accelerated property access via shared runtime helper
                         const escaped_prop = escapeZigString(self.allocator, prop_name) catch prop_name;
                         defer if (escaped_prop.ptr != prop_name.ptr) self.allocator.free(escaped_prop);
                         const ic_idx = self.nextIcSlot();
-                        try self.writeLine("{");
+                        try self.printLine("zig_runtime.frozenGetField2(ctx, &stack, &sp, &_IC.s[{d}], \"{s}\") catch", .{ ic_idx, escaped_prop });
                         self.pushIndent();
-                        try self.writeLine("const obj = stack[sp-1].toJSValueWithCtx(ctx);");
-                        try self.printLine("const _gf = zig_runtime.icLoad(ctx, obj, &_IC.s[{d}], \"{s}\") catch {{", .{ ic_idx, escaped_prop });
-                        self.pushIndent();
-                        try self.emitReturnException();
+                        try self.emitExceptionCleanupCall();
                         self.popIndent();
-                        try self.writeLine("};");
-                        try self.writeLine("stack[sp] = CV.fromJSValue(_gf); sp += 1;");
-                        self.popIndent();
-                        try self.writeLine("}");
                     }
                     // NOTE: Do NOT call vpush here - emitInstruction is stack-based only.
-                    // Calling vpush pollutes vstack with stale references that cause
-                    // materializeVStack to generate incorrect code.
                     // The stack is self-tracking via sp.
                 } else {
                     try self.writeLine("// get_field2: atom index out of range");
@@ -6935,60 +6956,24 @@ pub const ZigCodeGen = struct {
         }
 
         // Normal call - function is on the stack
-        if (argc == 0) {
-            // call0: func is at sp-1, no args
-            try self.writeLine("{");
+        // Use shared runtime helper: handles arg extraction, call, exception check,
+        // CV cleanup, sp update, and closure sync in one noinline call.
+        {
+            const need_closure_sync = self.has_fclosure and self.func.var_count > 0 and self.closure_created_in_block;
+            try self.printLine("zig_runtime.frozenCall(ctx, &stack, &sp, {d}, JSValue.UNDEFINED, {s}, {s}, {d}) catch", .{
+                argc,
+                if (need_closure_sync) @as([]const u8, "&locals") else @as([]const u8, "null"),
+                if (need_closure_sync) @as([]const u8, "&_locals_jsv") else @as([]const u8, "null"),
+                if (need_closure_sync) self.func.var_count else @as(u16, 0),
+            });
             self.pushIndent();
-            try self.writeLine("const func = CV.toJSValuePtr(&stack[sp - 1]);");
-            try self.writeLine("var no_args: [0]JSValue = undefined;");
-            // Sync locals TO _locals_jsv before call (ensures current values for round-trip)
-            try self.emitClosureVarSyncTo();
-            try self.writeLine("const call_result = JSValue.call(ctx, func, JSValue.UNDEFINED, 0, @ptrCast(&no_args));");
-            // Check for exception and propagate it
-            try self.emitInlineExceptionReturn("call_result");
-            // Free the func CV we're about to overwrite
-            try self.writeLine("{ const v = stack[sp - 1]; CV.freeRef(ctx, v); }");
-            try self.writeLine("stack[sp - 1] = CV.fromJSValue(call_result);");
-            // Sync closure variables back from _locals_jsv (closure may have written to them)
-            try self.emitClosureVarSync();
-            // Sync vstack: clear func, push result
-            self.vpopAndFree();
-            try self.vpush("stack[sp - 1]");
+            try self.emitExceptionCleanupCall();
             self.popIndent();
-            try self.writeLine("}");
-        } else {
-            // callN: func at sp-1-argc, args at sp-argc..sp-1
-            try self.writeLine("{");
-            self.pushIndent();
-            try self.printLine("const func = CV.toJSValuePtr(&stack[sp - 1 - {d}]);", .{argc});
-            try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
-            // Copy args from stack to args array
-            for (0..argc) |i| {
-                try self.printLine("args[{d}] = CV.toJSValuePtr(&stack[sp - {d}]);", .{ i, argc - i });
-            }
-            // Sync locals TO _locals_jsv before call (ensures current values for round-trip)
-            try self.emitClosureVarSyncTo();
-            // Call - JS_Call returns a new ref, no dup needed
-            try self.printLine("const call_result = JSValue.call(ctx, func, JSValue.UNDEFINED, {d}, @ptrCast(&args));", .{argc});
-            // Check for exception and propagate it
-            try self.emitInlineExceptionReturn("call_result");
-            try self.writeLine("const result = CV.fromJSValue(call_result);");
-            // Free the CVs we're abandoning
-            for (0..argc) |i| {
-                try self.printLine("CV.freeRef(ctx, stack[sp - {d}]);", .{argc - i});
-            }
-            try self.printLine("CV.freeRef(ctx, stack[sp - 1 - {d}]);", .{argc}); // func
-            try self.printLine("sp -= {d};", .{argc});
-            try self.writeLine("stack[sp - 1] = result;");
-            // Sync closure variables back from _locals_jsv (closure may have written to them)
-            try self.emitClosureVarSync();
             // Sync vstack: clear func + argc args, push result
             for (0..argc + 1) |_| {
                 self.vpopAndFree();
             }
             try self.vpush("stack[sp - 1]");
-            self.popIndent();
-            try self.writeLine("}");
         }
     }
 
@@ -7516,101 +7501,44 @@ pub const ZigCodeGen = struct {
 
     /// Emit code for call_method opcode
     /// Stack: [this, method, arg0, arg1, ...argN-1] -> [result]
-    /// Note: get_field2 pushes obj then obj.prop, so this comes before method
+    /// Uses shared runtime helper for compact codegen.
     fn emitCallMethod(self: *Self, argc: u16) !void {
-        try self.writeLine("{");
+        const need_closure_sync = self.has_fclosure and self.func.var_count > 0 and self.closure_created_in_block;
+        try self.printLine("zig_runtime.frozenCallMethod(ctx, &stack, &sp, {d}, {s}, {s}, {d}) catch", .{
+            argc,
+            if (need_closure_sync) @as([]const u8, "&locals") else @as([]const u8, "null"),
+            if (need_closure_sync) @as([]const u8, "&_locals_jsv") else @as([]const u8, "null"),
+            if (need_closure_sync) self.func.var_count else @as(u16, 0),
+        });
         self.pushIndent();
-
-        // this at sp-2-argc, method at sp-1-argc, args at sp-argc..sp-1
-        try self.printLine("const method = stack[sp - 1 - {d}].toJSValueWithCtx(ctx);", .{argc});
-        try self.printLine("const call_this = stack[sp - 2 - {d}].toJSValueWithCtx(ctx);", .{argc});
-
-        if (argc == 0) {
-            // Sync locals TO _locals_jsv before call (ensures current values for round-trip)
-            try self.emitClosureVarSyncTo();
-            try self.writeLine("const call_result = JSValue.call(ctx, method, call_this, 0, @as([*]JSValue, undefined));");
-            // Check for exception and propagate it
-            try self.emitInlineExceptionReturn("call_result");
-        } else {
-            try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
-            for (0..argc) |i| {
-                try self.printLine("args[{d}] = CV.toJSValuePtr(&stack[sp - {d}]);", .{ i, argc - i });
-            }
-            // Sync locals TO _locals_jsv before call (ensures current values for round-trip)
-            try self.emitClosureVarSyncTo();
-            try self.printLine("const call_result = JSValue.call(ctx, method, call_this, {d}, &args);", .{argc});
-            // Check for exception and propagate it
-            try self.emitInlineExceptionReturn("call_result");
-            // Note: Don't free args - CVs on stack still own the references
-        }
-        // Store result directly - JS_Call returns a new ref, no dup needed
-        try self.writeLine("const result = call_result;");
-        // Free the CVs we're abandoning
-        for (0..argc) |i| {
-            try self.printLine("CV.freeRef(ctx, stack[sp - {d}]);", .{argc - i});
-        }
-        try self.printLine("CV.freeRef(ctx, stack[sp - 1 - {d}]);", .{argc}); // method
-        try self.printLine("CV.freeRef(ctx, stack[sp - 2 - {d}]);", .{argc}); // this
-        try self.printLine("sp -= {d} + 2;", .{argc});
-        try self.writeLine("stack[sp] = CV.fromJSValue(result);");
-        try self.writeLine("sp += 1;");
-        // Sync closure variables back from _locals_jsv (closure may have written to them)
-        try self.emitClosureVarSync();
+        try self.emitExceptionCleanupCall();
+        self.popIndent();
         // Sync vstack: clear this + method + argc args, push result
         for (0..argc + 2) |_| {
             self.vpopAndFree();
         }
         try self.vpush("stack[sp - 1]");
-
-        self.popIndent();
-        try self.writeLine("}");
     }
 
     /// Emit code for call_constructor opcode (new X())
-    /// QuickJS-ng stack layout: [constructor, new.target, arg0, arg1, ...argN-1] -> [new_object]
-    /// constructor at sp-2-argc, new.target at sp-1-argc, args at sp-argc..sp-1
+    /// Uses shared runtime helper for compact codegen.
+    /// Stack: [constructor, new.target, arg0, ..., argN-1] -> [new_object]
     fn emitCallConstructor(self: *Self, argc: u16) !void {
-        try self.writeLine("{");
+        const need_closure_sync = self.has_fclosure and self.func.var_count > 0 and self.closure_created_in_block;
+        try self.printLine("zig_runtime.frozenCallConstructor(ctx, &stack, &sp, {d}, {s}, {s}, {d}) catch", .{
+            argc,
+            if (need_closure_sync) @as([]const u8, "&locals") else @as([]const u8, "null"),
+            if (need_closure_sync) @as([]const u8, "&_locals_jsv") else @as([]const u8, "null"),
+            if (need_closure_sync) self.func.var_count else @as(u16, 0),
+        });
         self.pushIndent();
-
-        // constructor at sp-2-argc, new.target at sp-1-argc
-        try self.printLine("const ctor = stack[sp - 2 - {d}].toJSValueWithCtx(ctx);", .{argc});
-
-        if (argc == 0) {
-            // Sync locals TO _locals_jsv before call (ensures current values for round-trip)
-            try self.emitClosureVarSyncTo();
-            try self.writeLine("const call_result = JSValue.callConstructor(ctx, ctor, &.{});");
-        } else {
-            try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
-            for (0..argc) |i| {
-                try self.printLine("args[{d}] = CV.toJSValuePtr(&stack[sp - {d}]);", .{ i, argc - i });
-            }
-            // Sync locals TO _locals_jsv before call (ensures current values for round-trip)
-            try self.emitClosureVarSyncTo();
-            try self.writeLine("const call_result = JSValue.callConstructor(ctx, ctor, &args);");
-            // Note: Don't free args - CVs on stack still own the references
-        }
-        // Store result directly - callConstructor returns a new ref, no dup needed
-        try self.writeLine("const result = call_result;");
-        // Free the CVs we're abandoning
-        for (0..argc) |i| {
-            try self.printLine("CV.freeRef(ctx, stack[sp - {d}]);", .{argc - i});
-        }
-        try self.printLine("CV.freeRef(ctx, stack[sp - 1 - {d}]);", .{argc}); // new.target
-        try self.printLine("CV.freeRef(ctx, stack[sp - 2 - {d}]);", .{argc}); // ctor
-        try self.printLine("sp -= {d} + 2;", .{argc});
-        try self.writeLine("stack[sp] = CV.fromJSValue(result);");
-        try self.writeLine("sp += 1;");
-        // Sync closure variables back from _locals_jsv (closure may have written to them)
-        try self.emitClosureVarSync();
+        try self.emitExceptionCleanupCall();
+        self.popIndent();
         // Sync vstack: clear ctor + new.target + argc args, push result
         for (0..argc + 2) |_| {
             self.vpopAndFree();
         }
         try self.vpush("stack[sp - 1]");
-
-        self.popIndent();
-        try self.writeLine("}");
     }
 
     /// Emit code for array_from opcode
@@ -8165,10 +8093,14 @@ pub const ZigCodeGen = struct {
         const stack_array_size2 = @max(self.func.var_count + self.func.stack_size, 16);
         try self.printLine("var stack: [{d}]CV = .{{CV.UNDEFINED}} ** {d};", .{ stack_array_size2, stack_array_size2 });
         try self.writeLine("var sp: usize = 0;");
-        // Track iterator positions for for-of loops (stack for nested loops)
-        try self.writeLine("var for_of_iter_stack: [8]usize = .{0} ** 8;");
-        try self.writeLine("var for_of_depth: usize = 0;");
-        try self.writeLine("_ = &stack; _ = &sp; _ = &for_of_iter_stack; _ = &for_of_depth;");
+        if (self.has_for_of) {
+            // Track iterator positions for for-of loops (stack for nested loops)
+            try self.writeLine("var for_of_iter_stack: [8]usize = .{0} ** 8;");
+            try self.writeLine("var for_of_depth: usize = 0;");
+            try self.writeLine("_ = &stack; _ = &sp; _ = &for_of_iter_stack; _ = &for_of_depth;");
+        } else {
+            try self.writeLine("_ = &stack; _ = &sp;");
+        }
         try self.writeLine("");
 
         // When function has put_arg operations, we need shadow storage for arguments

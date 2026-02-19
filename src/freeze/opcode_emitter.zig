@@ -279,19 +279,19 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
                 // IC-accelerated property access for all properties.
                 // Shape-based IC provides O(1) direct read on cache hit (inlined in Zig).
                 // Falls back to atom-cached JS_GetProperty on miss (handles proto chain, getters).
+                // Get the proper exception return expression (with cleanup if available)
+                const exc_expr = if (@hasDecl(CodeGen, "getExceptionReturnExpr"))
+                    self.getExceptionReturnExpr()
+                else if (self.dispatch_mode)
+                    ".exception"
+                else
+                    "JSValue.EXCEPTION";
+
                 if (@hasDecl(CodeGen, "nextIcSlot")) {
                     const ic_idx = self.nextIcSlot();
-                    if (self.dispatch_mode) {
-                        try self.vpushFmt("CV.fromJSValue(zig_runtime.icLoad(ctx, {s}.toJSValueWithCtx(ctx), &_IC.s[{d}], \"{s}\") catch return .exception)", .{ obj, ic_idx, prop_name });
-                    } else {
-                        try self.vpushFmt("CV.fromJSValue(zig_runtime.icLoad(ctx, {s}.toJSValueWithCtx(ctx), &_IC.s[{d}], \"{s}\") catch return JSValue.EXCEPTION)", .{ obj, ic_idx, prop_name });
-                    }
+                    try self.vpushFmt("CV.fromJSValue(zig_runtime.icLoad(ctx, {s}.toJSValueWithCtx(ctx), &_IC.s[{d}], \"{s}\") catch return {s})", .{ obj, ic_idx, prop_name, exc_expr });
                 } else {
-                    if (self.dispatch_mode) {
-                        try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\") catch return .exception)", .{ obj, prop_name });
-                    } else {
-                        try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\") catch return JSValue.EXCEPTION)", .{ obj, prop_name });
-                    }
+                    try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\") catch return {s})", .{ obj, prop_name, exc_expr });
                 }
             } else {
                 return false;
@@ -305,20 +305,21 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
                 const obj = self.vpop() orelse "stack[sp-1]";
                 // Push the object back first (for use as 'this' in call_method)
                 try self.vpush(obj);
+
+                // Get the proper exception return expression (with cleanup if available)
+                const exc_expr = if (@hasDecl(CodeGen, "getExceptionReturnExpr"))
+                    self.getExceptionReturnExpr()
+                else if (self.dispatch_mode)
+                    ".exception"
+                else
+                    "JSValue.EXCEPTION";
+
                 // Then push the method/property - with exception propagation
                 if (@hasDecl(CodeGen, "nextIcSlot")) {
                     const ic_idx = self.nextIcSlot();
-                    if (self.dispatch_mode) {
-                        try self.vpushFmt("CV.fromJSValue(zig_runtime.icLoad(ctx, {s}.toJSValueWithCtx(ctx), &_IC.s[{d}], \"{s}\") catch return .exception)", .{ obj, ic_idx, prop_name });
-                    } else {
-                        try self.vpushFmt("CV.fromJSValue(zig_runtime.icLoad(ctx, {s}.toJSValueWithCtx(ctx), &_IC.s[{d}], \"{s}\") catch return JSValue.EXCEPTION)", .{ obj, ic_idx, prop_name });
-                    }
+                    try self.vpushFmt("CV.fromJSValue(zig_runtime.icLoad(ctx, {s}.toJSValueWithCtx(ctx), &_IC.s[{d}], \"{s}\") catch return {s})", .{ obj, ic_idx, prop_name, exc_expr });
                 } else {
-                    if (self.dispatch_mode) {
-                        try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\") catch return .exception)", .{ obj, prop_name });
-                    } else {
-                        try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\") catch return JSValue.EXCEPTION)", .{ obj, prop_name });
-                    }
+                    try self.vpushFmt("CV.fromJSValue(zig_runtime.getFieldChecked(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\") catch return {s})", .{ obj, prop_name, exc_expr });
                 }
                 // Free the obj string after both vpushes if it was allocated
                 if (self.isAllocated(obj)) self.allocator.free(obj);

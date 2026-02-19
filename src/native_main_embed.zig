@@ -36,6 +36,13 @@ const assert_polyfill = @import("polyfills/assert.zig");
 const string_decoder_polyfill = @import("polyfills/string_decoder.zig");
 const native_shapes_polyfill = @import("polyfills/native_shapes.zig");
 const native_bindings = @import("native_bindings.zig");
+const call_profile = @import("freeze/call_profile.zig");
+comptime {
+    // Force link C-callable profile symbols so QuickJS patch and process.exit can call them
+    _ = &call_profile.edgebox_call_profile_enabled;
+    _ = &call_profile.edgebox_call_profile_increment;
+    _ = &call_profile.edgebox_call_profile_flush;
+}
 
 // Zig native registry (replaces C frozen_runtime.c registry)
 const native_shapes_registry = @import("freeze/native_shapes.zig");
@@ -478,6 +485,9 @@ pub fn main() !void {
     // Register native polyfills
     registerPolyfills(ctx, allocator);
 
+    // Intercept --profile-out=<path> before forwarding args to JS
+    var profile_out_path: ?[*:0]const u8 = null;
+
     // Set process.argv from command-line arguments
     {
         const args = std.process.argsAlloc(allocator) catch null;
@@ -491,8 +501,26 @@ pub fn main() !void {
         if (args_slice.len > 1 and std.mem.eql(u8, args_slice[1], "--")) {
             script_args_start = 2; // Skip the "--"
         }
-        if (args_slice.len > script_args_start) {
-            process_polyfill.setArgv(ctx, exe_path, args_slice[script_args_start..]);
+
+        // Check for --profile-out= and filter it from args passed to JS
+        var filtered_args = std.ArrayListUnmanaged([:0]const u8){};
+        defer filtered_args.deinit(allocator);
+        const forward_slice = if (args_slice.len > script_args_start) args_slice[script_args_start..] else &[_][:0]const u8{};
+        for (forward_slice) |arg| {
+            if (std.mem.startsWith(u8, arg, "--profile-out=")) {
+                // Enable profiling and save path (arg memory lives until argsFree)
+                const path_slice = arg["--profile-out=".len..];
+                // Dupe the path so it survives beyond argsFree
+                profile_out_path = (allocator.dupeZ(u8, path_slice) catch null);
+                call_profile.enable();
+                std.debug.print("[profile] Call profiling enabled, will write to {s}\n", .{path_slice});
+            } else {
+                filtered_args.append(allocator, arg) catch {};
+            }
+        }
+
+        if (filtered_args.items.len > 0) {
+            process_polyfill.setArgv(ctx, exe_path, filtered_args.items);
         } else {
             process_polyfill.setArgv(ctx, exe_path, &[_][:0]const u8{});
         }
@@ -503,8 +531,7 @@ pub fn main() !void {
         defer qjs.JS_FreeValue(ctx, global);
 
         const script_args_array = qjs.JS_NewArray(ctx);
-        const script_args_for_compat = if (args_slice.len > script_args_start) args_slice[script_args_start..] else &[_][:0]const u8{};
-        for (script_args_for_compat, 0..) |arg, i| {
+        for (filtered_args.items, 0..) |arg, i| {
             _ = qjs.JS_SetPropertyUint32(ctx, script_args_array, @intCast(i), qjs.JS_NewString(ctx, arg.ptr));
         }
         _ = qjs.JS_SetPropertyStr(ctx, global, "scriptArgs", script_args_array);
@@ -543,6 +570,11 @@ pub fn main() !void {
     // This ensures atoms match those in the loaded bytecode
     native_shapes_polyfill.initAtoms(@ptrCast(ctx));
 
+    // Set up profile dump target so process.exit() can flush the profile
+    if (profile_out_path) |path| {
+        call_profile.setDumpTarget(@ptrCast(ctx), path);
+    }
+
     // Execute
     const tag = qjs.JS_VALUE_GET_TAG(obj);
     var result: qjs.JSValue = undefined;
@@ -565,6 +597,11 @@ pub fn main() !void {
     } else {
         result = qjs.JS_EvalFunction(ctx, obj);
         _ = qjs.js_std_loop(ctx);
+    }
+
+    // Dump call profile before any exit path (process.exit, exception, or success)
+    if (profile_out_path) |path| {
+        call_profile.dump(@ptrCast(ctx), path);
     }
 
     if (qjs.JS_IsException(result)) {
