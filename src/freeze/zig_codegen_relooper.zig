@@ -231,10 +231,6 @@ pub const RelooperCodeGen = struct {
     // Inline cache slot counter - tracks how many IC slots this function needs
     ic_count: u32 = 0,
 
-    // Cached exception return expression for IC catch paths
-    exception_return_expr_buf: [256]u8 = undefined,
-    exception_return_expr_len: u8 = 0,
-
     const Self = @This();
 
     /// Allocate the next IC slot index for a property access site
@@ -242,33 +238,6 @@ pub const RelooperCodeGen = struct {
         const idx = self.ic_count;
         self.ic_count += 1;
         return idx;
-    }
-
-    /// Get the expression to use in `catch return <expr>` for IC and other error paths.
-    /// Returns either `.exception` (dispatch mode) or `zig_runtime.exceptionCleanup(...)`.
-    /// Cached after first call since parameters are fixed per function.
-    pub fn getExceptionReturnExpr(self: *Self) []const u8 {
-        if (self.exception_return_expr_len > 0) {
-            return self.exception_return_expr_buf[0..self.exception_return_expr_len];
-        }
-        if (self.dispatch_mode) {
-            const expr = ".exception";
-            @memcpy(self.exception_return_expr_buf[0..expr.len], expr);
-            self.exception_return_expr_len = @intCast(expr.len);
-            return self.exception_return_expr_buf[0..expr.len];
-        }
-        const has_fclosure = self.has_fclosure and self.func.var_count > 0;
-        const has_args = self.has_put_arg;
-        const arg_count: u32 = if (has_args) @max(self.func.arg_count, self.max_arg_idx_used) else 0;
-        const expr = std.fmt.bufPrint(&self.exception_return_expr_buf, "zig_runtime.exceptionCleanup(ctx, &locals, {s}, {d}, {s}, {s}, {d})", .{
-            if (has_fclosure) @as([]const u8, "&_locals_jsv") else @as([]const u8, "null"),
-            self.func.var_count,
-            if (has_fclosure) @as([]const u8, "_var_ref_list") else @as([]const u8, "null"),
-            if (has_args and arg_count > 0) @as([]const u8, "&arg_shadow") else @as([]const u8, "null"),
-            arg_count,
-        }) catch unreachable;
-        self.exception_return_expr_len = @intCast(expr.len);
-        return expr;
     }
 
     /// Tracks an await point for state machine generation
@@ -845,49 +814,19 @@ pub const RelooperCodeGen = struct {
     }
 
     /// Emit a full exception return with cleanup (detach var_refs + free locals).
-    /// Uses shared noinline runtime helper for compact generated code.
+    /// Used for inline exception checks that need to clean up before returning.
     fn emitExceptionReturn(self: *Self) !void {
+        try self.emitClosureDetach();
+        try self.emitLocalsCleanup();
+        if (self.has_put_arg) {
+            const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+            try opcode_emitter.emitArgShadowCleanupShared(Self, self, arg_count, "");
+        }
         if (self.dispatch_mode) {
-            // In dispatch mode, cleanup is done in dispatch loop
-            try self.emitClosureDetach();
-            try self.emitLocalsCleanup();
-            if (self.has_put_arg) {
-                const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
-                try opcode_emitter.emitArgShadowCleanupShared(Self, self, arg_count, "");
-            }
             try self.writeLine("return .exception;");
         } else {
-            try self.emitExceptionCleanupCall();
+            try self.writeLine("return zig_runtime.JSValue.EXCEPTION;");
         }
-    }
-
-    /// Emit a single-line call to zig_runtime.exceptionCleanup().
-    fn emitExceptionCleanupCall(self: *Self) !void {
-        const has_fclosure = self.has_fclosure and self.func.var_count > 0;
-        const has_args = self.has_put_arg;
-        const arg_count = if (has_args) @max(self.func.arg_count, self.max_arg_idx_used) else 0;
-        try self.printLine("return zig_runtime.exceptionCleanup(ctx, &locals, {s}, {d}, {s}, {s}, {d});", .{
-            if (has_fclosure) @as([]const u8, "&_locals_jsv") else @as([]const u8, "null"),
-            self.func.var_count,
-            if (has_fclosure) @as([]const u8, "_var_ref_list") else @as([]const u8, "null"),
-            if (has_args and arg_count > 0) @as([]const u8, "&arg_shadow") else @as([]const u8, "null"),
-            arg_count,
-        });
-    }
-
-    /// Emit a single-line call to zig_runtime.valueReturnCleanup() with the return value expression.
-    fn emitValueReturnCleanupCall(self: *Self, return_expr: []const u8) !void {
-        const has_fclosure = self.has_fclosure and self.func.var_count > 0;
-        const has_args = self.has_put_arg;
-        const arg_count = if (has_args) @max(self.func.arg_count, self.max_arg_idx_used) else 0;
-        try self.printLine("return zig_runtime.valueReturnCleanup(ctx, &locals, {s}, {d}, {s}, {s}, {d}, {s});", .{
-            if (has_fclosure) @as([]const u8, "&_locals_jsv") else @as([]const u8, "null"),
-            self.func.var_count,
-            if (has_fclosure) @as([]const u8, "_var_ref_list") else @as([]const u8, "null"),
-            if (has_args and arg_count > 0) @as([]const u8, "&arg_shadow") else @as([]const u8, "null"),
-            arg_count,
-            return_expr,
-        });
     }
 
     fn emitInstruction(self: *Self, instr: Instruction, block: BasicBlock, idx: usize) !void {
@@ -1026,19 +965,25 @@ pub const RelooperCodeGen = struct {
                         const obj = self.vpop().?;
                         try self.vpush(obj);
                         const ic_idx = self.nextIcSlot();
-                        const exc_expr = self.getExceptionReturnExpr();
-                        try self.vpushFmt("CV.fromJSValue(zig_runtime.icLoad(ctx, {s}.toJSValueWithCtx(ctx), &_IC.s[{d}], \"{s}\") catch return {s})", .{ obj, ic_idx, escaped_prop, exc_expr });
+                        if (self.dispatch_mode) {
+                            try self.vpushFmt("CV.fromJSValue(zig_runtime.icLoad(ctx, {s}.toJSValueWithCtx(ctx), &_IC.s[{d}], \"{s}\") catch return .exception)", .{ obj, ic_idx, escaped_prop });
+                        } else {
+                            try self.vpushFmt("CV.fromJSValue(zig_runtime.icLoad(ctx, {s}.toJSValueWithCtx(ctx), &_IC.s[{d}], \"{s}\") catch return JSValue.EXCEPTION)", .{ obj, ic_idx, escaped_prop });
+                        }
                         if (self.isAllocated(obj)) self.allocator.free(obj);
                     } else {
                         // Object is on real stack - materialize directly to avoid double-consumption.
                         // Object stays at sp-1, method goes at sp, then sp += 1.
                         // This way the object reference is only evaluated once.
                         const ic_idx = self.nextIcSlot();
-                        const exc_expr = self.getExceptionReturnExpr();
                         try self.writeLine("{");
                         self.pushIndent();
                         try self.writeLine("const obj = stack[sp-1].toJSValueWithCtx(ctx);");
-                        try self.printLine("const _gf = zig_runtime.icLoad(ctx, obj, &_IC.s[{d}], \"{s}\") catch return {s};", .{ ic_idx, escaped_prop, exc_expr });
+                        if (self.dispatch_mode) {
+                            try self.printLine("const _gf = zig_runtime.icLoad(ctx, obj, &_IC.s[{d}], \"{s}\") catch return .exception;", .{ ic_idx, escaped_prop });
+                        } else {
+                            try self.printLine("const _gf = zig_runtime.icLoad(ctx, obj, &_IC.s[{d}], \"{s}\") catch return JSValue.EXCEPTION;", .{ ic_idx, escaped_prop });
+                        }
                         try self.writeLine("stack[sp] = CV.fromJSValue(_gf); sp += 1;");
                         self.popIndent();
                         try self.writeLine("}");
@@ -1056,52 +1001,50 @@ pub const RelooperCodeGen = struct {
             // The shared emitter doesn't know about arg_shadow or locals cleanup, so we override it here
             .@"return" => {
                 try self.flushVstack();
-                if (self.is_async_function or self.dispatch_mode) {
-                    // Async/dispatch: keep inline cleanup for special return handling
-                    try self.writeLine("{");
-                    try self.writeLine("    const _ret_cv = stack[sp - 1];");
-                    try self.writeLine("    const _ret_val = if (_ret_cv.isRefType()) JSValue.dup(ctx, _ret_cv.toJSValueWithCtx(ctx)) else _ret_cv.toJSValueWithCtx(ctx);");
-                    try self.writeLine("    CV.freeRef(ctx, _ret_cv);");
-                    try self.emitClosureDetach();
-                    try self.emitLocalsCleanup();
-                    if (self.has_put_arg) {
-                        const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
-                        try opcode_emitter.emitArgShadowCleanupShared(Self, self, arg_count, "    ");
-                    }
-                    if (self.is_async_function) {
-                        try self.writeLine("    return JSValue.promiseResolve(ctx, _ret_val);");
-                    } else {
-                        try self.writeLine("    return .{ .return_value = _ret_val };");
-                    }
-                    try self.writeLine("}");
-                } else {
-                    // Non-dispatch, non-async: use shared runtime helper
-                    try self.writeLine("{ const _ret_cv = stack[sp - 1];");
-                    try self.writeLine("  const _ret_val = if (_ret_cv.isRefType()) JSValue.dup(ctx, _ret_cv.toJSValueWithCtx(ctx)) else _ret_cv.toJSValueWithCtx(ctx);");
-                    try self.writeLine("  CV.freeRef(ctx, _ret_cv);");
-                    try self.emitValueReturnCleanupCall("_ret_val");
-                    try self.writeLine("}");
+                try self.writeLine("{");
+                // Save return value (dup if ref type to avoid use-after-free during cleanup)
+                try self.writeLine("    const _ret_cv = stack[sp - 1];");
+                try self.writeLine("    const _ret_val = if (_ret_cv.isRefType()) JSValue.dup(ctx, _ret_cv.toJSValueWithCtx(ctx)) else _ret_cv.toJSValueWithCtx(ctx);");
+                // Free the original stack value (the dup created a new ref)
+                try self.writeLine("    CV.freeRef(ctx, _ret_cv);");
+                // Detach V2 closure var_refs before cleanup
+                try self.emitClosureDetach();
+                // Cleanup locals - free all ref-type values to prevent GC leaks
+                try self.emitLocalsCleanup();
+                // Free arg_shadow values if function modifies arguments (they were duped at function entry)
+                if (self.has_put_arg) {
+                    const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+                    try opcode_emitter.emitArgShadowCleanupShared(Self, self, arg_count, "    ");
                 }
+                // Async functions must wrap return value in Promise.resolve()
+                if (self.is_async_function) {
+                    try self.writeLine("    return JSValue.promiseResolve(ctx, _ret_val);");
+                } else if (self.dispatch_mode) {
+                    try self.writeLine("    return .{ .return_value = _ret_val };");
+                } else {
+                    try self.writeLine("    return _ret_val;");
+                }
+                try self.writeLine("}");
                 self.block_terminated = true;
                 return;
             },
             .return_undef => {
-                if (self.is_async_function or self.dispatch_mode) {
-                    // Async/dispatch: keep inline cleanup for special return handling
-                    try self.emitClosureDetach();
-                    try self.emitLocalsCleanup();
-                    if (self.has_put_arg) {
-                        const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
-                        try opcode_emitter.emitArgShadowCleanupShared(Self, self, arg_count, "");
-                    }
-                    if (self.is_async_function) {
-                        try self.writeLine("return JSValue.promiseResolve(ctx, zig_runtime.JSValue.UNDEFINED);");
-                    } else {
-                        try self.writeLine("return .return_undef;");
-                    }
+                // Detach V2 closure var_refs before cleanup
+                try self.emitClosureDetach();
+                // Cleanup locals - free all ref-type values to prevent GC leaks
+                try self.emitLocalsCleanup();
+                // Free arg_shadow values if function modifies arguments
+                if (self.has_put_arg) {
+                    const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+                    try opcode_emitter.emitArgShadowCleanupShared(Self, self, arg_count, "");
+                }
+                // Async functions must wrap undefined in Promise.resolve()
+                if (self.is_async_function) {
+                    try self.writeLine("return JSValue.promiseResolve(ctx, zig_runtime.JSValue.UNDEFINED);");
+                } else if (self.dispatch_mode) {
+                    try self.writeLine("return .return_undef;");
                 } else {
-                    // Non-dispatch, non-async: use shared runtime helper
-                    try self.emitValueReturnCleanupCall("zig_runtime.JSValue.UNDEFINED");
+                    try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
                 }
                 self.block_terminated = true;
                 return;
@@ -1861,27 +1804,87 @@ pub const RelooperCodeGen = struct {
 
     fn emitCall(self: *Self, argc: u16) !void {
         // For Relooper, always flush vstack first, then use real stack positions
+        // This handles cross-block values correctly
         try self.flushVstack();
 
-        // Use shared noinline helper: extracts args, calls, checks exception, updates sp
-        // Pass null for locals/locals_jsv — relooper does per-store sync TO, targeted sync FROM
-        try self.printLine("zig_runtime.frozenCall(ctx, &stack, &sp, {d}, zig_runtime.JSValue.UNDEFINED, null, null, 0) catch", .{argc});
-        try self.emitExceptionCleanupCall();
+        // Bytecode stack layout for call: [func, arg0, arg1, ..., argN-1]
+        // After flush: values are at stack[sp - argc - 1] (func) through stack[sp - 1] (last arg)
+        try self.writeLine("{");
+        self.pushIndent();
+
+        // Get function from real stack position
+        try self.printLine("const _fn = stack[sp - {d}].toJSValueWithCtx(ctx);", .{argc + 1});
+
+        if (argc > 0) {
+            // Build args array from real stack positions
+            try self.printLine("var _args: [{d}]JSValue = undefined;", .{argc});
+            try self.printLine("for (0..{d}) |_i| {{ _args[_i] = CV.toJSValuePtr(&stack[sp - {d} + _i]); }}", .{ argc, argc });
+            // Sync locals TO _locals_jsv before call
+            try self.emitClosureVarSyncTo();
+            try self.writeLine("const _result = JSValue.call(ctx, _fn, zig_runtime.JSValue.UNDEFINED, @intCast(_args.len), &_args);");
+        } else {
+            // Sync locals TO _locals_jsv before call
+            try self.emitClosureVarSyncTo();
+            try self.writeLine("const _result = JSValue.call(ctx, _fn, zig_runtime.JSValue.UNDEFINED, 0, @as([*]zig_runtime.JSValue, undefined));");
+        }
+
+        // Check for exception and propagate it
+        try self.writeLine("if (_result.isException()) {");
+        self.pushIndent();
+        try self.emitExceptionReturn();
+        self.popIndent();
+        try self.writeLine("}");
+
+        // Pop func + args, push result
+        try self.printLine("sp -= {d};", .{argc + 1});
+        try self.writeLine("stack[sp] = CV.fromJSValue(_result); sp += 1;");
         // Sync closure variables back from _locals_jsv (closure may have written to them)
         try self.emitClosureVarSyncFrom();
+        self.popIndent();
+        try self.writeLine("}");
     }
 
     fn emitCallMethod(self: *Self, argc: u16) !void {
         // call_method: the method is already on the stack from get_field2
         // Stack: [this, method, arg0, arg1, ...argN-1] -> [result]
+        // For Relooper, always flush vstack first, then use real stack positions
         try self.flushVstack();
 
-        // Use shared noinline helper: extracts this+method+args, calls, checks exception, updates sp
-        // Pass null for locals/locals_jsv — relooper does per-store sync TO, targeted sync FROM
-        try self.printLine("zig_runtime.frozenCallMethod(ctx, &stack, &sp, {d}, null, null, 0) catch", .{argc});
-        try self.emitExceptionCleanupCall();
+        try self.writeLine("{");
+        self.pushIndent();
+
+        // Get this and method from real stack positions
+        // Stack layout: [obj, method, arg0, arg1, ...]
+        try self.printLine("const _obj = stack[sp - {d}].toJSValueWithCtx(ctx);", .{argc + 2});
+        try self.printLine("const _method = stack[sp - {d}].toJSValueWithCtx(ctx);", .{argc + 1});
+
+        if (argc > 0) {
+            // Build args array from real stack positions
+            try self.printLine("var _args: [{d}]JSValue = undefined;", .{argc});
+            try self.printLine("for (0..{d}) |_i| {{ _args[_i] = CV.toJSValuePtr(&stack[sp - {d} + _i]); }}", .{ argc, argc });
+            // Sync locals TO _locals_jsv before call
+            try self.emitClosureVarSyncTo();
+            try self.writeLine("const _result = JSValue.call(ctx, _method, _obj, @intCast(_args.len), &_args);");
+        } else {
+            // Sync locals TO _locals_jsv before call
+            try self.emitClosureVarSyncTo();
+            try self.writeLine("const _result = JSValue.call(ctx, _method, _obj, 0, @as([*]zig_runtime.JSValue, undefined));");
+        }
+
+        // Check for exception and propagate it
+        try self.writeLine("if (_result.isException()) {");
+        self.pushIndent();
+        try self.emitExceptionReturn();
+        self.popIndent();
+        try self.writeLine("}");
+
+        // Pop obj + method + args, push result
+        try self.printLine("sp -= {d};", .{argc + 2});
+        try self.writeLine("stack[sp] = CV.fromJSValue(_result); sp += 1;");
         // Sync closure variables back from _locals_jsv (closure may have written to them)
         try self.emitClosureVarSyncFrom();
+        self.popIndent();
+        try self.writeLine("}");
     }
 
     pub fn getAtomString(self: *Self, atom_idx: u32) ?[]const u8 {
