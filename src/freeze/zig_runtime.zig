@@ -532,11 +532,16 @@ pub noinline fn cleanupLocals(ctx: *JSContext, locals_ptr: [*]CompressedValue, c
         if (v.isRefType()) {
             const ptr = v.decompressPtr() orelse continue;
             const ref_count: *i32 = @ptrCast(@alignCast(ptr));
+            // Validate: link.prev is at offset 8 from start of JSGCObjectHeader.
+            // If prev is null, the object was already freed/unlinked — skip to avoid crash.
+            const link_prev_ptr: *const ?*anyopaque = @ptrCast(@alignCast(@as([*]const u8, @ptrCast(ptr)) + 8));
+            if (link_prev_ptr.* == null) continue;
             if (ref_count.* > 1) {
                 ref_count.* -= 1;
-            } else {
+            } else if (ref_count.* == 1) {
                 quickjs.JS_FreeValue(ctx, v.toJSValue());
             }
+            // ref_count <= 0: skip (already freed or invalid)
         }
     }
 }
