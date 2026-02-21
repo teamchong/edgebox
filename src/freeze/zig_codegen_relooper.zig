@@ -1964,12 +1964,24 @@ pub const RelooperCodeGen = struct {
             const expr = self.vstack.orderedRemove(0);
             // Count stack references that need to be consumed
             const ref_count = self.countStackRefs(expr);
+            // Storage references (locals[], stack[]) are borrowed — the vstack
+            // optimization elides the dup from get_loc/dup opcodes. When flushing
+            // to the physical stack we must dup ref-counted values to create
+            // independent ownership, matching materializeVStack in the full codegen.
+            const is_storage_ref = std.mem.startsWith(u8, expr, "locals[") or
+                std.mem.startsWith(u8, expr, "stack[");
             if (ref_count > 0) {
-                // Expression references stack values - store result then adjust sp
-                // This replaces the referenced values with the computed result
-                try self.printLine("{{ const _tmp = {s}; sp -= {d}; stack[sp] = _tmp; sp += 1; }}", .{ expr, ref_count });
+                if (is_storage_ref) {
+                    try self.printLine("{{ const _vf = {s}; sp -= {d}; stack[sp] = if (_vf.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _vf.toJSValueWithCtx(ctx))) else _vf; sp += 1; }}", .{ expr, ref_count });
+                } else {
+                    try self.printLine("{{ const _tmp = {s}; sp -= {d}; stack[sp] = _tmp; sp += 1; }}", .{ expr, ref_count });
+                }
             } else {
-                try self.printLine("stack[sp] = {s}; sp += 1;", .{expr});
+                if (is_storage_ref) {
+                    try self.printLine("{{ const _vf = {s}; stack[sp] = if (_vf.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _vf.toJSValueWithCtx(ctx))) else _vf; sp += 1; }}", .{expr});
+                } else {
+                    try self.printLine("stack[sp] = {s}; sp += 1;", .{expr});
+                }
             }
             if (self.isAllocated(expr)) self.allocator.free(expr);
         }
@@ -2007,10 +2019,21 @@ pub const RelooperCodeGen = struct {
                 // Flush non-stable expression to real stack
                 _ = self.vstack.orderedRemove(i);
                 const ref_count = self.countStackRefs(expr);
+                // Dup storage references for independent ownership (see flushVstack)
+                const is_storage_ref = std.mem.startsWith(u8, expr, "locals[") or
+                    std.mem.startsWith(u8, expr, "stack[");
                 if (ref_count > 0) {
-                    try self.printLine("{{ const _tmp = {s}; sp -= {d}; stack[sp] = _tmp; sp += 1; }}", .{ expr, ref_count });
+                    if (is_storage_ref) {
+                        try self.printLine("{{ const _vf = {s}; sp -= {d}; stack[sp] = if (_vf.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _vf.toJSValueWithCtx(ctx))) else _vf; sp += 1; }}", .{ expr, ref_count });
+                    } else {
+                        try self.printLine("{{ const _tmp = {s}; sp -= {d}; stack[sp] = _tmp; sp += 1; }}", .{ expr, ref_count });
+                    }
                 } else {
-                    try self.printLine("stack[sp] = {s}; sp += 1;", .{expr});
+                    if (is_storage_ref) {
+                        try self.printLine("{{ const _vf = {s}; stack[sp] = if (_vf.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _vf.toJSValueWithCtx(ctx))) else _vf; sp += 1; }}", .{expr});
+                    } else {
+                        try self.printLine("stack[sp] = {s}; sp += 1;", .{expr});
+                    }
                 }
                 if (self.isAllocated(expr)) self.allocator.free(expr);
                 // Don't increment i - next item shifted into current position
