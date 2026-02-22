@@ -90,6 +90,17 @@ comptime {
     _ = &native_dispatch.frozen_dispatch_check_and_reset;
 }
 
+// Call profiling for PGO (Profile-Guided Optimization)
+const call_profile = if (is_wasm32) null else @import("freeze/call_profile.zig");
+comptime {
+    if (!is_wasm32) {
+        // Force link C-callable profile symbols so QuickJS patch can call them
+        _ = &call_profile.?.edgebox_call_profile_enabled;
+        _ = &call_profile.?.edgebox_call_profile_increment;
+        _ = &call_profile.?.edgebox_call_profile_flush;
+    }
+}
+
 // Zig hot paths (optional)
 const zig_hotpaths = @import("zig_hotpaths");
 comptime {
@@ -502,6 +513,9 @@ pub fn main() !void {
     // Register native polyfills
     registerPolyfills(ctx);
 
+    // Intercept --profile-out=<path> before forwarding args to JS
+    var profile_out_path: ?[*:0]const u8 = null;
+
     // Set process.argv from command-line arguments
     {
         const args = std.process.argsAlloc(allocator) catch &[_][:0]const u8{};
@@ -513,19 +527,32 @@ pub fn main() !void {
         if (args.len > 1 and std.mem.eql(u8, args[1], "--")) {
             script_args_start = 2; // Skip the "--"
         }
-        if (args.len > script_args_start) {
-            process_polyfill.setArgv(ctx, exe_path, args[script_args_start..]);
-        } else {
-            process_polyfill.setArgv(ctx, exe_path, &[_][:0]const u8{});
+
+        // Check for --profile-out= and filter it from args passed to JS
+        var filtered_args = std.ArrayListUnmanaged([:0]const u8){};
+        defer filtered_args.deinit(allocator);
+        const forward_slice = if (args.len > script_args_start) args[script_args_start..] else &[_][:0]const u8{};
+        for (forward_slice) |arg| {
+            if (std.mem.startsWith(u8, arg, "--profile-out=")) {
+                const path_slice = arg["--profile-out=".len..];
+                profile_out_path = (allocator.dupeZ(u8, path_slice) catch null);
+                if (call_profile) |cp| {
+                    cp.enable();
+                    std.debug.print("[profile] Call profiling enabled, will write to {s}\n", .{path_slice});
+                }
+            } else {
+                filtered_args.append(allocator, arg) catch {};
+            }
         }
+
+        process_polyfill.setArgv(ctx, exe_path, filtered_args.items);
 
         // Set scriptArgs for QuickJS std module compatibility
         const global = qjs.JS_GetGlobalObject(ctx);
         defer qjs.JS_FreeValue(ctx, global);
 
         const script_args_array = qjs.JS_NewArray(ctx);
-        const script_args_slice = if (args.len > script_args_start) args[script_args_start..] else &[_][:0]const u8{};
-        for (script_args_slice, 0..) |arg, i| {
+        for (filtered_args.items, 0..) |arg, i| {
             _ = qjs.JS_SetPropertyUint32(ctx, script_args_array, @intCast(i), qjs.JS_NewString(ctx, arg.ptr));
         }
         _ = qjs.JS_SetPropertyStr(ctx, global, "scriptArgs", script_args_array);
@@ -544,6 +571,11 @@ pub fn main() !void {
 
     // Register frozen functions BEFORE executing bytecode
     _ = frozen_module.frozen_init_c(@ptrCast(ctx));
+
+    // Set up profile dump target so process.exit() can flush the profile
+    if (profile_out_path) |path| {
+        if (call_profile) |cp| cp.setDumpTarget(@ptrCast(ctx), path);
+    }
 
     // Set __frozen_init_complete flag
     {
@@ -583,6 +615,11 @@ pub fn main() !void {
     // Print profiling stats
     const zig_runtime = @import("zig_runtime");
     if (zig_runtime.PROFILE) zig_runtime.printProfile();
+
+    // Dump call profile before any exit path
+    if (profile_out_path) |path| {
+        if (call_profile) |cp| cp.dump(@ptrCast(ctx), path);
+    }
 
     if (qjs.JS_IsException(result)) {
         printException(ctx);
