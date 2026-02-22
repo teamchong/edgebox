@@ -1467,6 +1467,16 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                 total_size += shard.len;
             }
 
+            // Clean up stale shard files from previous runs
+            {
+                var stale_buf: [4096]u8 = undefined;
+                var stale_idx = sharded.shards.len;
+                while (true) : (stale_idx += 1) {
+                    const stale_path = std.fmt.bufPrint(&stale_buf, "{s}/frozen_shard_{d}.zig", .{ cache_dir, stale_idx }) catch break;
+                    std.fs.cwd().deleteFile(stale_path) catch break;
+                }
+            }
+
             // Write main file
             var zig_path_buf: [4096]u8 = undefined;
             const zig_path = std.fmt.bufPrint(&zig_path_buf, "{s}/frozen_module.zig", .{cache_dir}) catch "zig-out/cache/frozen_module.zig";

@@ -43,7 +43,7 @@ index ae01300..587c949 100644
  }
  
 diff --git a/quickjs.c b/quickjs.c
-index 62f4381..3a64c7a 100644
+index 62f4381..321e7dc 100644
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -29,6 +29,10 @@
@@ -277,7 +277,7 @@ index 62f4381..3a64c7a 100644
  #define GLOBAL_VAR_OFFSET 0x40000000
  #define ARGUMENT_VAR_OFFSET 0x20000000
  
-@@ -15598,6 +15704,1063 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
+@@ -15598,6 +15704,1056 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
      return 0;
  }
  
@@ -434,9 +434,9 @@ index 62f4381..3a64c7a 100644
 +
 +void js_frozen_try_call_stats(void)
 +{
-+    fprintf(stderr, "[try_call] hits=%llu miss_not_obj=%llu miss_not_bc=%llu miss_no_impl=%llu miss_sentinel=%llu\n",
-+            try_call_hits, try_call_miss_not_obj, try_call_miss_not_bc,
-+            try_call_miss_no_impl, try_call_miss_sentinel);
++    fprintf(stderr, "[try_call] hits=%lu miss_not_obj=%lu miss_not_bc=%lu miss_no_impl=%lu miss_sentinel=%lu\n",
++            (unsigned long)try_call_hits, (unsigned long)try_call_miss_not_obj, (unsigned long)try_call_miss_not_bc,
++            (unsigned long)try_call_miss_no_impl, (unsigned long)try_call_miss_sentinel);
 +}
 +
 +/* Dump struct offsets for Zig-side direct access (zero FFI fast path) */
@@ -910,13 +910,6 @@ index 62f4381..3a64c7a 100644
 +                } else {
 +                    /* var_idx >= num_locals: out of bounds for locals array.
 +                     * Fall back to detached var_ref with undefined value. */
-+                    {
-+                        char parent_name[64], child_cv_name[64];
-+                        JS_AtomGetStr(ctx, parent_name, sizeof(parent_name), b->func_name);
-+                        JS_AtomGetStr(ctx, child_cv_name, sizeof(child_cv_name), cv->var_name);
-+                        fprintf(stderr, "[CLOSURE] OOB local capture: child='%s' cv[%d]='%s' var_idx=%d >= num_locals=%d (is_arg=%d)\n",
-+                                parent_name, i, child_cv_name, cv->var_idx, num_locals, cv->is_arg);
-+                    }
 +                    var_ref = js_malloc(ctx, sizeof(JSVarRef));
 +                    if (!var_ref)
 +                        goto fail_v2;
@@ -1341,7 +1334,7 @@ index 62f4381..3a64c7a 100644
  static JSValue JS_IteratorGetCompleteValue(JSContext *ctx, JSValue obj,
                                             int *pdone)
  {
-@@ -15853,7 +17016,7 @@ static __exception int JS_CopyDataProperties(JSContext *ctx,
+@@ -15853,7 +17009,7 @@ static __exception int JS_CopyDataProperties(JSContext *ctx,
  }
  
  /* only valid inside C functions */
@@ -1350,7 +1343,7 @@ index 62f4381..3a64c7a 100644
  {
      return ctx->rt->current_stack_frame->cur_func;
  }
-@@ -15955,15 +17118,16 @@ static const uint16_t func_kind_to_class_id[] = {
+@@ -15955,15 +17111,16 @@ static const uint16_t func_kind_to_class_id[] = {
      [JS_FUNC_ASYNC_GENERATOR] = JS_CLASS_ASYNC_GENERATOR_FUNCTION,
  };
  
@@ -1370,7 +1363,7 @@ index 62f4381..3a64c7a 100644
      func_obj = JS_NewObjectClass(ctx, func_kind_to_class_id[b->func_kind]);
      if (JS_IsException(func_obj)) {
          JS_FreeValue(ctx, bfunc);
-@@ -16383,6 +17547,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16383,6 +17540,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  
      if (js_poll_interrupts(caller_ctx))
          return JS_EXCEPTION;
@@ -1378,7 +1371,7 @@ index 62f4381..3a64c7a 100644
      if (unlikely(JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT)) {
          if (flags & JS_CALL_FLAG_GENERATOR) {
              JSAsyncFunctionState *s = JS_VALUE_GET_PTR(func_obj);
-@@ -16422,6 +17587,66 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16422,6 +17580,66 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
      }
      b = p->u.func.function_bytecode;
  
@@ -1445,7 +1438,7 @@ index 62f4381..3a64c7a 100644
      if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
          arg_allocated_size = b->arg_count;
      } else {
-@@ -16781,7 +18006,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16781,7 +17999,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  
          CASE(OP_fclosure):
              {
@@ -1455,18 +1448,38 @@ index 62f4381..3a64c7a 100644
                  pc += 4;
                  *sp++ = js_closure(ctx, bfunc, var_refs, sf);
                  if (unlikely(JS_IsException(sp[-1])))
-@@ -17265,7 +18491,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
-         CASE(OP_set_arg1): set_value(ctx, &arg_buf[1], js_dup(sp[-1])); BREAK;
-         CASE(OP_set_arg2): set_value(ctx, &arg_buf[2], js_dup(sp[-1])); BREAK;
-         CASE(OP_set_arg3): set_value(ctx, &arg_buf[3], js_dup(sp[-1])); BREAK;
--        CASE(OP_get_var_ref0): *sp++ = js_dup(*var_refs[0]->pvalue); BREAK;
-+        CASE(OP_get_var_ref0):
-+            *sp++ = js_dup(*var_refs[0]->pvalue);
-+            BREAK;
-         CASE(OP_get_var_ref1): *sp++ = js_dup(*var_refs[1]->pvalue); BREAK;
-         CASE(OP_get_var_ref2): *sp++ = js_dup(*var_refs[2]->pvalue); BREAK;
-         CASE(OP_get_var_ref3): *sp++ = js_dup(*var_refs[3]->pvalue); BREAK;
-@@ -17281,11 +18509,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16803,6 +18022,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+             has_call_argc:
+                 call_argv = sp - call_argc;
+                 sf->cur_pc = pc;
++                if (JS_IsUndefined(call_argv[-1]) && b->line_num == 110351) {
++                    fprintf(stderr, "[interp_debug] OP_call: func UNDEFINED in line=110351 argc=%d cvar=%d opcode=%d\n",
++                            call_argc, b->closure_var_count, opcode);
++                    fprintf(stderr, "[interp_debug]   sp=%d stack_base=%d\n",
++                            (int)(sp - stack_buf), (int)(stack_buf - var_buf));
++                    for (int vi = 0; vi < (int)b->closure_var_count && var_refs && vi < 5; vi++) {
++                        if (var_refs[vi]) {
++                            fprintf(stderr, "[interp_debug]   vr[%d]: tag=%d is_detached=%d\n",
++                                    vi, JS_VALUE_GET_TAG(*var_refs[vi]->pvalue), var_refs[vi]->is_detached);
++                        }
++                    }
++                }
+                 ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
+                                           JS_UNDEFINED, call_argc,
+                                           vc(call_argv), 0);
+@@ -16840,6 +18071,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                 pc += 2;
+                 call_argv = sp - call_argc;
+                 sf->cur_pc = pc;
++                if (JS_IsUndefined(call_argv[-1]) && b->line_num == 110351) {
++                    fprintf(stderr, "[interp_debug] OP_call_method: func UNDEFINED in line=110351 argc=%d cvar=%d\n",
++                            call_argc, b->closure_var_count);
++                    fprintf(stderr, "[interp_debug]   this_obj tag=%d\n", JS_VALUE_GET_TAG(call_argv[-2]));
++                }
+                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
+                                           JS_UNDEFINED, call_argc,
+                                           vc(call_argv), 0);
+@@ -17281,11 +18517,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          CASE(OP_get_var_ref):
              {
                  int idx;
@@ -1479,7 +1492,7 @@ index 62f4381..3a64c7a 100644
                  sp++;
              }
              BREAK;
-@@ -29006,7 +30232,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
+@@ -29006,7 +30240,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
      return promise;
  }
  
@@ -1488,7 +1501,7 @@ index 62f4381..3a64c7a 100644
                                       int argc, JSValueConst *argv)
  {
      JSValueConst *resolving_funcs = argv;
-@@ -29041,7 +30267,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
+@@ -29041,7 +30275,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
      return JS_UNDEFINED;
  }
  
@@ -1497,7 +1510,7 @@ index 62f4381..3a64c7a 100644
  {
      JSAtom basename;
      JSValue promise, resolving_funcs[2], basename_val;
-@@ -33979,6 +35205,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+@@ -33979,6 +35213,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
      b->has_prototype = fd->has_prototype;
      b->has_simple_parameter_list = fd->has_simple_parameter_list;
      b->is_strict_mode = fd->is_strict_mode;
@@ -1505,7 +1518,7 @@ index 62f4381..3a64c7a 100644
      b->is_derived_class_constructor = fd->is_derived_class_constructor;
      b->func_kind = fd->func_kind;
      b->need_home_object = (fd->home_object_var_idx >= 0 ||
-@@ -35616,6 +36843,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+@@ -35616,6 +36851,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
      assert(idx <= 16);
      bc_put_u16(s, flags);
      bc_put_u8(s, b->is_strict_mode);
@@ -1513,7 +1526,7 @@ index 62f4381..3a64c7a 100644
      bc_put_atom(s, b->func_name);
  
      bc_put_leb128(s, b->arg_count);
-@@ -36552,6 +37780,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -36552,6 +37788,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
      if (bc_get_u8(s, &v8))
          goto fail;
      bc.is_strict_mode = (v8 > 0);
@@ -1658,3 +1671,4 @@ index 3165256..4892a17 100644
 +
  #undef JS_EXTERN
  #undef js_force_inline
+ 

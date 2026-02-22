@@ -619,6 +619,7 @@ pub const ZigCodeGen = struct {
         // Check for exception
         try self.writeLine("if (_result.isException()) {");
         self.pushIndent();
+        try self.writeLine("@branchHint(.cold);");
         try self.emitLocalsCleanup();
         if (self.dispatch_mode) {
             try self.writeLine("return .{ .return_value = _result };");
@@ -824,6 +825,7 @@ pub const ZigCodeGen = struct {
     fn emitInlineExceptionReturn(self: *Self, condition_var: []const u8) !void {
         try self.printLine("if ({s}.isException()) {{", .{condition_var});
         self.pushIndent();
+        try self.writeLine("@branchHint(.cold);");
         try self.emitReturnException();
         self.popIndent();
         try self.writeLine("}");

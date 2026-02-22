@@ -22,6 +22,7 @@ const cfg_builder = @import("cfg_builder.zig");
 const zig_hotpath_codegen = @import("zig_hotpath_codegen.zig");
 const zig_codegen_full = @import("zig_codegen_full.zig");
 const zig_codegen_relooper = @import("zig_codegen_relooper.zig");
+const zig_codegen_thin = @import("zig_codegen_thin.zig");
 
 const JSValue = jsvalue.JSValue;
 const JSContext = jsvalue.JSContext;
@@ -702,6 +703,60 @@ fn generateFrozenZigGeneral(
     return @constCast(zig_code);
 }
 
+/// Generate thin-tier Zig code for a cold function.
+/// Uses ThinCodeGen: one-line-per-opcode, no vstack, minimal code size.
+/// Returns null if function cannot be frozen (killer opcodes, CFG issues).
+fn generateFrozenZigThin(
+    allocator: Allocator,
+    func: AnalyzedFunction,
+    func_index: usize,
+) !?[]u8 {
+    // Same fast-fail as full codegen
+    if (hasKillerOpcodes(func.instructions, func.is_self_recursive)) return null;
+
+    // Build CFG
+    var cfg = cfg_builder.buildCFG(allocator, func.instructions) catch |err| {
+        if (err == error.StackDepthConflict) return null;
+        return err;
+    };
+    defer cfg.deinit();
+
+    cfg_builder.analyzeContamination(&cfg);
+    const counts = cfg_builder.countBlocks(&cfg);
+    if (counts.clean == 0) return null;
+    if (counts.contaminated > 0) return null; // No partial freeze in thin tier
+
+    // Analyze closure variables
+    var closure_usage = try cfg_builder.analyzeClosureVars(allocator, func.instructions);
+    defer closure_usage.deinit(allocator);
+
+    // Build indexed name
+    var sanitized_buf: [256]u8 = undefined;
+    const sanitized_name = sanitizeName(func.name, &sanitized_buf);
+    var name_buf: [256]u8 = undefined;
+    const indexed_name = std.fmt.bufPrint(&name_buf, "{d}_{s}", .{ func_index, sanitized_name }) catch func.name;
+
+    return zig_codegen_thin.generateThin(allocator, .{
+        .name = indexed_name,
+        .arg_count = @intCast(func.arg_count),
+        .var_count = @intCast(func.var_count),
+        .cfg = &cfg,
+        .is_self_recursive = func.is_self_recursive,
+        .self_ref_var_idx = func.self_ref_var_idx,
+        .closure_var_indices = closure_usage.all_indices,
+        .closure_var_count = @intCast(func.closure_vars.len),
+        .atom_strings = func.atom_strings,
+        .has_use_strict = func.has_use_strict,
+        .is_async = func.func_kind >= 2,
+        .constants = func.constants,
+        .stack_size = func.stack_size,
+        .captured_local_indices = func.captured_local_indices,
+    }) catch |err| {
+        std.debug.print("[freeze] Thin codegen error for '{s}': {}\n", .{ func.name, err });
+        return null;
+    };
+}
+
 /// Sharded output for parallel compilation
 pub const ShardedOutput = struct {
     /// Main file that imports all shards and has init function
@@ -812,14 +867,35 @@ pub fn generateModuleZigSharded(
             }.lessThan);
         }
 
-        // Free discarded functions' code
-        for (generated_all.items[max_functions..]) |gf| {
+        // Tiered freeze: top N keep full codegen, remaining get thin codegen
+        var thin_count: usize = 0;
+        var thin_failed: usize = 0;
+        for (generated_all.items[max_functions..]) |*gf| {
             allocator.free(gf.code);
+            if (generateFrozenZigThin(allocator, gf.func, gf.idx) catch null) |thin_code| {
+                gf.code = thin_code;
+                thin_count += 1;
+            } else {
+                gf.code = &.{};
+                thin_failed += 1;
+            }
         }
-        generated_all.items.len = max_functions;
-        std.debug.print("[freeze] Selective: keeping {d}, discarding {d} functions\n", .{
+        // Remove entries with empty code (failed thin codegen)
+        if (thin_failed > 0) {
+            var write_idx: usize = 0;
+            for (generated_all.items) |gf| {
+                if (gf.code.len > 0) {
+                    generated_all.items[write_idx] = gf;
+                    write_idx += 1;
+                }
+            }
+            generated_all.items.len = write_idx;
+        }
+        std.debug.print("[freeze] Tiered: {d} full + {d} thin ({d} thin-failed) of {d} total\n", .{
             max_functions,
-            total_before - max_functions,
+            thin_count,
+            thin_failed,
+            total_before,
         });
     }
 

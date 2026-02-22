@@ -1351,6 +1351,7 @@ pub const RelooperCodeGen = struct {
                 try self.writeLine("const _result = JSValue.call(ctx, _func, _this_arg, @intCast(_argc), &_args);");
                 try self.writeLine("if (_result.isException()) {");
                 self.pushIndent();
+                try self.writeLine("@branchHint(.cold);");
                 try self.emitExceptionReturn();
                 self.popIndent();
                 try self.writeLine("}");
@@ -1538,6 +1539,7 @@ pub const RelooperCodeGen = struct {
                 try self.printLine("sp -= {d};", .{argc + 2});
                 try self.writeLine("if (_result.isException()) {");
                 self.pushIndent();
+                try self.writeLine("@branchHint(.cold);");
                 try self.emitExceptionReturn();
                 self.popIndent();
                 try self.writeLine("}");
@@ -1831,6 +1833,7 @@ pub const RelooperCodeGen = struct {
         // Check for exception and propagate it
         try self.writeLine("if (_result.isException()) {");
         self.pushIndent();
+        try self.writeLine("@branchHint(.cold);");
         try self.emitExceptionReturn();
         self.popIndent();
         try self.writeLine("}");
@@ -1874,6 +1877,7 @@ pub const RelooperCodeGen = struct {
         // Check for exception and propagate it
         try self.writeLine("if (_result.isException()) {");
         self.pushIndent();
+        try self.writeLine("@branchHint(.cold);");
         try self.emitExceptionReturn();
         self.popIndent();
         try self.writeLine("}");

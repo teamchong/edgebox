@@ -535,3 +535,535 @@ pub noinline fn cleanupLocals(ctx: *JSContext, locals_ptr: [*]CompressedValue, c
     }
 }
 
+// ============================================================================
+// Thin Codegen Helpers: Stack-Direct Operations for Cold Functions
+// ============================================================================
+//
+// These helpers operate directly on a [*]CV stack + *usize sp pointer.
+// Used by ThinCodeGen for the "cold" tier — one call per opcode, no vstack.
+//
+// Design:
+//   - `inline` helpers: simple ops (2-10 machine instructions, no JS FFI)
+//     → compiler inlines them, so no actual call overhead
+//   - `noinline` helpers: complex ops at JS FFI boundary (call, get_field, etc.)
+//     → kept out-of-line to minimize code size per frozen function
+
+pub const thin = struct {
+    // Uses module-level CV (= CompressedValue) alias — no redeclaration needed
+
+    // ================================================================
+    // Inline Helpers — Constants
+    // ================================================================
+
+    pub inline fn push_i32(stack: [*]CV, sp: *usize, val: i32) void {
+        stack[sp.*] = CV.newInt(val);
+        sp.* += 1;
+    }
+
+    pub inline fn push_true(stack: [*]CV, sp: *usize) void {
+        stack[sp.*] = CV.TRUE;
+        sp.* += 1;
+    }
+
+    pub inline fn push_false(stack: [*]CV, sp: *usize) void {
+        stack[sp.*] = CV.FALSE;
+        sp.* += 1;
+    }
+
+    pub inline fn push_null(stack: [*]CV, sp: *usize) void {
+        stack[sp.*] = CV.NULL;
+        sp.* += 1;
+    }
+
+    pub inline fn push_undefined(stack: [*]CV, sp: *usize) void {
+        stack[sp.*] = CV.UNDEFINED;
+        sp.* += 1;
+    }
+
+    pub inline fn push_cv(stack: [*]CV, sp: *usize, val: CV) void {
+        stack[sp.*] = val;
+        sp.* += 1;
+    }
+
+    // ================================================================
+    // Inline Helpers — Local Variable Access
+    // ================================================================
+
+    /// get_loc: push a copy of local onto stack (dup ref-types for ownership)
+    pub inline fn get_loc(_: *JSContext, stack: [*]CV, sp: *usize, locals: [*]CV, idx: u32) void {
+        const v = locals[idx];
+        stack[sp.*] = CV.dupRef(v);
+        sp.* += 1;
+    }
+
+    /// put_loc: transfer ownership from stack → local, free old local
+    pub inline fn put_loc(ctx: *JSContext, stack: [*]CV, sp: *usize, locals: [*]CV, idx: u32) void {
+        sp.* -= 1;
+        const old = locals[idx];
+        locals[idx] = stack[sp.*];
+        CV.freeRef(ctx, old);
+    }
+
+    /// set_loc: copy stack top → local (keep value on stack), free old local
+    pub inline fn set_loc(ctx: *JSContext, stack: [*]CV, sp: *usize, locals: [*]CV, idx: u32) void {
+        const v = stack[sp.* - 1];
+        const old = locals[idx];
+        locals[idx] = CV.dupRef(v);
+        CV.freeRef(ctx, old);
+    }
+
+    // ================================================================
+    // Inline Helpers — Argument Access
+    // ================================================================
+
+    /// get_arg: push argument value from argv (with dup for ownership)
+    pub inline fn get_arg(ctx: *JSContext, stack: [*]CV, sp: *usize, argc: c_int, argv: [*]JSValue, idx: u32) void {
+        stack[sp.*] = CV.fromJSValue(if (idx < argc) JSValue.dup(ctx, argv[idx]) else JSValue.UNDEFINED);
+        sp.* += 1;
+    }
+
+    /// get_arg from arg_shadow (when function modifies arguments)
+    pub inline fn get_arg_shadow(stack: [*]CV, sp: *usize, arg_shadow: [*]CV, idx: u32) void {
+        stack[sp.*] = CV.dupRef(arg_shadow[idx]);
+        sp.* += 1;
+    }
+
+    /// put_arg: transfer ownership from stack → arg_shadow
+    pub inline fn put_arg(ctx: *JSContext, stack: [*]CV, sp: *usize, arg_shadow: [*]CV, idx: u32) void {
+        sp.* -= 1;
+        const old = arg_shadow[idx];
+        arg_shadow[idx] = stack[sp.*];
+        CV.freeRef(ctx, old);
+    }
+
+    // ================================================================
+    // Inline Helpers — Closure Variable Access
+    // ================================================================
+
+    pub inline fn get_var_ref(ctx: *JSContext, stack: [*]CV, sp: *usize, var_refs: ?[*]*JSVarRef, idx: u32, closure_var_count: c_int) void {
+        stack[sp.*] = CV.fromJSValue(frozen_helpers.getClosureVarSafe(ctx, var_refs, idx, closure_var_count));
+        sp.* += 1;
+    }
+
+    pub inline fn put_var_ref(ctx: *JSContext, stack: [*]CV, sp: *usize, var_refs: ?[*]*JSVarRef, idx: u32, closure_var_count: c_int) void {
+        sp.* -= 1;
+        frozen_helpers.setClosureVarSafe(ctx, var_refs, idx, closure_var_count, stack[sp.*].toJSValueWithCtx(ctx));
+    }
+
+    pub inline fn set_var_ref(ctx: *JSContext, stack: [*]CV, sp: *usize, var_refs: ?[*]*JSVarRef, idx: u32, closure_var_count: c_int) void {
+        // set_var_ref: keep value on stack AND store in var_ref (dup needed)
+        frozen_helpers.setClosureVarDupSafe(ctx, var_refs, idx, closure_var_count, stack[sp.* - 1].toJSValueWithCtx(ctx));
+    }
+
+    // ================================================================
+    // Inline Helpers — Stack Operations
+    // ================================================================
+
+    pub inline fn dup_top(_: *JSContext, stack: [*]CV, sp: *usize) void {
+        const v = stack[sp.* - 1];
+        stack[sp.*] = CV.dupRef(v);
+        sp.* += 1;
+    }
+
+    pub inline fn dup1(_: *JSContext, stack: [*]CV, sp: *usize) void {
+        // [a, b] -> [a, b, a]
+        const a = stack[sp.* - 2];
+        const b = stack[sp.* - 1];
+        stack[sp.* - 1] = CV.dupRef(a);
+        stack[sp.*] = b;
+        sp.* += 1;
+    }
+
+    pub inline fn dup2(_: *JSContext, stack: [*]CV, sp: *usize) void {
+        const a = stack[sp.* - 2];
+        const b = stack[sp.* - 1];
+        stack[sp.*] = CV.dupRef(a);
+        stack[sp.* + 1] = CV.dupRef(b);
+        sp.* += 2;
+    }
+
+    pub inline fn dup3(_: *JSContext, stack: [*]CV, sp: *usize) void {
+        const a = stack[sp.* - 3];
+        const b = stack[sp.* - 2];
+        const c = stack[sp.* - 1];
+        stack[sp.*] = CV.dupRef(a);
+        stack[sp.* + 1] = CV.dupRef(b);
+        stack[sp.* + 2] = CV.dupRef(c);
+        sp.* += 3;
+    }
+
+    pub inline fn drop(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        sp.* -= 1;
+        CV.freeRef(ctx, stack[sp.*]);
+    }
+
+    pub inline fn nip(stack: [*]CV, sp: *usize) void {
+        // [a, b] -> [b]  (remove second-from-top, keep top)
+        stack[sp.* - 2] = stack[sp.* - 1];
+        sp.* -= 1;
+    }
+
+    pub inline fn swap(stack: [*]CV, sp: *usize) void {
+        const tmp = stack[sp.* - 1];
+        stack[sp.* - 1] = stack[sp.* - 2];
+        stack[sp.* - 2] = tmp;
+    }
+
+    // ================================================================
+    // Inline Helpers — Arithmetic (delegate to CV methods)
+    // ================================================================
+
+    pub inline fn op_add(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        const b = stack[sp.* - 1];
+        const a = stack[sp.* - 2];
+        stack[sp.* - 2] = CV.addWithCtx(ctx, a, b);
+        sp.* -= 1;
+    }
+
+    pub inline fn op_sub(stack: [*]CV, sp: *usize) void {
+        const b = stack[sp.* - 1];
+        const a = stack[sp.* - 2];
+        stack[sp.* - 2] = CV.sub(a, b);
+        sp.* -= 1;
+    }
+
+    pub inline fn op_mul(stack: [*]CV, sp: *usize) void {
+        const b = stack[sp.* - 1];
+        const a = stack[sp.* - 2];
+        stack[sp.* - 2] = CV.mul(a, b);
+        sp.* -= 1;
+    }
+
+    pub inline fn op_div(stack: [*]CV, sp: *usize) void {
+        const b = stack[sp.* - 1];
+        const a = stack[sp.* - 2];
+        stack[sp.* - 2] = CV.div(a, b);
+        sp.* -= 1;
+    }
+
+    pub inline fn op_mod(stack: [*]CV, sp: *usize) void {
+        const b = stack[sp.* - 1];
+        const a = stack[sp.* - 2];
+        stack[sp.* - 2] = CV.mod(a, b);
+        sp.* -= 1;
+    }
+
+    pub inline fn op_pow(stack: [*]CV, sp: *usize) void {
+        const b = stack[sp.* - 1];
+        const a = stack[sp.* - 2];
+        stack[sp.* - 2] = CV.pow(a, b);
+        sp.* -= 1;
+    }
+
+    pub inline fn op_neg(stack: [*]CV, sp: *usize) void {
+        stack[sp.* - 1] = CV.sub(CV.newInt(0), stack[sp.* - 1]);
+    }
+
+    pub inline fn op_plus(stack: [*]CV, sp: *usize) void {
+        stack[sp.* - 1] = CV.toNumber(stack[sp.* - 1]);
+    }
+
+    // ================================================================
+    // Inline Helpers — Bitwise
+    // ================================================================
+
+    pub inline fn op_band(stack: [*]CV, sp: *usize) void {
+        stack[sp.* - 2] = CV.band(stack[sp.* - 2], stack[sp.* - 1]);
+        sp.* -= 1;
+    }
+
+    pub inline fn op_bor(stack: [*]CV, sp: *usize) void {
+        stack[sp.* - 2] = CV.bor(stack[sp.* - 2], stack[sp.* - 1]);
+        sp.* -= 1;
+    }
+
+    pub inline fn op_bxor(stack: [*]CV, sp: *usize) void {
+        stack[sp.* - 2] = CV.bxor(stack[sp.* - 2], stack[sp.* - 1]);
+        sp.* -= 1;
+    }
+
+    pub inline fn op_bnot(stack: [*]CV, sp: *usize) void {
+        stack[sp.* - 1] = CV.bnot(stack[sp.* - 1]);
+    }
+
+    pub inline fn op_shl(stack: [*]CV, sp: *usize) void {
+        stack[sp.* - 2] = CV.shl(stack[sp.* - 2], stack[sp.* - 1]);
+        sp.* -= 1;
+    }
+
+    pub inline fn op_sar(stack: [*]CV, sp: *usize) void {
+        stack[sp.* - 2] = CV.sar(stack[sp.* - 2], stack[sp.* - 1]);
+        sp.* -= 1;
+    }
+
+    pub inline fn op_shr(stack: [*]CV, sp: *usize) void {
+        stack[sp.* - 2] = CV.ushr(stack[sp.* - 2], stack[sp.* - 1]);
+        sp.* -= 1;
+    }
+
+    // ================================================================
+    // Inline Helpers — Comparison
+    // ================================================================
+
+    pub inline fn op_lt(stack: [*]CV, sp: *usize) void {
+        stack[sp.* - 2] = CV.lt(stack[sp.* - 2], stack[sp.* - 1]);
+        sp.* -= 1;
+    }
+
+    pub inline fn op_lte(stack: [*]CV, sp: *usize) void {
+        stack[sp.* - 2] = CV.lte(stack[sp.* - 2], stack[sp.* - 1]);
+        sp.* -= 1;
+    }
+
+    pub inline fn op_gt(stack: [*]CV, sp: *usize) void {
+        stack[sp.* - 2] = CV.gt(stack[sp.* - 2], stack[sp.* - 1]);
+        sp.* -= 1;
+    }
+
+    pub inline fn op_gte(stack: [*]CV, sp: *usize) void {
+        stack[sp.* - 2] = CV.gte(stack[sp.* - 2], stack[sp.* - 1]);
+        sp.* -= 1;
+    }
+
+    pub inline fn op_eq(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        stack[sp.* - 2] = CV.eqWithCtx(ctx, stack[sp.* - 2], stack[sp.* - 1]);
+        sp.* -= 1;
+    }
+
+    pub inline fn op_neq(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        stack[sp.* - 2] = CV.neqWithCtx(ctx, stack[sp.* - 2], stack[sp.* - 1]);
+        sp.* -= 1;
+    }
+
+    pub inline fn op_strict_eq(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        stack[sp.* - 2] = strictEqWithCtx(ctx, stack[sp.* - 2], stack[sp.* - 1]);
+        sp.* -= 1;
+    }
+
+    pub inline fn op_strict_neq(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        stack[sp.* - 2] = strictNeqWithCtx(ctx, stack[sp.* - 2], stack[sp.* - 1]);
+        sp.* -= 1;
+    }
+
+    // ================================================================
+    // Inline Helpers — Logical / Type
+    // ================================================================
+
+    pub inline fn op_lnot(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        const v = stack[sp.* - 1];
+        stack[sp.* - 1] = if (v.toBoolWithCtx(ctx)) CV.FALSE else CV.TRUE;
+        CV.freeRef(ctx, v); // free old value (may be ref-type object/string)
+    }
+
+    pub inline fn op_typeof(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        const v = stack[sp.* - 1];
+        stack[sp.* - 1] = CV.fromJSValue(JSValue.typeOf(ctx, v.toJSValueWithCtx(ctx)));
+        CV.freeRef(ctx, v); // free old value (typeof consumes it)
+    }
+
+    // ================================================================
+    // Inline Helpers — Increment/Decrement Locals
+    // ================================================================
+
+    pub inline fn inc_loc(locals: [*]CV, idx: u32) void {
+        locals[idx] = CV.add(locals[idx], CV.newInt(1));
+    }
+
+    pub inline fn dec_loc(locals: [*]CV, idx: u32) void {
+        locals[idx] = CV.sub(locals[idx], CV.newInt(1));
+    }
+
+    // ================================================================
+    // Noinline Helpers — Function Calls (JS FFI boundary)
+    // ================================================================
+
+    /// Call a function: stack has [func, arg0, arg1, ...argN-1] → [result]
+    /// Handles closure sync TO/FROM internally.
+    pub noinline fn op_call(
+        ctx: *JSContext,
+        stack: [*]CV,
+        sp: *usize,
+        argc: u16,
+        locals: ?[*]CV,
+        locals_jsv: ?[*]JSValue,
+        var_count: usize,
+        closure_alive: ?*bool,
+        captured_indices: []const u16,
+    ) GetFieldError!void {
+        // Get function from stack
+        const fn_val = stack[sp.* - argc - 1].toJSValueWithCtx(ctx);
+
+        if (argc > 0) {
+            // Build args from stack
+            var args: [256]JSValue = undefined;
+            const n: usize = @intCast(argc);
+            for (0..n) |i| {
+                args[i] = CV.toJSValuePtr(&stack[sp.* - n + i]);
+            }
+            // Sync locals TO _locals_jsv before call (noop if no closures)
+            syncLocalsTo(locals, locals_jsv, var_count);
+            const result = JSValue.call(ctx, fn_val, JSValue.UNDEFINED, @intCast(argc), @ptrCast(&args));
+            if (result.isException()) return error.JsException;
+            // Pop func + args, push result
+            sp.* -= @as(usize, argc) + 1;
+            stack[sp.*] = CV.fromJSValue(result);
+            sp.* += 1;
+        } else {
+            syncLocalsTo(locals, locals_jsv, var_count);
+            const result = JSValue.call(ctx, fn_val, JSValue.UNDEFINED, 0, @as([*]JSValue, @ptrCast(@constCast(&[0]JSValue{}))));
+            if (result.isException()) return error.JsException;
+            sp.* -= 1; // pop func
+            stack[sp.*] = CV.fromJSValue(result);
+            sp.* += 1;
+        }
+        // Sync closure variables back
+        syncLocalsFrom(locals, locals_jsv, var_count, closure_alive, captured_indices);
+    }
+
+    /// Call a method: stack has [obj, method, arg0, ...argN-1] → [result]
+    pub noinline fn op_call_method(
+        ctx: *JSContext,
+        stack: [*]CV,
+        sp: *usize,
+        argc: u16,
+        locals: ?[*]CV,
+        locals_jsv: ?[*]JSValue,
+        var_count: usize,
+        closure_alive: ?*bool,
+        captured_indices: []const u16,
+    ) GetFieldError!void {
+        const obj = stack[sp.* - argc - 2].toJSValueWithCtx(ctx);
+        const method = stack[sp.* - argc - 1].toJSValueWithCtx(ctx);
+
+        if (argc > 0) {
+            var args: [256]JSValue = undefined;
+            const n: usize = @intCast(argc);
+            for (0..n) |i| {
+                args[i] = CV.toJSValuePtr(&stack[sp.* - n + i]);
+            }
+            syncLocalsTo(locals, locals_jsv, var_count);
+            const result = JSValue.call(ctx, method, obj, @intCast(argc), @ptrCast(&args));
+            if (result.isException()) return error.JsException;
+            sp.* -= @as(usize, argc) + 2;
+            stack[sp.*] = CV.fromJSValue(result);
+            sp.* += 1;
+        } else {
+            syncLocalsTo(locals, locals_jsv, var_count);
+            const result = JSValue.call(ctx, method, obj, 0, @as([*]JSValue, @ptrCast(@constCast(&[0]JSValue{}))));
+            if (result.isException()) return error.JsException;
+            sp.* -= 2;
+            stack[sp.*] = CV.fromJSValue(result);
+            sp.* += 1;
+        }
+        syncLocalsFrom(locals, locals_jsv, var_count, closure_alive, captured_indices);
+    }
+
+    /// IC-accelerated property load: pop obj, push property value
+    pub noinline fn op_get_field_ic(ctx: *JSContext, stack: [*]CV, sp: *usize, ic: *ICSlot, name: [*:0]const u8) GetFieldError!void {
+        const obj = stack[sp.* - 1].toJSValueWithCtx(ctx);
+        const result = icLoad(ctx, obj, ic, name) catch return error.JsException;
+        CV.freeRef(ctx, stack[sp.* - 1]);
+        stack[sp.* - 1] = CV.fromJSValue(result);
+    }
+
+    /// get_field2: pop obj, push obj AND method (for call_method)
+    pub noinline fn op_get_field2_ic(ctx: *JSContext, stack: [*]CV, sp: *usize, ic: *ICSlot, name: [*:0]const u8) GetFieldError!void {
+        const obj = stack[sp.* - 1].toJSValueWithCtx(ctx);
+        const result = icLoad(ctx, obj, ic, name) catch return error.JsException;
+        // obj stays at sp-1, method goes at sp
+        stack[sp.*] = CV.fromJSValue(result);
+        sp.* += 1;
+    }
+
+    /// Put property by name: stack has [obj, value] → [] (pops both)
+    pub noinline fn op_put_field(ctx: *JSContext, stack: [*]CV, sp: *usize, name: [*:0]const u8) GetFieldError!void {
+        const val = stack[sp.* - 1].toJSValueWithCtx(ctx);
+        const obj = stack[sp.* - 2].toJSValueWithCtx(ctx);
+        const rc = quickjs.JS_SetPropertyStr(ctx, obj, name, val);
+        CV.freeRef(ctx, stack[sp.* - 2]); // free obj
+        sp.* -= 2;
+        if (rc < 0) return error.JsException;
+    }
+
+    /// Get global variable by name
+    pub noinline fn op_get_var(ctx: *JSContext, stack: [*]CV, sp: *usize, name: [*:0]const u8) GetFieldError!void {
+        const global = quickjs.JS_GetGlobalObject(ctx);
+        const result = quickjs.JS_GetPropertyStr(ctx, global, name);
+        quickjs.JS_FreeValue(ctx, global);
+        if (result.isException()) return error.JsException;
+        stack[sp.*] = CV.fromJSValue(result);
+        sp.* += 1;
+    }
+
+    // ================================================================
+    // Noinline Helper — Exception Cleanup (ONE call replaces ~40% code)
+    // ================================================================
+
+    /// Combined exception cleanup: sync closures, detach var_refs, free locals, free arg_shadow.
+    /// Returns JSValue.EXCEPTION for easy `return rt.exceptionCleanup(...)` pattern.
+    pub noinline fn exceptionCleanup(
+        ctx: *JSContext,
+        locals: [*]CV,
+        local_count: usize,
+        locals_jsv: ?[*]JSValue,
+        var_ref_list: ?*ListHead,
+        arg_shadow: ?[*]CV,
+        arg_count: usize,
+    ) JSValue {
+        // 1. Sync locals → _locals_jsv and detach var_refs (if closures active)
+        if (locals_jsv) |jsv| {
+            for (0..local_count) |i| {
+                jsv[i] = CV.toJSValuePtr(&locals[i]);
+            }
+            if (var_ref_list) |vrl| {
+                quickjs.js_frozen_var_ref_list_detach(ctx, vrl);
+            }
+        }
+        // 2. Free ref-type locals
+        cleanupLocals(ctx, locals, local_count);
+        // 3. Free arg_shadow (if function modifies arguments)
+        if (arg_shadow) |shadow| {
+            for (0..arg_count) |i| {
+                CV.freeRef(ctx, shadow[i]);
+            }
+        }
+        return JSValue.EXCEPTION;
+    }
+
+    // ================================================================
+    // Internal: Closure Sync Helpers (used by op_call/op_call_method)
+    // ================================================================
+
+    inline fn syncLocalsTo(locals: ?[*]CV, locals_jsv: ?[*]JSValue, var_count: usize) void {
+        if (locals_jsv) |jsv| {
+            if (locals) |locs| {
+                for (0..var_count) |i| {
+                    jsv[i] = CV.toJSValuePtr(&locs[i]);
+                }
+            }
+        }
+    }
+
+    inline fn syncLocalsFrom(locals: ?[*]CV, locals_jsv: ?[*]JSValue, var_count: usize, closure_alive: ?*bool, captured_indices: []const u16) void {
+        _ = var_count;
+        if (closure_alive) |alive| {
+            if (alive.*) {
+                if (locals_jsv) |jsv| {
+                    if (locals) |locs| {
+                        if (captured_indices.len > 0) {
+                            for (captured_indices) |idx| {
+                                locs[idx] = CV.fromJSValue(jsv[idx]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sync a single local to _locals_jsv after put_loc/set_loc (for closure tracking)
+    pub inline fn sync_local_jsv(locals: [*]CV, locals_jsv: [*]JSValue, idx: u32) void {
+        locals_jsv[idx] = CV.toJSValuePtr(&locals[idx]);
+    }
+};
+
