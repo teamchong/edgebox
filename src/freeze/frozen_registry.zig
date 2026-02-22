@@ -765,6 +765,10 @@ pub const ShardedOutput = struct {
     shards: [][]u8,
     /// Target size per shard in bytes
     bytes_per_shard: usize,
+    /// Shard index where thin-codegen functions start (for hybrid optimization)
+    /// Shards [0..thin_shard_start) contain full-codegen functions (use ReleaseFast)
+    /// Shards [thin_shard_start..shards.len) contain thin-codegen functions (use ReleaseSmall)
+    thin_shard_start: usize,
 
     pub fn deinit(self: *ShardedOutput, allocator: Allocator) void {
         allocator.free(self.main);
@@ -812,6 +816,9 @@ pub fn generateModuleZigSharded(
             try generated_all.append(allocator, .{ .func = func, .idx = idx, .code = zig_code });
         }
     }
+
+    // Track where thin functions start for hybrid optimization (ReleaseFast vs ReleaseSmall)
+    var thin_start_func_idx: usize = generated_all.items.len; // default: all full-codegen
 
     // Selective freezing: keep only the top N functions
     // Profile-guided: sort by call frequency if profile data available, else by code size
@@ -868,6 +875,7 @@ pub fn generateModuleZigSharded(
         }
 
         // Tiered freeze: top N keep full codegen, remaining get thin codegen
+        thin_start_func_idx = max_functions;
         var thin_count: usize = 0;
         var thin_failed: usize = 0;
         for (generated_all.items[max_functions..]) |*gf| {
@@ -971,8 +979,23 @@ pub fn generateModuleZigSharded(
     var current_shard = std.ArrayListUnmanaged(u8){};
     try current_shard.appendSlice(allocator, shard_header);
     var current_shard_idx: usize = 0;
+    var thin_shard_start: usize = 0; // set during sharding
+    var thin_boundary_hit = false;
 
-    for (generated_all.items) |gf| {
+    for (generated_all.items, 0..) |gf, func_idx| {
+        // Force shard break at full→thin boundary for hybrid optimization
+        // This ensures full-codegen shards can use ReleaseFast while thin shards use ReleaseSmall
+        if (!thin_boundary_hit and func_idx >= thin_start_func_idx) {
+            thin_boundary_hit = true;
+            if (current_shard.items.len > shard_header.len) {
+                try shard_contents.append(allocator, current_shard);
+                current_shard_idx += 1;
+                current_shard = std.ArrayListUnmanaged(u8){};
+                try current_shard.appendSlice(allocator, shard_header);
+            }
+            thin_shard_start = current_shard_idx;
+        }
+
         // Check if adding this function would exceed shard size
         // (except for the first function in a shard - always add at least one)
         if (current_shard.items.len > shard_header.len and
@@ -1007,7 +1030,17 @@ pub fn generateModuleZigSharded(
     try shard_contents.append(allocator, current_shard);
     const actual_num_shards = shard_contents.items.len;
 
-    std.debug.print("[freeze] Generated {d} functions across {d} shards\n", .{ generated_funcs.items.len, actual_num_shards });
+    // If no thin boundary was hit, all shards are full-codegen
+    if (!thin_boundary_hit) {
+        thin_shard_start = actual_num_shards;
+    }
+
+    std.debug.print("[freeze] Generated {d} functions across {d} shards ({d} full + {d} thin)\n", .{
+        generated_funcs.items.len,
+        actual_num_shards,
+        thin_shard_start,
+        actual_num_shards - thin_shard_start,
+    });
     zig_codegen_full.printUnsupportedOpcodeReport();
 
     // Count ALL function dispatch keys (name@line_num) in the module (not just frozen ones)
@@ -1212,6 +1245,7 @@ pub fn generateModuleZigSharded(
         .main = try main_output.toOwnedSlice(allocator),
         .shards = shards,
         .bytes_per_shard = bytes_per_shard,
+        .thin_shard_start = thin_shard_start,
     };
 }
 

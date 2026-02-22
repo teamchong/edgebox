@@ -43,7 +43,7 @@ index ae01300..587c949 100644
  }
  
 diff --git a/quickjs.c b/quickjs.c
-index 62f4381..321e7dc 100644
+index 62f4381..1f296a1 100644
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -29,6 +29,10 @@
@@ -277,7 +277,7 @@ index 62f4381..321e7dc 100644
  #define GLOBAL_VAR_OFFSET 0x40000000
  #define ARGUMENT_VAR_OFFSET 0x20000000
  
-@@ -15598,6 +15704,1056 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
+@@ -15598,6 +15704,1058 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
      return 0;
  }
  
@@ -1242,8 +1242,10 @@ index 62f4381..321e7dc 100644
 +    if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
 +        JSObject *p = JS_VALUE_GET_OBJ(obj);
 +
-+        /* Fast path: shape matches cache → direct property read */
-+        if (likely(p->shape == (JSShape *)*ic_shape)) {
++        /* Fast path: shape matches cache → direct property read.
++         * Guard against NULL: when IC was never populated, *ic_shape is NULL.
++         * An object with shape==NULL (freed/corrupted) would false-match. */
++        if (likely(*ic_shape != NULL && p->shape == (JSShape *)*ic_shape)) {
 +            return js_dup(p->prop[*ic_offset].u.value);
 +        }
 +    }
@@ -1334,7 +1336,7 @@ index 62f4381..321e7dc 100644
  static JSValue JS_IteratorGetCompleteValue(JSContext *ctx, JSValue obj,
                                             int *pdone)
  {
-@@ -15853,7 +17009,7 @@ static __exception int JS_CopyDataProperties(JSContext *ctx,
+@@ -15853,7 +17011,7 @@ static __exception int JS_CopyDataProperties(JSContext *ctx,
  }
  
  /* only valid inside C functions */
@@ -1343,7 +1345,7 @@ index 62f4381..321e7dc 100644
  {
      return ctx->rt->current_stack_frame->cur_func;
  }
-@@ -15955,15 +17111,16 @@ static const uint16_t func_kind_to_class_id[] = {
+@@ -15955,15 +17113,16 @@ static const uint16_t func_kind_to_class_id[] = {
      [JS_FUNC_ASYNC_GENERATOR] = JS_CLASS_ASYNC_GENERATOR_FUNCTION,
  };
  
@@ -1363,7 +1365,7 @@ index 62f4381..321e7dc 100644
      func_obj = JS_NewObjectClass(ctx, func_kind_to_class_id[b->func_kind]);
      if (JS_IsException(func_obj)) {
          JS_FreeValue(ctx, bfunc);
-@@ -16383,6 +17540,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16383,6 +17542,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  
      if (js_poll_interrupts(caller_ctx))
          return JS_EXCEPTION;
@@ -1371,7 +1373,7 @@ index 62f4381..321e7dc 100644
      if (unlikely(JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT)) {
          if (flags & JS_CALL_FLAG_GENERATOR) {
              JSAsyncFunctionState *s = JS_VALUE_GET_PTR(func_obj);
-@@ -16422,6 +17580,66 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16422,6 +17582,66 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
      }
      b = p->u.func.function_bytecode;
  
@@ -1438,7 +1440,7 @@ index 62f4381..321e7dc 100644
      if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
          arg_allocated_size = b->arg_count;
      } else {
-@@ -16781,7 +17999,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16781,7 +18001,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  
          CASE(OP_fclosure):
              {
@@ -1448,7 +1450,7 @@ index 62f4381..321e7dc 100644
                  pc += 4;
                  *sp++ = js_closure(ctx, bfunc, var_refs, sf);
                  if (unlikely(JS_IsException(sp[-1])))
-@@ -16803,6 +18022,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16803,6 +18024,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              has_call_argc:
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -1467,7 +1469,7 @@ index 62f4381..321e7dc 100644
                  ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                            JS_UNDEFINED, call_argc,
                                            vc(call_argv), 0);
-@@ -16840,6 +18071,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16840,6 +18073,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                  pc += 2;
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -1479,7 +1481,7 @@ index 62f4381..321e7dc 100644
                  ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
                                            JS_UNDEFINED, call_argc,
                                            vc(call_argv), 0);
-@@ -17281,11 +18517,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -17281,11 +18519,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          CASE(OP_get_var_ref):
              {
                  int idx;
@@ -1492,7 +1494,7 @@ index 62f4381..321e7dc 100644
                  sp++;
              }
              BREAK;
-@@ -29006,7 +30240,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
+@@ -29006,7 +30242,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
      return promise;
  }
  
@@ -1501,7 +1503,7 @@ index 62f4381..321e7dc 100644
                                       int argc, JSValueConst *argv)
  {
      JSValueConst *resolving_funcs = argv;
-@@ -29041,7 +30275,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
+@@ -29041,7 +30277,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
      return JS_UNDEFINED;
  }
  
@@ -1510,7 +1512,7 @@ index 62f4381..321e7dc 100644
  {
      JSAtom basename;
      JSValue promise, resolving_funcs[2], basename_val;
-@@ -33979,6 +35213,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+@@ -33979,6 +35215,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
      b->has_prototype = fd->has_prototype;
      b->has_simple_parameter_list = fd->has_simple_parameter_list;
      b->is_strict_mode = fd->is_strict_mode;
@@ -1518,7 +1520,7 @@ index 62f4381..321e7dc 100644
      b->is_derived_class_constructor = fd->is_derived_class_constructor;
      b->func_kind = fd->func_kind;
      b->need_home_object = (fd->home_object_var_idx >= 0 ||
-@@ -35616,6 +36851,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+@@ -35616,6 +36853,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
      assert(idx <= 16);
      bc_put_u16(s, flags);
      bc_put_u8(s, b->is_strict_mode);
@@ -1526,7 +1528,7 @@ index 62f4381..321e7dc 100644
      bc_put_atom(s, b->func_name);
  
      bc_put_leb128(s, b->arg_count);
-@@ -36552,6 +37788,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -36552,6 +37790,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
      if (bc_get_u8(s, &v8))
          goto fail;
      bc.is_strict_mode = (v8 > 0);

@@ -1467,6 +1467,21 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                 total_size += shard.len;
             }
 
+            // Write thin shard start index for build.zig hybrid optimization
+            // (ReleaseFast for full-codegen shards, ReleaseSmall for thin-codegen shards)
+            {
+                var meta_path_buf: [4096]u8 = undefined;
+                const meta_path = std.fmt.bufPrint(&meta_path_buf, "{s}/frozen_thin_shard_start.txt", .{cache_dir}) catch "";
+                if (meta_path.len > 0) {
+                    if (std.fs.cwd().createFile(meta_path, .{})) |meta_file| {
+                        defer meta_file.close();
+                        var num_buf: [32]u8 = undefined;
+                        const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{sharded.thin_shard_start}) catch "0";
+                        meta_file.writeAll(num_str) catch {};
+                    } else |_| {}
+                }
+            }
+
             // Clean up stale shard files from previous runs
             {
                 var stale_buf: [4096]u8 = undefined;
@@ -1586,6 +1601,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
 
     const optimize_arg = if (options.debug_build) "-Doptimize=Debug" else "-Doptimize=ReleaseFast";
     const frozen_optimize_arg = "-Dfrozen-optimize=ReleaseFast";
+    const frozen_thin_optimize_arg = "-Dfrozen-thin-optimize=ReleaseSmall";
 
     // Step 7: Build WASM static (with host imports for edgebox daemon AOT)
     if (!options.binary_only) {
@@ -1633,11 +1649,11 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
     std.debug.print("[build] Building native binary with embedded bytecode (native)...\n", .{});
     const native_result = if (source_dir_arg.len > 0)
         try runCommand(allocator, &.{
-            "zig", "build", "-j4", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native", optimize_arg, frozen_optimize_arg, source_dir_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
+            "zig", "build", "-j4", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native", optimize_arg, frozen_optimize_arg, frozen_thin_optimize_arg, source_dir_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
         })
     else
         try runCommand(allocator, &.{
-            "zig", "build", "-j4", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native", optimize_arg, frozen_optimize_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
+            "zig", "build", "-j4", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native", optimize_arg, frozen_optimize_arg, frozen_thin_optimize_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
         });
     defer {
         if (native_result.stdout) |s| allocator.free(s);

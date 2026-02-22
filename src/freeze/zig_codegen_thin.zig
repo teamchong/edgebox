@@ -255,27 +255,61 @@ pub const ThinCodeGen = struct {
     }
 
     // ================================================================
+    // Shared parameter emission helpers
+    // ================================================================
+
+    /// Emit the common cleanup parameter suffix: local_count, locals_jsv, var_ref_list, arg_shadow, arg_count
+    /// Used by exceptionCleanup, returnFromStack, and returnUndef calls.
+    fn emitCleanupParams(self: *Self) !void {
+        try self.print("{d}, ", .{self.func.var_count});
+        if (self.has_fclosure and self.func.var_count > 0) {
+            try self.write("&_locals_jsv, _var_ref_list, ");
+        } else {
+            try self.write("null, null, ");
+        }
+        if (self.has_put_arg) {
+            const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+            try self.print("&arg_shadow, {d}", .{arg_count});
+        } else {
+            try self.write("null, 0");
+        }
+    }
+
+    /// Emit captured_local_indices as a Zig array literal: &[_]u16{ 0, 3, ... }
+    fn emitCapturedIndicesLiteral(self: *Self) !void {
+        const indices = self.func.captured_local_indices;
+        if (indices.len == 0) {
+            try self.write("&[_]u16{}");
+        } else {
+            try self.write("&[_]u16{ ");
+            for (indices, 0..) |idx, i| {
+                if (i > 0) try self.write(", ");
+                try self.print("{d}", .{idx});
+            }
+            try self.write(" }");
+        }
+    }
+
+    /// Emit closure-related parameters for op_call/op_call_method/op_apply:
+    /// locals, locals_jsv, var_count, closure_alive, captured_indices
+    fn emitCallClosureParams(self: *Self) !void {
+        if (self.has_fclosure and self.func.var_count > 0) {
+            try self.print("&locals, &_locals_jsv, {d}, &_closure_alive, ", .{self.func.var_count});
+        } else {
+            try self.print("&locals, null, {d}, null, ", .{self.func.var_count});
+        }
+        try self.emitCapturedIndicesLiteral();
+    }
+
+    // ================================================================
     // Exception cleanup expression
     // ================================================================
 
     fn emitExceptionCleanup(self: *Self) !void {
-        // Uses the thin.exceptionCleanup noinline helper to reduce code size
-        const var_count = self.func.var_count;
-        if (self.has_fclosure and var_count > 0) {
-            if (self.has_put_arg) {
-                const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
-                try self.printLine("return zig_runtime.thin.exceptionCleanup(ctx, &locals, {d}, &_locals_jsv, _var_ref_list, &arg_shadow, {d});", .{ var_count, arg_count });
-            } else {
-                try self.printLine("return zig_runtime.thin.exceptionCleanup(ctx, &locals, {d}, &_locals_jsv, _var_ref_list, null, 0);", .{var_count});
-            }
-        } else {
-            if (self.has_put_arg) {
-                const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
-                try self.printLine("return zig_runtime.thin.exceptionCleanup(ctx, &locals, {d}, null, null, &arg_shadow, {d});", .{ var_count, arg_count });
-            } else {
-                try self.printLine("return zig_runtime.thin.exceptionCleanup(ctx, &locals, {d}, null, null, null, 0);", .{var_count});
-            }
-        }
+        try self.writeIndent();
+        try self.write("return zig_runtime.thin.exceptionCleanup(ctx, &locals, ");
+        try self.emitCleanupParams();
+        try self.write(");\n");
     }
 
     /// Emit a catch-return pattern for operations that return GetFieldError
@@ -290,43 +324,10 @@ pub const ThinCodeGen = struct {
 
     /// Emit a return expression with proper cleanup (dup return value, free stack/closures/locals)
     fn emitReturnCleanup(self: *Self) !void {
-        try self.writeLine("{");
-        self.pushIndent();
-        try self.writeLine("const _ret_cv = stack[sp - 1];");
-        try self.writeLine("const _ret_val = if (_ret_cv.isRefType()) JSValue.dup(ctx, _ret_cv.toJSValueWithCtx(ctx)) else _ret_cv.toJSValueWithCtx(ctx);");
-        try self.writeLine("CV.freeRef(ctx, _ret_cv);");
-        // Detach closure var_refs
-        if (self.has_fclosure and self.func.var_count > 0) {
-            try self.printLine("for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{self.func.var_count});
-            try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, _var_ref_list);");
-        }
-        // Cleanup locals and arg_shadow
-        try self.printLine("zig_runtime.cleanupLocals(ctx, &locals, {d});", .{self.func.var_count});
-        if (self.has_put_arg) {
-            const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
-            for (0..arg_count) |i| {
-                try self.printLine("CV.freeRef(ctx, arg_shadow[{d}]);", .{i});
-            }
-        }
-        try self.writeLine("return _ret_val;");
-        self.popIndent();
-        try self.writeLine("}");
-    }
-
-    /// Emit closure variable sync from _locals_jsv → locals after a call
-    fn emitClosureSyncFrom(self: *Self) !void {
-        if (self.has_fclosure and self.func.var_count > 0) {
-            const captured = self.func.captured_local_indices;
-            if (captured.len > 0) {
-                try self.writeLine("if (_closure_alive) {");
-                self.pushIndent();
-                for (captured) |idx| {
-                    try self.printLine("locals[{d}] = CV.fromJSValue(_locals_jsv[{d}]);", .{ idx, idx });
-                }
-                self.popIndent();
-                try self.writeLine("}");
-            }
-        }
+        try self.writeIndent();
+        try self.write("return zig_runtime.thin.returnFromStack(ctx, &stack, sp, &locals, ");
+        try self.emitCleanupParams();
+        try self.write(");\n");
     }
 
     // ================================================================
@@ -407,28 +408,40 @@ pub const ThinCodeGen = struct {
         }
         try self.writeLine("");
 
-        // State machine
-        try self.writeLine("var next_block: u32 = 0;");
-        try self.writeLine("_ = &next_block;");
-        try self.writeLine("");
-        try self.writeLine("machine: while (true) {");
-        self.pushIndent();
-        try self.writeLine("switch (next_block) {");
-        self.pushIndent();
-
-        // Generate each block
+        // Generate blocks
         const blocks = self.func.cfg.blocks.items;
-        for (blocks, 0..) |block, idx| {
-            try self.emitBlock(block, @intCast(idx));
+        if (blocks.len == 1) {
+            // Single block: emit instructions directly, no state machine overhead
+            self.block_terminated = false;
+            for (blocks[0].instructions) |instr| {
+                if (self.block_terminated) break;
+                try self.emitInstruction(instr);
+            }
+            if (!self.block_terminated) {
+                try self.emitBlockTerminator(blocks[0]);
+            }
+        } else {
+            // Multi-block: state machine with switch/while
+            try self.writeLine("var next_block: u32 = 0;");
+            try self.writeLine("_ = &next_block;");
+            try self.writeLine("");
+            try self.writeLine("machine: while (true) {");
+            self.pushIndent();
+            try self.writeLine("switch (next_block) {");
+            self.pushIndent();
+
+            for (blocks, 0..) |block, idx| {
+                try self.emitBlock(block, @intCast(idx));
+            }
+
+            // Default case
+            try self.writeLine("else => { continue :machine; },");
+
+            self.popIndent();
+            try self.writeLine("}");
+            self.popIndent();
+            try self.writeLine("}");
         }
-
-        // Default case
-        try self.writeLine("else => { continue :machine; },");
-
-        self.popIndent();
-        try self.writeLine("}");
-        self.popIndent();
-        try self.writeLine("}");
 
         self.popIndent();
         try self.writeLine("}");
@@ -613,7 +626,7 @@ pub const ThinCodeGen = struct {
             .dup2 => try self.writeLine("zig_runtime.thin.dup2(ctx, &stack, &sp);"),
             .dup3 => try self.writeLine("zig_runtime.thin.dup3(ctx, &stack, &sp);"),
             .drop => try self.writeLine("zig_runtime.thin.drop(ctx, &stack, &sp);"),
-            .nip => try self.writeLine("zig_runtime.thin.nip(&stack, &sp);"),
+            .nip => try self.writeLine("zig_runtime.thin.nip(ctx, &stack, &sp);"),
             .swap => try self.writeLine("zig_runtime.thin.swap(&stack, &sp);"),
 
             // ========== Arithmetic ==========
@@ -708,15 +721,7 @@ pub const ThinCodeGen = struct {
                 try self.writeLine("{ const idx = stack[sp-1]; const arr = stack[sp-2]; var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx.toJSValueWithCtx(ctx)); stack[sp-1] = CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr.toJSValueWithCtx(ctx), @intCast(idx_i32))); }");
             },
             .put_array_el => {
-                try self.writeLine("{");
-                self.pushIndent();
-                try self.writeLine("const val = stack[sp-1]; const idx = stack[sp-2]; const arr = stack[sp-3];");
-                try self.writeLine("const arr_jsv = arr.toJSValueWithCtx(ctx); const idx_jsv = idx.toJSValueWithCtx(ctx);");
-                try self.writeLine("const atom = zig_runtime.quickjs.JS_ValueToAtom(ctx, idx_jsv);");
-                try self.writeLine("_ = zig_runtime.quickjs.JS_SetProperty(ctx, arr_jsv, atom, JSValue.dup(ctx, val.toJSValueWithCtx(ctx)));");
-                try self.writeLine("zig_runtime.quickjs.JS_FreeAtom(ctx, atom); sp -= 3;");
-                self.popIndent();
-                try self.writeLine("}");
+                try self.writeLine("zig_runtime.thin.op_put_array_el(ctx, &stack, &sp);");
             },
 
             // ========== Global Variables ==========
@@ -793,9 +798,9 @@ pub const ThinCodeGen = struct {
             .perm3 => try self.writeLine("{ const t = stack[sp-2]; stack[sp-2] = stack[sp-3]; stack[sp-3] = t; }"),
             .perm4 => try self.writeLine("{ const t = stack[sp-2]; stack[sp-2] = stack[sp-4]; stack[sp-4] = t; }"),
             .perm5 => try self.writeLine("{ const t = stack[sp-2]; stack[sp-2] = stack[sp-5]; stack[sp-5] = t; }"),
-            .insert2 => try self.writeLine("{ const t = stack[sp-1]; stack[sp-1] = stack[sp-2]; stack[sp-2] = t; stack[sp] = t; sp += 1; }"),
-            .insert3 => try self.writeLine("{ const t = stack[sp-1]; stack[sp-1] = stack[sp-2]; stack[sp-2] = stack[sp-3]; stack[sp-3] = t; stack[sp] = t; sp += 1; }"),
-            .insert4 => try self.writeLine("{ const t = stack[sp-1]; stack[sp-1] = stack[sp-2]; stack[sp-2] = stack[sp-3]; stack[sp-3] = stack[sp-4]; stack[sp-4] = t; stack[sp] = t; sp += 1; }"),
+            .insert2 => try self.writeLine("{ const t = stack[sp-1]; stack[sp-1] = stack[sp-2]; stack[sp-2] = t; stack[sp] = CV.dupRef(t); sp += 1; }"),
+            .insert3 => try self.writeLine("{ const t = stack[sp-1]; stack[sp-1] = stack[sp-2]; stack[sp-2] = stack[sp-3]; stack[sp-3] = t; stack[sp] = CV.dupRef(t); sp += 1; }"),
+            .insert4 => try self.writeLine("{ const t = stack[sp-1]; stack[sp-1] = stack[sp-2]; stack[sp-2] = stack[sp-3]; stack[sp-3] = stack[sp-4]; stack[sp-4] = t; stack[sp] = CV.dupRef(t); sp += 1; }"),
 
             // ========== Function Calls ==========
             .call0 => try self.emitCall(0),
@@ -808,56 +813,19 @@ pub const ThinCodeGen = struct {
             .tail_call_method => try self.emitCallMethod(instr.operand.u16),
 
             .call_constructor => {
-                // call_constructor: [new_target, func, arg0, ...argN-1] -> [result]
-                // QuickJS pops argc + 2 (new_target + func + args), pushes result
                 const argc_val = instr.operand.u16;
-                try self.writeLine("{");
-                self.pushIndent();
-                // func is at sp - argc - 1, new_target is at sp - argc - 2
-                try self.printLine("const _fn = stack[sp - {d}].toJSValueWithCtx(ctx);", .{@as(u32, argc_val) + 1});
-                if (argc_val > 0) {
-                    try self.printLine("var _args: [{d}]zig_runtime.JSValue = undefined;", .{argc_val});
-                    try self.printLine("for (0..{d}) |_i| {{ _args[_i] = CV.toJSValuePtr(&stack[sp - {d} + _i]); }}", .{ argc_val, argc_val });
-                    try self.printLine("const _result = zig_runtime.quickjs.JS_CallConstructor(ctx, _fn, {d}, &_args);", .{argc_val});
-                } else {
-                    try self.writeLine("var _no_args: [0]zig_runtime.JSValue = .{};");
-                    try self.writeLine("const _result = zig_runtime.quickjs.JS_CallConstructor(ctx, _fn, 0, &_no_args);");
-                }
-                try self.writeLine("if (_result.isException()) {");
-                self.pushIndent();
-                try self.emitExceptionCleanup();
-                self.popIndent();
-                try self.writeLine("}");
-                // Pop new_target + func + args (argc + 2 total)
-                try self.printLine("sp -= {d};", .{@as(u32, argc_val) + 2});
-                try self.writeLine("stack[sp] = CV.fromJSValue(_result); sp += 1;");
-                self.popIndent();
-                try self.writeLine("}");
+                try self.writeIndent();
+                try self.print("zig_runtime.thin.op_call_constructor(ctx, &stack, &sp, {d})", .{argc_val});
+                try self.emitCatchReturn();
             },
 
             // ========== Apply ==========
             .apply => {
-                try self.writeLine("{");
-                self.pushIndent();
-                try self.writeLine("const _args_array = stack[sp-1].toJSValue();");
-                try self.writeLine("const _this_arg = stack[sp-2].toJSValue();");
-                try self.writeLine("const _func = stack[sp-3].toJSValue();");
-                try self.writeLine("var _len: i64 = 0;");
-                try self.writeLine("_ = JSValue.getLength(ctx, &_len, _args_array);");
-                try self.writeLine("const _argc: u32 = @intCast(@min(_len, 32));");
-                try self.writeLine("var _args: [32]zig_runtime.JSValue = undefined;");
-                try self.writeLine("for (0.._argc) |i| { _args[i] = JSValue.getPropertyUint32(ctx, _args_array, @intCast(i)); }");
-                try self.writeLine("const _result = JSValue.call(ctx, _func, _this_arg, @intCast(_argc), &_args);");
-                try self.writeLine("if (_result.isException()) {");
-                self.pushIndent();
-                try self.emitExceptionCleanup();
-                self.popIndent();
-                try self.writeLine("}");
-                try self.writeLine("sp -= 3;");
-                try self.writeLine("stack[sp] = CV.fromJSValue(_result); sp += 1;");
-                try self.emitClosureSyncFrom();
-                self.popIndent();
-                try self.writeLine("}");
+                try self.writeIndent();
+                try self.print("zig_runtime.thin.op_apply(ctx, &stack, &sp, ", .{});
+                try self.emitCallClosureParams();
+                try self.write(")");
+                try self.emitCatchReturn();
             },
 
             // ========== Define Operations ==========
@@ -879,19 +847,10 @@ pub const ThinCodeGen = struct {
                 self.block_terminated = true;
             },
             .return_undef => {
-                // Detach closure var_refs
-                if (self.has_fclosure and self.func.var_count > 0) {
-                    try self.printLine("for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{self.func.var_count});
-                    try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, _var_ref_list);");
-                }
-                try self.printLine("zig_runtime.cleanupLocals(ctx, &locals, {d});", .{self.func.var_count});
-                if (self.has_put_arg) {
-                    const ac = @max(self.func.arg_count, self.max_arg_idx_used);
-                    for (0..ac) |i| {
-                        try self.printLine("CV.freeRef(ctx, arg_shadow[{d}]);", .{i});
-                    }
-                }
-                try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
+                try self.writeIndent();
+                try self.write("return zig_runtime.thin.returnUndef(ctx, &locals, ");
+                try self.emitCleanupParams();
+                try self.write(");\n");
                 self.block_terminated = true;
             },
 
@@ -980,81 +939,35 @@ pub const ThinCodeGen = struct {
 
             // ========== For-Of/For-In ==========
             .for_of_start => {
-                try self.writeLine("{");
-                try self.writeLine("    for_of_iter_stack[for_of_depth] = sp - 1;");
-                try self.writeLine("    for_of_depth += 1;");
-                try self.writeLine("    var for_of_buf: [2]zig_runtime.JSValue = undefined;");
-                try self.writeLine("    for_of_buf[0] = stack[sp - 1].toJSValueWithCtx(ctx);");
-                try self.writeLine("    for_of_buf[1] = zig_runtime.JSValue.UNDEFINED;");
-                try self.writeLine("    const rc = zig_runtime.quickjs.js_frozen_for_of_start(ctx, @ptrCast(&for_of_buf[1]), 0);");
-                try self.writeLine("    if (rc != 0) return zig_runtime.JSValue.EXCEPTION;");
-                try self.writeLine("    stack[sp - 1] = CV.fromJSValue(for_of_buf[0]);");
-                try self.writeLine("    stack[sp] = CV.fromJSValue(for_of_buf[1]); sp += 1;");
-                try self.writeLine("    stack[sp] = CV.fromJSValue(zig_runtime.newCatchOffset(0)); sp += 1;");
-                try self.writeLine("}");
+                try self.writeIndent();
+                try self.write("zig_runtime.thin.op_for_of_start(ctx, &stack, &sp, &for_of_iter_stack, &for_of_depth)");
+                try self.emitCatchReturn();
             },
             .for_of_next => {
-                try self.writeLine("{");
-                try self.writeLine("    const iter_idx = for_of_iter_stack[for_of_depth - 1];");
-                try self.writeLine("    var for_of_buf: [5]zig_runtime.JSValue = undefined;");
-                try self.writeLine("    for_of_buf[0] = stack[iter_idx].toJSValueWithCtx(ctx);");
-                try self.writeLine("    for_of_buf[1] = stack[iter_idx + 1].toJSValueWithCtx(ctx);");
-                try self.writeLine("    for_of_buf[2] = zig_runtime.JSValue.UNDEFINED;");
-                try self.writeLine("    for_of_buf[3] = zig_runtime.JSValue.UNDEFINED;");
-                try self.writeLine("    for_of_buf[4] = zig_runtime.JSValue.UNDEFINED;");
-                try self.writeLine("    const rc = zig_runtime.quickjs.js_frozen_for_of_next(ctx, @ptrCast(&for_of_buf[3]), -3);");
-                try self.writeLine("    if (rc != 0) return zig_runtime.JSValue.EXCEPTION;");
-                try self.writeLine("    stack[iter_idx] = CV.fromJSValue(for_of_buf[0]);");
-                try self.writeLine("    stack[sp] = CV.fromJSValue(for_of_buf[3]); sp += 1;");
-                try self.writeLine("    stack[sp] = CV.fromJSValue(for_of_buf[4]); sp += 1;");
-                try self.writeLine("}");
+                try self.writeIndent();
+                try self.write("zig_runtime.thin.op_for_of_next(ctx, &stack, &sp, &for_of_iter_stack, &for_of_depth)");
+                try self.emitCatchReturn();
             },
             .iterator_close => {
-                try self.writeLine("{");
-                try self.writeLine("    const _iter_base = for_of_iter_stack[for_of_depth - 1];");
-                try self.writeLine("    CV.freeRef(ctx, stack[_iter_base]);");
-                try self.writeLine("    CV.freeRef(ctx, stack[_iter_base + 1]);");
-                try self.writeLine("    sp = _iter_base;");
-                try self.writeLine("    for_of_depth -= 1;");
-                try self.writeLine("}");
+                try self.writeLine("zig_runtime.thin.op_iterator_close(ctx, &stack, &sp, &for_of_iter_stack, &for_of_depth);");
             },
             .iterator_get_value_done => {
-                try self.writeLine("{");
-                try self.writeLine("    const _result = stack[sp-1].toJSValue();");
-                try self.writeLine("    var _done: i32 = 0;");
-                try self.writeLine("    const _val = JSValue.iteratorGetValueDone(ctx, _result, &_done);");
-                try self.writeLine("    stack[sp-1] = CV.fromJSValue(_val);");
-                try self.writeLine("    stack[sp] = if (_done != 0) CV.TRUE else CV.FALSE; sp += 1;");
-                try self.writeLine("}");
+                try self.writeLine("zig_runtime.thin.op_iterator_get_value_done(ctx, &stack, &sp);");
             },
             .for_in_start => {
-                try self.writeLine("{");
-                try self.writeLine("    var _for_in_buf: [2]zig_runtime.JSValue = .{stack[sp - 1].toJSValue(), zig_runtime.JSValue.UNDEFINED};");
-                try self.writeLine("    const _rc = zig_runtime.quickjs.js_frozen_for_in_start(ctx, @ptrCast(&_for_in_buf[1]));");
-                try self.writeLine("    if (_rc < 0) return zig_runtime.JSValue.EXCEPTION;");
-                try self.writeLine("    stack[sp - 1] = CV.fromJSValue(_for_in_buf[0]);");
-                try self.writeLine("}");
+                try self.writeIndent();
+                try self.write("zig_runtime.thin.op_for_in_start(ctx, &stack, &sp)");
+                try self.emitCatchReturn();
             },
             .for_in_next => {
-                try self.writeLine("{");
-                try self.writeLine("    var _for_in_buf: [3]zig_runtime.JSValue = .{stack[sp - 1].toJSValue(), zig_runtime.JSValue.UNDEFINED, zig_runtime.JSValue.UNDEFINED};");
-                try self.writeLine("    const _rc = zig_runtime.quickjs.js_frozen_for_in_next(ctx, @ptrCast(&_for_in_buf[1]));");
-                try self.writeLine("    if (_rc < 0) return zig_runtime.JSValue.EXCEPTION;");
-                try self.writeLine("    stack[sp - 1] = CV.fromJSValue(_for_in_buf[0]);");
-                try self.writeLine("    stack[sp] = CV.fromJSValue(_for_in_buf[1]); sp += 1;");
-                try self.writeLine("    stack[sp] = CV.fromJSValue(_for_in_buf[2]); sp += 1;");
-                try self.writeLine("}");
+                try self.writeIndent();
+                try self.write("zig_runtime.thin.op_for_in_next(ctx, &stack, &sp)");
+                try self.emitCatchReturn();
             },
             .in => {
-                try self.writeLine("{");
-                try self.writeLine("    const _obj = stack[sp-1].toJSValue();");
-                try self.writeLine("    const _prop = stack[sp-2].toJSValue();");
-                try self.writeLine("    const _atom = zig_runtime.quickjs.JS_ValueToAtom(ctx, _prop);");
-                try self.writeLine("    const _result = zig_runtime.quickjs.JS_HasProperty(ctx, _obj, _atom);");
-                try self.writeLine("    zig_runtime.quickjs.JS_FreeAtom(ctx, _atom);");
-                try self.writeLine("    if (_result < 0) return zig_runtime.JSValue.EXCEPTION;");
-                try self.writeLine("    stack[sp-2] = CV.fromJSValue(JSValue.newBool(_result > 0)); sp -= 1;");
-                try self.writeLine("}");
+                try self.writeIndent();
+                try self.write("zig_runtime.thin.op_in(ctx, &stack, &sp)");
+                try self.emitCatchReturn();
             },
 
             // ========== Special Object ==========
@@ -1096,26 +1009,7 @@ pub const ThinCodeGen = struct {
                 try self.writeLine("}");
             },
             .append => {
-                try self.writeLine("{");
-                try self.writeLine("    const enumobj = stack[sp-1].toJSValueWithCtx(ctx);");
-                try self.writeLine("    var pos: i32 = stack[sp-2].getInt();");
-                try self.writeLine("    const arr = stack[sp-3].toJSValueWithCtx(ctx);");
-                try self.writeLine("    if (!enumobj.isUndefined() and !enumobj.isNull()) {");
-                try self.writeLine("        const src_len_val = JSValue.getPropertyStr(ctx, enumobj, \"length\");");
-                try self.writeLine("        var src_len: i32 = 0;");
-                try self.writeLine("        _ = JSValue.toInt32(ctx, &src_len, src_len_val);");
-                try self.writeLine("        JSValue.free(ctx, src_len_val);");
-                try self.writeLine("        var i: i32 = 0;");
-                try self.writeLine("        while (i < src_len) : (i += 1) {");
-                try self.writeLine("            const elem = JSValue.getPropertyUint32(ctx, enumobj, @intCast(i));");
-                try self.writeLine("            _ = JSValue.setPropertyUint32(ctx, arr, @intCast(pos), elem);");
-                try self.writeLine("            pos += 1;");
-                try self.writeLine("        }");
-                try self.writeLine("    }");
-                try self.writeLine("    stack[sp-2] = CV.newInt(pos);");
-                try self.writeLine("    if (CV.fromJSValue(enumobj).isRefType()) JSValue.free(ctx, enumobj);");
-                try self.writeLine("    sp -= 1;");
-                try self.writeLine("}");
+                try self.writeLine("zig_runtime.thin.op_append(ctx, &stack, &sp);");
             },
 
             // ========== Class / Define Method ==========
@@ -1233,63 +1127,19 @@ pub const ThinCodeGen = struct {
     // ================================================================
 
     fn emitCall(self: *Self, argc: u16) !void {
-        try self.writeLine("{");
-        self.pushIndent();
-        try self.printLine("const _fn = stack[sp - {d}].toJSValueWithCtx(ctx);", .{@as(u32, argc) + 1});
-        if (argc > 0) {
-            try self.printLine("var _args: [{d}]zig_runtime.JSValue = undefined;", .{argc});
-            try self.printLine("for (0..{d}) |_i| {{ _args[_i] = CV.toJSValuePtr(&stack[sp - {d} + _i]); }}", .{ argc, argc });
-            // Sync locals TO _locals_jsv before call
-            if (self.has_fclosure and self.func.var_count > 0) {
-                try self.printLine("for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{self.func.var_count});
-            }
-            try self.writeLine("const _result = zig_runtime.JSValue.call(ctx, _fn, zig_runtime.JSValue.UNDEFINED, @intCast(_args.len), &_args);");
-        } else {
-            if (self.has_fclosure and self.func.var_count > 0) {
-                try self.printLine("for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{self.func.var_count});
-            }
-            try self.writeLine("const _result = zig_runtime.JSValue.call(ctx, _fn, zig_runtime.JSValue.UNDEFINED, 0, @as([*]zig_runtime.JSValue, @ptrCast(@constCast(&[0]zig_runtime.JSValue{}))));");
-        }
-        try self.writeLine("if (_result.isException()) {");
-        self.pushIndent();
-        try self.emitExceptionCleanup();
-        self.popIndent();
-        try self.writeLine("}");
-        try self.printLine("sp -= {d};", .{@as(u32, argc) + 1});
-        try self.writeLine("stack[sp] = CV.fromJSValue(_result); sp += 1;");
-        try self.emitClosureSyncFrom();
-        self.popIndent();
-        try self.writeLine("}");
+        try self.writeIndent();
+        try self.print("zig_runtime.thin.op_call(ctx, &stack, &sp, {d}, ", .{argc});
+        try self.emitCallClosureParams();
+        try self.write(")");
+        try self.emitCatchReturn();
     }
 
     fn emitCallMethod(self: *Self, argc: u16) !void {
-        try self.writeLine("{");
-        self.pushIndent();
-        try self.printLine("const _obj = stack[sp - {d}].toJSValueWithCtx(ctx);", .{@as(u32, argc) + 2});
-        try self.printLine("const _method = stack[sp - {d}].toJSValueWithCtx(ctx);", .{@as(u32, argc) + 1});
-        if (argc > 0) {
-            try self.printLine("var _args: [{d}]zig_runtime.JSValue = undefined;", .{argc});
-            try self.printLine("for (0..{d}) |_i| {{ _args[_i] = CV.toJSValuePtr(&stack[sp - {d} + _i]); }}", .{ argc, argc });
-            if (self.has_fclosure and self.func.var_count > 0) {
-                try self.printLine("for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{self.func.var_count});
-            }
-            try self.writeLine("const _result = zig_runtime.JSValue.call(ctx, _method, _obj, @intCast(_args.len), &_args);");
-        } else {
-            if (self.has_fclosure and self.func.var_count > 0) {
-                try self.printLine("for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{self.func.var_count});
-            }
-            try self.writeLine("const _result = zig_runtime.JSValue.call(ctx, _method, _obj, 0, @as([*]zig_runtime.JSValue, @ptrCast(@constCast(&[0]zig_runtime.JSValue{}))));");
-        }
-        try self.writeLine("if (_result.isException()) {");
-        self.pushIndent();
-        try self.emitExceptionCleanup();
-        self.popIndent();
-        try self.writeLine("}");
-        try self.printLine("sp -= {d};", .{@as(u32, argc) + 2});
-        try self.writeLine("stack[sp] = CV.fromJSValue(_result); sp += 1;");
-        try self.emitClosureSyncFrom();
-        self.popIndent();
-        try self.writeLine("}");
+        try self.writeIndent();
+        try self.print("zig_runtime.thin.op_call_method(ctx, &stack, &sp, {d}, ", .{argc});
+        try self.emitCallClosureParams();
+        try self.write(")");
+        try self.emitCatchReturn();
     }
 
     // ================================================================
@@ -1373,29 +1223,19 @@ pub const ThinCodeGen = struct {
         if (successors.len == 1) {
             try self.printLine("next_block = {d}; continue :machine;", .{successors[0]});
         } else if (successors.len == 0) {
-            // Exit block
-            if (self.has_fclosure and self.func.var_count > 0) {
-                try self.printLine("for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{self.func.var_count});
-                try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, _var_ref_list);");
-            }
-            try self.printLine("zig_runtime.cleanupLocals(ctx, &locals, {d});", .{self.func.var_count});
-            if (self.has_put_arg) {
-                const ac = @max(self.func.arg_count, self.max_arg_idx_used);
-                try self.writeLine("if (sp > 0) {");
-                try self.writeLine("    const _ret_cv = stack[sp - 1];");
-                try self.writeLine("    const _ret_val = if (_ret_cv.isRefType()) JSValue.dup(ctx, _ret_cv.toJSValueWithCtx(ctx)) else _ret_cv.toJSValueWithCtx(ctx);");
-                for (0..ac) |i| {
-                    try self.printLine("    CV.freeRef(ctx, arg_shadow[{d}]);", .{i});
-                }
-                try self.writeLine("    return _ret_val;");
-                try self.writeLine("}");
-                for (0..ac) |i| {
-                    try self.printLine("CV.freeRef(ctx, arg_shadow[{d}]);", .{i});
-                }
-            } else {
-                try self.writeLine("if (sp > 0) { return stack[sp - 1].toJSValueWithCtx(ctx); }");
-            }
-            try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
+            // Exit block — use return helpers for cleanup
+            try self.writeLine("if (sp > 0) {");
+            self.pushIndent();
+            try self.writeIndent();
+            try self.write("return zig_runtime.thin.returnFromStack(ctx, &stack, sp, &locals, ");
+            try self.emitCleanupParams();
+            try self.write(");\n");
+            self.popIndent();
+            try self.writeLine("}");
+            try self.writeIndent();
+            try self.write("return zig_runtime.thin.returnUndef(ctx, &locals, ");
+            try self.emitCleanupParams();
+            try self.write(");\n");
         } else {
             try self.printLine("next_block = {d}; continue :machine;", .{successors[0]});
         }

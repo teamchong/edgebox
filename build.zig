@@ -133,6 +133,15 @@ pub fn build(b: *std.Build) void {
         "Optimization for frozen modules: ReleaseFast (default, max perf) or ReleaseSafe (fast compile)",
     ) orelse .ReleaseFast;
 
+    // Thin (cold) frozen shard optimization (default: ReleaseSmall/-Oz for minimum icache pressure)
+    // Thin-codegen functions are cold — they benefit from small code size rather than aggressive inlining.
+    // LLVM's machine outliner (-Oz) factors common sequences across thousands of thin functions.
+    const frozen_thin_optimize = b.option(
+        std.builtin.OptimizeMode,
+        "frozen-thin-optimize",
+        "Optimization for thin frozen shards: ReleaseSmall (default, min size) or ReleaseFast (max perf)",
+    ) orelse .ReleaseSmall;
+
     // Auto-download wgpu-native if GPU enabled and not present
     const download_wgpu = b.addSystemCommand(&.{
         "sh", "-c",
@@ -666,18 +675,43 @@ pub fn build(b: *std.Build) void {
         else
             cache_prefix;
 
+        // Read thin shard start index for hybrid optimization
+        // Full-codegen shards use frozen_optimize (ReleaseFast), thin shards use frozen_thin_optimize (ReleaseSmall)
+        var thin_shard_start: usize = std.math.maxInt(usize); // default: all full
+        {
+            const meta_path = b.fmt("{s}/frozen_thin_shard_start.txt", .{shard_dir});
+            if (std.fs.cwd().openFile(meta_path, .{})) |file| {
+                defer file.close();
+                var buf: [32]u8 = undefined;
+                const len = file.readAll(&buf) catch 0;
+                if (len > 0) {
+                    thin_shard_start = std.fmt.parseInt(usize, buf[0..len], 10) catch std.math.maxInt(usize);
+                }
+            } else |_| {}
+        }
+
         // Discover and compile shard files
         var shard_count: usize = 0;
+        var full_shard_count: usize = 0;
+        var thin_shard_count: usize = 0;
         while (true) : (shard_count += 1) {
             const shard_path = b.fmt("{s}/frozen_shard_{d}.zig", .{ shard_dir, shard_count });
 
             // Check if shard file exists
             if (std.fs.cwd().access(shard_path, .{})) |_| {
-                // Create module for shard with frozen_optimize for inlining CV helpers
+                // Hybrid optimization: ReleaseFast for full-codegen shards, ReleaseSmall for thin
+                const shard_opt = if (shard_count >= thin_shard_start) frozen_thin_optimize else frozen_optimize;
+                if (shard_count >= thin_shard_start) {
+                    thin_shard_count += 1;
+                } else {
+                    full_shard_count += 1;
+                }
+
+                // Create module for shard with appropriate optimization level
                 const shard_mod = b.createModule(.{
                     .root_source_file = .{ .cwd_relative = shard_path },
                     .target = target,
-                    .optimize = frozen_optimize,
+                    .optimize = shard_opt,
                 });
                 shard_mod.addImport("zig_runtime", native_zig_runtime_mod);
                 shard_mod.addImport("math_polyfill", native_math_polyfill_mod);
@@ -697,7 +731,11 @@ pub fn build(b: *std.Build) void {
         }
 
         if (shard_count > 0) {
-            std.debug.print("[build] Compiling {d} frozen shards as separate object files\n", .{shard_count});
+            if (thin_shard_count > 0) {
+                std.debug.print("[build] Compiling {d} frozen shards ({d} full -O2 + {d} thin -Oz)\n", .{ shard_count, full_shard_count, thin_shard_count });
+            } else {
+                std.debug.print("[build] Compiling {d} frozen shards as separate object files\n", .{shard_count});
+            }
         }
 
         // Compile frozen_module.zig (thin loader that calls shard init functions via extern)

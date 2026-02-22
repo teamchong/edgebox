@@ -697,10 +697,12 @@ pub const thin = struct {
         CV.freeRef(ctx, stack[sp.*]);
     }
 
-    pub inline fn nip(stack: [*]CV, sp: *usize) void {
+    pub inline fn nip(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
         // [a, b] -> [b]  (remove second-from-top, keep top)
+        const old = stack[sp.* - 2];
         stack[sp.* - 2] = stack[sp.* - 1];
         sp.* -= 1;
+        CV.freeRef(ctx, old);
     }
 
     pub inline fn swap(stack: [*]CV, sp: *usize) void {
@@ -1064,6 +1066,259 @@ pub const thin = struct {
     /// Sync a single local to _locals_jsv after put_loc/set_loc (for closure tracking)
     pub inline fn sync_local_jsv(locals: [*]CV, locals_jsv: [*]JSValue, idx: u32) void {
         locals_jsv[idx] = CV.toJSValuePtr(&locals[idx]);
+    }
+
+    // ================================================================
+    // Noinline Helpers — Return Cleanup
+    // ================================================================
+
+    /// Return the top-of-stack value with full cleanup:
+    /// dup return value, free CV, detach closures, free locals, free arg_shadow.
+    pub noinline fn returnFromStack(
+        ctx: *JSContext,
+        stack: [*]CV,
+        sp: usize,
+        locals: [*]CV,
+        local_count: usize,
+        locals_jsv: ?[*]JSValue,
+        var_ref_list: ?*ListHead,
+        arg_shadow: ?[*]CV,
+        arg_count: usize,
+    ) JSValue {
+        const ret_cv = stack[sp - 1];
+        const ret_val = if (ret_cv.isRefType())
+            JSValue.dup(ctx, ret_cv.toJSValueWithCtx(ctx))
+        else
+            ret_cv.toJSValueWithCtx(ctx);
+        CV.freeRef(ctx, ret_cv);
+        // Sync locals → _locals_jsv and detach var_refs
+        if (locals_jsv) |jsv| {
+            for (0..local_count) |i| {
+                jsv[i] = CV.toJSValuePtr(&locals[i]);
+            }
+            if (var_ref_list) |vrl| {
+                quickjs.js_frozen_var_ref_list_detach(ctx, vrl);
+            }
+        }
+        cleanupLocals(ctx, locals, local_count);
+        if (arg_shadow) |shadow| {
+            for (0..arg_count) |i| {
+                CV.freeRef(ctx, shadow[i]);
+            }
+        }
+        return ret_val;
+    }
+
+    /// Return UNDEFINED with full cleanup.
+    pub noinline fn returnUndef(
+        ctx: *JSContext,
+        locals: [*]CV,
+        local_count: usize,
+        locals_jsv: ?[*]JSValue,
+        var_ref_list: ?*ListHead,
+        arg_shadow: ?[*]CV,
+        arg_count: usize,
+    ) JSValue {
+        if (locals_jsv) |jsv| {
+            for (0..local_count) |i| {
+                jsv[i] = CV.toJSValuePtr(&locals[i]);
+            }
+            if (var_ref_list) |vrl| {
+                quickjs.js_frozen_var_ref_list_detach(ctx, vrl);
+            }
+        }
+        cleanupLocals(ctx, locals, local_count);
+        if (arg_shadow) |shadow| {
+            for (0..arg_count) |i| {
+                CV.freeRef(ctx, shadow[i]);
+            }
+        }
+        return JSValue.UNDEFINED;
+    }
+
+    // ================================================================
+    // Noinline Helpers — Constructor Call
+    // ================================================================
+
+    /// Call a constructor: stack has [new_target, func, arg0, ...argN-1] → [result]
+    pub noinline fn op_call_constructor(
+        ctx: *JSContext,
+        stack: [*]CV,
+        sp: *usize,
+        argc: u16,
+    ) GetFieldError!void {
+        const fn_val = stack[sp.* - @as(usize, argc) - 1].toJSValueWithCtx(ctx);
+        if (argc > 0) {
+            var args: [256]JSValue = undefined;
+            const n: usize = @intCast(argc);
+            for (0..n) |i| {
+                args[i] = CV.toJSValuePtr(&stack[sp.* - n + i]);
+            }
+            const result = quickjs.JS_CallConstructor(ctx, fn_val, @intCast(argc), @ptrCast(&args));
+            if (result.isException()) return error.JsException;
+            sp.* -= n + 2;
+            stack[sp.*] = CV.fromJSValue(result);
+            sp.* += 1;
+        } else {
+            var no_args: [0]JSValue = .{};
+            const result = quickjs.JS_CallConstructor(ctx, fn_val, 0, &no_args);
+            if (result.isException()) return error.JsException;
+            sp.* -= 2;
+            stack[sp.*] = CV.fromJSValue(result);
+            sp.* += 1;
+        }
+    }
+
+    // ================================================================
+    // Noinline Helpers — Apply
+    // ================================================================
+
+    /// Function.prototype.apply: stack has [func, this, args_array] → [result]
+    pub noinline fn op_apply(
+        ctx: *JSContext,
+        stack: [*]CV,
+        sp: *usize,
+        locals: ?[*]CV,
+        locals_jsv: ?[*]JSValue,
+        var_count: usize,
+        closure_alive: ?*bool,
+        captured_indices: []const u16,
+    ) GetFieldError!void {
+        const args_array = stack[sp.* - 1].toJSValueWithCtx(ctx);
+        const this_arg = stack[sp.* - 2].toJSValueWithCtx(ctx);
+        const func = stack[sp.* - 3].toJSValueWithCtx(ctx);
+        var len: i64 = 0;
+        _ = JSValue.getLength(ctx, &len, args_array);
+        const argc_val: u32 = @intCast(@min(len, 32));
+        var args: [32]JSValue = undefined;
+        for (0..argc_val) |i| {
+            args[i] = JSValue.getPropertyUint32(ctx, args_array, @intCast(i));
+        }
+        const result = JSValue.call(ctx, func, this_arg, @intCast(argc_val), &args);
+        if (result.isException()) return error.JsException;
+        sp.* -= 3;
+        stack[sp.*] = CV.fromJSValue(result);
+        sp.* += 1;
+        syncLocalsFrom(locals, locals_jsv, var_count, closure_alive, captured_indices);
+    }
+
+    // ================================================================
+    // Noinline Helpers — For-Of / For-In / Iterator
+    // ================================================================
+
+    pub noinline fn op_for_of_start(ctx: *JSContext, stack: [*]CV, sp: *usize, for_of_iter_stack: [*]usize, for_of_depth: *usize) GetFieldError!void {
+        for_of_iter_stack[for_of_depth.*] = sp.* - 1;
+        for_of_depth.* += 1;
+        var buf: [2]JSValue = undefined;
+        buf[0] = stack[sp.* - 1].toJSValueWithCtx(ctx);
+        buf[1] = JSValue.UNDEFINED;
+        const rc = quickjs.js_frozen_for_of_start(ctx, @ptrCast(&buf[1]), 0);
+        if (rc != 0) return error.JsException;
+        stack[sp.* - 1] = CV.fromJSValue(buf[0]);
+        stack[sp.*] = CV.fromJSValue(buf[1]);
+        sp.* += 1;
+        stack[sp.*] = CV.fromJSValue(frozen_helpers.newCatchOffset(0));
+        sp.* += 1;
+    }
+
+    pub noinline fn op_for_of_next(ctx: *JSContext, stack: [*]CV, sp: *usize, for_of_iter_stack: [*]usize, for_of_depth: *usize) GetFieldError!void {
+        const iter_idx = for_of_iter_stack[for_of_depth.* - 1];
+        var buf: [5]JSValue = undefined;
+        buf[0] = stack[iter_idx].toJSValueWithCtx(ctx);
+        buf[1] = stack[iter_idx + 1].toJSValueWithCtx(ctx);
+        buf[2] = JSValue.UNDEFINED;
+        buf[3] = JSValue.UNDEFINED;
+        buf[4] = JSValue.UNDEFINED;
+        const rc = quickjs.js_frozen_for_of_next(ctx, @ptrCast(&buf[3]), -3);
+        if (rc != 0) return error.JsException;
+        stack[iter_idx] = CV.fromJSValue(buf[0]);
+        stack[sp.*] = CV.fromJSValue(buf[3]);
+        sp.* += 1;
+        stack[sp.*] = CV.fromJSValue(buf[4]);
+        sp.* += 1;
+    }
+
+    pub noinline fn op_iterator_close(ctx: *JSContext, stack: [*]CV, sp: *usize, for_of_iter_stack: [*]usize, for_of_depth: *usize) void {
+        const iter_base = for_of_iter_stack[for_of_depth.* - 1];
+        CV.freeRef(ctx, stack[iter_base]);
+        CV.freeRef(ctx, stack[iter_base + 1]);
+        sp.* = iter_base;
+        for_of_depth.* -= 1;
+    }
+
+    pub noinline fn op_iterator_get_value_done(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        const result = stack[sp.* - 1].toJSValueWithCtx(ctx);
+        var done: i32 = 0;
+        const val = JSValue.iteratorGetValueDone(ctx, result, &done);
+        stack[sp.* - 1] = CV.fromJSValue(val);
+        stack[sp.*] = if (done != 0) CV.TRUE else CV.FALSE;
+        sp.* += 1;
+    }
+
+    pub noinline fn op_for_in_start(ctx: *JSContext, stack: [*]CV, sp: *usize) GetFieldError!void {
+        var buf: [2]JSValue = .{ stack[sp.* - 1].toJSValueWithCtx(ctx), JSValue.UNDEFINED };
+        const rc = quickjs.js_frozen_for_in_start(ctx, @ptrCast(&buf[1]));
+        if (rc < 0) return error.JsException;
+        stack[sp.* - 1] = CV.fromJSValue(buf[0]);
+    }
+
+    pub noinline fn op_for_in_next(ctx: *JSContext, stack: [*]CV, sp: *usize) GetFieldError!void {
+        var buf: [3]JSValue = .{ stack[sp.* - 1].toJSValueWithCtx(ctx), JSValue.UNDEFINED, JSValue.UNDEFINED };
+        const rc = quickjs.js_frozen_for_in_next(ctx, @ptrCast(&buf[1]));
+        if (rc < 0) return error.JsException;
+        stack[sp.* - 1] = CV.fromJSValue(buf[0]);
+        stack[sp.*] = CV.fromJSValue(buf[1]);
+        sp.* += 1;
+        stack[sp.*] = CV.fromJSValue(buf[2]);
+        sp.* += 1;
+    }
+
+    pub noinline fn op_in(ctx: *JSContext, stack: [*]CV, sp: *usize) GetFieldError!void {
+        const obj = stack[sp.* - 1].toJSValueWithCtx(ctx);
+        const prop = stack[sp.* - 2].toJSValueWithCtx(ctx);
+        const atom = quickjs.JS_ValueToAtom(ctx, prop);
+        const result = quickjs.JS_HasProperty(ctx, obj, atom);
+        quickjs.JS_FreeAtom(ctx, atom);
+        if (result < 0) return error.JsException;
+        stack[sp.* - 2] = CV.fromJSValue(JSValue.newBool(result > 0));
+        sp.* -= 1;
+    }
+
+    // ================================================================
+    // Noinline Helpers — Array Operations
+    // ================================================================
+
+    pub noinline fn op_append(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        const enumobj = stack[sp.* - 1].toJSValueWithCtx(ctx);
+        var pos: i32 = stack[sp.* - 2].getInt();
+        const arr = stack[sp.* - 3].toJSValueWithCtx(ctx);
+        if (!enumobj.isUndefined() and !enumobj.isNull()) {
+            const src_len_val = JSValue.getPropertyStr(ctx, enumobj, "length");
+            var src_len: i32 = 0;
+            _ = JSValue.toInt32(ctx, &src_len, src_len_val);
+            JSValue.free(ctx, src_len_val);
+            var i: i32 = 0;
+            while (i < src_len) : (i += 1) {
+                const elem = JSValue.getPropertyUint32(ctx, enumobj, @intCast(i));
+                _ = JSValue.setPropertyUint32(ctx, arr, @intCast(pos), elem);
+                pos += 1;
+            }
+        }
+        stack[sp.* - 2] = CV.newInt(pos);
+        if (CV.fromJSValue(enumobj).isRefType()) JSValue.free(ctx, enumobj);
+        sp.* -= 1;
+    }
+
+    pub noinline fn op_put_array_el(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        const val = stack[sp.* - 1];
+        const idx = stack[sp.* - 2];
+        const arr = stack[sp.* - 3];
+        const arr_jsv = arr.toJSValueWithCtx(ctx);
+        const idx_jsv = idx.toJSValueWithCtx(ctx);
+        const atom = quickjs.JS_ValueToAtom(ctx, idx_jsv);
+        _ = quickjs.JS_SetProperty(ctx, arr_jsv, atom, JSValue.dup(ctx, val.toJSValueWithCtx(ctx)));
+        quickjs.JS_FreeAtom(ctx, atom);
+        sp.* -= 3;
     }
 };
 
