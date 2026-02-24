@@ -1339,6 +1339,7 @@ pub const ZigCodeGen = struct {
         // This enables function hoisting - closures see updates to locals assigned later
         if (self.has_fclosure and self.func.var_count > 0) {
             try self.printLine("var _locals_jsv: [{d}]JSValue = .{{JSValue.UNDEFINED}} ** {d};", .{ self.func.var_count, self.func.var_count });
+            try self.writeLine("_ = &_locals_jsv;"); // Pin to stack - prevent optimizer from splitting/reusing slots
             try self.writeLine("var _var_ref_list: zig_runtime.ListHead = .{ .prev = null, .next = null };");
             try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_init(&_var_ref_list);");
         }
@@ -6043,18 +6044,15 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("}");
             },
 
-            // regexp: create RegExp from pattern and flags
+            // regexp: create RegExp from pattern and compiled bytecode
+            // QuickJS OP_regexp takes sp[-2]=pattern, sp[-1]=compiled_bytecode
+            // Must use internal constructor, NOT new RegExp(pattern, flags)
             .regexp => {
                 try self.writeLine("{");
                 self.pushIndent();
-                try self.writeLine("const flags = stack[sp-1].toJSValueWithCtx(ctx);");
+                try self.writeLine("const bc = stack[sp-1].toJSValueWithCtx(ctx);");
                 try self.writeLine("const pattern = stack[sp-2].toJSValueWithCtx(ctx);");
-                try self.writeLine("const global = JSValue.getGlobalObject(ctx);");
-                try self.writeLine("const RegExpCtor = JSValue.getPropertyStr(ctx, global, \"RegExp\");");
-                try self.writeLine("JSValue.free(ctx, global);");
-                try self.writeLine("var args = [2]JSValue{ pattern, flags };");
-                try self.writeLine("const rx = JSValue.callConstructor(ctx, RegExpCtor, 2, &args);");
-                try self.writeLine("JSValue.free(ctx, RegExpCtor);");
+                try self.writeLine("const rx = zig_runtime.quickjs.js_frozen_regexp_constructor(ctx, pattern, bc);");
                 try self.emitInlineExceptionReturn("rx");
                 try self.writeLine("stack[sp-2] = CV.fromJSValue(rx); sp -= 1;");
                 self.popIndent();
@@ -7023,8 +7021,13 @@ pub const ZigCodeGen = struct {
                     }
                     break;
                 }
-                // If we hit another call or control flow, stop looking
+                // If we hit another call, get_field2 (intermediate method setup), or control flow, stop looking
                 if (future_instr.opcode == .call or future_instr.opcode == .call0 or
+                    future_instr.opcode == .call1 or future_instr.opcode == .call2 or future_instr.opcode == .call3 or
+                    future_instr.opcode == .call_constructor or
+                    future_instr.opcode == .tail_call or future_instr.opcode == .tail_call_method or
+                    future_instr.opcode == .apply or
+                    future_instr.opcode == .get_field2 or
                     future_instr.opcode == .if_true or future_instr.opcode == .if_false or
                     future_instr.opcode == .goto or future_instr.opcode == .@"return")
                 {
@@ -7057,7 +7060,13 @@ pub const ZigCodeGen = struct {
                     }
                     break;
                 }
+                // If we hit another call, get_field2 (intermediate method setup), or control flow, stop looking
                 if (future_instr.opcode == .call or future_instr.opcode == .call0 or
+                    future_instr.opcode == .call1 or future_instr.opcode == .call2 or future_instr.opcode == .call3 or
+                    future_instr.opcode == .call_constructor or
+                    future_instr.opcode == .tail_call or future_instr.opcode == .tail_call_method or
+                    future_instr.opcode == .apply or
+                    future_instr.opcode == .get_field2 or
                     future_instr.opcode == .if_true or future_instr.opcode == .if_false or
                     future_instr.opcode == .goto or future_instr.opcode == .@"return")
                 {
@@ -7093,6 +7102,11 @@ pub const ZigCodeGen = struct {
         if (!std.mem.eql(u8, method_name, "push")) return false;
 
         // Look ahead for call_method with argc >= 1
+        // IMPORTANT: We must stop at ALL call-like opcodes and get_field2 to avoid
+        // matching an intermediate call_method (e.g., colors.bold() in arr.push(colors.bold(x)))
+        // as the push's call_method. The backward search in tryEmitNativeArrayPush stops at
+        // call/call_method, so if we skip get_field2("push") past an intermediate call,
+        // the backward search won't find it, leaving the stack corrupted.
         var i: usize = idx + 1;
         while (i < instrs.len) : (i += 1) {
             const future_instr = instrs[i];
@@ -7103,8 +7117,13 @@ pub const ZigCodeGen = struct {
                 }
                 break;
             }
-            // If we hit another call or control flow, stop looking
+            // If we hit another call, get_field2 (sets up a method call), or control flow, stop looking
             if (future_instr.opcode == .call or future_instr.opcode == .call0 or
+                future_instr.opcode == .call1 or future_instr.opcode == .call2 or future_instr.opcode == .call3 or
+                future_instr.opcode == .call_constructor or
+                future_instr.opcode == .tail_call or future_instr.opcode == .tail_call_method or
+                future_instr.opcode == .apply or
+                future_instr.opcode == .get_field2 or // intermediate method setup (e.g., get_field2("bold"))
                 future_instr.opcode == .if_true or future_instr.opcode == .if_false or
                 future_instr.opcode == .goto or future_instr.opcode == .@"return")
             {

@@ -2098,14 +2098,10 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .regexp => {
-                try self.write("            { JSValue flags = POP(); JSValue pattern = POP();\n");
-                try self.write("              JSValue global = JS_GetGlobalObject(ctx);\n");
-                try self.write("              JSValue RegExp = JS_GetPropertyStr(ctx, global, \"RegExp\");\n");
-                try self.write("              JS_FreeValue(ctx, global);\n");
-                try self.write("              JSValue args[2] = { pattern, flags };\n");
-                try self.write("              JSValue rx = JS_CallConstructor(ctx, RegExp, 2, args);\n");
-                try self.write("              JS_FreeValue(ctx, RegExp);\n");
-                try self.write("              FROZEN_FREE(ctx, pattern); FROZEN_FREE(ctx, flags);\n");
+                // QuickJS OP_regexp: sp[-2]=pattern, sp[-1]=compiled_bytecode
+                // Must use internal constructor, NOT new RegExp(pattern, flags)
+                try self.write("            { JSValue bc = POP(); JSValue pattern = POP();\n");
+                try self.write("              JSValue rx = js_frozen_regexp_constructor(ctx, pattern, bc);\n");
                 try self.write("              "); try self.emitExceptionCheck("rx", is_trampoline);
                 try self.write("              PUSH(rx); }\n");
                 return true;

@@ -372,6 +372,7 @@ pub const ThinCodeGen = struct {
         // V2 closure support
         if (self.has_fclosure and self.func.var_count > 0) {
             try self.printLine("var _locals_jsv: [{d}]zig_runtime.JSValue = .{{zig_runtime.JSValue.UNDEFINED}} ** {d};", .{ self.func.var_count, self.func.var_count });
+            try self.writeLine("_ = &_locals_jsv;"); // Pin to stack - prevent optimizer from splitting/reusing slots
             try self.writeLine("var _closure_alive: bool = false;");
             try self.writeLine("const _var_ref_list: *zig_runtime.ListHead = @ptrCast(@alignCast(zig_runtime.quickjs.js_malloc(ctx, @sizeOf(zig_runtime.ListHead)) orelse return zig_runtime.JSValue.EXCEPTION));");
             try self.writeLine("defer zig_runtime.quickjs.js_free(ctx, @ptrCast(_var_ref_list));");
@@ -405,6 +406,7 @@ pub const ThinCodeGen = struct {
         // IC slots
         if (total_ic_slots > 0) {
             try self.printLine("const _IC = struct {{ var s: [{d}]zig_runtime.ICSlot = .{{zig_runtime.ICSlot.ZERO}} ** {d}; }};", .{ total_ic_slots, total_ic_slots });
+            try self.writeLine("_ = &_IC;");
         }
         try self.writeLine("");
 
@@ -1113,11 +1115,11 @@ pub const ThinCodeGen = struct {
             // ========== Control Flow — handled by block terminator ==========
             .if_false, .if_false8, .if_true, .if_true8, .goto, .goto8, .goto16 => {},
 
-            // ========== Unsupported — emit trap ==========
+            // ========== Unsupported — skip function ==========
             else => {
-                try self.printLine("// UNSUPPORTED OPCODE: {s}", .{@tagName(instr.opcode)});
-                try self.writeLine("@trap();");
-                self.block_terminated = true;
+                // Return error so caller skips this function entirely
+                // (falls back to interpreter at runtime)
+                return error.UnsupportedOpcode;
             },
         }
     }

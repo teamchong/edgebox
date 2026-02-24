@@ -225,11 +225,6 @@ pub fn disableDispatch() void {
 ///
 /// This is the hot path - must be as fast as possible
 /// Uses name@line_num format to disambiguate functions with the same name in different scopes
-// Debug counters for frozen dispatch (disabled in production)
-const ENABLE_DISPATCH_COUNTERS = false;
-var dispatch_hits: usize = 0;
-var dispatch_misses: usize = 0;
-
 pub export fn frozen_dispatch_lookup(
     ctx: *JSContext,
     func_name: [*:0]const u8,
@@ -247,11 +242,8 @@ pub export fn frozen_dispatch_lookup(
 
     // Lookup frozen function by name@line_num key
     const func = lookup(func_name) orelse {
-        if (ENABLE_DISPATCH_COUNTERS) dispatch_misses += 1;
-        return 0;
+            return 0;
     };
-
-    if (ENABLE_DISPATCH_COUNTERS) dispatch_hits += 1;
 
     // Register this function by bytecode pointer for future bytecode-based dispatch
     // Only registers this specific function, NOT cpool entries (to avoid bytecode collisions)
@@ -283,9 +275,6 @@ pub export fn frozen_dispatch_lookup(
 /// Called from JS_CallInternal when executing a bytecode function
 /// This is the closure-aware dispatch path - var_refs is extracted from the function object
 /// Returns: 1 if frozen function was called (result in *result_out), 0 if not found
-var bytecode_dispatch_hits: usize = 0;
-var bytecode_dispatch_misses: usize = 0;
-
 pub export fn frozen_dispatch_lookup_bytecode(
     ctx: *JSContext,
     bytecode_ptr: *anyopaque,
@@ -302,11 +291,8 @@ pub export fn frozen_dispatch_lookup_bytecode(
 
     // Lookup frozen function by bytecode pointer
     const func = lookupByBytecode(bytecode_ptr) orelse {
-        if (ENABLE_DISPATCH_COUNTERS) bytecode_dispatch_misses += 1;
         return 0;
     };
-
-    if (ENABLE_DISPATCH_COUNTERS) bytecode_dispatch_hits += 1;
 
     // Call the frozen function with var_refs, closure_var_count, and cpool for closure/fclosure support
     if (is_wasm32) {
@@ -343,32 +329,6 @@ pub export fn frozen_dispatch_count() callconv(.c) c_int {
     return 0;
 }
 
-/// Print dispatch stats (callable from Zig)
-pub fn printDispatchStats() void {
-    frozen_dispatch_stats();
-}
-
-/// Debug: print dispatch stats (remove after debugging)
-export fn frozen_dispatch_stats() callconv(.c) void {
-    const name_count = if (name_registry) |reg| reg.count() else 0;
-    const bc_count = if (bytecode_registry) |reg| reg.count() else 0;
-    std.debug.print("[frozen] Name dispatch: {d} hits, {d} misses, {d} registered\n", .{ dispatch_hits, dispatch_misses, name_count });
-    std.debug.print("[frozen] Bytecode dispatch: {d} hits, {d} misses, {d} registered\n", .{ bytecode_dispatch_hits, bytecode_dispatch_misses, bc_count });
-}
-
-/// Debug: get dispatch hits count (useful when debug print doesn't work)
-export fn frozen_dispatch_get_hits() callconv(.c) c_int {
-    return @intCast(dispatch_hits + bytecode_dispatch_hits);
-}
-
-/// Debug: get the last return slot values
-export fn frozen_dispatch_get_return_lo() callconv(.c) u32 {
-    return zig_runtime.g_return_slot_lo.*;
-}
-
-export fn frozen_dispatch_get_return_hi() callconv(.c) u32 {
-    return zig_runtime.g_return_slot_hi.*;
-}
 
 /// Get the number of bytecode-registered frozen functions
 export fn frozen_dispatch_bytecode_count() callconv(.c) c_int {
@@ -387,10 +347,6 @@ pub fn clear() void {
     name_registry = null;
     bytecode_registry = null;
     dispatch_enabled = false;
-    dispatch_hits = 0;
-    dispatch_misses = 0;
-    bytecode_dispatch_hits = 0;
-    bytecode_dispatch_misses = 0;
 }
 
 // ============================================================================

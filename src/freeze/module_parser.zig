@@ -556,16 +556,24 @@ pub const ModuleParser = struct {
                 return .{ .float64 = val };
             },
             .string => {
-                const len = self.readLeb128() orelse return error.UnexpectedEof;
+                // QuickJS encodes strings as LEB128((str_len << 1) | is_wide_char)
+                // followed by str_len bytes (narrow) or str_len * 2 bytes (wide)
+                const len_encoded = self.readLeb128() orelse return error.UnexpectedEof;
+                const is_wide = (len_encoded & 1) != 0;
+                const str_len = len_encoded >> 1;
+                const byte_len: usize = if (is_wide) str_len * 2 else str_len;
                 // Security: Limit string size to prevent OOM DoS (1MB max)
-                if (len > 1024 * 1024) return error.InvalidFormat;
+                if (byte_len > 1024 * 1024) return error.InvalidFormat;
                 // Security: Check for overflow in position + length calculation
-                if (len > self.data.len or self.pos > self.data.len - len) return error.UnexpectedEof;
-                const str_data = self.data[self.pos .. self.pos + len];
-                self.pos += len;
-                // Make a copy owned by the allocator
-                const str_copy = try self.allocator.dupe(u8, str_data);
-                return .{ .string = str_copy };
+                if (byte_len > self.data.len or self.pos > self.data.len - byte_len) return error.UnexpectedEof;
+                const str_data = self.data[self.pos .. self.pos + byte_len];
+                self.pos += byte_len;
+                // Make a copy owned by the allocator (only non-wide for now)
+                if (!is_wide and str_len > 0) {
+                    const str_copy = try self.allocator.dupe(u8, str_data);
+                    return .{ .string = str_copy };
+                }
+                return .{ .string = "" };
             },
             .function_bytecode => {
                 // Parse the nested function and track its index for fclosure dispatch
@@ -612,12 +620,16 @@ pub const ModuleParser = struct {
                 if (!self.skip(8)) return error.UnexpectedEof;
             },
             .string => {
-                // String: LEB128 length + data
-                const len = self.readLeb128() orelse return error.UnexpectedEof;
+                // QuickJS encodes strings as LEB128((str_len << 1) | is_wide_char)
+                // followed by str_len bytes (narrow) or str_len * 2 bytes (wide)
+                const len_encoded = self.readLeb128() orelse return error.UnexpectedEof;
+                const is_wide = (len_encoded & 1) != 0;
+                const str_len = len_encoded >> 1;
+                const byte_len: usize = if (is_wide) str_len * 2 else str_len;
                 // Security: Limit string size and check for overflow
-                if (len > 1024 * 1024) return error.InvalidFormat;
-                if (len > self.data.len or self.pos > self.data.len - len) return error.UnexpectedEof;
-                self.pos += len;
+                if (byte_len > 1024 * 1024) return error.InvalidFormat;
+                if (byte_len > self.data.len or self.pos > self.data.len - byte_len) return error.UnexpectedEof;
+                self.pos += byte_len;
             },
             .function_bytecode => {
                 const func = try self.parseFunctionBytecode();
@@ -647,11 +659,18 @@ pub const ModuleParser = struct {
                 if (!self.skip(len * 4)) return error.UnexpectedEof; // limbs are u32
             },
             .regexp => {
-                // RegExp: bytecode_len + bytecode + pattern string
-                const bc_len = self.readLeb128() orelse return error.UnexpectedEof;
-                if (!self.skip(bc_len)) return error.UnexpectedEof;
-                const pat_len = self.readLeb128() orelse return error.UnexpectedEof;
-                if (!self.skip(pat_len)) return error.UnexpectedEof;
+                // RegExp: pattern (JS_WriteString) + bytecode (JS_WriteString)
+                // Both use (len << 1 | is_wide) encoding from JS_WriteString
+                const pat_encoded = self.readLeb128() orelse return error.UnexpectedEof;
+                const pat_wide = (pat_encoded & 1) != 0;
+                const pat_str_len = pat_encoded >> 1;
+                const pat_byte_len: usize = if (pat_wide) pat_str_len * 2 else pat_str_len;
+                if (!self.skip(pat_byte_len)) return error.UnexpectedEof;
+                const bc_encoded = self.readLeb128() orelse return error.UnexpectedEof;
+                const bc_wide = (bc_encoded & 1) != 0;
+                const bc_str_len = bc_encoded >> 1;
+                const bc_byte_len: usize = if (bc_wide) bc_str_len * 2 else bc_str_len;
+                if (!self.skip(bc_byte_len)) return error.UnexpectedEof;
             },
             .date => {
                 // Date: float64 timestamp
@@ -761,7 +780,6 @@ pub const ModuleParser = struct {
             },
             else => {
                 // Unknown tag - we can't safely skip it without knowing its size
-                // Return a sentinel error so caller can handle gracefully
                 return error.InvalidFormat;
             },
         }
@@ -814,7 +832,6 @@ pub const ModuleParser = struct {
             }
         }
 
-        // Restore position after scan
         _ = scan_start;
     }
 

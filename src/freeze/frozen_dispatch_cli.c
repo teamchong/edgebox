@@ -83,3 +83,13 @@ void native_shapes_init_atoms(uint32_t atom_kind, uint32_t atom_flags, uint32_t 
 // Debug stats - no-op in CLI mode
 void native_shapes_debug_stats(void) {
 }
+
+// Call profiling stubs - weak symbols overridden by Zig exports in CLI builds
+__attribute__((weak)) int edgebox_call_profile_enabled(void) {
+    return 0;
+}
+
+__attribute__((weak)) void edgebox_call_profile_increment(uint32_t atom, uint32_t line_num) {
+    (void)atom;
+    (void)line_num;
+}

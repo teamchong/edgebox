@@ -2311,6 +2311,11 @@ const JSValueWasm32 = extern struct {
         return result;
     }
 
+    /// Get the global object
+    pub inline fn getGlobalObject(ctx: *JSContext) JSValueWasm32 {
+        return quickjs.JS_GetGlobalObject(ctx);
+    }
+
     /// Get global variable by name
     pub inline fn getGlobal(ctx: *JSContext, name: [*:0]const u8) JSValueWasm32 {
         const global = quickjs.JS_GetGlobalObject(ctx);
@@ -2773,6 +2778,11 @@ const JSValueNative = extern struct {
         return result;
     }
 
+    /// Get the global object
+    pub inline fn getGlobalObject(ctx: *JSContext) JSValueNative {
+        return quickjs.JS_GetGlobalObject(ctx);
+    }
+
     /// Get global variable by name
     pub inline fn getGlobal(ctx: *JSContext, name: [*:0]const u8) JSValueNative {
         const global = quickjs.JS_GetGlobalObject(ctx);
@@ -3220,6 +3230,9 @@ pub const quickjs = struct {
     pub extern fn js_frozen_var_ref_list_init(list: *ListHead) void;
     pub extern fn js_frozen_var_ref_list_detach(ctx: *JSContext, list: *ListHead) void;
     pub extern fn js_frozen_create_closure_v2(ctx: *JSContext, bfunc: JSValue, cur_var_refs: ?[*]*JSVarRef, local_var_ref_list: ?*ListHead, locals: ?[*]JSValue, num_locals: c_int, args: ?[*]JSValue, num_args: c_int) JSValue;
+
+    // RegExp construction from compiled bytecode (for frozen OP_regexp)
+    pub extern fn js_frozen_regexp_constructor(ctx: *JSContext, pattern: JSValue, bc: JSValue) JSValue;
 
     // Class constructor creation (for define_class opcode)
     pub extern fn js_frozen_define_class(ctx: *JSContext, bfunc: JSValue, parent_class: JSValue, class_flags: c_int, class_name: u32, cur_var_refs: ?[*]*JSVarRef, local_var_ref_list: ?*ListHead, locals: ?[*]JSValue, num_locals: c_int, args: ?[*]JSValue, num_args: c_int, out_ctor: *JSValue, out_proto: *JSValue) c_int;

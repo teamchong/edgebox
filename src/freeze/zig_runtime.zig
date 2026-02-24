@@ -285,14 +285,11 @@ pub const prof = profile.prof;
 pub const cycles = profile.cycles;
 pub const vinc = profile.vinc;
 
-extern fn frozen_dispatch_stats() void;
 extern fn js_frozen_try_call_stats() void;
 extern fn js_frozen_dump_offsets() void;
 
 pub fn printProfile() void {
     profile.prof.print();
-    // Also print dispatch stats
-    frozen_dispatch_stats();
     js_frozen_try_call_stats();
     js_frozen_dump_offsets();
 }
@@ -537,6 +534,19 @@ pub noinline fn cleanupLocals(ctx: *JSContext, locals_ptr: [*]CompressedValue, c
 
 // ============================================================================
 // Thin Codegen Helpers: Stack-Direct Operations for Cold Functions
+// DEBUG: JSValue tag corruption detection helpers
+pub inline fn jsvalueTagCorrupt(jsv: *const JSValue) bool {
+    const tag = jsvalueRawTag(jsv);
+    // JS_TAG_FIRST = -9 (BIG_INT), JS_TAG_FLOAT64 = 8 (max valid tag)
+    return tag > 8 or tag < -9;
+}
+
+pub inline fn jsvalueRawTag(jsv: *const JSValue) i64 {
+    const ptr: [*]const u8 = @ptrCast(jsv);
+    // JSValue layout: { value: u64 (bytes 0-7), tag: i64 (bytes 8-15) }
+    return @as(*align(1) const i64, @ptrCast(ptr + 8)).*;
+}
+
 // ============================================================================
 //
 // These helpers operate directly on a [*]CV stack + *usize sp pointer.

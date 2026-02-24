@@ -410,6 +410,7 @@ pub const RelooperCodeGen = struct {
         // Enables closures to see updates to locals assigned after closure creation
         if (self.has_fclosure and self.func.var_count > 0) {
             try self.printLine("var _locals_jsv: [{d}]JSValue = .{{JSValue.UNDEFINED}} ** {d};", .{ self.func.var_count, self.func.var_count });
+            try self.writeLine("_ = &_locals_jsv;"); // Pin to stack - prevent optimizer from splitting/reusing slots
             try self.writeLine("var _closure_alive: bool = false;");
             // Heap-allocate var_ref_list to isolate from stack corruption
             try self.writeLine("const _var_ref_list: *zig_runtime.ListHead = @ptrCast(@alignCast(zig_runtime.quickjs.js_malloc(ctx, @sizeOf(zig_runtime.ListHead)) orelse return zig_runtime.JSValue.EXCEPTION));");
@@ -989,6 +990,7 @@ pub const RelooperCodeGen = struct {
                         try self.writeLine("}");
                         // Track that we've added one item to base stack (now have obj + method)
                         self.base_stack_depth += 1;
+                        self.base_popped_count = 0;
                     }
                 } else {
                     try self.writeLine("// get_field2: atom index out of range");
@@ -1425,6 +1427,7 @@ pub const RelooperCodeGen = struct {
                 }
                 // Track this value on base stack - vpop will compute correct offset when needed
                 self.base_stack_depth += 1;
+                self.base_popped_count = 0;
             },
             .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3, .put_var_ref => {
                 const bytecode_idx: u16 = switch (instr.opcode) {
