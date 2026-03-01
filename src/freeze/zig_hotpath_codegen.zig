@@ -533,6 +533,12 @@ pub const ZigHotPathGen = struct {
                 try self.print("    // goto offset {d}\n", .{target_offset});
             },
 
+            // Local variable ops and boolean/lnot - only used by non-recursive int32 path
+            // (zig_codegen_full handles these; this codegen only handles self-recursive patterns)
+            .get_loc_i32, .put_loc_i32, .set_loc_i32, .push_bool_i32, .lnot_i32, .if_true_i32 => {
+                return error.UnsupportedOpcode;
+            },
+
             .unsupported => {
                 return error.UnsupportedOpcode;
             },

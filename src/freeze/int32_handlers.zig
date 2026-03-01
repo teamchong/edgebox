@@ -35,10 +35,22 @@ pub const Int32Pattern = enum {
     tail_call_self_i32,
     /// Return int32 value
     return_i32,
-    /// Conditional jump
+    /// Conditional jump (jump if false)
     if_false_i32,
+    /// Conditional jump (jump if true)
+    if_true_i32,
     /// Unconditional jump
     goto_i32,
+    /// Get local variable (loc0..loc3, loc, loc8)
+    get_loc_i32,
+    /// Put (store) local variable - pops value, stores to local slot
+    put_loc_i32,
+    /// Set local variable - stores to local slot, keeps value on stack
+    set_loc_i32,
+    /// Push boolean as i32 (true=1, false=0)
+    push_bool_i32,
+    /// Logical NOT: pop 1, push !val as i32 (0→1, nonzero→0)
+    lnot_i32,
     /// Unsupported in int32 mode
     unsupported,
 };
@@ -61,12 +73,22 @@ pub fn getInt32Handler(opcode: Opcode) Int32Handler {
         .push_2 => .{ .pattern = .push_const_i32, .value = 2 },
         .push_3 => .{ .pattern = .push_const_i32, .value = 3 },
         .push_i8, .push_i16, .push_i32 => .{ .pattern = .push_const_i32 }, // Value from operand
+        .push_minus1 => .{ .pattern = .push_const_i32, .value = -1 },
+        .push_4 => .{ .pattern = .push_const_i32, .value = 4 },
+        .push_5 => .{ .pattern = .push_const_i32, .value = 5 },
+        .push_6 => .{ .pattern = .push_const_i32, .value = 6 },
+        .push_7 => .{ .pattern = .push_const_i32, .value = 7 },
+
+        // Push booleans as i32
+        .push_true => .{ .pattern = .push_bool_i32, .value = 1 },
+        .push_false => .{ .pattern = .push_bool_i32, .value = 0 },
 
         // Get arguments
         .get_arg0 => .{ .pattern = .get_arg_i32, .index = 0 },
         .get_arg1 => .{ .pattern = .get_arg_i32, .index = 1 },
         .get_arg2 => .{ .pattern = .get_arg_i32, .index = 2 },
         .get_arg3 => .{ .pattern = .get_arg_i32, .index = 3 },
+        .get_arg => .{ .pattern = .get_arg_i32 }, // Index from operand
 
         // Put (store) arguments - used for tail recursion optimization
         .put_arg0 => .{ .pattern = .put_arg_i32, .index = 0 },
@@ -100,6 +122,30 @@ pub fn getInt32Handler(opcode: Opcode) Int32Handler {
         .neg => .{ .pattern = .unary_i32, .op = "-" },
         .not => .{ .pattern = .unary_i32, .op = "~" },
 
+        // Logical NOT
+        .lnot => .{ .pattern = .lnot_i32 },
+
+        // Get local variables
+        .get_loc0 => .{ .pattern = .get_loc_i32, .index = 0 },
+        .get_loc1 => .{ .pattern = .get_loc_i32, .index = 1 },
+        .get_loc2 => .{ .pattern = .get_loc_i32, .index = 2 },
+        .get_loc3 => .{ .pattern = .get_loc_i32, .index = 3 },
+        .get_loc, .get_loc8 => .{ .pattern = .get_loc_i32 }, // Index from operand
+
+        // Put (store) local variables - pops value
+        .put_loc0 => .{ .pattern = .put_loc_i32, .index = 0 },
+        .put_loc1 => .{ .pattern = .put_loc_i32, .index = 1 },
+        .put_loc2 => .{ .pattern = .put_loc_i32, .index = 2 },
+        .put_loc3 => .{ .pattern = .put_loc_i32, .index = 3 },
+        .put_loc, .put_loc8 => .{ .pattern = .put_loc_i32 }, // Index from operand
+
+        // Set local variables - stores but keeps value on stack
+        .set_loc0 => .{ .pattern = .set_loc_i32, .index = 0 },
+        .set_loc1 => .{ .pattern = .set_loc_i32, .index = 1 },
+        .set_loc2 => .{ .pattern = .set_loc_i32, .index = 2 },
+        .set_loc3 => .{ .pattern = .set_loc_i32, .index = 3 },
+        .set_loc, .set_loc8 => .{ .pattern = .set_loc_i32 }, // Index from operand
+
         // Inc/Dec
         .inc => .{ .pattern = .inc_dec_i32, .is_inc = true },
         .dec => .{ .pattern = .inc_dec_i32, .is_inc = false },
@@ -126,6 +172,7 @@ pub fn getInt32Handler(opcode: Opcode) Int32Handler {
 
         // Control flow
         .if_false, .if_false8 => .{ .pattern = .if_false_i32 },
+        .if_true, .if_true8 => .{ .pattern = .if_true_i32 },
         .goto, .goto8, .goto16 => .{ .pattern = .goto_i32 },
 
         // Everything else is unsupported in int32 mode

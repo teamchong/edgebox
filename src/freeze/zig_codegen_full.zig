@@ -39,6 +39,19 @@ const Allocator = std.mem.Allocator;
 // Debug flag - set to true for verbose codegen logging
 const CODEGEN_DEBUG = false;
 
+/// Extract integer constant from instruction operand (handles i8, i16, i32, implicit_int variants)
+fn int32ExtractConst(instr: Instruction) i32 {
+    return switch (instr.operand) {
+        .i8 => |v| @as(i32, v),
+        .i16 => |v| @as(i32, v),
+        .i32 => |v| v,
+        .u8 => |v| @as(i32, v),
+        .u16 => |v| @as(i32, v),
+        .implicit_int => |v| v,
+        else => 0,
+    };
+}
+
 // Runtime tracing - generates std.debug.print at entry of each frozen function
 // Enable this to trace which frozen functions are being called (for debugging infinite loops)
 const TRACE_FROZEN_CALLS = false;
@@ -238,8 +251,8 @@ pub const ZigCodeGen = struct {
     skip_blocks: std.AutoHashMapUnmanaged(u32, void) = .{},
     /// Current block index (for fallback code generation)
     current_block_idx: u32 = 0,
-    /// Virtual stack for expression-based codegen (tracks symbolic expressions)
-    vstack: std.ArrayListUnmanaged([]const u8) = .{},
+    /// Virtual stack for expression-based codegen (tracks symbolic expressions with ownership)
+    vstack: std.ArrayListUnmanaged(VStackEntry) = .{},
     /// Force stack-based codegen after a fallback (to avoid vstack/stack mismatches)
     force_stack_mode: bool = false,
     /// Track that shouldSkipForNativeMath skipped get_var/get_field2 instructions,
@@ -313,6 +326,17 @@ pub const ZigCodeGen = struct {
 
     const Self = @This();
 
+    /// Ownership tag for virtual stack entries
+    pub const Ownership = enum { owned, borrowed };
+
+    /// Virtual stack entry: expression string + ownership tracking
+    /// - `owned`: Caller holds the only reference. Can be moved without dup; must be freed if dropped.
+    /// - `borrowed`: References storage (locals, stack, args). Must be duped to move; no-op to drop.
+    pub const VStackEntry = struct {
+        expr: []const u8,
+        ownership: Ownership,
+    };
+
     /// Allocate the next IC slot index for a property access site
     pub fn nextIcSlot(self: *Self) u32 {
         const idx = self.ic_count;
@@ -354,8 +378,8 @@ pub const ZigCodeGen = struct {
         self.emitted_blocks.deinit(self.allocator);
         self.deferred_blocks.deinit(self.allocator);
         // Free virtual stack expressions
-        for (self.vstack.items) |expr| {
-            if (self.isAllocated(expr)) self.allocator.free(expr);
+        for (self.vstack.items) |entry| {
+            if (self.isAllocated(entry.expr)) self.allocator.free(entry.expr);
         }
         self.vstack.deinit(self.allocator);
     }
@@ -556,6 +580,64 @@ pub const ZigCodeGen = struct {
     /// Delegates to shared helper in opcode_emitter.zig.
     fn emitLocalsCleanup(self: *Self) !void {
         try opcode_emitter.emitLocalsCleanupShared(Self, self, self.func.var_count, "");
+    }
+
+    /// Emit ownership-aware put_loc: pop value, store to local, free old local.
+    /// When source is owned, moves without dup. When borrowed, dups to create independent ref.
+    fn emitPutLocalOwned(self: *Self, loc_idx: u32) !void {
+        if (self.vpopEntry()) |entry| {
+            if (entry.ownership == .owned) {
+                // Owned: move value to local (no dup), free old local
+                try self.printLine("{{ const _old = locals[{d}]; locals[{d}] = {s}; CV.freeRef(ctx, _old); }}", .{ loc_idx, loc_idx, entry.expr });
+            } else {
+                // Borrowed: dup value for local, free old local
+                try self.printLine("{{ const _old = locals[{d}]; locals[{d}] = CV.dupRef({s}); CV.freeRef(ctx, _old); }}", .{ loc_idx, loc_idx, entry.expr });
+            }
+            // If expr contains stack references, pop from real stack
+            const ref_count = self.countStackRefs(entry.expr);
+            if (ref_count > 0) try self.printLine("sp -= {d};", .{ref_count});
+            if (self.isAllocated(entry.expr)) self.allocator.free(entry.expr);
+        } else {
+            // Physical stack: transfer ownership from stack to local, free old
+            try self.printLine("{{ const _old = locals[{d}]; locals[{d}] = stack[sp - 1]; sp -= 1; CV.freeRef(ctx, _old); }}", .{ loc_idx, loc_idx });
+        }
+        // Sync JSValue shadow for shared var_refs (function hoisting support)
+        if (self.has_fclosure and self.func.var_count > 0 and loc_idx < self.func.var_count) {
+            try self.printLine("{s}[{d}] = CV.toJSValuePtr(&locals[{d}]);", .{ self.getLocalsJsvExpr(), loc_idx, loc_idx });
+        }
+    }
+
+    /// Emit ownership-aware set_loc: pop value, store to local AND keep on vstack.
+    /// When source is owned AND not a stack reference, transfers to local without dup.
+    /// Stack references always need dup because the value stays on both stack and local.
+    /// When borrowed, dups for local and pushes borrowed ref back.
+    fn emitSetLocalOwned(self: *Self, loc_idx: u32) !void {
+        if (self.vpopEntry()) |entry| {
+            const is_stack_ref = std.mem.startsWith(u8, entry.expr, "stack[sp");
+            if (entry.ownership == .owned and !is_stack_ref) {
+                // Owned non-stack: transfer ownership to local (no dup), push borrowed ref
+                try self.printLine("{{ const _old = locals[{d}]; locals[{d}] = {s}; CV.freeRef(ctx, _old); }}", .{ loc_idx, loc_idx, entry.expr });
+                try self.vpushFmt("locals[{d}]", .{loc_idx});
+            } else {
+                // Borrowed OR stack ref: dup for local, push appropriate ref back
+                // Stack refs MUST dup because value stays on both physical stack and local
+                try self.printLine("{{ const _old = locals[{d}]; CV.freeRef(ctx, _old); const _v = {s}; locals[{d}] = CV.dupRef(_v); }}", .{ loc_idx, entry.expr, loc_idx });
+                // If expr is a stack ref, preserve for sp accounting; otherwise use locals[N]
+                if (is_stack_ref) {
+                    try self.vpushFmt("{s}", .{entry.expr});
+                } else {
+                    try self.vpushFmt("locals[{d}]", .{loc_idx});
+                }
+            }
+            if (self.isAllocated(entry.expr)) self.allocator.free(entry.expr);
+        } else {
+            // Physical stack: dup for local, stack keeps original
+            try self.printLine("{{ const _old = locals[{d}]; CV.freeRef(ctx, _old); const _v = stack[sp - 1]; locals[{d}] = CV.dupRef(_v); }}", .{ loc_idx, loc_idx });
+        }
+        // Sync JSValue shadow for shared var_refs (function hoisting support)
+        if (self.has_fclosure and self.func.var_count > 0 and loc_idx < self.func.var_count) {
+            try self.printLine("{s}[{d}] = CV.toJSValuePtr(&locals[{d}]);", .{ self.getLocalsJsvExpr(), loc_idx, loc_idx });
+        }
     }
 
     /// Emit block-level interpreter fallback for a single unsupported opcode
@@ -837,8 +919,8 @@ pub const ZigCodeGen = struct {
 
     /// Generate complete Zig function
     pub fn generate(self: *Self) ![]const u8 {
-        // Check for pure int32 optimization (fib-like functions)
-        if (self.func.is_pure_int32 and self.func.is_self_recursive) {
+        // Check for pure int32 optimization (fib-like recursive or non-recursive pure-integer functions)
+        if (self.func.is_pure_int32) {
             try self.emitInt32Specialized();
             return self.output.toOwnedSlice(self.allocator);
         }
@@ -1261,8 +1343,8 @@ pub const ZigCodeGen = struct {
                         const continues = try self.emitInstruction(instr, block.instructions, idx);
                         // Clear vstack after emitInstruction to prevent stale entries
                         // (matches force_stack_mode cleanup in emitInstructionExpr)
-                        for (self.vstack.items) |expr| {
-                            if (self.isAllocated(expr)) self.allocator.free(expr);
+                        for (self.vstack.items) |entry| {
+                            if (self.isAllocated(entry.expr)) self.allocator.free(entry.expr);
                         }
                         self.vstack.clearRetainingCapacity();
                         if (!continues) break; // Stop after terminating instruction
@@ -1545,8 +1627,8 @@ pub const ZigCodeGen = struct {
             try self.writeLine("}");
         } else {
             // Clean block - emit instructions with expression-based codegen
-            for (self.vstack.items) |expr| {
-                if (self.isAllocated(expr)) self.allocator.free(expr);
+            for (self.vstack.items) |entry| {
+                if (self.isAllocated(entry.expr)) self.allocator.free(entry.expr);
             }
             self.vstack.clearRetainingCapacity();
 
@@ -1691,8 +1773,8 @@ pub const ZigCodeGen = struct {
             // Clean block - use expression-based codegen
             // Clear existing vstack - don't pre-populate with existing stack refs
             // Instead, set base_stack_depth so vpop can compute refs when vstack underflows
-            for (self.vstack.items) |expr| {
-                if (self.isAllocated(expr)) self.allocator.free(expr);
+            for (self.vstack.items) |entry| {
+                if (self.isAllocated(entry.expr)) self.allocator.free(entry.expr);
             }
             self.vstack.clearRetainingCapacity();
 
@@ -2067,8 +2149,8 @@ pub const ZigCodeGen = struct {
         const condition_start = if (is_iterator_loop) 0 else self.findConditionStart(header_block);
 
         // Clear vstack and reconstruct from incoming stack values
-        for (self.vstack.items) |expr| {
-            if (self.isAllocated(expr)) self.allocator.free(expr);
+        for (self.vstack.items) |entry| {
+            if (self.isAllocated(entry.expr)) self.allocator.free(entry.expr);
         }
         self.vstack.clearRetainingCapacity();
 
@@ -2106,7 +2188,7 @@ pub const ZigCodeGen = struct {
                         .get_loc, .get_loc8 => {
                             const loc_idx = instr.operand.loc;
                             const ref = std.fmt.allocPrint(self.allocator, "locals[{d}]", .{loc_idx}) catch @panic("OOM");
-                            try self.vstack.append(self.allocator, ref);
+                            try self.vstack.append(self.allocator, .{ .expr = ref, .ownership = .borrowed });
                             found_count += 1;
                         },
                         else => break, // Stop at non-get_loc instruction
@@ -2182,11 +2264,11 @@ pub const ZigCodeGen = struct {
                 if (nested.header_block == bid and nested.depth > loop.depth) {
                     if (nested.parent_header != null and nested.parent_header.? == loop.header_block) {
                         // Save and restore vstack around nested loop
-                        var saved_vstack = std.ArrayListUnmanaged([]const u8){};
+                        var saved_vstack = std.ArrayListUnmanaged(VStackEntry){};
                         defer saved_vstack.deinit(self.allocator);
                         for (self.vstack.items) |item| {
-                            const copy = try self.allocator.dupe(u8, item);
-                            try saved_vstack.append(self.allocator, copy);
+                            const copy = try self.allocator.dupe(u8, item.expr);
+                            try saved_vstack.append(self.allocator, .{ .expr = copy, .ownership = item.ownership });
                         }
 
                         try self.emitNativeLoop(nested, blocks);
@@ -2200,10 +2282,7 @@ pub const ZigCodeGen = struct {
                         }
 
                         // Restore vstack
-                        for (self.vstack.items) |expr| {
-                            if (self.isAllocated(expr)) self.allocator.free(expr);
-                        }
-                        self.vstack.clearRetainingCapacity();
+                        self.freeVStack();
                         for (saved_vstack.items) |item| {
                             try self.vstack.append(self.allocator, item);
                         }
@@ -2376,8 +2455,8 @@ pub const ZigCodeGen = struct {
 
         // Clear vstack and reconstruct from incoming stack values
         // For loops, predecessors often push values (like loop counters) that the header expects
-        for (self.vstack.items) |expr| {
-            if (self.isAllocated(expr)) self.allocator.free(expr);
+        for (self.vstack.items) |entry| {
+            if (self.isAllocated(entry.expr)) self.allocator.free(entry.expr);
         }
         self.vstack.clearRetainingCapacity();
 
@@ -2417,7 +2496,7 @@ pub const ZigCodeGen = struct {
                         .get_loc, .get_loc8 => {
                             const loc_idx = instr.operand.loc;
                             const ref = std.fmt.allocPrint(self.allocator, "locals[{d}]", .{loc_idx}) catch @panic("OOM");
-                            try self.vstack.append(self.allocator, ref);
+                            try self.vstack.append(self.allocator, .{ .expr = ref, .ownership = .borrowed });
                             found_count += 1;
                         },
                         else => break, // Stop at non-get_loc instruction
@@ -2760,10 +2839,17 @@ pub const ZigCodeGen = struct {
     // Expression-Based Codegen (no stack machine overhead)
     // ========================================================================
 
-    /// Push an expression onto the virtual stack
+    /// Push a borrowed expression onto the virtual stack (default: .borrowed)
     fn vpush(self: *Self, expr: []const u8) !void {
-        const owned = try self.allocator.dupe(u8, expr);
-        try self.vstack.append(self.allocator, owned);
+        const duped = try self.allocator.dupe(u8, expr);
+        try self.vstack.append(self.allocator, .{ .expr = duped, .ownership = .borrowed });
+    }
+
+    /// Push an owned expression onto the virtual stack
+    /// Use for expressions that create new values: call results, binary ops, get_field, etc.
+    fn vpushOwned(self: *Self, expr: []const u8) !void {
+        const duped = try self.allocator.dupe(u8, expr);
+        try self.vstack.append(self.allocator, .{ .expr = duped, .ownership = .owned });
     }
 
     /// Push a stack reference to vstack and adjust existing stack refs to account for sp change
@@ -2776,7 +2862,7 @@ pub const ZigCodeGen = struct {
             // Find and replace all "stack[sp-N]" and "stack[sp - N]" patterns in the entry
             var new_expr = std.ArrayListUnmanaged(u8){};
             var i: usize = 0;
-            const expr = entry.*;
+            const expr = entry.expr;
             while (i < expr.len) {
                 // Look for "stack[sp-" pattern (9 chars, no spaces)
                 if (i + 9 <= expr.len and std.mem.eql(u8, expr[i .. i + 9], "stack[sp-")) {
@@ -2822,52 +2908,61 @@ pub const ZigCodeGen = struct {
                 new_expr.append(self.allocator, expr[i]) catch {};
                 i += 1;
             }
-            // Replace the entry with the adjusted expression
-            self.allocator.free(entry.*);
-            entry.* = new_expr.toOwnedSlice(self.allocator) catch "";
+            // Replace the entry expression with the adjusted one (preserve ownership)
+            self.allocator.free(entry.expr);
+            entry.expr = new_expr.toOwnedSlice(self.allocator) catch "";
         }
-        // Now push the new stack reference
-        try self.vpush("stack[sp-1]");
+        // Now push the new stack reference (owned — vstack takes ownership, sp will be decremented on consume)
+        try self.vpushOwned("stack[sp-1]");
     }
 
-    /// Push a formatted expression onto the virtual stack
+    /// Push a formatted borrowed expression onto the virtual stack
     fn vpushFmt(self: *Self, comptime fmt: []const u8, args: anytype) !void {
         const expr = try std.fmt.allocPrint(self.allocator, fmt, args);
-        try self.vstack.append(self.allocator, expr);
+        try self.vstack.append(self.allocator, .{ .expr = expr, .ownership = .borrowed });
     }
 
-    /// Pop an expression from the virtual stack
+    /// Push a formatted owned expression onto the virtual stack
+    fn vpushFmtOwned(self: *Self, comptime fmt: []const u8, args: anytype) !void {
+        const expr = try std.fmt.allocPrint(self.allocator, fmt, args);
+        try self.vstack.append(self.allocator, .{ .expr = expr, .ownership = .owned });
+    }
+
+    /// Pop an expression string from the virtual stack (discards ownership info)
     /// If vstack is empty but base_stack_depth > 0, returns a ref to existing stack value
     fn vpop(self: *Self) ?[]const u8 {
+        if (self.vpopEntry()) |entry| return entry.expr;
+        return null;
+    }
+
+    /// Pop a full VStackEntry (expression + ownership) from the virtual stack
+    /// Use this when ownership info matters (put_loc, set_loc, return, drop, materializeVStack)
+    fn vpopEntry(self: *Self) ?VStackEntry {
         if (self.vstack.items.len > 0) {
             return self.vstack.pop() orelse return null;
         }
         // vstack empty - check if there are base stack values we can reference
         if (self.base_stack_depth > 0) {
-            // Generate a reference to the topmost base stack value
-            // offset = 1 + number already popped from base
-            // First pop: offset = 1 -> stack[sp - 1] (the actual top)
-            // Second pop: offset = 2 -> stack[sp - 2]
             const offset = 1 + self.base_popped_count;
             const ref = std.fmt.allocPrint(self.allocator, "stack[sp - {d}]", .{offset}) catch @panic("OOM");
             self.base_stack_depth -= 1;
             self.base_popped_count += 1;
-            return ref;
+            return .{ .expr = ref, .ownership = .owned };
         }
         return null;
     }
 
     /// Pop and free in one step - use when discarding values
     fn vpopAndFree(self: *Self) void {
-        if (self.vpop()) |expr| {
-            if (self.isAllocated(expr)) self.allocator.free(expr);
+        if (self.vpopEntry()) |entry| {
+            if (self.isAllocated(entry.expr)) self.allocator.free(entry.expr);
         }
     }
 
     /// Peek at the top expression without popping
     fn vpeek(self: *Self) ?[]const u8 {
         if (self.vstack.items.len > 0) {
-            return self.vstack.items[self.vstack.items.len - 1];
+            return self.vstack.items[self.vstack.items.len - 1].expr;
         }
         // vstack empty but base stack exists
         // The top is at offset = 1 + base_popped_count
@@ -2882,6 +2977,14 @@ pub const ZigCodeGen = struct {
             return "stack[sp - 1]";
         }
         return null;
+    }
+
+    /// Free all vstack expressions and clear the vstack
+    fn freeVStack(self: *Self) void {
+        for (self.vstack.items) |entry| {
+            if (self.isAllocated(entry.expr)) self.allocator.free(entry.expr);
+        }
+        self.vstack.clearRetainingCapacity();
     }
 
     /// Check if a string was heap-allocated (vs a literal fallback)
@@ -2958,13 +3061,14 @@ pub const ZigCodeGen = struct {
         return seen_count;
     }
 
-    /// Count unique stack references across multiple expressions.
+    /// Count unique stack references across multiple vstack entries.
     /// Unlike countStackRefs (single expression), this deduplicates across ALL items.
-    fn countStackRefsMulti(_: *Self, exprs: []const []const u8) usize {
+    fn countStackRefsMulti(_: *Self, entries: []const VStackEntry) usize {
         var seen_offsets: [16]u16 = .{0} ** 16;
         var seen_count: usize = 0;
 
-        for (exprs) |expr| {
+        for (entries) |entry| {
+            const expr = entry.expr;
             var i: usize = 0;
             while (i < expr.len) {
                 var offset: ?u16 = null;
@@ -3113,8 +3217,8 @@ pub const ZigCodeGen = struct {
         // Each block should build its own vstack from instructions (get_loc, get_arg, etc.)
         // Don't reconstruct from stack_depth_in as that can cause issues with nested loops
         // where the condition should read from locals, not outer stack values
-        for (self.vstack.items) |expr| {
-            if (self.isAllocated(expr)) self.allocator.free(expr);
+        for (self.vstack.items) |entry| {
+            if (self.isAllocated(entry.expr)) self.allocator.free(entry.expr);
         }
         self.vstack.clearRetainingCapacity();
 
@@ -3260,8 +3364,8 @@ pub const ZigCodeGen = struct {
             // Clear vstack after emitInstruction in force_stack_mode
             // emitInstruction uses real stack operations, so any vstack pushes (e.g., from
             // emitCallMethod) should be cleared to prevent stale data at block terminator flush
-            for (self.vstack.items) |expr| {
-                if (self.isAllocated(expr)) self.allocator.free(expr);
+            for (self.vstack.items) |entry| {
+                if (self.isAllocated(entry.expr)) self.allocator.free(entry.expr);
             }
             self.vstack.clearRetainingCapacity();
             if (!continues) {
@@ -3306,15 +3410,15 @@ pub const ZigCodeGen = struct {
             // push_this - keep in expression mode for nullish coalescing patterns
             .push_this => {
                 if (self.func.has_use_strict) {
-                    try self.vpush("CV.fromJSValue(JSValue.dup(ctx, this_val))");
+                    try self.vpushOwned("CV.fromJSValue(JSValue.dup(ctx, this_val))");
                 } else {
                     // Non-strict mode: undefined/null this becomes globalThis
-                    try self.vpushFmt("CV.fromJSValue(if (this_val.isUndefined() or this_val.isNull()) JSValue.getGlobal(ctx, \"{s}\") else JSValue.dup(ctx, this_val))", .{"globalThis"});
+                    try self.vpushFmtOwned("CV.fromJSValue(if (this_val.isUndefined() or this_val.isNull()) JSValue.getGlobal(ctx, \"{s}\") else JSValue.dup(ctx, this_val))", .{"globalThis"});
                 }
             },
 
             // object - create empty object (keep in expression mode)
-            .object => try self.vpush("CV.fromJSValue(JSValue.newObject(ctx))"),
+            .object => try self.vpushOwned("CV.fromJSValue(JSValue.newObject(ctx))"),
 
             // Local variables - push reference expression
             .get_loc0 => try self.vpush("locals[0]"),
@@ -3327,175 +3431,19 @@ pub const ZigCodeGen = struct {
                 try self.vpush("locals[1]");
             },
 
-            // Put local - emit assignment, pop from stack
-            .put_loc0 => {
-                if (self.vpop()) |expr| {
-                    try self.printLine("locals[0] = {s};", .{expr});
-                    // If expr contains stack references, we need to pop from real stack
-                    const ref_count = self.countStackRefs(expr);
-                    if (ref_count > 0) try self.printLine("sp -= {d};", .{ref_count});
-                    if (self.isAllocated(expr)) self.allocator.free(expr);
-                } else {
-                    try self.writeLine("locals[0] = stack[sp - 1]; sp -= 1;");
-                }
-                // Sync JSValue shadow for shared var_refs (function hoisting support)
-                if (self.has_fclosure and self.func.var_count > 0) {
-                    try self.printLine("{s}[0] = CV.toJSValuePtr(&locals[0]);", .{self.getLocalsJsvExpr()});
-                }
-            },
-            .put_loc1 => {
-                if (self.vpop()) |expr| {
-                    try self.printLine("locals[1] = {s};", .{expr});
-                    const ref_count = self.countStackRefs(expr);
-                    if (ref_count > 0) try self.printLine("sp -= {d};", .{ref_count});
-                    if (self.isAllocated(expr)) self.allocator.free(expr);
-                } else {
-                    try self.writeLine("locals[1] = stack[sp - 1]; sp -= 1;");
-                }
-                // Sync JSValue shadow for shared var_refs (function hoisting support)
-                if (self.has_fclosure and self.func.var_count > 0) {
-                    try self.printLine("{s}[1] = CV.toJSValuePtr(&locals[1]);", .{self.getLocalsJsvExpr()});
-                }
-            },
-            .put_loc2 => {
-                if (self.vpop()) |expr| {
-                    try self.printLine("locals[2] = {s};", .{expr});
-                    const ref_count = self.countStackRefs(expr);
-                    if (ref_count > 0) try self.printLine("sp -= {d};", .{ref_count});
-                    if (self.isAllocated(expr)) self.allocator.free(expr);
-                } else {
-                    try self.writeLine("locals[2] = stack[sp - 1]; sp -= 1;");
-                }
-                // Sync JSValue shadow for shared var_refs (function hoisting support)
-                if (self.has_fclosure and self.func.var_count > 0) {
-                    try self.printLine("{s}[2] = CV.toJSValuePtr(&locals[2]);", .{self.getLocalsJsvExpr()});
-                }
-            },
-            .put_loc3 => {
-                if (self.vpop()) |expr| {
-                    try self.printLine("locals[3] = {s};", .{expr});
-                    const ref_count = self.countStackRefs(expr);
-                    if (ref_count > 0) try self.printLine("sp -= {d};", .{ref_count});
-                    if (self.isAllocated(expr)) self.allocator.free(expr);
-                } else {
-                    try self.writeLine("locals[3] = stack[sp - 1]; sp -= 1;");
-                }
-                // Sync JSValue shadow for shared var_refs (function hoisting support)
-                if (self.has_fclosure and self.func.var_count > 0) {
-                    try self.printLine("{s}[3] = CV.toJSValuePtr(&locals[3]);", .{self.getLocalsJsvExpr()});
-                }
-            },
-            .put_loc, .put_loc8 => {
-                const loc_idx = instr.operand.loc;
-                if (self.vpop()) |expr| {
-                    try self.printLine("locals[{d}] = {s};", .{ loc_idx, expr });
-                    // If expr contains stack references, we need to pop from real stack
-                    const ref_count = self.countStackRefs(expr);
-                    if (ref_count > 0) try self.printLine("sp -= {d};", .{ref_count});
-                    if (self.isAllocated(expr)) self.allocator.free(expr);
-                } else {
-                    try self.printLine("locals[{d}] = stack[sp - 1]; sp -= 1;", .{loc_idx});
-                }
-                // Sync JSValue shadow for shared var_refs (function hoisting support)
-                if (self.has_fclosure and self.func.var_count > 0 and loc_idx < self.func.var_count) {
-                    try self.printLine("{s}[{d}] = CV.toJSValuePtr(&locals[{d}]);", .{ self.getLocalsJsvExpr(), loc_idx, loc_idx });
-                }
-            },
+            // Put local - ownership-aware: move owned values, dup borrowed, free old local
+            .put_loc0 => try self.emitPutLocalOwned(0),
+            .put_loc1 => try self.emitPutLocalOwned(1),
+            .put_loc2 => try self.emitPutLocalOwned(2),
+            .put_loc3 => try self.emitPutLocalOwned(3),
+            .put_loc, .put_loc8 => try self.emitPutLocalOwned(instr.operand.loc),
 
-            // Set local (keep on stack) - emit assignment and push back
-            // set_loc: stack keeps ref, local gets NEW ref -> dup to local, free old local
-            // This is critical for correct refcounting when the stack value is later freed
-            // IMPORTANT: After storing, we must replace the vstack expression with a reference
-            // to locals[N] so that subsequent uses don't re-evaluate the original expression
-            // (e.g., JSValue.newObject() would create a different object each time)
-            .set_loc0 => {
-                if (self.vpop()) |expr| {
-                    try self.printLine("{{ const _old = locals[0]; CV.freeRef(ctx, _old); const _v = {s}; locals[0] = CV.dupRef(_v); }}", .{expr});
-                    // If expr is a stack reference (from base stack vpop), push it back to preserve
-                    // sp accounting in materializeVStack. Otherwise use locals[0] to avoid re-evaluation.
-                    if (std.mem.startsWith(u8, expr, "stack[sp")) {
-                        try self.vpushFmt("{s}", .{expr});
-                    } else {
-                        try self.vpush("locals[0]");
-                    }
-                    if (self.isAllocated(expr)) self.allocator.free(expr);
-                } else {
-                    try self.writeLine("{ const _old = locals[0]; CV.freeRef(ctx, _old); const _v = stack[sp - 1]; locals[0] = CV.dupRef(_v); }");
-                }
-                // Sync JSValue shadow for shared var_refs (function hoisting support)
-                if (self.has_fclosure and self.func.var_count > 0) {
-                    try self.printLine("{s}[0] = CV.toJSValuePtr(&locals[0]);", .{self.getLocalsJsvExpr()});
-                }
-            },
-            .set_loc1 => {
-                if (self.vpop()) |expr| {
-                    try self.printLine("{{ const _old = locals[1]; CV.freeRef(ctx, _old); const _v = {s}; locals[1] = CV.dupRef(_v); }}", .{expr});
-                    if (std.mem.startsWith(u8, expr, "stack[sp")) {
-                        try self.vpushFmt("{s}", .{expr});
-                    } else {
-                        try self.vpush("locals[1]");
-                    }
-                    if (self.isAllocated(expr)) self.allocator.free(expr);
-                } else {
-                    try self.writeLine("{ const _old = locals[1]; CV.freeRef(ctx, _old); const _v = stack[sp - 1]; locals[1] = CV.dupRef(_v); }");
-                }
-                // Sync JSValue shadow for shared var_refs (function hoisting support)
-                if (self.has_fclosure and self.func.var_count > 0) {
-                    try self.printLine("{s}[1] = CV.toJSValuePtr(&locals[1]);", .{self.getLocalsJsvExpr()});
-                }
-            },
-            .set_loc2 => {
-                if (self.vpop()) |expr| {
-                    try self.printLine("{{ const _old = locals[2]; CV.freeRef(ctx, _old); const _v = {s}; locals[2] = CV.dupRef(_v); }}", .{expr});
-                    if (std.mem.startsWith(u8, expr, "stack[sp")) {
-                        try self.vpushFmt("{s}", .{expr});
-                    } else {
-                        try self.vpush("locals[2]");
-                    }
-                    if (self.isAllocated(expr)) self.allocator.free(expr);
-                } else {
-                    try self.writeLine("{ const _old = locals[2]; CV.freeRef(ctx, _old); const _v = stack[sp - 1]; locals[2] = CV.dupRef(_v); }");
-                }
-                // Sync JSValue shadow for shared var_refs (function hoisting support)
-                if (self.has_fclosure and self.func.var_count > 0) {
-                    try self.printLine("{s}[2] = CV.toJSValuePtr(&locals[2]);", .{self.getLocalsJsvExpr()});
-                }
-            },
-            .set_loc3 => {
-                if (self.vpop()) |expr| {
-                    try self.printLine("{{ const _old = locals[3]; CV.freeRef(ctx, _old); const _v = {s}; locals[3] = CV.dupRef(_v); }}", .{expr});
-                    if (std.mem.startsWith(u8, expr, "stack[sp")) {
-                        try self.vpushFmt("{s}", .{expr});
-                    } else {
-                        try self.vpush("locals[3]");
-                    }
-                    if (self.isAllocated(expr)) self.allocator.free(expr);
-                } else {
-                    try self.writeLine("{ const _old = locals[3]; CV.freeRef(ctx, _old); const _v = stack[sp - 1]; locals[3] = CV.dupRef(_v); }");
-                }
-                // Sync JSValue shadow for shared var_refs (function hoisting support)
-                if (self.has_fclosure and self.func.var_count > 0) {
-                    try self.printLine("{s}[3] = CV.toJSValuePtr(&locals[3]);", .{self.getLocalsJsvExpr()});
-                }
-            },
-            .set_loc, .set_loc8 => {
-                const loc_idx = instr.operand.loc;
-                if (self.vpop()) |expr| {
-                    try self.printLine("{{ const _old = locals[{d}]; CV.freeRef(ctx, _old); const _v = {s}; locals[{d}] = CV.dupRef(_v); }}", .{ loc_idx, expr, loc_idx });
-                    if (std.mem.startsWith(u8, expr, "stack[sp")) {
-                        try self.vpushFmt("{s}", .{expr});
-                    } else {
-                        try self.vpushFmt("locals[{d}]", .{loc_idx});
-                    }
-                    if (self.isAllocated(expr)) self.allocator.free(expr);
-                } else {
-                    try self.printLine("{{ const _old = locals[{d}]; CV.freeRef(ctx, _old); const _v = stack[sp - 1]; locals[{d}] = CV.dupRef(_v); }}", .{ loc_idx, loc_idx });
-                }
-                // Sync JSValue shadow for shared var_refs (function hoisting support)
-                if (self.has_fclosure and self.func.var_count > 0 and loc_idx < self.func.var_count) {
-                    try self.printLine("{s}[{d}] = CV.toJSValuePtr(&locals[{d}]);", .{ self.getLocalsJsvExpr(), loc_idx, loc_idx });
-                }
-            },
+            // Set local (keep on stack) - ownership-aware: move owned, dup borrowed
+            .set_loc0 => try self.emitSetLocalOwned(0),
+            .set_loc1 => try self.emitSetLocalOwned(1),
+            .set_loc2 => try self.emitSetLocalOwned(2),
+            .set_loc3 => try self.emitSetLocalOwned(3),
+            .set_loc, .set_loc8 => try self.emitSetLocalOwned(instr.operand.loc),
 
             // Arguments - use cached values if available (prevents repeated dup leaks in loops)
             // arg_cache is populated at function start and freed on exit via defer
@@ -3512,7 +3460,7 @@ pub const ZigCodeGen = struct {
                 } else if (self.uses_arg_cache and 0 <= self.max_loop_arg_idx) {
                     try self.vpush("(if (0 < argc) arg_cache[0] else CV.UNDEFINED)");
                 } else {
-                    try self.vpush("(if (0 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[0])) else CV.UNDEFINED)");
+                    try self.vpushOwned("(if (0 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[0])) else CV.UNDEFINED)");
                 }
             },
             .get_arg1 => {
@@ -3524,7 +3472,7 @@ pub const ZigCodeGen = struct {
                 } else if (self.uses_arg_cache and 1 <= self.max_loop_arg_idx) {
                     try self.vpush("(if (1 < argc) arg_cache[1] else CV.UNDEFINED)");
                 } else {
-                    try self.vpush("(if (1 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[1])) else CV.UNDEFINED)");
+                    try self.vpushOwned("(if (1 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[1])) else CV.UNDEFINED)");
                 }
             },
             .get_arg2 => {
@@ -3536,7 +3484,7 @@ pub const ZigCodeGen = struct {
                 } else if (self.uses_arg_cache and 2 <= self.max_loop_arg_idx) {
                     try self.vpush("(if (2 < argc) arg_cache[2] else CV.UNDEFINED)");
                 } else {
-                    try self.vpush("(if (2 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[2])) else CV.UNDEFINED)");
+                    try self.vpushOwned("(if (2 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[2])) else CV.UNDEFINED)");
                 }
             },
             .get_arg3 => {
@@ -3548,7 +3496,7 @@ pub const ZigCodeGen = struct {
                 } else if (self.uses_arg_cache and 3 <= self.max_loop_arg_idx) {
                     try self.vpush("(if (3 < argc) arg_cache[3] else CV.UNDEFINED)");
                 } else {
-                    try self.vpush("(if (3 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[3])) else CV.UNDEFINED)");
+                    try self.vpushOwned("(if (3 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[3])) else CV.UNDEFINED)");
                 }
             },
             .get_arg => {
@@ -3560,7 +3508,7 @@ pub const ZigCodeGen = struct {
                 } else if (self.uses_arg_cache and instr.operand.arg <= self.max_loop_arg_idx) {
                     try self.vpushFmt("(if ({d} < argc) arg_cache[{d}] else CV.UNDEFINED)", .{ instr.operand.arg, instr.operand.arg });
                 } else {
-                    try self.vpushFmt("(if ({d} < argc) CV.fromJSValue(JSValue.dup(ctx, argv[{d}])) else CV.UNDEFINED)", .{ instr.operand.arg, instr.operand.arg });
+                    try self.vpushFmtOwned("(if ({d} < argc) CV.fromJSValue(JSValue.dup(ctx, argv[{d}])) else CV.UNDEFINED)", .{ instr.operand.arg, instr.operand.arg });
                 }
             },
 
@@ -3572,7 +3520,7 @@ pub const ZigCodeGen = struct {
                 const a = self.vpop() orelse "CV.UNDEFINED";
                 const free_a = self.isAllocated(a);
                 defer if (free_a) self.allocator.free(a);
-                try self.vpushFmt("CV.addWithCtx(ctx, {s}, {s})", .{ a, b });
+                try self.vpushFmtOwned("CV.addWithCtx(ctx, {s}, {s})", .{ a, b });
             },
             .sub => {
                 const b = self.vpop() orelse "CV.UNDEFINED";
@@ -3581,7 +3529,7 @@ pub const ZigCodeGen = struct {
                 const a = self.vpop() orelse "CV.UNDEFINED";
                 const free_a = self.isAllocated(a);
                 defer if (free_a) self.allocator.free(a);
-                try self.vpushFmt("CV.sub({s}, {s})", .{ a, b });
+                try self.vpushFmtOwned("CV.sub({s}, {s})", .{ a, b });
             },
             .mul => {
                 const b = self.vpop() orelse "CV.UNDEFINED";
@@ -3590,7 +3538,7 @@ pub const ZigCodeGen = struct {
                 const a = self.vpop() orelse "CV.UNDEFINED";
                 const free_a = self.isAllocated(a);
                 defer if (free_a) self.allocator.free(a);
-                try self.vpushFmt("CV.mul({s}, {s})", .{ a, b });
+                try self.vpushFmtOwned("CV.mul({s}, {s})", .{ a, b });
             },
             .div => {
                 const b = self.vpop() orelse "CV.UNDEFINED";
@@ -3599,7 +3547,7 @@ pub const ZigCodeGen = struct {
                 const a = self.vpop() orelse "CV.UNDEFINED";
                 const free_a = self.isAllocated(a);
                 defer if (free_a) self.allocator.free(a);
-                try self.vpushFmt("CV.div({s}, {s})", .{ a, b });
+                try self.vpushFmtOwned("CV.div({s}, {s})", .{ a, b });
             },
             .mod => {
                 const b = self.vpop() orelse "CV.UNDEFINED";
@@ -3608,13 +3556,13 @@ pub const ZigCodeGen = struct {
                 const a = self.vpop() orelse "CV.UNDEFINED";
                 const free_a = self.isAllocated(a);
                 defer if (free_a) self.allocator.free(a);
-                try self.vpushFmt("CV.mod({s}, {s})", .{ a, b });
+                try self.vpushFmtOwned("CV.mod({s}, {s})", .{ a, b });
             },
             .neg => {
                 const a = self.vpop() orelse "CV.UNDEFINED";
                 const free_a = self.isAllocated(a);
                 defer if (free_a) self.allocator.free(a);
-                try self.vpushFmt("CV.sub(CV.newInt(0), {s})", .{a});
+                try self.vpushFmtOwned("CV.sub(CV.newInt(0), {s})", .{a});
             },
 
             // Bitwise operations (vstack-aware to avoid stack leaks in loops)
@@ -3625,7 +3573,7 @@ pub const ZigCodeGen = struct {
                 const a = self.vpop() orelse "CV.UNDEFINED";
                 const free_a = self.isAllocated(a);
                 defer if (free_a) self.allocator.free(a);
-                try self.vpushFmt("CV.bitAnd({s}, {s})", .{ a, b });
+                try self.vpushFmtOwned("CV.bitAnd({s}, {s})", .{ a, b });
             },
             .@"or" => {
                 const b = self.vpop() orelse "CV.UNDEFINED";
@@ -3634,7 +3582,7 @@ pub const ZigCodeGen = struct {
                 const a = self.vpop() orelse "CV.UNDEFINED";
                 const free_a = self.isAllocated(a);
                 defer if (free_a) self.allocator.free(a);
-                try self.vpushFmt("CV.bitOr({s}, {s})", .{ a, b });
+                try self.vpushFmtOwned("CV.bitOr({s}, {s})", .{ a, b });
             },
             .xor => {
                 const b = self.vpop() orelse "CV.UNDEFINED";
@@ -3643,7 +3591,7 @@ pub const ZigCodeGen = struct {
                 const a = self.vpop() orelse "CV.UNDEFINED";
                 const free_a = self.isAllocated(a);
                 defer if (free_a) self.allocator.free(a);
-                try self.vpushFmt("CV.bitXor({s}, {s})", .{ a, b });
+                try self.vpushFmtOwned("CV.bitXor({s}, {s})", .{ a, b });
             },
             .shl => {
                 const b = self.vpop() orelse "CV.UNDEFINED";
@@ -3652,7 +3600,7 @@ pub const ZigCodeGen = struct {
                 const a = self.vpop() orelse "CV.UNDEFINED";
                 const free_a = self.isAllocated(a);
                 defer if (free_a) self.allocator.free(a);
-                try self.vpushFmt("CV.shl({s}, {s})", .{ a, b });
+                try self.vpushFmtOwned("CV.shl({s}, {s})", .{ a, b });
             },
             .sar => {
                 const b = self.vpop() orelse "CV.UNDEFINED";
@@ -3661,7 +3609,7 @@ pub const ZigCodeGen = struct {
                 const a = self.vpop() orelse "CV.UNDEFINED";
                 const free_a = self.isAllocated(a);
                 defer if (free_a) self.allocator.free(a);
-                try self.vpushFmt("CV.sar({s}, {s})", .{ a, b });
+                try self.vpushFmtOwned("CV.sar({s}, {s})", .{ a, b });
             },
             .shr => {
                 const b = self.vpop() orelse "CV.UNDEFINED";
@@ -3670,13 +3618,13 @@ pub const ZigCodeGen = struct {
                 const a = self.vpop() orelse "CV.UNDEFINED";
                 const free_a = self.isAllocated(a);
                 defer if (free_a) self.allocator.free(a);
-                try self.vpushFmt("CV.ushr({s}, {s})", .{ a, b });
+                try self.vpushFmtOwned("CV.ushr({s}, {s})", .{ a, b });
             },
             .not => {
                 const a = self.vpop() orelse "CV.UNDEFINED";
                 const free_a = self.isAllocated(a);
                 defer if (free_a) self.allocator.free(a);
-                try self.vpushFmt("CV.bitNot({s})", .{a});
+                try self.vpushFmtOwned("CV.bitNot({s})", .{a});
             },
 
             // Comparisons
@@ -3758,13 +3706,13 @@ pub const ZigCodeGen = struct {
                 const a = self.vpop() orelse "CV.UNDEFINED";
                 const free_a = self.isAllocated(a);
                 defer if (free_a) self.allocator.free(a);
-                try self.vpushFmt("CV.add({s}, CV.newInt(1))", .{a});
+                try self.vpushFmtOwned("CV.add({s}, CV.newInt(1))", .{a});
             },
             .dec => {
                 const a = self.vpop() orelse "CV.UNDEFINED";
                 const free_a = self.isAllocated(a);
                 defer if (free_a) self.allocator.free(a);
-                try self.vpushFmt("CV.sub({s}, CV.newInt(1))", .{a});
+                try self.vpushFmtOwned("CV.sub({s}, CV.newInt(1))", .{a});
             },
 
             // Inc/dec local directly
@@ -3975,16 +3923,20 @@ pub const ZigCodeGen = struct {
                 self.base_popped_count = 0;
             },
             .drop => {
-                if (self.vpop()) |expr| {
+                if (self.vpopEntry()) |entry| {
                     // Check if this is a reference to an existing value on the real stack
                     // (returned from base_stack_depth when vstack was empty)
                     // If so, we need to emit actual drop code to decrement sp and free ref
-                    const is_stack_ref = std.mem.startsWith(u8, expr, "stack[sp - ");
+                    const is_stack_ref = std.mem.startsWith(u8, entry.expr, "stack[sp - ");
                     if (is_stack_ref) {
                         try self.writeLine("{ const v = stack[sp - 1]; CV.freeRef(ctx, v); sp -= 1; }");
+                    } else if (entry.ownership == .owned) {
+                        // Owned value being dropped — must free to prevent leak
+                        try self.printLine("CV.freeRef(ctx, {s});", .{entry.expr});
                     }
+                    // Borrowed non-stack refs: no-op (we don't own it)
                     // Free the expression string if it was allocated
-                    if (self.isAllocated(expr)) self.allocator.free(expr);
+                    if (self.isAllocated(entry.expr)) self.allocator.free(entry.expr);
                 } else {
                     // vstack empty AND no base stack values - emit real stack drop as fallback
                     try self.writeLine("{ const v = stack[sp - 1]; CV.freeRef(ctx, v); sp -= 1; }");
@@ -3997,8 +3949,10 @@ pub const ZigCodeGen = struct {
                     try self.materializeVStack();
                     // materializeVStack now updates base_stack_depth internally
                 }
-                const b = self.vpop();
-                const a = self.vpop();
+                const b_entry = self.vpopEntry();
+                const a_entry = self.vpopEntry();
+                const a = if (a_entry) |e| e.expr else null;
+                const b = if (b_entry) |e| e.expr else null;
                 // After materializing, both operands should be stack refs
                 // Check if both are simple stack refs - if so, do in-place swap
                 const a_is_stack_ref = if (a) |ae| std.mem.startsWith(u8, ae, "stack[sp - ") else false;
@@ -4020,9 +3974,9 @@ pub const ZigCodeGen = struct {
                         self.base_popped_count = 0;
                     }
                 } else {
-                    // Use vstack-based swap (shouldn't happen after materialization, but handle it)
-                    if (b) |be| try self.vstack.append(self.allocator, be);
-                    if (a) |ae| try self.vstack.append(self.allocator, ae);
+                    // Use vstack-based swap — re-append entries in reversed order (preserves ownership)
+                    if (b_entry) |be| try self.vstack.append(self.allocator, be);
+                    if (a_entry) |ae| try self.vstack.append(self.allocator, ae);
                 }
             },
 
@@ -4205,19 +4159,25 @@ pub const ZigCodeGen = struct {
             // Return
             .@"return" => {
                 // In block dispatch mode, vstack may be empty but real stack has the value
-                const result = self.vpop() orelse "stack[sp - 1]";
+                const ret_entry = self.vpopEntry();
+                const result = if (ret_entry) |e| e.expr else "stack[sp - 1]";
+                const ret_ownership: Ownership = if (ret_entry) |e| e.ownership else .borrowed;
                 const should_free = self.isAllocated(result);
                 defer if (should_free) self.allocator.free(result);
-                // Check if returning from stack vs local - only free stack values manually
-                // (locals are freed by emitLocalsCleanup)
                 const is_stack_value = std.mem.startsWith(u8, result, "stack[");
-                // Save return value (dup if ref type), cleanup locals, then return
-                // Must dup because cleanup may free the same object (e.g., returning a local)
-                try self.printLine("{{ const _ret_cv = {s}; const _ret_val = if (_ret_cv.isRefType()) JSValue.dup(ctx, _ret_cv.toJSValueWithCtx(ctx)) else _ret_cv.toJSValueWithCtx(ctx);", .{result});
-                // Free the original stack value to avoid GC leaks (dup created a new reference)
-                // Only for stack values - locals are freed by emitLocalsCleanup
-                if (is_stack_value) {
-                    try self.writeLine("CV.freeRef(ctx, _ret_cv);");
+                if (ret_ownership == .owned) {
+                    // Owned: no dup needed — we already hold the only reference
+                    // Just extract the JSValue and return it
+                    try self.printLine("{{ const _ret_cv = {s}; const _ret_val = _ret_cv.toJSValueWithCtx(ctx);", .{result});
+                    // Owned values are independent of locals — no need to free _ret_cv
+                } else {
+                    // Borrowed: must dup to create independent reference before cleanup
+                    try self.printLine("{{ const _ret_cv = {s}; const _ret_val = if (_ret_cv.isRefType()) JSValue.dup(ctx, _ret_cv.toJSValueWithCtx(ctx)) else _ret_cv.toJSValueWithCtx(ctx);", .{result});
+                    // Free the original stack value to avoid GC leaks (dup created a new reference)
+                    // Only for stack values - locals are freed by emitLocalsCleanup
+                    if (is_stack_value) {
+                        try self.writeLine("CV.freeRef(ctx, _ret_cv);");
+                    }
                 }
                 try self.emitVarRefDetach();
                 // Free arg_shadow values before returning (they were duped at function entry)
@@ -4325,29 +4285,24 @@ pub const ZigCodeGen = struct {
         try self.writeLine("{");
         self.pushIndent();
         // First, evaluate all expressions while sp is unchanged
-        for (self.vstack.items, 0..) |expr, i| {
-            try self.printLine("const vf_{d} = {s};", .{ i, expr });
+        for (self.vstack.items, 0..) |entry, i| {
+            try self.printLine("const vf_{d} = {s};", .{ i, entry.expr });
         }
         // Then assign to stack in FIFO order
-        // If expression is a reference to existing storage, we need to dup the reftype to avoid sharing
+        // Ownership-based dup/move: borrowed entries must be duped, owned entries move directly
         // Calculate the net stack position change: +count for outputs, -refs_consumed for inputs
         var assign_offset: i32 = -@as(i32, @intCast(total_stack_refs_consumed));
-        for (self.vstack.items, 0..) |expr, i| {
-            const is_stack_ref = std.mem.startsWith(u8, expr, "stack[");
-            const is_locals_ref = std.mem.startsWith(u8, expr, "locals[");
-            // Check if expression IS a direct arg_cache reference (not just contains one)
-            // Pattern: "(if (N < argc) arg_cache[N] else CV.UNDEFINED)"
-            const is_direct_arg_cache = std.mem.startsWith(u8, expr, "(if (") and
-                std.mem.indexOf(u8, expr, " arg_cache[") != null;
-            const is_storage_ref = is_stack_ref or is_locals_ref or is_direct_arg_cache;
-            if (is_storage_ref) {
-                // Storage references need duping to create independent ownership
-                // In dispatch_mode, arg_cache_js is not available from block functions, use fallback
+        for (self.vstack.items, 0..) |entry, i| {
+            if (entry.ownership == .borrowed) {
+                // Borrowed reference — must dup to create independent ownership on physical stack
+                const expr = entry.expr;
+                // Check for arg_cache optimization (faster dup path using arg_cache_js[])
+                const is_direct_arg_cache = std.mem.startsWith(u8, expr, "(if (") and
+                    std.mem.indexOf(u8, expr, " arg_cache[") != null;
                 if (self.uses_arg_cache and is_direct_arg_cache and !self.dispatch_mode) {
                     // Use arg_cache_js directly to avoid CV→JSValue reconstruction issues
-                    // Extract N from "arg_cache[N]" in the expression
                     if (std.mem.indexOf(u8, expr, "arg_cache[")) |cache_start| {
-                        const after_bracket = cache_start + 10; // "arg_cache[" is 10 chars
+                        const after_bracket = cache_start + 10;
                         if (std.mem.indexOfPos(u8, expr, after_bracket, "]")) |bracket_end| {
                             const arg_num_str = expr[after_bracket..bracket_end];
                             if (assign_offset >= 0) {
@@ -4370,6 +4325,7 @@ pub const ZigCodeGen = struct {
                         }
                     }
                 } else {
+                    // Generic borrowed dup
                     if (assign_offset >= 0) {
                         try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, vf_{d}.toJSValueWithCtx(ctx))) else vf_{d};", .{ @as(usize, @intCast(assign_offset)), i, i, i });
                     } else {
@@ -4377,7 +4333,7 @@ pub const ZigCodeGen = struct {
                     }
                 }
             } else {
-                // Expression creates a new value, no dup needed
+                // Owned — already own the value, move directly to physical stack (no dup needed)
                 if (assign_offset >= 0) {
                     try self.printLine("stack[sp + {d}] = vf_{d};", .{ @as(usize, @intCast(assign_offset)), i });
                 } else {
@@ -4397,8 +4353,8 @@ pub const ZigCodeGen = struct {
         try self.writeLine("}");
 
         // Free allocated expressions
-        for (self.vstack.items) |expr| {
-            if (self.isAllocated(expr)) self.allocator.free(expr);
+        for (self.vstack.items) |entry| {
+            if (self.isAllocated(entry.expr)) self.allocator.free(entry.expr);
         }
         self.vstack.clearRetainingCapacity();
 
@@ -5044,7 +5000,7 @@ pub const ZigCodeGen = struct {
                     // Math.method(arg) replaces stack[sp-1] in-place
                     // Pop the arg from vstack and push result reference
                     self.vpopAndFree(); // pop the argument
-                    try self.vpush("stack[sp - 1]"); // push result reference
+                    try self.vpushOwned("stack[sp - 1]"); // push result reference
                 } else if (try self.tryEmitNativeArrayPush(argc, block_instrs, instr_idx)) {
                     // Native Array.push emitted - handled internally
                     // NOTE: Array.push works in force_stack_mode because stack state is the same:
@@ -5246,7 +5202,7 @@ pub const ZigCodeGen = struct {
                     // Sync vstack: pops 2 (val, obj), pushes 1 (obj for chaining)
                     if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
                     if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
-                    try self.vpush("stack[sp - 1]");
+                    try self.vpushOwned("stack[sp - 1]");
                 } else {
                     try self.emitReturnValue("JSValue.throwTypeError(ctx, \"Invalid field name\")");
                     return false; // Control terminates
@@ -5399,7 +5355,7 @@ pub const ZigCodeGen = struct {
                 // (CV.strictEq only compares bits, failing for different string objects with same content)
                 try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = zig_runtime.strictEqWithCtx(ctx, a, b); sp -= 1; }");
                 // Push result reference to vstack so if_false can pop it
-                try self.vpush("stack[sp - 1]");
+                try self.vpushOwned("stack[sp - 1]");
             },
 
             // strict_neq: strict inequality (!==)
@@ -5410,7 +5366,7 @@ pub const ZigCodeGen = struct {
                 // Use strictNeqWithCtx which properly handles strings through FFI
                 try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = zig_runtime.strictNeqWithCtx(ctx, a, b); sp -= 1; }");
                 // Push result reference to vstack so if_false can pop it
-                try self.vpush("stack[sp - 1]");
+                try self.vpushOwned("stack[sp - 1]");
             },
 
             // tail_call_method: tail call optimization for method calls
@@ -5466,7 +5422,7 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = zig_runtime.nativeGetLengthCV(ctx, obj); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                 // Sync vstack: replaces top of stack
                 if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
-                try self.vpush("stack[sp - 1]");
+                try self.vpushOwned("stack[sp - 1]");
             },
 
             // push_i16: push 16-bit integer
@@ -5609,7 +5565,7 @@ pub const ZigCodeGen = struct {
                 self.vpopAndFree();
                 try self.writeLine("{ const v = stack[sp-1]; const result = if (v.isUndefined() or v.isNull()) CV.TRUE else CV.FALSE; CV.freeRef(ctx, v); stack[sp-1] = result; }");
                 // Push result reference to vstack so if_true/if_false can pop it
-                try self.vpush("stack[sp - 1]");
+                try self.vpushOwned("stack[sp - 1]");
             },
 
             // set_name: set function name property
@@ -6899,7 +6855,7 @@ pub const ZigCodeGen = struct {
                 // Sync closure variables back from _locals_jsv (closure may have written to them)
                 try self.emitClosureVarSync();
                 // Sync vstack: push result expression
-                try self.vpush("stack[sp - 1]");
+                try self.vpushOwned("stack[sp - 1]");
             } else {
                 // With args - copy from stack (no func on stack for self-call)
                 try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
@@ -6927,7 +6883,7 @@ pub const ZigCodeGen = struct {
                 for (0..argc) |_| {
                     self.vpopAndFree();
                 }
-                try self.vpush("stack[sp - 1]");
+                try self.vpushOwned("stack[sp - 1]");
             }
             self.popIndent();
             try self.writeLine("}");
@@ -6953,7 +6909,7 @@ pub const ZigCodeGen = struct {
             try self.emitClosureVarSync();
             // Sync vstack: clear func, push result
             self.vpopAndFree();
-            try self.vpush("stack[sp - 1]");
+            try self.vpushOwned("stack[sp - 1]");
             self.popIndent();
             try self.writeLine("}");
         } else {
@@ -6986,7 +6942,7 @@ pub const ZigCodeGen = struct {
             for (0..argc + 1) |_| {
                 self.vpopAndFree();
             }
-            try self.vpush("stack[sp - 1]");
+            try self.vpushOwned("stack[sp - 1]");
             self.popIndent();
             try self.writeLine("}");
         }
@@ -7306,7 +7262,7 @@ pub const ZigCodeGen = struct {
             for (0..argc + 1) |_| {
                 self.vpopAndFree();
             }
-            try self.vpush("stack[sp - 1]");
+            try self.vpushOwned("stack[sp - 1]");
         } else {
             // get_field2("push") was NOT skipped - stack has [arr, arr.push, val0, val1, ...]
             try self.printLine("{{ // Native Array.push inline ({d} args)", .{argc});
@@ -7338,7 +7294,7 @@ pub const ZigCodeGen = struct {
             for (0..argc + 2) |_| {
                 self.vpopAndFree();
             }
-            try self.vpush("stack[sp - 1]");
+            try self.vpushOwned("stack[sp - 1]");
         }
 
         return true;
@@ -7581,7 +7537,7 @@ pub const ZigCodeGen = struct {
         for (0..argc + 2) |_| {
             self.vpopAndFree();
         }
-        try self.vpush("stack[sp - 1]");
+        try self.vpushOwned("stack[sp - 1]");
 
         self.popIndent();
         try self.writeLine("}");
@@ -7628,7 +7584,7 @@ pub const ZigCodeGen = struct {
         for (0..argc + 2) |_| {
             self.vpopAndFree();
         }
-        try self.vpush("stack[sp - 1]");
+        try self.vpushOwned("stack[sp - 1]");
 
         self.popIndent();
         try self.writeLine("}");
@@ -7687,6 +7643,22 @@ pub const ZigCodeGen = struct {
         try self.write(") i32 {\n");
         self.pushIndent();
 
+        // Emit local variable declarations for non-recursive functions
+        if (!self.func.is_self_recursive) {
+            // Suppress unused parameter warnings (some int32 functions don't use all args)
+            for (0..argc) |i| {
+                try self.print("_ = n{d};\n", .{i});
+            }
+            const var_count = self.func.var_count;
+            for (0..var_count) |i| {
+                try self.print("var loc{d}: i32 = 0;\n", .{i});
+            }
+            // Suppress "unused variable" for locals that may not be referenced
+            for (0..var_count) |i| {
+                try self.print("_ = &loc{d};\n", .{i});
+            }
+        }
+
         // Emit int32 specialized code from CFG
         try self.emitInt32Body();
 
@@ -7703,9 +7675,11 @@ pub const ZigCodeGen = struct {
         self.pushIndent();
 
         // Unbox arguments - argc/argv are always used in the wrapper
-        // Only suppress if no arguments
+        // Suppress unused params for non-recursive functions (no var_refs/closure/cpool needed)
         if (argc == 0) {
             try self.writeLine("_ = argc; _ = argv; _ = var_refs; _ = closure_var_count; _ = cpool;");
+        } else if (!self.func.is_self_recursive) {
+            try self.writeLine("_ = argc; _ = var_refs; _ = closure_var_count; _ = cpool;");
         }
         for (0..argc) |i| {
             try self.print("    var n{d}: i32 = 0;\n", .{i});
@@ -7730,6 +7704,15 @@ pub const ZigCodeGen = struct {
 
     /// Emit pure int32 function body from CFG
     fn emitInt32Body(self: *Self) !void {
+        if (self.func.is_self_recursive) {
+            try self.emitInt32BodyRecursive();
+        } else {
+            try self.emitInt32BodyNonRecursive();
+        }
+    }
+
+    /// Emit int32 body for self-recursive functions (existing fib path)
+    fn emitInt32BodyRecursive(self: *Self) !void {
         const int32_handlers = @import("int32_handlers.zig");
         const blocks = self.func.cfg.blocks.items;
 
@@ -7744,14 +7727,18 @@ pub const ZigCodeGen = struct {
                 const handler = int32_handlers.getInt32Handler(instr.opcode);
                 switch (handler.pattern) {
                     .push_const_i32 => {
-                        const val = handler.value orelse @as(i32, @intCast(instr.operand.i32));
+                        const val = handler.value orelse int32ExtractConst(instr);
                         const s = std.fmt.bufPrint(&expr_buf, "{d}", .{val}) catch "0";
                         stack[sp] = self.allocator.dupe(u8, s) catch "0";
                         sp += 1;
                     },
                     .get_arg_i32 => {
-                        const handler_idx = handler.index orelse 0;
-                        const s = std.fmt.bufPrint(&expr_buf, "n{d}", .{handler_idx}) catch "n0";
+                        const idx = handler.index orelse switch (instr.operand) {
+                            .arg => |a| @as(u8, @intCast(a)),
+                            .implicit_arg => |a| @as(u8, @intCast(a)),
+                            else => 0,
+                        };
+                        const s = std.fmt.bufPrint(&expr_buf, "n{d}", .{idx}) catch "n0";
                         stack[sp] = self.allocator.dupe(u8, s) catch "n0";
                         sp += 1;
                     },
@@ -7770,8 +7757,8 @@ pub const ZigCodeGen = struct {
                             const b = stack[sp - 1];
                             const a = stack[sp - 2];
                             const op = handler.op orelse "<";
-                            const s = std.fmt.bufPrint(&expr_buf, "({s} {s} {s})", .{ a, op, b }) catch "false";
-                            stack[sp - 2] = self.allocator.dupe(u8, s) catch "false";
+                            const s = std.fmt.bufPrint(&expr_buf, "@intFromBool(({s} {s} {s}))", .{ a, op, b }) catch "0";
+                            stack[sp - 2] = self.allocator.dupe(u8, s) catch "0";
                             sp -= 1;
                         }
                     },
@@ -7810,7 +7797,14 @@ pub const ZigCodeGen = struct {
                         if (sp >= 1) {
                             const cond = stack[sp - 1];
                             sp -= 1;
-                            try self.print("if (!({s})) ", .{cond});
+                            try self.print("if (!(@as(i32, {s}) != 0)) ", .{cond});
+                        }
+                    },
+                    .if_true_i32 => {
+                        if (sp >= 1) {
+                            const cond = stack[sp - 1];
+                            sp -= 1;
+                            try self.print("if (@as(i32, {s}) != 0) ", .{cond});
                         }
                     },
                     .return_i32 => {
@@ -7835,6 +7829,201 @@ pub const ZigCodeGen = struct {
 
         // If no return was emitted, return 0
         try self.writeLine("return 0;");
+    }
+
+    /// Emit int32 body for non-recursive functions using runtime i32 stack.
+    /// Uses while(true) { switch(__blk) { ... } } with a runtime operand stack
+    /// so that stack state carries correctly across blocks.
+    fn emitInt32BodyNonRecursive(self: *Self) !void {
+        const int32_handlers = @import("int32_handlers.zig");
+        const blocks = self.func.cfg.blocks.items;
+
+        if (blocks.len == 0) {
+            try self.writeLine("return 0;");
+            return;
+        }
+
+        // Int32 functions have very shallow stacks (typically 2-4 entries for comparisons)
+        const max_stack: u32 = 8;
+
+        // Declare runtime i32 stack and stack pointer
+        try self.print("var __stk: [{d}]i32 = .{{0}} ** {d};\n", .{ max_stack, max_stack });
+        try self.writeLine("var __sp: usize = 0;");
+        try self.writeLine("_ = &__stk; _ = &__sp;");
+
+        // For single-block functions, emit inline (no switch needed)
+        if (blocks.len == 1) {
+            try self.emitInt32BlockRuntime(blocks[0].instructions, blocks, int32_handlers);
+            // Only emit fallback return if the block doesn't already end with a return
+            if (blocks[0].instructions.len > 0) {
+                const last = blocks[0].instructions[blocks[0].instructions.len - 1];
+                const last_handler = int32_handlers.getInt32Handler(last.opcode);
+                if (last_handler.pattern != .return_i32) {
+                    try self.writeLine("return 0;");
+                }
+            } else {
+                try self.writeLine("return 0;");
+            }
+            return;
+        }
+
+        // Multi-block: switch dispatch
+        try self.writeLine("var __blk: u32 = 0;");
+        try self.writeLine("while (true) {");
+        self.pushIndent();
+        try self.writeLine("switch (__blk) {");
+        self.pushIndent();
+
+        for (blocks, 0..) |block, block_idx| {
+            try self.print("{d} => {{\n", .{block_idx});
+            self.pushIndent();
+
+            try self.emitInt32BlockRuntime(block.instructions, blocks, int32_handlers);
+
+            // Fall-through: if block doesn't end with return or unconditional jump
+            if (block.instructions.len > 0) {
+                const last = block.instructions[block.instructions.len - 1];
+                const last_handler = int32_handlers.getInt32Handler(last.opcode);
+                if (last_handler.pattern != .return_i32 and last_handler.pattern != .goto_i32) {
+                    if (block_idx + 1 < blocks.len) {
+                        try self.print("__blk = {d}; continue;\n", .{block_idx + 1});
+                    }
+                }
+            }
+
+            self.popIndent();
+            try self.writeLine("},");
+        }
+
+        try self.writeLine("else => return 0,");
+        self.popIndent();
+        try self.writeLine("}");
+        self.popIndent();
+        try self.writeLine("}");
+    }
+
+    /// Emit instructions for a single int32 block using runtime i32 stack variables.
+    /// All operations push/pop from __stk[__sp] at runtime, ensuring correct state across blocks.
+    fn emitInt32BlockRuntime(
+        self: *Self,
+        instructions: []const Instruction,
+        blocks: []const BasicBlock,
+        int32_handlers: anytype,
+    ) !void {
+        for (instructions) |instr| {
+            const handler = int32_handlers.getInt32Handler(instr.opcode);
+            switch (handler.pattern) {
+                .push_const_i32 => {
+                    const val = handler.value orelse int32ExtractConst(instr);
+                    try self.print("__stk[__sp] = {d}; __sp += 1;\n", .{val});
+                },
+                .push_bool_i32 => {
+                    const val = handler.value orelse 0;
+                    try self.print("__stk[__sp] = {d}; __sp += 1;\n", .{val});
+                },
+                .get_arg_i32 => {
+                    const idx = handler.index orelse switch (instr.operand) {
+                        .arg => |a| @as(u8, @intCast(a)),
+                        .implicit_arg => |a| @as(u8, @intCast(a)),
+                        else => 0,
+                    };
+                    try self.print("__stk[__sp] = n{d}; __sp += 1;\n", .{idx});
+                },
+                .get_loc_i32 => {
+                    const idx = handler.index orelse switch (instr.operand) {
+                        .loc => |l| @as(u8, @intCast(l)),
+                        .implicit_loc => |l| @as(u8, @intCast(l)),
+                        else => 0,
+                    };
+                    try self.print("__stk[__sp] = loc{d}; __sp += 1;\n", .{idx});
+                },
+                .put_loc_i32 => {
+                    const idx = handler.index orelse switch (instr.operand) {
+                        .loc => |l| @as(u8, @intCast(l)),
+                        .implicit_loc => |l| @as(u8, @intCast(l)),
+                        else => 0,
+                    };
+                    try self.print("__sp -= 1; loc{d} = __stk[__sp];\n", .{idx});
+                },
+                .set_loc_i32 => {
+                    // set_loc keeps value on stack (unlike put_loc)
+                    const idx = handler.index orelse switch (instr.operand) {
+                        .loc => |l| @as(u8, @intCast(l)),
+                        .implicit_loc => |l| @as(u8, @intCast(l)),
+                        else => 0,
+                    };
+                    try self.print("loc{d} = __stk[__sp - 1];\n", .{idx});
+                },
+                .binary_arith_i32 => {
+                    const op = handler.op orelse "+";
+                    try self.print("__stk[__sp - 2] = __stk[__sp - 2] {s} __stk[__sp - 1]; __sp -= 1;\n", .{op});
+                },
+                .binary_cmp_i32 => {
+                    const op = handler.op orelse "<";
+                    try self.print("__stk[__sp - 2] = @intFromBool(__stk[__sp - 2] {s} __stk[__sp - 1]); __sp -= 1;\n", .{op});
+                },
+                .bitwise_binary_i32 => {
+                    const op = handler.op orelse "&";
+                    try self.print("__stk[__sp - 2] = __stk[__sp - 2] {s} __stk[__sp - 1]; __sp -= 1;\n", .{op});
+                },
+                .unary_i32 => {
+                    const op = handler.op orelse "-";
+                    try self.print("__stk[__sp - 1] = {s}__stk[__sp - 1];\n", .{op});
+                },
+                .inc_dec_i32 => {
+                    const op: []const u8 = if (handler.is_inc orelse true) "+" else "-";
+                    try self.print("__stk[__sp - 1] = __stk[__sp - 1] {s} 1;\n", .{op});
+                },
+                .lnot_i32 => {
+                    try self.writeLine("__stk[__sp - 1] = @intFromBool(__stk[__sp - 1] == 0);");
+                },
+                .stack_op_i32 => {
+                    const op = handler.op orelse "drop";
+                    if (std.mem.eql(u8, op, "dup")) {
+                        try self.writeLine("__stk[__sp] = __stk[__sp - 1]; __sp += 1;");
+                    } else {
+                        try self.writeLine("__sp -= 1;");
+                    }
+                },
+                .if_false_i32 => {
+                    const target_pc = instr.getJumpTarget() orelse 0;
+                    const target_block = findBlockByPC(blocks, target_pc);
+                    try self.print("__sp -= 1; if (__stk[__sp] == 0) {{ __blk = {d}; continue; }}\n", .{target_block});
+                },
+                .if_true_i32 => {
+                    const target_pc = instr.getJumpTarget() orelse 0;
+                    const target_block = findBlockByPC(blocks, target_pc);
+                    try self.print("__sp -= 1; if (__stk[__sp] != 0) {{ __blk = {d}; continue; }}\n", .{target_block});
+                },
+                .goto_i32 => {
+                    const target_pc = instr.getJumpTarget() orelse 0;
+                    const target_block = findBlockByPC(blocks, target_pc);
+                    try self.print("__blk = {d}; continue;\n", .{target_block});
+                },
+                .return_i32 => {
+                    if (handler.value) |val| {
+                        try self.print("return {d};\n", .{val});
+                    } else {
+                        try self.writeLine("__sp -= 1; return __stk[__sp];");
+                    }
+                },
+                else => {
+                    try self.print("// unsupported int32 op: {}\n", .{instr.opcode});
+                },
+            }
+        }
+    }
+
+    /// Find block index by target PC
+    fn findBlockByPC(blocks: []const BasicBlock, target_pc: u32) usize {
+        for (blocks, 0..) |block, idx| {
+            if (block.start_pc == target_pc) return idx;
+        }
+        // If exact match not found, find the block containing this PC
+        for (blocks, 0..) |block, idx| {
+            if (target_pc >= block.start_pc and target_pc < block.end_pc) return idx;
+        }
+        return 0; // Fallback to first block
     }
 
     // Native Specialization (Zero-FFI)
@@ -8166,8 +8355,8 @@ pub const ZigCodeGen = struct {
     /// Emit the fallback body using regular FFI (for regular Arrays)
     fn emitFallbackBody(self: *Self) !void {
         // Clear vstack for fresh start - free allocated items first
-        for (self.vstack.items) |expr| {
-            if (self.isAllocated(expr)) self.allocator.free(expr);
+        for (self.vstack.items) |entry| {
+            if (self.isAllocated(entry.expr)) self.allocator.free(entry.expr);
         }
         self.vstack.clearRetainingCapacity();
         self.temp_counter = 100; // Start temps at 100 to avoid conflicts with native path

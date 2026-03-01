@@ -530,8 +530,10 @@ pub fn generateFrozenZig(
     var name_buf: [256]u8 = undefined;
     const indexed_name = std.fmt.bufPrint(&name_buf, "{d}_{s}", .{ func_index, sanitized_name }) catch func.name;
 
-    // Check if this is a pure int32 function - use hot path for 18x speedup!
-    if (isPureInt32Function(func) and !partial_freeze) {
+    // Check if this is a pure int32 self-recursive function - use hot path for 18x speedup!
+    // Non-recursive int32 functions (isLineBreak, isDigit, etc.) go through zig_codegen_full
+    // which handles them via emitInt32Specialized with switch-based block dispatch.
+    if (isPureInt32Function(func) and func.is_self_recursive and !partial_freeze) {
         // Use func_X_name format to ensure valid Zig identifier (no leading numbers)
         var hot_name_buf: [256]u8 = undefined;
         const hot_name = std.fmt.bufPrint(&hot_name_buf, "func_{d}_{s}", .{ func_index, sanitized_name }) catch func.name;
@@ -735,6 +737,12 @@ fn generateFrozenZigThin(
     const sanitized_name = sanitizeName(func.name, &sanitized_buf);
     var name_buf: [256]u8 = undefined;
     const indexed_name = std.fmt.bufPrint(&name_buf, "{d}_{s}", .{ func_index, sanitized_name }) catch func.name;
+
+    // For pure int32 non-recursive functions, use full codegen int32 path
+    // instead of thin codegen — generates native i32 operations with no JSValue overhead
+    if (isPureInt32Function(func) and !func.is_self_recursive) {
+        return generateFrozenZigGeneral(allocator, &cfg, indexed_name, func, false, closure_usage.all_indices);
+    }
 
     return zig_codegen_thin.generateThin(allocator, .{
         .name = indexed_name,
@@ -1595,17 +1603,45 @@ pub fn freeManifest(allocator: Allocator, manifest: []const ManifestFunction) vo
 // ============================================================================
 
 /// Check if a function is pure int32 (can be compiled to Zig hot path)
-/// Returns true if all operations are int32-safe
+/// Returns true if all operations are int32-safe.
+/// Supports both self-recursive functions (like fib) and non-recursive
+/// pure-integer functions (like isLineBreak, isDigit) with forward-only control flow.
 pub fn isPureInt32Function(func: AnalyzedFunction) bool {
-    // Must be self-recursive with 1-8 args
-    if (!func.is_self_recursive) return false;
+    // Must have 1-8 args
     if (func.arg_count < 1 or func.arg_count > 8) return false;
 
+    // Guard: too many locals for non-recursive functions
+    if (!func.is_self_recursive and func.var_count > 16) return false;
+
     // Check all instructions for non-int32 operations
+    const int32_handlers = @import("int32_handlers.zig");
     for (func.instructions) |instr| {
-        const handler = @import("int32_handlers.zig").getInt32Handler(instr.opcode);
+        const handler = int32_handlers.getInt32Handler(instr.opcode);
         if (handler.pattern == .unsupported) return false;
     }
+
+    // For non-recursive functions, reject recursive-only patterns (self_ref, call_self)
+    // and verify forward-jump-only control flow.
+    if (!func.is_self_recursive) {
+        for (func.instructions) |instr| {
+            const handler = int32_handlers.getInt32Handler(instr.opcode);
+            if (handler.pattern == .self_ref_i32 or handler.pattern == .call_self_i32 or handler.pattern == .tail_call_self_i32) return false;
+        }
+        for (func.instructions) |instr| {
+            const handler = int32_handlers.getInt32Handler(instr.opcode);
+            if (handler.pattern == .if_false_i32 or handler.pattern == .if_true_i32 or handler.pattern == .goto_i32) {
+                // Jump offset is relative: target = pc + 1 + label
+                const label: i32 = switch (instr.operand) {
+                    .label => |l| l,
+                    else => continue,
+                };
+                // Forward jumps have label >= 0 (offset from operand position)
+                // A label of -1 or less means backward jump (loop)
+                if (label < 0) return false;
+            }
+        }
+    }
+
     return true;
 }
 
