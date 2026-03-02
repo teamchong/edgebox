@@ -1259,7 +1259,7 @@ pub const thin = struct {
     pub noinline fn op_iterator_get_value_done(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
         const result = stack[sp.* - 1].toJSValueWithCtx(ctx);
         var done: i32 = 0;
-        const val = JSValue.iteratorGetValueDone(ctx, result, &done);
+        const val = quickjs.js_frozen_iterator_get_value_done(ctx, result, &done);
         stack[sp.* - 1] = CV.fromJSValue(val);
         stack[sp.*] = if (done != 0) CV.TRUE else CV.FALSE;
         sp.* += 1;

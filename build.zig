@@ -738,6 +738,46 @@ pub fn build(b: *std.Build) void {
             }
         }
 
+        // Discover and link LLVM-generated .o shard files (from --freeze-backend=llvm)
+        var llvm_shard_count: usize = 0;
+        while (true) : (llvm_shard_count += 1) {
+            const llvm_obj_path = b.fmt("{s}/frozen_llvm_shard_{d}.o", .{ shard_dir, llvm_shard_count });
+            if (std.fs.cwd().access(llvm_obj_path, .{})) |_| {
+                native_static_exe.addObjectFile(.{ .cwd_relative = llvm_obj_path });
+            } else |_| {
+                break;
+            }
+        }
+        if (llvm_shard_count > 0) {
+            std.debug.print("[build] Linking {d} LLVM IR frozen shard .o files\n", .{llvm_shard_count});
+
+            // Compile the C constructor that calls LLVM shard init functions.
+            // This uses __attribute__((constructor)) to auto-register LLVM-compiled
+            // versions at startup, overriding the Zig versions.
+            const llvm_init_c_path = b.fmt("{s}/frozen_llvm_init.c", .{shard_dir});
+            if (std.fs.cwd().access(llvm_init_c_path, .{})) |_| {
+                native_static_exe.addCSourceFile(.{
+                    .file = .{ .cwd_relative = llvm_init_c_path },
+                });
+            } else |_| {}
+
+            // Compile llvm_runtime_exports.zig — provides C-ABI exports that LLVM IR
+            // thin codegen calls. These are `export fn` with callconv(.c), so symbols
+            // are globally visible and resolve against the LLVM .o shard references.
+            const llvm_rt_exports_mod = b.createModule(.{
+                .root_source_file = b.path("src/freeze/llvm_runtime_exports.zig"),
+                .target = target,
+                .optimize = frozen_optimize,
+            });
+            llvm_rt_exports_mod.addImport("zig_runtime", native_zig_runtime_mod);
+            llvm_rt_exports_mod.addIncludePath(b.path(quickjs_dir));
+            const llvm_rt_exports_obj = b.addObject(.{
+                .name = "llvm_runtime_exports",
+                .root_module = llvm_rt_exports_mod,
+            });
+            native_static_exe.addObject(llvm_rt_exports_obj);
+        }
+
         // Compile frozen_module.zig (thin loader that calls shard init functions via extern)
         const native_frozen_mod = b.createModule(.{
             .root_source_file = .{ .cwd_relative = native_frozen_zig_path },
@@ -966,6 +1006,44 @@ pub fn build(b: *std.Build) void {
 
         if (embed_shard_count > 0) {
             std.debug.print("[build] Compiling {d} embed frozen shards as separate object files\n", .{embed_shard_count});
+        }
+
+        // Discover and link LLVM-generated .o shard files for embed/native target
+        {
+            var embed_llvm_shard_count: usize = 0;
+            while (true) : (embed_llvm_shard_count += 1) {
+                const llvm_obj_path = b.fmt("{s}/frozen_llvm_shard_{d}.o", .{ embed_shard_dir, embed_llvm_shard_count });
+                if (std.fs.cwd().access(llvm_obj_path, .{})) |_| {
+                    native_exe.addObjectFile(.{ .cwd_relative = llvm_obj_path });
+                } else |_| {
+                    break;
+                }
+            }
+            if (embed_llvm_shard_count > 0) {
+                std.debug.print("[build] Linking {d} LLVM IR frozen shard .o files (native)\n", .{embed_llvm_shard_count});
+
+                // Compile the C constructor that auto-registers LLVM-compiled functions
+                const llvm_init_c_path = b.fmt("{s}/frozen_llvm_init.c", .{embed_shard_dir});
+                if (std.fs.cwd().access(llvm_init_c_path, .{})) |_| {
+                    native_exe.addCSourceFile(.{
+                        .file = .{ .cwd_relative = llvm_init_c_path },
+                    });
+                } else |_| {}
+
+                // Compile llvm_runtime_exports.zig for embed/native target
+                const embed_llvm_rt_mod = b.createModule(.{
+                    .root_source_file = b.path("src/freeze/llvm_runtime_exports.zig"),
+                    .target = target,
+                    .optimize = frozen_optimize,
+                });
+                embed_llvm_rt_mod.addImport("zig_runtime", embed_zig_runtime_mod);
+                embed_llvm_rt_mod.addIncludePath(b.path(quickjs_dir));
+                const embed_llvm_rt_obj = b.addObject(.{
+                    .name = "llvm_runtime_exports_embed",
+                    .root_module = embed_llvm_rt_mod,
+                });
+                native_exe.addObject(embed_llvm_rt_obj);
+            }
         }
 
         const embed_frozen_mod = b.createModule(.{

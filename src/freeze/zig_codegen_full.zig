@@ -7635,20 +7635,41 @@ pub const ZigCodeGen = struct {
             try self.print("fn __frozen_{s}_int32(", .{func_name});
         }
 
-        // Generate int32 parameters
+        // Determine which parameters are actually used by scanning instructions
+        const int32_h = @import("int32_handlers.zig");
+        var used_params: [8]bool = .{false} ** 8;
+        for (self.func.cfg.blocks.items) |block| {
+            for (block.instructions) |instr| {
+                const h = int32_h.getInt32Handler(instr.opcode);
+                if (h.pattern == .get_arg_i32) {
+                    const idx: usize = @intCast(h.index orelse switch (instr.operand) {
+                        .arg => |a| @as(u32, a),
+                        .u8 => |a| @as(u32, a),
+                        .implicit_arg => |a| @as(u32, a),
+                        else => 0,
+                    });
+                    if (idx < 8) used_params[idx] = true;
+                } else if (h.pattern == .call_self_i32 or h.pattern == .tail_call_self_i32) {
+                    // Self-recursive calls use all args
+                    for (0..@min(argc, 8)) |j| used_params[j] = true;
+                }
+            }
+        }
+
+        // Generate int32 parameters (prefix unused ones with _)
         for (0..argc) |i| {
             if (i > 0) try self.write(", ");
-            try self.print("n{d}: i32", .{i});
+            if (used_params[i]) {
+                try self.print("n{d}: i32", .{i});
+            } else {
+                try self.write("_: i32");
+            }
         }
         try self.write(") i32 {\n");
         self.pushIndent();
 
         // Emit local variable declarations for non-recursive functions
         if (!self.func.is_self_recursive) {
-            // Suppress unused parameter warnings (some int32 functions don't use all args)
-            for (0..argc) |i| {
-                try self.print("_ = n{d};\n", .{i});
-            }
             const var_count = self.func.var_count;
             for (0..var_count) |i| {
                 try self.print("var loc{d}: i32 = 0;\n", .{i});
@@ -7747,7 +7768,10 @@ pub const ZigCodeGen = struct {
                             const b = stack[sp - 1];
                             const a = stack[sp - 2];
                             const op = handler.op orelse "+";
-                            const s = std.fmt.bufPrint(&expr_buf, "({s} {s} {s})", .{ a, op, b }) catch "(0)";
+                            const s = if (std.mem.eql(u8, op, "%"))
+                                std.fmt.bufPrint(&expr_buf, "@rem({s}, {s})", .{ a, b }) catch "(0)"
+                            else
+                                std.fmt.bufPrint(&expr_buf, "({s} {s} {s})", .{ a, op, b }) catch "(0)";
                             stack[sp - 2] = self.allocator.dupe(u8, s) catch "(0)";
                             sp -= 1;
                         }
@@ -7956,7 +7980,12 @@ pub const ZigCodeGen = struct {
                 },
                 .binary_arith_i32 => {
                     const op = handler.op orelse "+";
-                    try self.print("__stk[__sp - 2] = __stk[__sp - 2] {s} __stk[__sp - 1]; __sp -= 1;\n", .{op});
+                    if (std.mem.eql(u8, op, "%")) {
+                        // Zig requires @rem for signed integer remainder
+                        try self.write("__stk[__sp - 2] = @rem(__stk[__sp - 2], __stk[__sp - 1]); __sp -= 1;\n");
+                    } else {
+                        try self.print("__stk[__sp - 2] = __stk[__sp - 2] {s} __stk[__sp - 1]; __sp -= 1;\n", .{op});
+                    }
                 },
                 .binary_cmp_i32 => {
                     const op = handler.op orelse "<";
@@ -7964,7 +7993,12 @@ pub const ZigCodeGen = struct {
                 },
                 .bitwise_binary_i32 => {
                     const op = handler.op orelse "&";
-                    try self.print("__stk[__sp - 2] = __stk[__sp - 2] {s} __stk[__sp - 1]; __sp -= 1;\n", .{op});
+                    if (std.mem.eql(u8, op, "<<") or std.mem.eql(u8, op, ">>")) {
+                        // Zig requires u5 for i32 shift amounts
+                        try self.print("__stk[__sp - 2] = __stk[__sp - 2] {s} @as(u5, @intCast(__stk[__sp - 1] & 31)); __sp -= 1;\n", .{op});
+                    } else {
+                        try self.print("__stk[__sp - 2] = __stk[__sp - 2] {s} __stk[__sp - 1]; __sp -= 1;\n", .{op});
+                    }
                 },
                 .unary_i32 => {
                     const op = handler.op orelse "-";

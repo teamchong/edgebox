@@ -23,6 +23,7 @@ const zig_hotpath_codegen = @import("zig_hotpath_codegen.zig");
 const zig_codegen_full = @import("zig_codegen_full.zig");
 const zig_codegen_relooper = @import("zig_codegen_relooper.zig");
 const zig_codegen_thin = @import("zig_codegen_thin.zig");
+const llvm_codegen = @import("llvm_codegen.zig");
 
 const JSValue = jsvalue.JSValue;
 const JSContext = jsvalue.JSContext;
@@ -765,6 +766,14 @@ fn generateFrozenZigThin(
     };
 }
 
+/// Codegen backend selection
+pub const CodegenBackend = enum {
+    /// Default: generate Zig source code, compiled by Zig compiler
+    zig_source,
+    /// LLVM IR: emit LLVM IR directly, skip Zig parser/type-checker
+    llvm_ir,
+};
+
 /// Sharded output for parallel compilation
 pub const ShardedOutput = struct {
     /// Main file that imports all shards and has init function
@@ -777,6 +786,8 @@ pub const ShardedOutput = struct {
     /// Shards [0..thin_shard_start) contain full-codegen functions (use ReleaseFast)
     /// Shards [thin_shard_start..shards.len) contain thin-codegen functions (use ReleaseSmall)
     thin_shard_start: usize,
+    /// Number of LLVM IR shards generated (when backend == .llvm_ir)
+    llvm_shard_count: usize = 0,
 
     pub fn deinit(self: *ShardedOutput, allocator: Allocator) void {
         allocator.free(self.main);
@@ -797,6 +808,23 @@ pub fn generateModuleZigSharded(
     bytes_per_shard: usize,
     max_functions: u32,
     profile_path: ?[]const u8,
+) !ShardedOutput {
+    return generateModuleZigShardedWithBackend(allocator, analysis, module_name, manifest_json, bytes_per_shard, max_functions, profile_path, .zig_source, null);
+}
+
+/// Generate frozen code with sharding, using the specified backend.
+/// When backend == .llvm_ir, int32 functions are emitted as LLVM IR → .o files,
+/// while non-int32 functions fall back to Zig source generation.
+pub fn generateModuleZigShardedWithBackend(
+    allocator: Allocator,
+    analysis: *const ModuleAnalysis,
+    module_name: []const u8,
+    manifest_json: ?[]const u8,
+    bytes_per_shard: usize,
+    max_functions: u32,
+    profile_path: ?[]const u8,
+    backend: CodegenBackend,
+    output_dir: ?[]const u8,
 ) !ShardedOutput {
     _ = module_name;
 
@@ -913,6 +941,207 @@ pub fn generateModuleZigSharded(
             thin_failed,
             total_before,
         });
+    }
+
+    // LLVM IR backend: generate int32 functions as .o files directly
+    var llvm_shard_count: usize = 0;
+    if (backend == .llvm_ir) {
+        const cache_dir = output_dir orelse "zig-out/cache";
+
+        // Collect int32 functions for LLVM IR generation
+        var llvm_funcs = std.ArrayListUnmanaged(llvm_codegen.ShardFunction){};
+        defer llvm_funcs.deinit(allocator);
+
+        var llvm_func_names = std.ArrayListUnmanaged([]u8){};
+        defer {
+            for (llvm_func_names.items) |name| allocator.free(name);
+            llvm_func_names.deinit(allocator);
+        }
+
+        // Build CFGs for int32 functions
+        var llvm_cfgs = std.ArrayListUnmanaged(cfg_builder.CFG){};
+        defer {
+            for (llvm_cfgs.items) |*cfg_item| cfg_item.deinit();
+            llvm_cfgs.deinit(allocator);
+        }
+
+        // Two-pass approach to avoid pointer invalidation:
+        // Pass 1: Collect int32 function info and build CFGs
+        const Int32FuncInfo = struct {
+            gf_idx: usize,
+            cfg_idx: usize,
+            func_name_idx: usize,
+        };
+        var int32_infos = std.ArrayListUnmanaged(Int32FuncInfo){};
+        defer int32_infos.deinit(allocator);
+
+        for (generated_all.items, 0..) |gf, gi| {
+            if (!isPureInt32Function(gf.func)) continue;
+
+            // Build CFG for this function
+            const cfg = cfg_builder.buildCFG(allocator, gf.func.instructions) catch continue;
+            const cfg_idx = llvm_cfgs.items.len;
+            try llvm_cfgs.append(allocator, cfg);
+
+            // Sanitize name for LLVM symbol
+            var sanitized_buf: [256]u8 = undefined;
+            const sanitized = sanitizeName(gf.func.name, &sanitized_buf);
+            const llvm_func_name = try std.fmt.allocPrint(allocator, "__frozen_{d}_{s}", .{ gf.idx, sanitized });
+            const func_name_idx = llvm_func_names.items.len;
+            try llvm_func_names.append(allocator, llvm_func_name);
+
+            try int32_infos.append(allocator, .{
+                .gf_idx = gi,
+                .cfg_idx = cfg_idx,
+                .func_name_idx = func_name_idx,
+            });
+        }
+
+        // Pass 2: Build ShardFunction structs (safe — llvm_cfgs won't grow anymore)
+        for (int32_infos.items) |info| {
+            const gf = generated_all.items[info.gf_idx];
+            try llvm_funcs.append(allocator, .{
+                .name = gf.func.name,
+                .func_index = gf.idx,
+                .line_num = gf.func.line_num,
+                .llvm_func_name = llvm_func_names.items[info.func_name_idx],
+                .func = gf.func,
+                .cfg = &llvm_cfgs.items[info.cfg_idx],
+            });
+        }
+
+        if (llvm_funcs.items.len > 0) {
+            std.debug.print("[freeze] LLVM IR: {d} int32 functions identified for compilation\n", .{llvm_funcs.items.len});
+            const FUNCS_PER_SHARD = 100;
+            var func_offset: usize = 0;
+
+            while (func_offset < llvm_funcs.items.len) {
+                const end = @min(func_offset + FUNCS_PER_SHARD, llvm_funcs.items.len);
+                const shard_funcs = llvm_funcs.items[func_offset..end];
+
+                var obj_path_buf: [4096]u8 = undefined;
+                const obj_path = std.fmt.bufPrintZ(&obj_path_buf, "{s}/frozen_llvm_shard_{d}.o", .{ cache_dir, llvm_shard_count }) catch {
+                    func_offset = end;
+                    continue;
+                };
+
+                const result = llvm_codegen.generateShard(allocator, shard_funcs, llvm_shard_count, obj_path) catch |err| {
+                    std.debug.print("[freeze] LLVM shard {d} failed: {}\n", .{ llvm_shard_count, err });
+                    func_offset = end;
+                    continue;
+                };
+
+                if (result.has_functions) {
+                    std.debug.print("[freeze] LLVM shard {d}: {d} int32 functions → {s}\n", .{ llvm_shard_count, result.func_count, obj_path });
+                    llvm_shard_count += 1;
+                }
+
+                func_offset = end;
+            }
+
+            if (llvm_shard_count > 0) {
+                std.debug.print("[freeze] LLVM IR: generated {d} shard .o files with int32 functions\n", .{llvm_shard_count});
+            }
+
+            // NOTE: Int32 functions are NOT removed from generated_all.
+            // They remain in Zig shards for cross-platform compatibility (embed, standalone/WASM).
+            // The LLVM .o files re-register the same dispatch keys with LLVM-compiled versions.
+            // Since native_dispatch.register() uses put() (overwrites), the LLVM versions win
+            // because LLVM shard constructors run AFTER Zig shard inits.
+        }
+
+        // ===== Phase 2: Thin codegen for ALL remaining functions =====
+        // Collect non-int32 functions for LLVM thin codegen
+        var thin_llvm_funcs = std.ArrayListUnmanaged(llvm_codegen.ThinShardFunction){};
+        defer thin_llvm_funcs.deinit(allocator);
+
+        var thin_func_names = std.ArrayListUnmanaged([]u8){};
+        defer {
+            for (thin_func_names.items) |name| allocator.free(name);
+            thin_func_names.deinit(allocator);
+        }
+
+        var thin_cfgs = std.ArrayListUnmanaged(cfg_builder.CFG){};
+        defer {
+            for (thin_cfgs.items) |*cfg_item| cfg_item.deinit();
+            thin_cfgs.deinit(allocator);
+        }
+
+        const ThinFuncInfo = struct {
+            gf_idx: usize,
+            cfg_idx: usize,
+            func_name_idx: usize,
+        };
+        var thin_infos = std.ArrayListUnmanaged(ThinFuncInfo){};
+        defer thin_infos.deinit(allocator);
+
+        for (generated_all.items, 0..) |gf, gi| {
+            // Skip int32 functions (already handled above)
+            if (isPureInt32Function(gf.func)) continue;
+
+            const cfg = cfg_builder.buildCFG(allocator, gf.func.instructions) catch continue;
+            const cfg_idx = thin_cfgs.items.len;
+            try thin_cfgs.append(allocator, cfg);
+
+            var sanitized_buf: [256]u8 = undefined;
+            const sanitized = sanitizeName(gf.func.name, &sanitized_buf);
+            const llvm_func_name = try std.fmt.allocPrint(allocator, "__frozen_{d}_{s}", .{ gf.idx, sanitized });
+            const func_name_idx = thin_func_names.items.len;
+            try thin_func_names.append(allocator, llvm_func_name);
+
+            try thin_infos.append(allocator, .{
+                .gf_idx = gi,
+                .cfg_idx = cfg_idx,
+                .func_name_idx = func_name_idx,
+            });
+        }
+
+        // Pass 2: Build ThinShardFunction structs
+        for (thin_infos.items) |info| {
+            const gf = generated_all.items[info.gf_idx];
+            try thin_llvm_funcs.append(allocator, .{
+                .name = gf.func.name,
+                .func_index = gf.idx,
+                .line_num = gf.func.line_num,
+                .llvm_func_name = thin_func_names.items[info.func_name_idx],
+                .func = gf.func,
+                .cfg = &thin_cfgs.items[info.cfg_idx],
+            });
+        }
+
+        if (thin_llvm_funcs.items.len > 0) {
+            std.debug.print("[freeze] LLVM thin: {d} functions identified for compilation\n", .{thin_llvm_funcs.items.len});
+            const THIN_FUNCS_PER_SHARD = 200;
+            var func_offset: usize = 0;
+
+            while (func_offset < thin_llvm_funcs.items.len) {
+                const end = @min(func_offset + THIN_FUNCS_PER_SHARD, thin_llvm_funcs.items.len);
+                const shard_funcs = thin_llvm_funcs.items[func_offset..end];
+
+                var obj_path_buf: [4096]u8 = undefined;
+                const obj_path = std.fmt.bufPrintZ(&obj_path_buf, "{s}/frozen_llvm_shard_{d}.o", .{ cache_dir, llvm_shard_count }) catch {
+                    func_offset = end;
+                    continue;
+                };
+
+                const result = llvm_codegen.generateThinShard(allocator, shard_funcs, llvm_shard_count, obj_path) catch |err| {
+                    std.debug.print("[freeze] LLVM thin shard {d} failed: {}\n", .{ llvm_shard_count, err });
+                    func_offset = end;
+                    continue;
+                };
+
+                if (result.has_functions) {
+                    std.debug.print("[freeze] LLVM thin shard {d}: {d} functions → {s}\n", .{ llvm_shard_count, result.func_count, obj_path });
+                    llvm_shard_count += 1;
+                }
+
+                func_offset = end;
+            }
+
+            if (llvm_shard_count > 0) {
+                std.debug.print("[freeze] LLVM IR total: {d} shard .o files (int32 + thin)\n", .{llvm_shard_count});
+            }
+        }
     }
 
     // Calculate total size and number of shards needed
@@ -1254,6 +1483,7 @@ pub fn generateModuleZigSharded(
         .shards = shards,
         .bytes_per_shard = bytes_per_shard,
         .thin_shard_start = thin_shard_start,
+        .llvm_shard_count = llvm_shard_count,
     };
 }
 
@@ -1613,12 +1843,27 @@ pub fn isPureInt32Function(func: AnalyzedFunction) bool {
     // Guard: too many locals for non-recursive functions
     if (!func.is_self_recursive and func.var_count > 16) return false;
 
-    // Check all instructions for non-int32 operations
+    // Check all instructions for non-int32 operations,
+    // and require at least one integer-producing operation to prove
+    // the function actually works with integers (not just pass-through).
     const int32_handlers = @import("int32_handlers.zig");
+    var has_int32_op = false;
     for (func.instructions) |instr| {
         const handler = int32_handlers.getInt32Handler(instr.opcode);
         if (handler.pattern == .unsupported) return false;
+        // These patterns prove the function actually computes with integers
+        switch (handler.pattern) {
+            .binary_arith_i32, .binary_cmp_i32, .bitwise_binary_i32,
+            .unary_i32, .inc_dec_i32, .lnot_i32, .push_const_i32,
+            .push_bool_i32, .call_self_i32, .tail_call_self_i32,
+            => has_int32_op = true,
+            else => {},
+        }
     }
+
+    // Reject functions that are just pass-throughs (e.g., `function f(x) { return x; }`)
+    // — they can be called with any type and int32 specialization would corrupt objects.
+    if (!has_int32_op) return false;
 
     // For non-recursive functions, reject recursive-only patterns (self_ref, call_self)
     // and verify forward-jump-only control flow.
@@ -1630,13 +1875,10 @@ pub fn isPureInt32Function(func: AnalyzedFunction) bool {
         for (func.instructions) |instr| {
             const handler = int32_handlers.getInt32Handler(instr.opcode);
             if (handler.pattern == .if_false_i32 or handler.pattern == .if_true_i32 or handler.pattern == .goto_i32) {
-                // Jump offset is relative: target = pc + 1 + label
                 const label: i32 = switch (instr.operand) {
                     .label => |l| l,
                     else => continue,
                 };
-                // Forward jumps have label >= 0 (offset from operand position)
-                // A label of -1 or less means backward jump (loop)
                 if (label < 0) return false;
             }
         }
