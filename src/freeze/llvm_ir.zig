@@ -417,11 +417,17 @@ pub const TargetMachine = struct {
             return Error.TargetLookupFailed;
         }
 
+        // Use host CPU features for optimal vectorization (AVX2, etc.)
+        const cpu = c.LLVMGetHostCPUName();
+        defer c.LLVMDisposeMessage(cpu);
+        const features = c.LLVMGetHostCPUFeatures();
+        defer c.LLVMDisposeMessage(features);
+
         const tm = c.LLVMCreateTargetMachine(
             target,
             triple,
-            "generic",
-            "",
+            cpu,
+            features,
             opt_level,
             c.LLVMRelocPIC,
             c.LLVMCodeModelDefault,
