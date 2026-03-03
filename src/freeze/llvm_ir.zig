@@ -130,6 +130,10 @@ pub const Builder = struct {
         return c.LLVMBuildAdd(self.ref, lhs, rhs, name);
     }
 
+    pub fn buildNSWAdd(self: Builder, lhs: Value, rhs: Value, name: [*:0]const u8) Value {
+        return c.LLVMBuildNSWAdd(self.ref, lhs, rhs, name);
+    }
+
     pub fn buildSub(self: Builder, lhs: Value, rhs: Value, name: [*:0]const u8) Value {
         return c.LLVMBuildSub(self.ref, lhs, rhs, name);
     }

@@ -216,6 +216,13 @@ fn finalizeAndEmitShard(
         return CodegenError.LLVMError;
     };
 
+    // Dump IR before optimization (debug)
+    if (std.posix.getenv("EDGEBOX_DUMP_IR")) |_| {
+        const ir = native.module.printToString();
+        defer llvm.disposeMessage(ir);
+        std.debug.print("=== PRE-OPT IR ({s}) ===\n{s}\n=== END PRE-OPT ===\n", .{ label, ir });
+    }
+
     // Run optimization passes (-O2)
     {
         const pass_opts = c.LLVMCreatePassBuilderOptions();
@@ -228,6 +235,13 @@ fn finalizeAndEmitShard(
                 c.LLVMDisposeErrorMessage(m);
             }
         }
+    }
+
+    // Dump IR after optimization (debug)
+    if (std.posix.getenv("EDGEBOX_DUMP_IR")) |_| {
+        const ir2 = native.module.printToString();
+        defer llvm.disposeMessage(ir2);
+        std.debug.print("=== POST-OPT IR ({s}) ===\n{s}\n=== END POST-OPT ===\n", .{ label, ir2 });
     }
 
     // Emit to object file
@@ -3613,8 +3627,8 @@ fn emitCountedLoopFastPath(
     const t_elem_ptr = b.buildInBoundsGEP(i32t, values_ptr, &.{t_ctr_i64}, "tep");
     const t_elem_i32 = b.buildLoad(i32t, t_elem_ptr, "tei32");
     const t_elem_i64 = b.buildSExt(t_elem_i32, i64t, "tei64");
-    const t_new_acc = b.buildAdd(t_acc_phi, t_elem_i64, "tnacc");
-    const t_next_ctr = b.buildAdd(t_ctr_phi, llvm.constInt32(1), "tnctr");
+    const t_new_acc = b.buildNSWAdd(t_acc_phi, t_elem_i64, "tnacc");
+    const t_next_ctr = b.buildNSWAdd(t_ctr_phi, llvm.constInt32(1), "tnctr");
     _ = b.buildBr(typed_loop_bb);
 
     // Typed loop back-edge phis
@@ -3690,8 +3704,8 @@ fn emitCountedLoopFastPath(
     b.positionAtEnd(fast_add_bb);
     const elem_i32 = b.buildTrunc(elem_payload, i32t, "ei32");
     const elem_i64 = b.buildSExt(elem_i32, i64t, "ei64");
-    const new_acc = b.buildAdd(acc_phi, elem_i64, "nacc");
-    const next_ctr = b.buildAdd(ctr_phi, llvm.constInt32(1), "nctr");
+    const new_acc = b.buildNSWAdd(acc_phi, elem_i64, "nacc");
+    const next_ctr = b.buildNSWAdd(ctr_phi, llvm.constInt32(1), "nctr");
     _ = b.buildBr(fast_loop_bb);
 
     // JSValue loop back-edge phis
