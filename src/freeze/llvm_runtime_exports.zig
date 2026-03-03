@@ -43,6 +43,16 @@ export fn llvm_rt_push_cv(stack: [*]CV, sp: *usize, val: CV) callconv(.c) void {
     thin.push_cv(stack, sp, val);
 }
 
+export fn llvm_rt_push_const(ctx: *JSContext, stack: [*]CV, sp: *usize, cpool: ?[*]JSValue, idx: u32) callconv(.c) void {
+    if (cpool) |cp| {
+        const val = JSValue.dup(ctx, cp[idx]);
+        stack[sp.*] = CV.fromJSValue(val);
+    } else {
+        stack[sp.*] = CV.UNDEFINED;
+    }
+    sp.* += 1;
+}
+
 // ============================================================================
 // Local variable access
 // ============================================================================
@@ -81,6 +91,16 @@ export fn llvm_rt_put_arg(ctx: *JSContext, stack: [*]CV, sp: *usize, arg_shadow:
 
 export fn llvm_rt_get_var_ref(ctx: *JSContext, stack: [*]CV, sp: *usize, var_refs: ?[*]*JSVarRef, idx: u32, closure_var_count: c_int) callconv(.c) void {
     thin.get_var_ref(ctx, stack, sp, var_refs, idx, closure_var_count);
+}
+
+/// get_var_ref with TDZ (Temporal Dead Zone) check.
+/// Returns 0 on success, 1 on exception (uninitialized variable).
+export fn llvm_rt_get_var_ref_check(ctx: *JSContext, stack: [*]CV, sp: *usize, var_refs: ?[*]*JSVarRef, idx: u32, closure_var_count: c_int) callconv(.c) c_int {
+    const val = zig_runtime.getClosureVarCheckSafe(ctx, var_refs, idx, closure_var_count);
+    stack[sp.*] = CV.fromJSValue(val);
+    sp.* += 1;
+    if (stack[sp.* - 1].isException()) return 1;
+    return 0;
 }
 
 export fn llvm_rt_put_var_ref(ctx: *JSContext, stack: [*]CV, sp: *usize, var_refs: ?[*]*JSVarRef, idx: u32, closure_var_count: c_int) callconv(.c) void {
@@ -264,7 +284,6 @@ export fn llvm_rt_op_call(
     sp: *usize,
     argc: u16,
 ) callconv(.c) c_int {
-    // Simplified version: no closure sync (for thin codegen)
     thin.op_call(ctx, stack, sp, argc, null, null, 0, null, &.{}) catch return 1;
     return 0;
 }
@@ -367,6 +386,115 @@ export fn llvm_rt_exceptionCleanup(
 }
 
 // ============================================================================
+// Tail call + return (combined to match Zig full codegen semantics)
+// ============================================================================
+
+
+/// Combined tail_call: call function + free consumed CVs + cleanup + return.
+/// This matches the Zig full codegen's emitCall+return sequence exactly.
+/// Unlike op_call + returnFromStack, this properly frees func+arg CVs.
+export fn llvm_rt_tail_call_return(
+    ctx: *JSContext,
+    stack: [*]CV,
+    sp: *usize,
+    argc: u16,
+    locals: [*]CV,
+    local_count: usize,
+    arg_shadow: ?[*]CV,
+    arg_count: usize,
+) callconv(.c) JSValue {
+    const n: usize = @intCast(argc);
+
+    // Extract function from stack
+    const fn_val = CV.toJSValuePtr(&stack[sp.* - n - 1]);
+
+    // Build args array from stack
+    var args: [256]JSValue = undefined;
+    for (0..n) |i| {
+        args[i] = CV.toJSValuePtr(&stack[sp.* - n + i]);
+    }
+
+    // Call the function
+    const result = JSValue.call(ctx, fn_val, JSValue.UNDEFINED, @intCast(argc), @ptrCast(&args));
+
+    // Free consumed CVs: args then func (matching Zig full codegen order)
+    for (0..n) |i| {
+        CV.freeRef(ctx, stack[sp.* - n + i]);
+    }
+    CV.freeRef(ctx, stack[sp.* - n - 1]); // func
+
+    // Exit frozen call depth
+    zig_runtime.exitStack();
+
+    // Cleanup locals
+    zig_runtime.cleanupLocals(ctx, locals, local_count);
+
+    // Free arg shadow
+    if (arg_shadow) |shadow| {
+        for (0..arg_count) |i| {
+            CV.freeRef(ctx, shadow[i]);
+        }
+    }
+
+    if (result.isException()) {
+        return result;
+    }
+
+    return result;
+}
+
+/// Combined tail_call_method: call method + free consumed CVs + cleanup + return.
+export fn llvm_rt_tail_call_method_return(
+    ctx: *JSContext,
+    stack: [*]CV,
+    sp: *usize,
+    argc: u16,
+    locals: [*]CV,
+    local_count: usize,
+    arg_shadow: ?[*]CV,
+    arg_count: usize,
+) callconv(.c) JSValue {
+    const n: usize = @intCast(argc);
+
+    // Extract obj and method from stack
+    const obj = CV.toJSValuePtr(&stack[sp.* - n - 2]);
+    const method = CV.toJSValuePtr(&stack[sp.* - n - 1]);
+
+    // Build args
+    var args: [256]JSValue = undefined;
+    for (0..n) |i| {
+        args[i] = CV.toJSValuePtr(&stack[sp.* - n + i]);
+    }
+
+    // Call
+    const result = JSValue.call(ctx, method, obj, @intCast(argc), @ptrCast(&args));
+
+    // Free consumed CVs: args, method, obj
+    for (0..n) |i| {
+        CV.freeRef(ctx, stack[sp.* - n + i]);
+    }
+    CV.freeRef(ctx, stack[sp.* - n - 1]); // method
+    CV.freeRef(ctx, stack[sp.* - n - 2]); // obj
+
+    // Exit frozen call depth
+    zig_runtime.exitStack();
+
+    // Cleanup
+    zig_runtime.cleanupLocals(ctx, locals, local_count);
+    if (arg_shadow) |shadow| {
+        for (0..arg_count) |i| {
+            CV.freeRef(ctx, shadow[i]);
+        }
+    }
+
+    if (result.isException()) {
+        return result;
+    }
+
+    return result;
+}
+
+// ============================================================================
 // Iterator operations
 // ============================================================================
 
@@ -433,6 +561,243 @@ export fn llvm_rt_cv_dup_ref(cv: CV) callconv(.c) CV {
 
 export fn llvm_rt_cv_free_ref(ctx: *JSContext, cv: CV) callconv(.c) void {
     CV.freeRef(ctx, cv);
+}
+
+/// Pop CV from stack, evaluate JS truthiness (handles empty string, NaN, 0.0, etc.)
+/// Returns 1 for truthy, 0 for falsy — matches JS semantics exactly.
+export fn llvm_rt_cv_to_bool(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) i32 {
+    const s = sp.*;
+    if (s == 0) return 0;
+    sp.* = s - 1;
+    const cv = stack[s - 1];
+    return if (cv.toBoolWithCtx(ctx)) @as(i32, 1) else @as(i32, 0);
+}
+
+// ============================================================================
+// Push operations (this, empty string, atom value)
+// ============================================================================
+
+export fn llvm_rt_push_this(ctx: *JSContext, stack: [*]CV, sp: *usize, this_val: JSValue) callconv(.c) void {
+    // Non-strict mode: coerce undefined/null this to globalThis
+    // Most bundled code behaves as non-strict (bundlers strip "use strict")
+    if (this_val.isUndefined() or this_val.isNull()) {
+        stack[sp.*] = CV.fromJSValue(zig_runtime.quickjs.JS_GetGlobalObject(ctx));
+    } else {
+        stack[sp.*] = CV.fromJSValue(JSValue.dup(ctx, this_val));
+    }
+    sp.* += 1;
+}
+
+export fn llvm_rt_push_empty_string(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    stack[sp.*] = CV.fromJSValue(JSValue.newString(ctx, ""));
+    sp.* += 1;
+}
+
+// ============================================================================
+// Stack manipulation (insert, perm, rot)
+// ============================================================================
+
+/// insert2: [obj, val] -> [val, obj, val] (dup_x1)
+export fn llvm_rt_insert2(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    const val = stack[sp.* - 1];
+    const obj = stack[sp.* - 2];
+    stack[sp.*] = val;
+    stack[sp.* - 1] = obj;
+    stack[sp.* - 2] = CV.dupRef(val);
+    sp.* += 1;
+    _ = ctx;
+}
+
+/// insert3: [obj, prop, val] -> [val, obj, prop, val] (dup_x2)
+export fn llvm_rt_insert3(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    const val = stack[sp.* - 1];
+    const c_val = stack[sp.* - 2];
+    const b_val = stack[sp.* - 3];
+    stack[sp.*] = val;
+    stack[sp.* - 1] = c_val;
+    stack[sp.* - 2] = b_val;
+    stack[sp.* - 3] = CV.dupRef(val);
+    sp.* += 1;
+    _ = ctx;
+}
+
+/// insert4: [this, obj, prop, val] -> [val, this, obj, prop, val]
+export fn llvm_rt_insert4(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    const val = stack[sp.* - 1];
+    const d = stack[sp.* - 2];
+    const c_val = stack[sp.* - 3];
+    const b_val = stack[sp.* - 4];
+    stack[sp.*] = val;
+    stack[sp.* - 1] = d;
+    stack[sp.* - 2] = c_val;
+    stack[sp.* - 3] = b_val;
+    stack[sp.* - 4] = CV.dupRef(val);
+    sp.* += 1;
+    _ = ctx;
+}
+
+/// perm3: [a, b, c] -> [b, a, c]
+export fn llvm_rt_perm3(stack: [*]CV, sp: *usize) callconv(.c) void {
+    const c_val = stack[sp.* - 1];
+    const b_val = stack[sp.* - 2];
+    const a_val = stack[sp.* - 3];
+    stack[sp.* - 3] = b_val;
+    stack[sp.* - 2] = a_val;
+    stack[sp.* - 1] = c_val;
+}
+
+/// perm4: [a, b, c, d] -> [c, a, b, d]
+export fn llvm_rt_perm4(stack: [*]CV, sp: *usize) callconv(.c) void {
+    const d = stack[sp.* - 1];
+    const c_val = stack[sp.* - 2];
+    const b_val = stack[sp.* - 3];
+    const a_val = stack[sp.* - 4];
+    stack[sp.* - 4] = c_val;
+    stack[sp.* - 3] = a_val;
+    stack[sp.* - 2] = b_val;
+    stack[sp.* - 1] = d;
+}
+
+/// perm5: [a, b, c, d, e] -> [d, a, b, c, e]
+export fn llvm_rt_perm5(stack: [*]CV, sp: *usize) callconv(.c) void {
+    const e = stack[sp.* - 1];
+    const d = stack[sp.* - 2];
+    const c_val = stack[sp.* - 3];
+    const b_val = stack[sp.* - 4];
+    const a_val = stack[sp.* - 5];
+    stack[sp.* - 5] = d;
+    stack[sp.* - 4] = a_val;
+    stack[sp.* - 3] = b_val;
+    stack[sp.* - 2] = c_val;
+    stack[sp.* - 1] = e;
+}
+
+/// rot3l: [a, b, c] -> [c, a, b]
+export fn llvm_rt_rot3l(stack: [*]CV, sp: *usize) callconv(.c) void {
+    const c_val = stack[sp.* - 1];
+    const b_val = stack[sp.* - 2];
+    const a_val = stack[sp.* - 3];
+    stack[sp.* - 3] = c_val;
+    stack[sp.* - 2] = a_val;
+    stack[sp.* - 1] = b_val;
+}
+
+/// rot3r: [a, b, c] -> [b, c, a] (this is the standard right rotation semantics)
+export fn llvm_rt_rot3r(stack: [*]CV, sp: *usize) callconv(.c) void {
+    const c_val = stack[sp.* - 1];
+    const b_val = stack[sp.* - 2];
+    const a_val = stack[sp.* - 3];
+    stack[sp.* - 3] = b_val;
+    stack[sp.* - 2] = c_val;
+    stack[sp.* - 1] = a_val;
+}
+
+/// nip1: [a, b] -> [b] but free a
+export fn llvm_rt_nip1(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    const b_val = stack[sp.* - 1];
+    const a_val = stack[sp.* - 2];
+    CV.freeRef(ctx, a_val);
+    stack[sp.* - 2] = b_val;
+    sp.* -= 1;
+}
+
+// ============================================================================
+// Stack-based increment / decrement
+// ============================================================================
+
+export fn llvm_rt_inc(stack: [*]CV, sp: *usize) callconv(.c) void {
+    const v = stack[sp.* - 1];
+    if (v.isInt()) {
+        const n = v.getInt();
+        if (n < 0x7fffffff) {
+            stack[sp.* - 1] = CV.newInt(n + 1);
+        } else {
+            stack[sp.* - 1] = CV.newFloat(@as(f64, @floatFromInt(n)) + 1.0);
+        }
+    } else if (v.isFloat()) {
+        stack[sp.* - 1] = CV.newFloat(v.getFloat() + 1.0);
+    }
+}
+
+export fn llvm_rt_dec(stack: [*]CV, sp: *usize) callconv(.c) void {
+    const v = stack[sp.* - 1];
+    if (v.isInt()) {
+        const n = v.getInt();
+        if (n > -0x7fffffff) {
+            stack[sp.* - 1] = CV.newInt(n - 1);
+        } else {
+            stack[sp.* - 1] = CV.newFloat(@as(f64, @floatFromInt(n)) - 1.0);
+        }
+    } else if (v.isFloat()) {
+        stack[sp.* - 1] = CV.newFloat(v.getFloat() - 1.0);
+    }
+}
+
+export fn llvm_rt_post_inc(stack: [*]CV, sp: *usize) callconv(.c) void {
+    const v = stack[sp.* - 1];
+    if (v.isInt()) {
+        const n = v.getInt();
+        if (n < 0x7fffffff) {
+            stack[sp.* - 1] = CV.newInt(n + 1);
+        } else {
+            stack[sp.* - 1] = CV.newFloat(@as(f64, @floatFromInt(n)) + 1.0);
+        }
+        stack[sp.*] = v; // push old value
+        sp.* += 1;
+    } else if (v.isFloat()) {
+        stack[sp.* - 1] = CV.newFloat(v.getFloat() + 1.0);
+        stack[sp.*] = v;
+        sp.* += 1;
+    }
+}
+
+export fn llvm_rt_post_dec(stack: [*]CV, sp: *usize) callconv(.c) void {
+    const v = stack[sp.* - 1];
+    if (v.isInt()) {
+        const n = v.getInt();
+        if (n > -0x7fffffff) {
+            stack[sp.* - 1] = CV.newInt(n - 1);
+        } else {
+            stack[sp.* - 1] = CV.newFloat(@as(f64, @floatFromInt(n)) - 1.0);
+        }
+        stack[sp.*] = v;
+        sp.* += 1;
+    } else if (v.isFloat()) {
+        stack[sp.* - 1] = CV.newFloat(v.getFloat() - 1.0);
+        stack[sp.*] = v;
+        sp.* += 1;
+    }
+}
+
+// ============================================================================
+// Type check operations
+// ============================================================================
+
+export fn llvm_rt_is_undefined(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    const v = stack[sp.* - 1];
+    CV.freeRef(ctx, v);
+    stack[sp.* - 1] = if (v.isUndefined()) CV.TRUE else CV.FALSE;
+}
+
+export fn llvm_rt_is_null(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    const v = stack[sp.* - 1];
+    CV.freeRef(ctx, v);
+    stack[sp.* - 1] = if (v.isNull()) CV.TRUE else CV.FALSE;
+}
+
+export fn llvm_rt_is_undefined_or_null(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    const v = stack[sp.* - 1];
+    CV.freeRef(ctx, v);
+    stack[sp.* - 1] = if (v.isUndefined() or v.isNull()) CV.TRUE else CV.FALSE;
+}
+
+// ============================================================================
+// Object/array operations
+// ============================================================================
+
+export fn llvm_rt_object(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    stack[sp.*] = CV.fromJSValue(zig_runtime.quickjs.JS_NewObject(ctx));
+    sp.* += 1;
 }
 
 // ============================================================================

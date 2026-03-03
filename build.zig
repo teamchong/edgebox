@@ -738,7 +738,7 @@ pub fn build(b: *std.Build) void {
             }
         }
 
-        // Discover and link LLVM-generated .o shard files (from --freeze-backend=llvm)
+        // Discover and link LLVM-generated .o shard files
         var llvm_shard_count: usize = 0;
         while (true) : (llvm_shard_count += 1) {
             const llvm_obj_path = b.fmt("{s}/frozen_llvm_shard_{d}.o", .{ shard_dir, llvm_shard_count });
@@ -751,15 +751,8 @@ pub fn build(b: *std.Build) void {
         if (llvm_shard_count > 0) {
             std.debug.print("[build] Linking {d} LLVM IR frozen shard .o files\n", .{llvm_shard_count});
 
-            // Compile the C constructor that calls LLVM shard init functions.
-            // This uses __attribute__((constructor)) to auto-register LLVM-compiled
-            // versions at startup, overriding the Zig versions.
-            const llvm_init_c_path = b.fmt("{s}/frozen_llvm_init.c", .{shard_dir});
-            if (std.fs.cwd().access(llvm_init_c_path, .{})) |_| {
-                native_static_exe.addCSourceFile(.{
-                    .file = .{ .cwd_relative = llvm_init_c_path },
-                });
-            } else |_| {}
+            // LLVM shard inits are now called from frozen_init() via extern linkage
+            // (no C constructor needed — the generated Zig code declares and calls them directly)
 
             // Compile llvm_runtime_exports.zig — provides C-ABI exports that LLVM IR
             // thin codegen calls. These are `export fn` with callconv(.c), so symbols
@@ -1022,13 +1015,8 @@ pub fn build(b: *std.Build) void {
             if (embed_llvm_shard_count > 0) {
                 std.debug.print("[build] Linking {d} LLVM IR frozen shard .o files (native)\n", .{embed_llvm_shard_count});
 
-                // Compile the C constructor that auto-registers LLVM-compiled functions
-                const llvm_init_c_path = b.fmt("{s}/frozen_llvm_init.c", .{embed_shard_dir});
-                if (std.fs.cwd().access(llvm_init_c_path, .{})) |_| {
-                    native_exe.addCSourceFile(.{
-                        .file = .{ .cwd_relative = llvm_init_c_path },
-                    });
-                } else |_| {}
+                // LLVM shard inits are called from frozen_init() via extern linkage
+                // (no C constructor needed)
 
                 // Compile llvm_runtime_exports.zig for embed/native target
                 const embed_llvm_rt_mod = b.createModule(.{

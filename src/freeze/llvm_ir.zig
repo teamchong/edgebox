@@ -452,12 +452,18 @@ pub const TargetMachine = struct {
 // Convenience: create module with native target configured
 // ============================================================================
 
-pub fn createNativeModule(name: [*:0]const u8) Error!struct { ctx: Context, module: Module, tm: TargetMachine } {
+pub const NativeModule = struct { ctx: Context, module: Module, tm: TargetMachine };
+
+pub fn createNativeModule(name: [*:0]const u8) Error!NativeModule {
+    return createNativeModuleWithOpt(name, c.LLVMCodeGenLevelAggressive);
+}
+
+pub fn createNativeModuleWithOpt(name: [*:0]const u8, opt_level: c.LLVMCodeGenOptLevel) Error!NativeModule {
     // Use the global context so that types from i32Type()/i64Type()/etc.
     // (which use LLVMInt32Type() etc. — global context) match the module.
     const ctx = Context{ .ref = c.LLVMGetGlobalContext() };
     const module = Module.create(name, ctx);
-    const tm = try TargetMachine.createWithOptLevel(c.LLVMCodeGenLevelAggressive);
+    const tm = try TargetMachine.createWithOptLevel(opt_level);
 
     // Set target triple and data layout
     const triple = tm.getTriple();

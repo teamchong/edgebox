@@ -22,7 +22,6 @@ const cfg_builder = @import("cfg_builder.zig");
 const zig_hotpath_codegen = @import("zig_hotpath_codegen.zig");
 const zig_codegen_full = @import("zig_codegen_full.zig");
 const zig_codegen_relooper = @import("zig_codegen_relooper.zig");
-const zig_codegen_thin = @import("zig_codegen_thin.zig");
 const llvm_codegen = @import("llvm_codegen.zig");
 
 const JSValue = jsvalue.JSValue;
@@ -709,243 +708,63 @@ fn generateFrozenZigGeneral(
 /// Generate thin-tier Zig code for a cold function.
 /// Uses ThinCodeGen: one-line-per-opcode, no vstack, minimal code size.
 /// Returns null if function cannot be frozen (killer opcodes, CFG issues).
-fn generateFrozenZigThin(
-    allocator: Allocator,
-    func: AnalyzedFunction,
-    func_index: usize,
-) !?[]u8 {
-    // Same fast-fail as full codegen
-    if (hasKillerOpcodes(func.instructions, func.is_self_recursive)) return null;
-
-    // Build CFG
-    var cfg = cfg_builder.buildCFG(allocator, func.instructions) catch |err| {
-        if (err == error.StackDepthConflict) return null;
-        return err;
-    };
-    defer cfg.deinit();
-
-    cfg_builder.analyzeContamination(&cfg);
-    const counts = cfg_builder.countBlocks(&cfg);
-    if (counts.clean == 0) return null;
-    if (counts.contaminated > 0) return null; // No partial freeze in thin tier
-
-    // Analyze closure variables
-    var closure_usage = try cfg_builder.analyzeClosureVars(allocator, func.instructions);
-    defer closure_usage.deinit(allocator);
-
-    // Build indexed name
-    var sanitized_buf: [256]u8 = undefined;
-    const sanitized_name = sanitizeName(func.name, &sanitized_buf);
-    var name_buf: [256]u8 = undefined;
-    const indexed_name = std.fmt.bufPrint(&name_buf, "{d}_{s}", .{ func_index, sanitized_name }) catch func.name;
-
-    // For pure int32 non-recursive functions, use full codegen int32 path
-    // instead of thin codegen — generates native i32 operations with no JSValue overhead
-    if (isPureInt32Function(func) and !func.is_self_recursive) {
-        return generateFrozenZigGeneral(allocator, &cfg, indexed_name, func, false, closure_usage.all_indices);
-    }
-
-    return zig_codegen_thin.generateThin(allocator, .{
-        .name = indexed_name,
-        .arg_count = @intCast(func.arg_count),
-        .var_count = @intCast(func.var_count),
-        .cfg = &cfg,
-        .is_self_recursive = func.is_self_recursive,
-        .self_ref_var_idx = func.self_ref_var_idx,
-        .closure_var_indices = closure_usage.all_indices,
-        .closure_var_count = @intCast(func.closure_vars.len),
-        .atom_strings = func.atom_strings,
-        .has_use_strict = func.has_use_strict,
-        .is_async = func.func_kind >= 2,
-        .constants = func.constants,
-        .stack_size = func.stack_size,
-        .captured_local_indices = func.captured_local_indices,
-    }) catch |err| {
-        std.debug.print("[freeze] Thin codegen error for '{s}': {}\n", .{ func.name, err });
-        return null;
-    };
-}
-
-/// Codegen backend selection
-pub const CodegenBackend = enum {
-    /// Default: generate Zig source code, compiled by Zig compiler
-    zig_source,
-    /// LLVM IR: emit LLVM IR directly, skip Zig parser/type-checker
-    llvm_ir,
-};
-
 /// Sharded output for parallel compilation
 pub const ShardedOutput = struct {
-    /// Main file that imports all shards and has init function
+    /// Main file (frozen_module.zig) with init function and LLVM shard extern declarations
     main: []u8,
-    /// Individual shard files (frozen_shard_0.zig, frozen_shard_1.zig, etc.)
-    shards: [][]u8,
-    /// Target size per shard in bytes
-    bytes_per_shard: usize,
-    /// Shard index where thin-codegen functions start (for hybrid optimization)
-    /// Shards [0..thin_shard_start) contain full-codegen functions (use ReleaseFast)
-    /// Shards [thin_shard_start..shards.len) contain thin-codegen functions (use ReleaseSmall)
-    thin_shard_start: usize,
-    /// Number of LLVM IR shards generated (when backend == .llvm_ir)
+    /// Number of LLVM IR shards generated
     llvm_shard_count: usize = 0,
 
     pub fn deinit(self: *ShardedOutput, allocator: Allocator) void {
         allocator.free(self.main);
-        for (self.shards) |shard| {
-            allocator.free(shard);
-        }
-        allocator.free(self.shards);
     }
 };
 
-/// Generate frozen Zig code with sharding for parallel compilation
-/// Returns multiple shard files + main file for large codebases
-pub fn generateModuleZigSharded(
-    allocator: Allocator,
-    analysis: *const ModuleAnalysis,
-    module_name: []const u8,
-    manifest_json: ?[]const u8,
-    bytes_per_shard: usize,
-    max_functions: u32,
-    profile_path: ?[]const u8,
-) !ShardedOutput {
-    return generateModuleZigShardedWithBackend(allocator, analysis, module_name, manifest_json, bytes_per_shard, max_functions, profile_path, .zig_source, null);
-}
-
-/// Generate frozen code with sharding, using the specified backend.
-/// When backend == .llvm_ir, int32 functions are emitted as LLVM IR → .o files,
-/// while non-int32 functions fall back to Zig source generation.
+/// Generate frozen module via LLVM IR backend.
+/// All freezable functions are compiled as LLVM IR → .o shard files.
+/// Returns a main frozen_module.zig with extern declarations for LLVM shard init functions.
 pub fn generateModuleZigShardedWithBackend(
     allocator: Allocator,
     analysis: *const ModuleAnalysis,
     module_name: []const u8,
     manifest_json: ?[]const u8,
-    bytes_per_shard: usize,
     max_functions: u32,
     profile_path: ?[]const u8,
-    backend: CodegenBackend,
     output_dir: ?[]const u8,
 ) !ShardedOutput {
     _ = module_name;
-
-    // NOTE: We no longer use manifest for filtering - we freeze ALL freezable functions.
-    // The manifest was previously used to filter which functions to freeze, but that caused
-    // top-level functions without closures (like getPrimeFactors) to not be frozen.
     _ = manifest_json;
+    _ = profile_path;
 
-    // First pass: collect all functions to generate and their code
+    // Collect all freezable functions
     const GeneratedFunc = struct {
         func: AnalyzedFunction,
         idx: usize,
-        code: []u8,
     };
     var generated_all = std.ArrayListUnmanaged(GeneratedFunc){};
-    defer {
-        for (generated_all.items) |gf| allocator.free(gf.code);
-        generated_all.deinit(allocator);
-    }
+    defer generated_all.deinit(allocator);
 
+    // Filter: skip functions with unsupported opcodes or unbuildable CFGs
     for (analysis.functions.items, 0..) |func, idx| {
-        // Generate the function code for ALL freezable functions
-        const result = generateFrozenZig(allocator, func, idx) catch continue;
-        if (result) |zig_code| {
-            try generated_all.append(allocator, .{ .func = func, .idx = idx, .code = zig_code });
-        }
+        if (hasKillerOpcodes(func.instructions, func.is_self_recursive)) continue;
+        var cfg = cfg_builder.buildCFG(allocator, func.instructions) catch continue;
+        cfg.deinit();
+        try generated_all.append(allocator, .{ .func = func, .idx = idx });
     }
 
-    // Track where thin functions start for hybrid optimization (ReleaseFast vs ReleaseSmall)
-    var thin_start_func_idx: usize = generated_all.items.len; // default: all full-codegen
-
-    // Selective freezing: keep only the top N functions
-    // Profile-guided: sort by call frequency if profile data available, else by code size
+    // Selective freezing: limit to top N functions if requested
     if (max_functions > 0 and generated_all.items.len > max_functions) {
         const total_before = generated_all.items.len;
-
-        if (profile_path) |pp| {
-            // PGO: sort by weighted score = call_count × code_size
-            // This maximizes total interpreter work eliminated:
-            //   - A huge function called 100 times scores high (lots of bytecode per call)
-            //   - A tiny function called 1M times also scores high (huge aggregate work)
-            //   - A tiny function called 10 times scores low (almost no work to save)
-            const call_profile = @import("call_profile.zig");
-            if (call_profile.parseProfileJson(allocator, pp)) |profile_map| {
-                std.debug.print("[freeze] PGO: sorting {d} functions by calls×size score\n", .{total_before});
-                const SortCtx = struct { profile: std.StringHashMapUnmanaged(u64) };
-                const ctx = SortCtx{ .profile = profile_map };
-                std.mem.sort(GeneratedFunc, generated_all.items, ctx, struct {
-                    fn lessThan(c: SortCtx, a: GeneratedFunc, b: GeneratedFunc) bool {
-                        const a_score = score(c.profile, a);
-                        const b_score = score(c.profile, b);
-                        if (a_score != b_score) return a_score > b_score; // descending by weighted score
-                        return a.code.len > b.code.len; // tie-break by code size
-                    }
-
-                    fn score(profile: std.StringHashMapUnmanaged(u64), gf: GeneratedFunc) u64 {
-                        const call_count = lookupProfile(profile, gf.func) orelse 1;
-                        return call_count * gf.code.len; // weighted: calls × code_size
-                    }
-
-                    fn lookupProfile(profile: std.StringHashMapUnmanaged(u64), func: AnalyzedFunction) ?u64 {
-                        // Build "name@line_num" key to match profile JSON format
-                        var key_buf: [320]u8 = undefined;
-                        const key = std.fmt.bufPrint(&key_buf, "{s}@{d}", .{ func.name, func.line_num }) catch return null;
-                        return profile.get(key);
-                    }
-                }.lessThan);
-            } else {
-                // Profile load failed — fall back to code size
-                std.debug.print("[freeze] PGO: profile load failed, falling back to code size\n", .{});
-                std.mem.sort(GeneratedFunc, generated_all.items, {}, struct {
-                    fn lessThan(_: void, a: GeneratedFunc, b: GeneratedFunc) bool {
-                        return a.code.len > b.code.len;
-                    }
-                }.lessThan);
-            }
-        } else {
-            // No profile: sort by code size descending (original heuristic)
-            std.mem.sort(GeneratedFunc, generated_all.items, {}, struct {
-                fn lessThan(_: void, a: GeneratedFunc, b: GeneratedFunc) bool {
-                    return a.code.len > b.code.len;
-                }
-            }.lessThan);
-        }
-
-        // Tiered freeze: top N keep full codegen, remaining get thin codegen
-        thin_start_func_idx = max_functions;
-        var thin_count: usize = 0;
-        var thin_failed: usize = 0;
-        for (generated_all.items[max_functions..]) |*gf| {
-            allocator.free(gf.code);
-            if (generateFrozenZigThin(allocator, gf.func, gf.idx) catch null) |thin_code| {
-                gf.code = thin_code;
-                thin_count += 1;
-            } else {
-                gf.code = &.{};
-                thin_failed += 1;
-            }
-        }
-        // Remove entries with empty code (failed thin codegen)
-        if (thin_failed > 0) {
-            var write_idx: usize = 0;
-            for (generated_all.items) |gf| {
-                if (gf.code.len > 0) {
-                    generated_all.items[write_idx] = gf;
-                    write_idx += 1;
-                }
-            }
-            generated_all.items.len = write_idx;
-        }
-        std.debug.print("[freeze] Tiered: {d} full + {d} thin ({d} thin-failed) of {d} total\n", .{
-            max_functions,
-            thin_count,
-            thin_failed,
-            total_before,
-        });
+        // LLVM handles all functions as int32 or thin internally,
+        // so just truncate the list to max_functions
+        generated_all.items.len = max_functions;
+        std.debug.print("[freeze] Limited to {d} of {d} freezable functions\n", .{ max_functions, total_before });
     }
 
-    // LLVM IR backend: generate int32 functions as .o files directly
+    // Generate int32 functions as LLVM IR .o files
     var llvm_shard_count: usize = 0;
-    if (backend == .llvm_ir) {
+    var int32_llvm_shard_count: usize = 0;
+    {
         const cache_dir = output_dir orelse "zig-out/cache";
 
         // Collect int32 functions for LLVM IR generation
@@ -1042,6 +861,9 @@ pub fn generateModuleZigShardedWithBackend(
             if (llvm_shard_count > 0) {
                 std.debug.print("[freeze] LLVM IR: generated {d} shard .o files with int32 functions\n", .{llvm_shard_count});
             }
+
+            // Track int32 shard count (thin shards follow after these)
+            int32_llvm_shard_count = llvm_shard_count;
 
             // NOTE: Int32 functions are NOT removed from generated_all.
             // They remain in Zig shards for cross-platform compatibility (embed, standalone/WASM).
@@ -1144,244 +966,14 @@ pub fn generateModuleZigShardedWithBackend(
         }
     }
 
-    // Calculate total size and number of shards needed
-    var total_size: usize = 0;
-    for (generated_all.items) |gf| {
-        total_size += gf.code.len;
-    }
-    const num_shards = if (total_size == 0) 1 else @max(1, (total_size + bytes_per_shard - 1) / bytes_per_shard);
-
-    std.debug.print("[freeze] Sharding {d} functions ({d} KB) into ~{d} shards (~{d} KB each)\n", .{
+    std.debug.print("[freeze] LLVM backend: {d} functions ({d} int32 + {d} thin) in {d} shard .o files\n", .{
         generated_all.items.len,
-        total_size / 1024,
-        num_shards,
-        bytes_per_shard / 1024,
+        int32_llvm_shard_count,
+        llvm_shard_count - int32_llvm_shard_count,
+        llvm_shard_count,
     });
 
-    // Size-based sharding: distribute functions to keep shards under size limit
-    var shard_contents = std.ArrayListUnmanaged(std.ArrayListUnmanaged(u8)){};
-    defer {
-        for (shard_contents.items) |*sc| sc.deinit(allocator);
-        shard_contents.deinit(allocator);
-    }
-
-    // Track generated functions for init - now also track sanitized name for shard init generation
-    const GenFuncInfo = struct {
-        name: []const u8,
-        idx: usize,
-        arg_count: u32,
-        shard: usize,
-        line_num: u32,
-        sanitized_name: []const u8, // Owned copy for shard init generation
-    };
-    var generated_funcs = std.ArrayListUnmanaged(GenFuncInfo){};
-    defer {
-        for (generated_funcs.items) |gf| allocator.free(gf.sanitized_name);
-        generated_funcs.deinit(allocator);
-    }
-
-    // Shard header - each shard is compiled as a separate translation unit
-    // NOTE: We no longer import shards from main module. Each shard exports its own
-    // frozen_init_shard_N() function that registers its functions with native_dispatch.
-    // This allows LLVM to compile each shard independently, avoiding the 138MB+ TU issue.
-    const shard_header =
-        \\//! Auto-generated frozen functions shard
-        \\//! DO NOT EDIT - generated by EdgeBox freeze system
-        \\//! This shard is compiled as a SEPARATE translation unit for LLVM scalability.
-        \\
-        \\const std = @import("std");
-        \\const zig_runtime = @import("zig_runtime");
-        \\const math_polyfill = @import("math_polyfill");
-        \\const JSValue = zig_runtime.JSValue;
-        \\const JSContext = zig_runtime.JSContext;
-        \\
-        \\// Extern declarations for native_dispatch functions
-        \\// Using extern instead of @import to avoid compiling native_dispatch's exports into each shard
-        \\const FrozenFnPtr = *const fn (*JSContext, JSValue, c_int, [*]JSValue, ?[*]*zig_runtime.JSVarRef, c_int, ?[*]JSValue) callconv(.c) JSValue;
-        \\extern fn native_dispatch_register(name: [*:0]const u8, func: FrozenFnPtr) void;
-        \\
-        \\// Wrapper namespace for native_dispatch calls in function bodies
-        \\const native_dispatch = struct {
-        \\    pub const registerCpoolBytecodeByName = native_dispatch_registerCpoolBytecodeByName;
-        \\};
-        \\extern fn native_dispatch_registerCpoolBytecodeByName(bfunc: JSValue, name: [*:0]const u8) void;
-        \\
-        \\// Increase eval quota for large shards (date-fns, etc.)
-        \\comptime { @setEvalBranchQuota(1000000); }
-        \\
-        \\
-    ;
-
-    // Start first shard
-    var current_shard = std.ArrayListUnmanaged(u8){};
-    try current_shard.appendSlice(allocator, shard_header);
-    var current_shard_idx: usize = 0;
-    var thin_shard_start: usize = 0; // set during sharding
-    var thin_boundary_hit = false;
-
-    for (generated_all.items, 0..) |gf, func_idx| {
-        // Force shard break at full→thin boundary for hybrid optimization
-        // This ensures full-codegen shards can use ReleaseFast while thin shards use ReleaseSmall
-        if (!thin_boundary_hit and func_idx >= thin_start_func_idx) {
-            thin_boundary_hit = true;
-            if (current_shard.items.len > shard_header.len) {
-                try shard_contents.append(allocator, current_shard);
-                current_shard_idx += 1;
-                current_shard = std.ArrayListUnmanaged(u8){};
-                try current_shard.appendSlice(allocator, shard_header);
-            }
-            thin_shard_start = current_shard_idx;
-        }
-
-        // Check if adding this function would exceed shard size
-        // (except for the first function in a shard - always add at least one)
-        if (current_shard.items.len > shard_header.len and
-            current_shard.items.len + gf.code.len > bytes_per_shard)
-        {
-            // Finalize current shard
-            try shard_contents.append(allocator, current_shard);
-            current_shard_idx += 1;
-            // Start new shard
-            current_shard = std.ArrayListUnmanaged(u8){};
-            try current_shard.appendSlice(allocator, shard_header);
-        }
-
-        // Add function to current shard
-        try current_shard.appendSlice(allocator, gf.code);
-        try current_shard.appendSlice(allocator, "\n");
-
-        // Sanitize name for Zig identifier (replace colons, etc.)
-        var sanitized_buf: [256]u8 = undefined;
-        const sanitized_name = sanitizeName(gf.func.name, &sanitized_buf);
-        try generated_funcs.append(allocator, .{
-            .name = gf.func.name,
-            .idx = gf.idx,
-            .arg_count = gf.func.arg_count,
-            .shard = current_shard_idx,
-            .line_num = gf.func.line_num,
-            .sanitized_name = try allocator.dupe(u8, sanitized_name),
-        });
-    }
-
-    // Finalize last shard
-    try shard_contents.append(allocator, current_shard);
-    const actual_num_shards = shard_contents.items.len;
-
-    // If no thin boundary was hit, all shards are full-codegen
-    if (!thin_boundary_hit) {
-        thin_shard_start = actual_num_shards;
-    }
-
-    std.debug.print("[freeze] Generated {d} functions across {d} shards ({d} full + {d} thin)\n", .{
-        generated_funcs.items.len,
-        actual_num_shards,
-        thin_shard_start,
-        actual_num_shards - thin_shard_start,
-    });
-    zig_codegen_full.printUnsupportedOpcodeReport();
-
-    // Count ALL function dispatch keys (name@line_num) in the module (not just frozen ones)
-    // This prevents name collision: if there are 2 functions with the same dispatch key,
-    // we'd intercept calls to both with our frozen version
-    // Note: functions with the same name but different line numbers have unique dispatch keys
-    var dispatch_key_counts = hashmap_helper.StringHashMap(u32).init(allocator);
-    defer dispatch_key_counts.deinit();
-    for (analysis.functions.items) |func| {
-        // Build dispatch key: "name@line_num" (same format used for registration)
-        const dispatch_key = try std.fmt.allocPrint(allocator, "{s}@{d}", .{ func.name, func.line_num });
-        const entry = try dispatch_key_counts.getOrPut(dispatch_key);
-        if (entry.found_existing) {
-            // Key already in map, free the duplicate
-            allocator.free(dispatch_key);
-            entry.value_ptr.* += 1;
-        } else {
-            entry.value_ptr.* = 1;
-        }
-    }
-
-    // Add frozen_init_shard_N() function to each shard
-    // This function registers all functions in the shard with native_dispatch
-    // Each shard is compiled as a separate object file, solving the LLVM TU explosion
-    for (shard_contents.items, 0..) |*sc, shard_idx| {
-        // Count how many registrations this shard will have
-        var shard_reg_count: usize = 0;
-        for (generated_funcs.items) |gf| {
-            if (gf.shard != shard_idx) continue;
-            // Check dispatch key collision using name@line_num format
-            var key_buf: [512]u8 = undefined;
-            const dispatch_key = std.fmt.bufPrint(&key_buf, "{s}@{d}", .{ gf.name, gf.line_num }) catch continue;
-            if ((dispatch_key_counts.get(dispatch_key) orelse 0) > 1) continue;
-            shard_reg_count += 1;
-        }
-
-        // Start the init function
-        var init_buf: [256]u8 = undefined;
-        if (shard_reg_count == 0) {
-            // Empty shard - return 0 directly to avoid unused variable warning
-            const init_header = std.fmt.bufPrint(&init_buf,
-                \\
-                \\/// Initialize this shard - no functions to register
-                \\/// Called from frozen_module.zig via extern linkage
-                \\pub export fn frozen_init_shard_{d}() callconv(.c) c_int {{
-                \\    return 0;
-                \\}}
-                \\
-            , .{shard_idx}) catch continue;
-            try sc.appendSlice(allocator, init_header);
-        } else {
-            // Shard has functions - use normal pattern
-            const init_header = std.fmt.bufPrint(&init_buf,
-                \\
-                \\/// Initialize this shard - register all frozen functions with native_dispatch
-                \\/// Called from frozen_module.zig via extern linkage
-                \\pub export fn frozen_init_shard_{d}() callconv(.c) c_int {{
-                \\    var count: c_int = 0;
-                \\
-            , .{shard_idx}) catch continue;
-            try sc.appendSlice(allocator, init_header);
-
-            // Add registration calls for each function in this shard
-            for (generated_funcs.items) |gf| {
-                if (gf.shard != shard_idx) continue;
-
-                // Skip if dispatch key collides with another function
-                var reg_key_buf: [512]u8 = undefined;
-                const reg_dispatch_key = std.fmt.bufPrint(&reg_key_buf, "{s}@{d}", .{ gf.name, gf.line_num }) catch continue;
-                if ((dispatch_key_counts.get(reg_dispatch_key) orelse 0) > 1) continue;
-
-                var reg_buf: [512]u8 = undefined;
-                const reg_line = std.fmt.bufPrint(&reg_buf,
-                    \\    native_dispatch_register("{s}@{d}", &__frozen_{d}_{s});
-                    \\    count += 1;
-                    \\
-                , .{ gf.name, gf.line_num, gf.idx, gf.sanitized_name }) catch continue;
-                try sc.appendSlice(allocator, reg_line);
-            }
-
-            // Close the init function
-            try sc.appendSlice(allocator,
-                \\    return count;
-                \\}
-                \\
-            );
-        }
-    }
-
-    // Convert to output format
-    var shards = try allocator.alloc([]u8, actual_num_shards);
-    errdefer {
-        for (shards, 0..) |shard, i| {
-            if (i < shards.len and shard.len > 0) allocator.free(shard);
-        }
-        allocator.free(shards);
-    }
-
-    for (shard_contents.items, 0..) |*sc, i| {
-        shards[i] = try sc.toOwnedSlice(allocator);
-    }
-
-    // Generate main file with extern declarations (no @import of shards)
-    // This is the key change: shards are compiled as separate object files and linked
+    // Generate main frozen_module.zig with extern declarations for LLVM shard init functions
     var main_output = std.ArrayListUnmanaged(u8){};
     errdefer main_output.deinit(allocator);
 
@@ -1389,10 +981,8 @@ pub fn generateModuleZigShardedWithBackend(
         \\//! Auto-generated frozen functions main module
         \\//! DO NOT EDIT - generated by EdgeBox freeze system
         \\//!
-        \\//! ARCHITECTURE: Sharded compilation for LLVM scalability
-        \\//! Each shard (frozen_shard_N.zig) is compiled as a SEPARATE translation unit.
-        \\//! This file uses extern linkage to call each shard's init function.
-        \\//! This avoids the LLVM "TU explosion" issue with 138MB+ of Zig code.
+        \\//! All frozen functions are compiled via LLVM IR → .o shard files.
+        \\//! This file declares extern init functions for each LLVM shard.
         \\
         \\const std = @import("std");
         \\const zig_runtime = @import("zig_runtime");
@@ -1404,11 +994,13 @@ pub fn generateModuleZigShardedWithBackend(
         \\
     );
 
-    // Declare extern functions for each shard's init (no @import - these come from separate .o files)
-    for (0..actual_num_shards) |i| {
-        var extern_buf: [128]u8 = undefined;
-        const extern_line = std.fmt.bufPrint(&extern_buf, "extern fn frozen_init_shard_{d}() callconv(.c) c_int;\n", .{i}) catch continue;
-        try main_output.appendSlice(allocator, extern_line);
+    // Declare extern functions for LLVM shard inits (from LLVM-compiled .o files)
+    if (llvm_shard_count > 0) {
+        for (0..llvm_shard_count) |i| {
+            var extern_buf: [128]u8 = undefined;
+            const extern_line = std.fmt.bufPrint(&extern_buf, "extern fn frozen_init_llvm_shard_{d}() callconv(.c) c_int;\n", .{i}) catch continue;
+            try main_output.appendSlice(allocator, extern_line);
+        }
     }
 
     // Native registry functions and init
@@ -1454,18 +1046,16 @@ pub fn generateModuleZigShardedWithBackend(
         \\        qjs.JS_NewCFunction(ctx, @ptrCast(&registryCountImpl), "__edgebox_registry_count", 0));
         \\    math_polyfill.register(ctx);
         \\
-        \\    // Call each shard's init function (each is a separate translation unit)
+        \\    // Call each LLVM shard's init function
         \\
     );
 
-    // Call each shard's init function
-    for (0..actual_num_shards) |i| {
+    for (0..llvm_shard_count) |i| {
         var call_buf: [128]u8 = undefined;
-        const call_line = std.fmt.bufPrint(&call_buf, "    count += frozen_init_shard_{d}();\n", .{i}) catch continue;
+        const call_line = std.fmt.bufPrint(&call_buf, "    count += frozen_init_llvm_shard_{d}();\n", .{i}) catch continue;
         try main_output.appendSlice(allocator, call_line);
     }
 
-    // Enable dispatch after all registrations
     try main_output.appendSlice(allocator,
         \\
         \\    native_dispatch.enableDispatch();
@@ -1480,9 +1070,6 @@ pub fn generateModuleZigShardedWithBackend(
 
     return ShardedOutput{
         .main = try main_output.toOwnedSlice(allocator),
-        .shards = shards,
-        .bytes_per_shard = bytes_per_shard,
-        .thin_shard_start = thin_shard_start,
         .llvm_shard_count = llvm_shard_count,
     };
 }

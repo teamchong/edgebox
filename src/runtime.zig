@@ -513,7 +513,6 @@ pub fn main() !void {
     var output_prefix: ?[]const u8 = null; // Custom output prefix (default: zig-out)
     var freeze_max_functions: u32 = 0; // 0 = freeze all, N = freeze only top N largest
     var freeze_profile_path: ?[]const u8 = null; // PGO: path to call profile JSON
-    var freeze_backend: freeze.CodegenBackend = .zig_source; // codegen backend: zig (default) or llvm
     var app_dir: ?[]const u8 = null;
 
     var i: usize = 1;
@@ -562,16 +561,6 @@ pub fn main() !void {
             };
         } else if (std.mem.startsWith(u8, arg, "--freeze-profile=")) {
             freeze_profile_path = arg["--freeze-profile=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--freeze-backend=")) {
-            const value = arg["--freeze-backend=".len..];
-            if (std.mem.eql(u8, value, "llvm")) {
-                freeze_backend = .llvm_ir;
-            } else if (std.mem.eql(u8, value, "zig")) {
-                freeze_backend = .zig_source;
-            } else {
-                std.debug.print("Unknown --freeze-backend value: {s} (use: zig, llvm)\n", .{value});
-                std.process.exit(1);
-            }
         } else if (std.mem.eql(u8, arg, "--minimal")) {
             // Shortcut for test262: skip polyfills, freeze, bundler, and WASM/AOT
             no_polyfill = true;
@@ -624,7 +613,6 @@ pub fn main() !void {
             .output_prefix = output_prefix,
             .freeze_max_functions = freeze_max_functions,
             .freeze_profile_path = freeze_profile_path,
-            .freeze_backend = freeze_backend,
         });
     }
 }
@@ -917,7 +905,6 @@ const BuildOptions = struct {
     output_prefix: ?[]const u8 = null, // Custom output prefix (default: zig-out)
     freeze_max_functions: u32 = 0, // 0 = freeze all, N = freeze only top N largest functions
     freeze_profile_path: ?[]const u8 = null, // PGO: path to call profile JSON from --profile-out
-    freeze_backend: freeze.CodegenBackend = .zig_source, // codegen backend: zig (default) or llvm
 };
 
 /// Static build: compile JS to C bytecode with qjsc, embed in WASM
@@ -1458,54 +1445,25 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             }
         }
 
-        // Generate Zig frozen module (sharded for parallel compilation)
+        // Generate frozen module via LLVM IR backend
         zig_gen: {
-            // Use size-based sharding for even distribution (200KB per shard)
-            // Smaller shards prevent LLVM hang/thrashing on large files
-            const BYTES_PER_SHARD = 200 * 1024;
-            var sharded = freeze.generateModuleZigShardedWithBackend(allocator, &analysis, "frozen", manifest_content, BYTES_PER_SHARD, options.freeze_max_functions, options.freeze_profile_path, options.freeze_backend, cache_dir) catch |err| {
-                std.debug.print("[warn] Zig codegen failed: {}\n", .{err});
+            var sharded = freeze.generateModuleZigShardedWithBackend(allocator, &analysis, "frozen", manifest_content, options.freeze_max_functions, options.freeze_profile_path, cache_dir) catch |err| {
+                std.debug.print("[warn] LLVM codegen failed: {}\n", .{err});
                 break :zig_gen;
             };
             defer sharded.deinit(allocator);
 
-            // Write each shard file
-            var total_size: usize = 0;
-            for (sharded.shards, 0..) |shard, i| {
-                var shard_path_buf: [4096]u8 = undefined;
-                const shard_path = std.fmt.bufPrint(&shard_path_buf, "{s}/frozen_shard_{d}.zig", .{ cache_dir, i }) catch continue;
-                const shard_file = std.fs.cwd().createFile(shard_path, .{}) catch continue;
-                defer shard_file.close();
-                shard_file.writeAll(shard) catch continue;
-                total_size += shard.len;
-            }
-
-            // Write thin shard start index for build.zig hybrid optimization
-            // (ReleaseFast for full-codegen shards, ReleaseSmall for thin-codegen shards)
-            {
-                var meta_path_buf: [4096]u8 = undefined;
-                const meta_path = std.fmt.bufPrint(&meta_path_buf, "{s}/frozen_thin_shard_start.txt", .{cache_dir}) catch "";
-                if (meta_path.len > 0) {
-                    if (std.fs.cwd().createFile(meta_path, .{})) |meta_file| {
-                        defer meta_file.close();
-                        var num_buf: [32]u8 = undefined;
-                        const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{sharded.thin_shard_start}) catch "0";
-                        meta_file.writeAll(num_str) catch {};
-                    } else |_| {}
-                }
-            }
-
-            // Clean up stale shard files from previous runs
+            // Clean up stale Zig shard files from previous runs (no longer generated)
             {
                 var stale_buf: [4096]u8 = undefined;
-                var stale_idx = sharded.shards.len;
+                var stale_idx: usize = 0;
                 while (true) : (stale_idx += 1) {
                     const stale_path = std.fmt.bufPrint(&stale_buf, "{s}/frozen_shard_{d}.zig", .{ cache_dir, stale_idx }) catch break;
                     std.fs.cwd().deleteFile(stale_path) catch break;
                 }
             }
 
-            // Write main file
+            // Write main frozen_module.zig (just extern declarations + init)
             var zig_path_buf: [4096]u8 = undefined;
             const zig_path = std.fmt.bufPrint(&zig_path_buf, "{s}/frozen_module.zig", .{cache_dir}) catch "zig-out/cache/frozen_module.zig";
             const zig_file = std.fs.cwd().createFile(zig_path, .{}) catch {
@@ -1517,57 +1475,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                 std.debug.print("[warn] Could not write frozen_module.zig\n", .{});
                 break :zig_gen;
             };
-            total_size += sharded.main.len;
 
-            const zig_size_kb = @as(f64, @floatFromInt(total_size)) / 1024.0;
-            std.debug.print("[build] Frozen module (Zig): {s} ({d:.1}KB, {d} shards)\n", .{ zig_path, zig_size_kb, sharded.shards.len });
-
-            // Generate a C constructor file that calls LLVM shard init functions.
-            // This uses __attribute__((constructor)) to run before main(), ensuring
-            // LLVM-compiled versions override Zig versions via native_dispatch_register().
-            if (sharded.llvm_shard_count > 0) {
-                var bridge_path_buf: [4096]u8 = undefined;
-                const bridge_path = std.fmt.bufPrint(&bridge_path_buf, "{s}/frozen_llvm_init.c", .{cache_dir}) catch "";
-                if (bridge_path.len > 0) {
-                    if (std.fs.cwd().createFile(bridge_path, .{})) |bridge_file| {
-                        defer bridge_file.close();
-                        var bridge_buf = std.ArrayListUnmanaged(u8){};
-                        defer bridge_buf.deinit(allocator);
-
-                        bridge_buf.appendSlice(allocator,
-                            "/* Auto-generated LLVM shard constructor */\n"
-                        ) catch {};
-
-                        // Declare extern init functions
-                        for (0..sharded.llvm_shard_count) |i| {
-                            var buf: [128]u8 = undefined;
-                            const line = std.fmt.bufPrint(&buf, "int frozen_init_llvm_shard_{d}(void);\n", .{i}) catch continue;
-                            bridge_buf.appendSlice(allocator, line) catch {};
-                        }
-
-                        // Use __attribute__((constructor)) so it runs automatically
-                        bridge_buf.appendSlice(allocator,
-                            "__attribute__((constructor)) static void frozen_llvm_ctor(void) {\n"
-                        ) catch {};
-
-                        for (0..sharded.llvm_shard_count) |i| {
-                            var buf: [128]u8 = undefined;
-                            const line = std.fmt.bufPrint(&buf, "    frozen_init_llvm_shard_{d}();\n", .{i}) catch continue;
-                            bridge_buf.appendSlice(allocator, line) catch {};
-                        }
-
-                        bridge_buf.appendSlice(allocator, "}\n") catch {};
-                        bridge_file.writeAll(bridge_buf.items) catch {};
-                    } else |_| {}
-                }
-            } else {
-                // Clean up stale init file
-                var bridge_path_buf: [4096]u8 = undefined;
-                const bridge_path = std.fmt.bufPrint(&bridge_path_buf, "{s}/frozen_llvm_init.c", .{cache_dir}) catch "";
-                if (bridge_path.len > 0) {
-                    std.fs.cwd().deleteFile(bridge_path) catch {};
-                }
-            }
+            std.debug.print("[build] Frozen module: {s} ({d} LLVM shards)\n", .{ zig_path, sharded.llvm_shard_count });
         }
 
         // Note: Closure-based functions fall back to interpreter (not frozen)

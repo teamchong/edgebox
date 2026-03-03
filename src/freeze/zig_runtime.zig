@@ -902,27 +902,40 @@ pub const thin = struct {
         closure_alive: ?*bool,
         captured_indices: []const u16,
     ) GetFieldError!void {
+        const n: usize = @intCast(argc);
         // Get function from stack
-        const fn_val = stack[sp.* - argc - 1].toJSValueWithCtx(ctx);
+        const fn_val = stack[sp.* - n - 1].toJSValueWithCtx(ctx);
 
-        if (argc > 0) {
+        // Save consumed CVs for freeRef after call (JS_Call does NOT consume them)
+        const func_cv = stack[sp.* - n - 1];
+        var saved_arg_cvs: [256]CV = undefined;
+        for (0..n) |i| {
+            saved_arg_cvs[i] = stack[sp.* - n + i];
+        }
+
+        if (n > 0) {
             // Build args from stack
             var args: [256]JSValue = undefined;
-            const n: usize = @intCast(argc);
             for (0..n) |i| {
                 args[i] = CV.toJSValuePtr(&stack[sp.* - n + i]);
             }
             // Sync locals TO _locals_jsv before call (noop if no closures)
             syncLocalsTo(locals, locals_jsv, var_count);
             const result = JSValue.call(ctx, fn_val, JSValue.UNDEFINED, @intCast(argc), @ptrCast(&args));
+            // Free consumed CVs
+            CV.freeRef(ctx, func_cv);
+            for (0..n) |i| {
+                CV.freeRef(ctx, saved_arg_cvs[i]);
+            }
             if (result.isException()) return error.JsException;
             // Pop func + args, push result
-            sp.* -= @as(usize, argc) + 1;
+            sp.* -= n + 1;
             stack[sp.*] = CV.fromJSValue(result);
             sp.* += 1;
         } else {
             syncLocalsTo(locals, locals_jsv, var_count);
             const result = JSValue.call(ctx, fn_val, JSValue.UNDEFINED, 0, @as([*]JSValue, @ptrCast(@constCast(&[0]JSValue{}))));
+            CV.freeRef(ctx, func_cv);
             if (result.isException()) return error.JsException;
             sp.* -= 1; // pop func
             stack[sp.*] = CV.fromJSValue(result);
@@ -944,24 +957,39 @@ pub const thin = struct {
         closure_alive: ?*bool,
         captured_indices: []const u16,
     ) GetFieldError!void {
-        const obj = stack[sp.* - argc - 2].toJSValueWithCtx(ctx);
-        const method = stack[sp.* - argc - 1].toJSValueWithCtx(ctx);
+        const n: usize = @intCast(argc);
+        const obj = stack[sp.* - n - 2].toJSValueWithCtx(ctx);
+        const method = stack[sp.* - n - 1].toJSValueWithCtx(ctx);
 
-        if (argc > 0) {
+        // Save consumed CVs for freeRef after call
+        const obj_cv = stack[sp.* - n - 2];
+        const method_cv = stack[sp.* - n - 1];
+        var saved_arg_cvs: [256]CV = undefined;
+        for (0..n) |i| {
+            saved_arg_cvs[i] = stack[sp.* - n + i];
+        }
+
+        if (n > 0) {
             var args: [256]JSValue = undefined;
-            const n: usize = @intCast(argc);
             for (0..n) |i| {
                 args[i] = CV.toJSValuePtr(&stack[sp.* - n + i]);
             }
             syncLocalsTo(locals, locals_jsv, var_count);
             const result = JSValue.call(ctx, method, obj, @intCast(argc), @ptrCast(&args));
+            CV.freeRef(ctx, obj_cv);
+            CV.freeRef(ctx, method_cv);
+            for (0..n) |i| {
+                CV.freeRef(ctx, saved_arg_cvs[i]);
+            }
             if (result.isException()) return error.JsException;
-            sp.* -= @as(usize, argc) + 2;
+            sp.* -= n + 2;
             stack[sp.*] = CV.fromJSValue(result);
             sp.* += 1;
         } else {
             syncLocalsTo(locals, locals_jsv, var_count);
             const result = JSValue.call(ctx, method, obj, 0, @as([*]JSValue, @ptrCast(@constCast(&[0]JSValue{}))));
+            CV.freeRef(ctx, obj_cv);
+            CV.freeRef(ctx, method_cv);
             if (result.isException()) return error.JsException;
             sp.* -= 2;
             stack[sp.*] = CV.fromJSValue(result);
@@ -1157,14 +1185,28 @@ pub const thin = struct {
         sp: *usize,
         argc: u16,
     ) GetFieldError!void {
-        const fn_val = stack[sp.* - @as(usize, argc) - 1].toJSValueWithCtx(ctx);
-        if (argc > 0) {
+        const n: usize = @intCast(argc);
+        const fn_val = stack[sp.* - n - 1].toJSValueWithCtx(ctx);
+
+        // Save consumed CVs for freeRef
+        const new_target_cv = stack[sp.* - n - 2];
+        const func_cv = stack[sp.* - n - 1];
+        var saved_arg_cvs: [256]CV = undefined;
+        for (0..n) |i| {
+            saved_arg_cvs[i] = stack[sp.* - n + i];
+        }
+
+        if (n > 0) {
             var args: [256]JSValue = undefined;
-            const n: usize = @intCast(argc);
             for (0..n) |i| {
                 args[i] = CV.toJSValuePtr(&stack[sp.* - n + i]);
             }
             const result = quickjs.JS_CallConstructor(ctx, fn_val, @intCast(argc), @ptrCast(&args));
+            CV.freeRef(ctx, new_target_cv);
+            CV.freeRef(ctx, func_cv);
+            for (0..n) |i| {
+                CV.freeRef(ctx, saved_arg_cvs[i]);
+            }
             if (result.isException()) return error.JsException;
             sp.* -= n + 2;
             stack[sp.*] = CV.fromJSValue(result);
@@ -1172,6 +1214,8 @@ pub const thin = struct {
         } else {
             var no_args: [0]JSValue = .{};
             const result = quickjs.JS_CallConstructor(ctx, fn_val, 0, &no_args);
+            CV.freeRef(ctx, new_target_cv);
+            CV.freeRef(ctx, func_cv);
             if (result.isException()) return error.JsException;
             sp.* -= 2;
             stack[sp.*] = CV.fromJSValue(result);

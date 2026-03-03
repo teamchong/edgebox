@@ -29,6 +29,16 @@ const AnalyzedFunction = frozen_registry.AnalyzedFunction;
 
 const c = llvm.c;
 
+// JSValue on native x86_64 is a 16-byte struct: { JSValueUnion(i64), tag(i64) }
+// Must use this in LLVM IR for correct C ABI (passed in 2 registers: rsi+rdx)
+fn jsvalueType() llvm.Type {
+    var fields = [_]llvm.Type{ llvm.i64Type(), llvm.i64Type() };
+    return c.LLVMStructType(&fields, fields.len, 0); // packed=0 (not packed)
+}
+
+// JS_TAG_INT on native = 0 (tag field)
+const JS_TAG_INT_NATIVE: i64 = 0;
+
 pub const CodegenError = error{
     UnsupportedOpcode,
     StackUnderflow,
@@ -160,6 +170,7 @@ const GeneratedFuncInfo = struct {
     func_index: usize,
     line_num: u32,
     llvm_func_name: []const u8,
+    has_tail_call: bool = false,
 };
 
 // ============================================================================
@@ -236,30 +247,35 @@ fn generateInt32Function(
     };
 
     // Create the JSValue wrapper:
-    // i64 @__frozen_N_name(ptr %ctx, i64 %this, i32 %argc, ptr %argv, ptr %var_refs, i32 %closure_cnt, ptr %cpool)
+    // {i64,i64} @__frozen_N_name(ptr %ctx, {i64,i64} %this, i32 %argc, ptr %argv, ptr %var_refs, i32 %closure_cnt, ptr %cpool)
+    // JSValue on native is 16-byte struct {JSValueUnion, tag} — must match C ABI
     var wrapper_name_buf: [512]u8 = undefined;
     const wrapper_name = std.fmt.bufPrintZ(&wrapper_name_buf, "{s}", .{sf.llvm_func_name}) catch
         return CodegenError.FormatError;
 
+    const jsv_ty = jsvalueType();
     const wrapper_params = [_]llvm.Type{
         llvm.ptrType(), // ctx
-        llvm.i64Type(), // this_val
+        jsv_ty, // this_val: JSValue = {i64, i64}
         llvm.i32Type(), // argc
         llvm.ptrType(), // argv
         llvm.ptrType(), // var_refs
         llvm.i32Type(), // closure_var_count
         llvm.ptrType(), // cpool
     };
-    const wrapper_fn_ty = llvm.functionType(llvm.i64Type(), &wrapper_params, false);
+    const wrapper_fn_ty = llvm.functionType(jsv_ty, &wrapper_params, false);
     const wrapper_fn = module.addFunction(wrapper_name, wrapper_fn_ty);
-    llvm.setLinkage(wrapper_fn, c.LLVMExternalLinkage);
+    // Internal linkage: avoid symbol collision with Zig-compiled versions.
+    // Init function references these by pointer within the same .o file.
+    llvm.setLinkage(wrapper_fn, c.LLVMInternalLinkage);
     llvm.setFunctionCallConv(wrapper_fn, c.LLVMCCallConv);
 
     // Build wrapper body
     const entry = llvm.appendBasicBlock(wrapper_fn, "entry");
     builder.positionAtEnd(entry);
 
-    // Extract int32 arguments from argv: argv[i] is i64, extract low 32 bits
+    // Extract int32 arguments from argv: each argv[i] is a JSValue {i64, i64}
+    // The int32 value is in field 0 (JSValueUnion.int32 = low 32 bits of first i64)
     const argv_param = c.LLVMGetParam(wrapper_fn, 3); // argv: ptr
     const argc_param = c.LLVMGetParam(wrapper_fn, 2); // argc: i32
 
@@ -269,10 +285,13 @@ fn generateInt32Function(
         const idx = llvm.constInt32(@intCast(i));
         const in_bounds = builder.buildICmp(c.LLVMIntSLT, idx, argc_param, "inb");
 
-        // Load argv[i] as i64
+        // Load argv[i] as JSValue {i64, i64} — stride is 16 bytes
         var gep_indices = [_]llvm.Value{llvm.constInt(llvm.i64Type(), i, false)};
-        const argv_ptr = builder.buildInBoundsGEP(llvm.i64Type(), argv_param, &gep_indices, "argp");
-        const argv_val = builder.buildLoad(llvm.i64Type(), argv_ptr, "argv");
+        const argv_ptr = builder.buildInBoundsGEP(jsv_ty, argv_param, &gep_indices, "argp");
+        // Load field 0 (JSValueUnion) as i64, then truncate to i32
+        var field_indices = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(0) };
+        const union_ptr = builder.buildInBoundsGEP(jsv_ty, argv_ptr, &field_indices, "up");
+        const argv_val = builder.buildLoad(llvm.i64Type(), union_ptr, "argv");
 
         // Extract int32: truncate i64 to i32 (low 32 bits contain the int value)
         const arg_i32 = builder.buildTrunc(argv_val, llvm.i32Type(), "argi");
@@ -286,15 +305,15 @@ fn generateInt32Function(
     const call_args = call_args_buf[0..func.arg_count];
     const result = builder.buildCall(hot_fn_ty, hot_fn, call_args, "res");
 
-    // Box result as JSValue: JSValue.newInt(result)
-    // In CompressedValue layout: (JS_TAG_INT << 32) | (value & 0xFFFFFFFF)
-    // JS_TAG_INT = 7 (from js_types.zig)
+    // Box result as native JSValue: { .u = { .int32 = result }, .tag = JS_TAG_INT }
+    // Native JSValue is { i64, i64 } where field 0 = union value, field 1 = tag
+    // JS_TAG_INT on native = 0
     const result_i64 = builder.buildSExt(result, llvm.i64Type(), "res64");
-    const tag = llvm.constInt64(7 << 32); // JS_TAG_INT << 32
-    const masked = builder.buildAnd(result_i64, llvm.constInt64(0xFFFFFFFF), "mask");
-    const boxed = builder.buildOr(masked, tag, "jsval");
+    var jsval = c.LLVMGetUndef(jsv_ty);
+    jsval = c.LLVMBuildInsertValue(builder.ref, jsval, result_i64, 0, "jsv0");
+    jsval = c.LLVMBuildInsertValue(builder.ref, jsval, llvm.constInt64(JS_TAG_INT_NATIVE), 1, "jsv1");
 
-    _ = builder.buildRet(boxed);
+    _ = builder.buildRet(jsval);
 }
 
 /// Generate the body of an int32 hot function using LLVM IR.
@@ -741,7 +760,7 @@ fn emitInt32Instruction(
 // Shard Init Function Generation
 // ============================================================================
 
-/// Generate frozen_init_llvm_shard_N() function that registers all frozen functions
+/// Generate frozen_init_llvm_shard_N() function that registers all frozen functions.
 fn generateShardInit(
     allocator: Allocator,
     module: llvm.Module,
@@ -811,7 +830,8 @@ pub fn generateThinShard(
     const mod_name = std.fmt.bufPrintZ(&name_buf, "frozen_thin_shard_{d}", .{shard_idx}) catch
         return CodegenError.FormatError;
 
-    const native = llvm.createNativeModule(mod_name) catch return CodegenError.LLVMError;
+    // Thin codegen is just runtime call wrappers — O0 is sufficient and much faster
+    const native = llvm.createNativeModuleWithOpt(mod_name, c.LLVMCodeGenLevelNone) catch return CodegenError.LLVMError;
     defer native.tm.dispose();
     var module_disposed = false;
     defer if (!module_disposed) native.module.dispose();
@@ -828,13 +848,38 @@ pub fn generateThinShard(
     var generated_infos = std.ArrayListUnmanaged(GeneratedFuncInfo){};
     defer generated_infos.deinit(allocator);
 
+    var skipped_unsafe: u32 = 0;
     for (functions) |sf| {
-        if (generateThinFunction(allocator, native.module, builder, sf, &rt_decls)) |_| {
+        if (generateThinFunction(allocator, native.module, builder, sf, &rt_decls)) |has_unsafe_fallback| {
+            if (has_unsafe_fallback) {
+                // Function uses opcodes that exec_opcode can't handle —
+                // don't register it, let the Zig version handle this function.
+                // Change linkage to internal so it doesn't conflict with the Zig symbol.
+                var fn_name_buf: [512]u8 = undefined;
+                const fn_name_z = std.fmt.bufPrintZ(&fn_name_buf, "{s}", .{sf.llvm_func_name}) catch continue;
+                if (native.module.getNamedFunction(fn_name_z)) |func_val| {
+                    llvm.setLinkage(func_val, c.LLVMInternalLinkage);
+                }
+                skipped_unsafe += 1;
+                continue;
+            }
+            // Check if function has tail_call opcodes
+            var func_has_tail_call = false;
+            for (sf.cfg.blocks.items) |block| {
+                for (block.instructions) |bi| {
+                    if (bi.opcode == .tail_call or bi.opcode == .tail_call_method) {
+                        func_has_tail_call = true;
+                        break;
+                    }
+                }
+                if (func_has_tail_call) break;
+            }
             generated_infos.append(allocator, .{
                 .name = sf.name,
                 .func_index = sf.func_index,
                 .line_num = sf.line_num,
                 .llvm_func_name = sf.llvm_func_name,
+                .has_tail_call = func_has_tail_call,
             }) catch continue;
             generated_count += 1;
         } else |err| {
@@ -845,7 +890,9 @@ pub fn generateThinShard(
             continue;
         }
     }
-
+    if (skipped_unsafe > 0) {
+        std.debug.print("[llvm-thin] Skipped {d} functions with unsafe fallback opcodes (keeping Zig versions)\n", .{skipped_unsafe});
+    }
     if (generated_count == 0) {
         return .{ .func_count = 0, .has_functions = false };
     }
@@ -866,6 +913,9 @@ const ThinRuntimeDecls = struct {
     push_null: llvm.Value,
     push_undefined: llvm.Value,
     push_cv: llvm.Value,
+    push_const: llvm.Value,
+    push_this: llvm.Value,
+    push_empty_string: llvm.Value,
 
     // Local variable access
     get_loc: llvm.Value,
@@ -879,8 +929,20 @@ const ThinRuntimeDecls = struct {
 
     // Closure variable access
     get_var_ref: llvm.Value,
+    get_var_ref_check: llvm.Value,
     put_var_ref: llvm.Value,
     set_var_ref: llvm.Value,
+
+    // Stack manipulation (advanced)
+    insert2: llvm.Value,
+    insert3: llvm.Value,
+    insert4: llvm.Value,
+    perm3: llvm.Value,
+    perm4: llvm.Value,
+    perm5: llvm.Value,
+    rot3l: llvm.Value,
+    rot3r: llvm.Value,
+    nip1: llvm.Value,
 
     // Stack manipulation
     dup_top: llvm.Value,
@@ -924,9 +986,23 @@ const ThinRuntimeDecls = struct {
     op_lnot: llvm.Value,
     op_typeof: llvm.Value,
 
-    // Increment
+    // Increment (local)
     inc_loc: llvm.Value,
     dec_loc: llvm.Value,
+
+    // Increment (stack)
+    inc: llvm.Value,
+    dec: llvm.Value,
+    post_inc: llvm.Value,
+    post_dec: llvm.Value,
+
+    // Type checks
+    is_undefined: llvm.Value,
+    is_null: llvm.Value,
+    is_undefined_or_null: llvm.Value,
+
+    // Object creation
+    object: llvm.Value,
 
     // Complex ops (return c_int for error)
     op_call: llvm.Value,
@@ -963,6 +1039,13 @@ const ThinRuntimeDecls = struct {
     op_append: llvm.Value,
     op_put_array_el: llvm.Value,
 
+    // Boolean conversion (handles strings, NaN, 0.0 — full JS semantics)
+    cv_to_bool: llvm.Value,
+
+    // Combined tail_call+return
+    tail_call_return: llvm.Value,
+    tail_call_method_return: llvm.Value,
+
     // Opcode fallback
     exec_opcode: llvm.Value,
 
@@ -971,6 +1054,7 @@ const ThinRuntimeDecls = struct {
         const i32t = llvm.i32Type();
         const i64t = llvm.i64Type();
         const voidt = llvm.voidType();
+        const jsv_ty = jsvalueType(); // {i64, i64} — native JSValue ABI
 
         // Common signatures
         // void(stack, sp, i32)
@@ -991,10 +1075,10 @@ const ThinRuntimeDecls = struct {
         const field_ic_op = llvm.functionType(i32t, &.{ ptr, ptr, ptr, ptr, ptr }, false);
         // i32(ctx, stack, sp, ptr) - simpler field/var op
         const field_op = llvm.functionType(i32t, &.{ ptr, ptr, ptr, ptr }, false);
-        // i64(ctx, stack, sp, locals, usize, ptr, ptr, ptr, usize) - return helper
-        const return_helper = llvm.functionType(i64t, &.{ ptr, ptr, ptr, ptr, i64t, ptr, ptr, ptr, i64t }, false);
-        // i64(ctx, locals, usize, ptr, ptr, ptr, usize) - returnUndef/exceptionCleanup
-        const cleanup_helper = llvm.functionType(i64t, &.{ ptr, ptr, i64t, ptr, ptr, ptr, i64t }, false);
+        // JSValue(ctx, stack, sp, locals, usize, ptr, ptr, ptr, usize) - return helper
+        const return_helper = llvm.functionType(jsv_ty, &.{ ptr, ptr, ptr, ptr, i64t, ptr, ptr, ptr, i64t }, false);
+        // JSValue(ctx, locals, usize, ptr, ptr, ptr, usize) - returnUndef/exceptionCleanup
+        const cleanup_helper = llvm.functionType(jsv_ty, &.{ ptr, ptr, i64t, ptr, ptr, ptr, i64t }, false);
 
         return .{
             .push_i32 = declareExtern(module, "llvm_rt_push_i32", stack_sp_i32),
@@ -1003,6 +1087,19 @@ const ThinRuntimeDecls = struct {
             .push_null = declareExtern(module, "llvm_rt_push_null", stack_sp),
             .push_undefined = declareExtern(module, "llvm_rt_push_undefined", stack_sp),
             .push_cv = declareExtern(module, "llvm_rt_push_cv", stack_sp_cv),
+            .push_const = declareExtern(module, "llvm_rt_push_const", llvm.functionType(voidt, &.{ ptr, ptr, ptr, ptr, i32t }, false)),
+            .push_this = declareExtern(module, "llvm_rt_push_this", llvm.functionType(voidt, &.{ ptr, ptr, ptr, jsv_ty }, false)),
+            .push_empty_string = declareExtern(module, "llvm_rt_push_empty_string", ctx_stack_sp),
+
+            .insert2 = declareExtern(module, "llvm_rt_insert2", ctx_stack_sp),
+            .insert3 = declareExtern(module, "llvm_rt_insert3", ctx_stack_sp),
+            .insert4 = declareExtern(module, "llvm_rt_insert4", ctx_stack_sp),
+            .perm3 = declareExtern(module, "llvm_rt_perm3", stack_sp),
+            .perm4 = declareExtern(module, "llvm_rt_perm4", stack_sp),
+            .perm5 = declareExtern(module, "llvm_rt_perm5", stack_sp),
+            .rot3l = declareExtern(module, "llvm_rt_rot3l", stack_sp),
+            .rot3r = declareExtern(module, "llvm_rt_rot3r", stack_sp),
+            .nip1 = declareExtern(module, "llvm_rt_nip1", ctx_stack_sp),
 
             .get_loc = declareExtern(module, "llvm_rt_get_loc", ctx_stack_sp_loc_u32),
             .put_loc = declareExtern(module, "llvm_rt_put_loc", ctx_stack_sp_loc_u32),
@@ -1013,6 +1110,7 @@ const ThinRuntimeDecls = struct {
             .put_arg = declareExtern(module, "llvm_rt_put_arg", ctx_stack_sp_loc_u32),
 
             .get_var_ref = declareExtern(module, "llvm_rt_get_var_ref", llvm.functionType(voidt, &.{ ptr, ptr, ptr, ptr, i32t, i32t }, false)),
+            .get_var_ref_check = declareExtern(module, "llvm_rt_get_var_ref_check", llvm.functionType(i32t, &.{ ptr, ptr, ptr, ptr, i32t, i32t }, false)),
             .put_var_ref = declareExtern(module, "llvm_rt_put_var_ref", llvm.functionType(voidt, &.{ ptr, ptr, ptr, ptr, i32t, i32t }, false)),
             .set_var_ref = declareExtern(module, "llvm_rt_set_var_ref", llvm.functionType(voidt, &.{ ptr, ptr, ptr, ptr, i32t, i32t }, false)),
 
@@ -1056,6 +1154,17 @@ const ThinRuntimeDecls = struct {
             .inc_loc = declareExtern(module, "llvm_rt_inc_loc", locals_u32),
             .dec_loc = declareExtern(module, "llvm_rt_dec_loc", locals_u32),
 
+            .inc = declareExtern(module, "llvm_rt_inc", stack_sp),
+            .dec = declareExtern(module, "llvm_rt_dec", stack_sp),
+            .post_inc = declareExtern(module, "llvm_rt_post_inc", stack_sp),
+            .post_dec = declareExtern(module, "llvm_rt_post_dec", stack_sp),
+
+            .is_undefined = declareExtern(module, "llvm_rt_is_undefined", ctx_stack_sp),
+            .is_null = declareExtern(module, "llvm_rt_is_null", ctx_stack_sp),
+            .is_undefined_or_null = declareExtern(module, "llvm_rt_is_undefined_or_null", ctx_stack_sp),
+
+            .object = declareExtern(module, "llvm_rt_object", ctx_stack_sp),
+
             .op_call = declareExtern(module, "llvm_rt_op_call", call_op),
             .op_call_method = declareExtern(module, "llvm_rt_op_call_method", call_op),
             .op_call_constructor = declareExtern(module, "llvm_rt_op_call_constructor", call_op),
@@ -1069,7 +1178,7 @@ const ThinRuntimeDecls = struct {
             .returnUndef = declareExtern(module, "llvm_rt_returnUndef", cleanup_helper),
             .exceptionCleanup = declareExtern(module, "llvm_rt_exceptionCleanup", cleanup_helper),
 
-            .cv_from_jsvalue = declareExtern(module, "llvm_rt_cv_from_jsvalue", llvm.functionType(i64t, &.{i64t}, false)),
+            .cv_from_jsvalue = declareExtern(module, "llvm_rt_cv_from_jsvalue", llvm.functionType(i64t, &.{jsv_ty}, false)),
             .cv_dup_ref = declareExtern(module, "llvm_rt_cv_dup_ref", llvm.functionType(i64t, &.{i64t}, false)),
             .cv_free_ref = declareExtern(module, "llvm_rt_cv_free_ref", llvm.functionType(voidt, &.{ ptr, i64t }, false)),
 
@@ -1085,7 +1194,13 @@ const ThinRuntimeDecls = struct {
             .op_append = declareExtern(module, "llvm_rt_op_append", ctx_stack_sp),
             .op_put_array_el = declareExtern(module, "llvm_rt_op_put_array_el", ctx_stack_sp),
 
+            .cv_to_bool = declareExtern(module, "llvm_rt_cv_to_bool", llvm.functionType(i32t, &.{ ptr, ptr, ptr }, false)),
+
             .exec_opcode = declareExtern(module, "llvm_rt_exec_opcode", llvm.functionType(i32t, &.{ ptr, llvm.i8Type(), i32t, ptr, ptr, ptr, i32t }, false)),
+
+            // Combined tail_call+return: (ctx, stack, sp, argc, locals, local_count, arg_shadow, arg_count) -> JSValue
+            .tail_call_return = declareExtern(module, "llvm_rt_tail_call_return", llvm.functionType(jsv_ty, &.{ ptr, ptr, ptr, i32t, ptr, i64t, ptr, i64t }, false)),
+            .tail_call_method_return = declareExtern(module, "llvm_rt_tail_call_method_return", llvm.functionType(jsv_ty, &.{ ptr, ptr, ptr, i32t, ptr, i64t, ptr, i64t }, false)),
         };
     }
 };
@@ -1129,6 +1244,10 @@ const ThinCodegenCtx = struct {
     // Arg shadow
     arg_shadow_ptr: ?llvm.Value = null,
 
+    // Tracks whether any fallback opcode was emitted that exec_opcode can't handle
+    // (exec_opcode only supports set_proto and pow — everything else crashes at runtime)
+    has_unsafe_fallback: bool = false,
+
     // Exception cleanup block
     cleanup_bb: llvm.BasicBlock,
 
@@ -1145,13 +1264,14 @@ const ThinCodegenCtx = struct {
 
 /// Generate a single thin-codegen function as LLVM IR.
 /// Creates a state-machine function calling llvm_rt_* runtime helpers.
+/// Returns true if the function has unsafe fallback opcodes (should not be registered).
 fn generateThinFunction(
     allocator: Allocator,
     module: llvm.Module,
     builder: llvm.Builder,
     sf: ThinShardFunction,
     rt: *ThinRuntimeDecls,
-) CodegenError!void {
+) CodegenError!bool {
     const func = sf.func;
     const cfg = sf.cfg;
     const blocks = cfg.blocks.items;
@@ -1178,23 +1298,27 @@ fn generateThinFunction(
     }
 
     // Create the wrapper function:
-    // i64 @__frozen_N_name(ptr %ctx, i64 %this, i32 %argc, ptr %argv, ptr %var_refs, i32 %closure_cnt, ptr %cpool)
+    // {i64,i64} @__frozen_N_name(ptr %ctx, {i64,i64} %this, i32 %argc, ptr %argv, ptr %var_refs, i32 %closure_cnt, ptr %cpool)
+    // JSValue on native is 16-byte struct {JSValueUnion, tag} — must match C ABI
     var wrapper_name_buf: [512]u8 = undefined;
     const wrapper_name = std.fmt.bufPrintZ(&wrapper_name_buf, "{s}", .{sf.llvm_func_name}) catch
         return CodegenError.FormatError;
 
+    const jsv_ty = jsvalueType();
     const wrapper_params = [_]llvm.Type{
         llvm.ptrType(), // ctx
-        llvm.i64Type(), // this_val
+        jsv_ty, // this_val: JSValue = {i64, i64}
         llvm.i32Type(), // argc
         llvm.ptrType(), // argv
         llvm.ptrType(), // var_refs
         llvm.i32Type(), // closure_var_count
         llvm.ptrType(), // cpool
     };
-    const wrapper_fn_ty = llvm.functionType(llvm.i64Type(), &wrapper_params, false);
+    const wrapper_fn_ty = llvm.functionType(jsv_ty, &wrapper_params, false);
     const wrapper_fn = module.addFunction(wrapper_name, wrapper_fn_ty);
-    llvm.setLinkage(wrapper_fn, c.LLVMExternalLinkage);
+    // Internal linkage: avoid symbol collision with Zig-compiled versions.
+    // Init function references these by pointer within the same .o file.
+    llvm.setLinkage(wrapper_fn, c.LLVMInternalLinkage);
     llvm.setFunctionCallConv(wrapper_fn, c.LLVMCCallConv);
     // Mark as noinline (thin functions shouldn't be inlined)
     {
@@ -1223,7 +1347,6 @@ fn generateThinFunction(
     const closure_var_count_param = c.LLVMGetParam(wrapper_fn, 5);
     const cpool_param = c.LLVMGetParam(wrapper_fn, 6);
 
-    _ = this_param;
     _ = closure_var_count_param;
 
     // Stack overflow check: if (check_stack()) return throwRangeError
@@ -1236,9 +1359,15 @@ fn generateThinFunction(
         const overflow_bb = llvm.appendBasicBlock(wrapper_fn, "overflow");
         _ = builder.buildCondBr(overflow, overflow_bb, no_overflow_bb);
 
-        // Overflow: return EXCEPTION value (0x0006_0000_0000_0000 = JS_TAG_EXCEPTION << 32)
+        // Overflow: return EXCEPTION value
+        // Native JSValue: { .u = { .int32 = 0 }, .tag = JS_TAG_EXCEPTION }
+        // JS_TAG_EXCEPTION on native = 6
         builder.positionAtEnd(overflow_bb);
-        _ = builder.buildRet(llvm.constInt64(0x0006_0000_0000_0000));
+        const exc_jsv_ty = jsvalueType();
+        var exc_val = c.LLVMGetUndef(exc_jsv_ty);
+        exc_val = c.LLVMBuildInsertValue(builder.ref, exc_val, llvm.constInt64(0), 0, "exc0");
+        exc_val = c.LLVMBuildInsertValue(builder.ref, exc_val, llvm.constInt64(6), 1, "exc1");
+        _ = builder.buildRet(exc_val);
 
         builder.positionAtEnd(no_overflow_bb);
     }
@@ -1274,14 +1403,15 @@ fn generateThinFunction(
             const idx_val = llvm.constInt32(@intCast(i));
             const in_bounds = builder.buildICmp(c.LLVMIntSLT, idx_val, argc_param, "inb");
 
-            // Load argv[i]
+            // Load argv[i] — argv is a [*]JSValue where JSValue is {i64, i64}
+            const jsv_el_ty = jsvalueType();
             var argv_idx = [_]llvm.Value{llvm.constInt(llvm.i64Type(), i, false)};
-            const argv_elem_ptr = builder.buildInBoundsGEP(llvm.i64Type(), argv_param, &argv_idx, "avp");
-            const argv_val = builder.buildLoad(llvm.i64Type(), argv_elem_ptr, "av");
+            const argv_elem_ptr = builder.buildInBoundsGEP(jsv_el_ty, argv_param, &argv_idx, "avp");
+            const argv_val = builder.buildLoad(jsv_el_ty, argv_elem_ptr, "av");
 
-            // Convert to CV
+            // Convert JSValue to CV (CompressedValue)
             const cv_val = builder.buildCall(
-                llvm.functionType(llvm.i64Type(), &.{llvm.i64Type()}, false),
+                llvm.functionType(llvm.i64Type(), &.{jsv_el_ty}, false),
                 rt.cv_from_jsvalue, &.{argv_val}, "cv",
             );
 
@@ -1313,8 +1443,9 @@ fn generateThinFunction(
     {
         // Call exit_stack, then exceptionCleanup
         _ = builder.buildCall(llvm.functionType(llvm.voidType(), &.{}, false), rt.exit_stack, &.{}, "");
+        const cleanup_fn_ty = llvm.functionType(jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.i64Type(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i64Type() }, false);
         const cleanup_result = builder.buildCall(
-            llvm.functionType(llvm.i64Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.i64Type(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i64Type() }, false),
+            cleanup_fn_ty,
             rt.exceptionCleanup,
             &.{
                 ctx_param,
@@ -1343,7 +1474,7 @@ fn generateThinFunction(
         .rt = rt,
         .allocator = allocator,
         .ctx_param = ctx_param,
-        .this_param = c.LLVMGetParam(wrapper_fn, 1),
+        .this_param = this_param,
         .argc_param = argc_param,
         .argv_param = argv_param,
         .var_refs_param = var_refs_param,
@@ -1386,7 +1517,7 @@ fn generateThinFunction(
         if (!isBlockTerminated(blocks[0])) {
             _ = builder.buildCall(llvm.functionType(llvm.voidType(), &.{}, false), rt.exit_stack, &.{}, "");
             const ret = builder.buildCall(
-                llvm.functionType(llvm.i64Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.i64Type(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i64Type() }, false),
+                llvm.functionType(jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.i64Type(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i64Type() }, false),
                 rt.returnUndef,
                 &.{
                     ctx_param, locals_flat, llvm.constInt64(local_count),
@@ -1456,12 +1587,15 @@ fn generateThinFunction(
             emitThinBlockTerminator(&tctx, block, block_id_ptr, dispatch_bb, llvm_blocks);
         }
     }
+
+    return tctx.has_unsafe_fallback;
 }
 
 fn isBlockTerminated(block: CFGBasicBlock) bool {
     if (block.instructions.len == 0) return false;
     const last = block.instructions[block.instructions.len - 1].opcode;
-    return last == .@"return" or last == .return_undef or last == .throw;
+    return last == .@"return" or last == .return_undef or last == .throw or
+        last == .tail_call or last == .tail_call_method;
 }
 
 /// Emit a single thin-codegen instruction as LLVM IR calls to llvm_rt_* functions.
@@ -1495,10 +1629,24 @@ fn emitThinInstruction(
         .null => callVoid2(b, rt.push_null, stk, sp),
         .undefined => callVoid2(b, rt.push_undefined, stk, sp),
 
+        .push_this => {
+            _ = b.buildCall(
+                llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), jsvalueType() }, false),
+                rt.push_this,
+                &.{ ctx_p, stk, sp, tctx.this_param },
+                "",
+            );
+        },
+        .push_empty_string => callVoid3(b, rt.push_empty_string, ctx_p, stk, sp),
+
         .push_const8, .push_const => {
-            // push_cv(&stack, &sp, if (cpool) cv_from_jsvalue(cpool[idx]) else UNDEFINED)
-            // For now, push UNDEFINED as fallback (cpool handling needs runtime support)
-            callVoid2(b, rt.push_undefined, stk, sp);
+            const idx: u32 = instr.operand.const_idx;
+            _ = b.buildCall(
+                llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false),
+                rt.push_const,
+                &.{ ctx_p, stk, sp, tctx.cpool_param, llvm.constInt32(@intCast(idx)) },
+                "",
+            );
         },
 
         // ========== Local Variables ==========
@@ -1574,6 +1722,15 @@ fn emitThinInstruction(
         },
 
         // ========== Closure Variables ==========
+        .get_var_ref_check => {
+            // get_var_ref with TDZ check — returns error code (0=ok, 1=exception)
+            const idx: u32 = instr.operand.var_ref;
+            const err_code = b.buildCall(
+                llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.i32Type() }, false),
+                rt.get_var_ref_check, &.{ ctx_p, stk, sp, tctx.var_refs_param, llvm.constInt32(@intCast(idx)), tctx.closure_var_count_param }, "err",
+            );
+            emitErrorCheck(tctx, err_code);
+        },
         .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3, .get_var_ref,
         .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3, .put_var_ref,
         .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3, .set_var_ref,
@@ -1604,6 +1761,15 @@ fn emitThinInstruction(
         .drop => callVoid3(b, rt.drop, ctx_p, stk, sp),
         .nip => callVoid3(b, rt.nip, ctx_p, stk, sp),
         .swap => callVoid2(b, rt.swap, stk, sp),
+        .insert2 => callVoid3(b, rt.insert2, ctx_p, stk, sp),
+        .insert3 => callVoid3(b, rt.insert3, ctx_p, stk, sp),
+        .insert4 => callVoid3(b, rt.insert4, ctx_p, stk, sp),
+        .perm3 => callVoid2(b, rt.perm3, stk, sp),
+        .perm4 => callVoid2(b, rt.perm4, stk, sp),
+        .perm5 => callVoid2(b, rt.perm5, stk, sp),
+        .rot3l => callVoid2(b, rt.rot3l, stk, sp),
+        .rot3r => callVoid2(b, rt.rot3r, stk, sp),
+        .nip1 => callVoid3(b, rt.nip1, ctx_p, stk, sp),
 
         // ========== Arithmetic ==========
         .add => callVoid3(b, rt.op_add, ctx_p, stk, sp),
@@ -1638,7 +1804,21 @@ fn emitThinInstruction(
         .lnot => callVoid3(b, rt.op_lnot, ctx_p, stk, sp),
         .typeof => callVoid3(b, rt.op_typeof, ctx_p, stk, sp),
 
-        // ========== Increment / Decrement ==========
+        // ========== Type Checks ==========
+        .is_undefined => callVoid3(b, rt.is_undefined, ctx_p, stk, sp),
+        .is_null => callVoid3(b, rt.is_null, ctx_p, stk, sp),
+        .is_undefined_or_null => callVoid3(b, rt.is_undefined_or_null, ctx_p, stk, sp),
+
+        // ========== Stack-based Increment / Decrement ==========
+        .inc => callVoid2(b, rt.inc, stk, sp),
+        .dec => callVoid2(b, rt.dec, stk, sp),
+        .post_inc => callVoid2(b, rt.post_inc, stk, sp),
+        .post_dec => callVoid2(b, rt.post_dec, stk, sp),
+
+        // ========== Object Creation ==========
+        .object => callVoid3(b, rt.object, ctx_p, stk, sp),
+
+        // ========== Increment / Decrement (local) ==========
         .inc_loc, .dec_loc => {
             const rt_fn = if (instr.opcode == .inc_loc) rt.inc_loc else rt.dec_loc;
             _ = b.buildCall(
@@ -1652,8 +1832,46 @@ fn emitThinInstruction(
         .call1 => emitThinCallOp(tctx, rt.op_call, 1),
         .call2 => emitThinCallOp(tctx, rt.op_call, 2),
         .call3 => emitThinCallOp(tctx, rt.op_call, 3),
-        .call, .tail_call => emitThinCallOp(tctx, rt.op_call, instr.operand.u16),
-        .call_method, .tail_call_method => emitThinCallOp(tctx, rt.op_call_method, instr.operand.u16),
+        .call => emitThinCallOp(tctx, rt.op_call, instr.operand.u16),
+        .call_method => emitThinCallOp(tctx, rt.op_call_method, instr.operand.u16),
+        .tail_call => {
+            // Combined: call + cleanup + return in one runtime function
+            const tc_fn_ty = llvm.functionType(jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.i64Type(), llvm.ptrType(), llvm.i64Type() }, false);
+            const ret = b.buildCall(
+                tc_fn_ty,
+                rt.tail_call_return,
+                &.{
+                    ctx_p, stk, sp, llvm.constInt32(@intCast(instr.operand.u16)),
+                    locs, llvm.constInt64(tctx.local_count),
+                    if (tctx.arg_shadow_ptr) |asp| blk: {
+                        var si = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(0) };
+                        break :blk b.buildInBoundsGEP(llvm.arrayType(llvm.i64Type(), tctx.func.arg_count), asp, &si, "asp");
+                    } else llvm.constNull(llvm.ptrType()),
+                    llvm.constInt64(if (tctx.has_put_arg) tctx.func.arg_count else 0),
+                },
+                "ret",
+            );
+            _ = b.buildRet(ret);
+        },
+        .tail_call_method => {
+            // Combined: call_method + cleanup + return in one runtime function
+            const tc_fn_ty = llvm.functionType(jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.i64Type(), llvm.ptrType(), llvm.i64Type() }, false);
+            const ret = b.buildCall(
+                tc_fn_ty,
+                rt.tail_call_method_return,
+                &.{
+                    ctx_p, stk, sp, llvm.constInt32(@intCast(instr.operand.u16)),
+                    locs, llvm.constInt64(tctx.local_count),
+                    if (tctx.arg_shadow_ptr) |asp| blk: {
+                        var si = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(0) };
+                        break :blk b.buildInBoundsGEP(llvm.arrayType(llvm.i64Type(), tctx.func.arg_count), asp, &si, "asp");
+                    } else llvm.constNull(llvm.ptrType()),
+                    llvm.constInt64(if (tctx.has_put_arg) tctx.func.arg_count else 0),
+                },
+                "ret",
+            );
+            _ = b.buildRet(ret);
+        },
         .call_constructor => emitThinCallOp(tctx, rt.op_call_constructor, instr.operand.u16),
 
         // ========== Property Access (with error check) ==========
@@ -1680,7 +1898,7 @@ fn emitThinInstruction(
         .@"return" => {
             _ = b.buildCall(llvm.functionType(llvm.voidType(), &.{}, false), rt.exit_stack, &.{}, "");
             const ret = b.buildCall(
-                llvm.functionType(llvm.i64Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i64Type(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i64Type() }, false),
+                llvm.functionType(jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i64Type(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i64Type() }, false),
                 rt.returnFromStack,
                 &.{
                     ctx_p, stk, sp, locs, llvm.constInt64(tctx.local_count),
@@ -1699,7 +1917,7 @@ fn emitThinInstruction(
         .return_undef => {
             _ = b.buildCall(llvm.functionType(llvm.voidType(), &.{}, false), rt.exit_stack, &.{}, "");
             const ret = b.buildCall(
-                llvm.functionType(llvm.i64Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.i64Type(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i64Type() }, false),
+                llvm.functionType(jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.i64Type(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i64Type() }, false),
                 rt.returnUndef,
                 &.{
                     ctx_p, locs, llvm.constInt64(tctx.local_count),
@@ -1712,7 +1930,7 @@ fn emitThinInstruction(
         },
 
         // ========== No-op / Control flow handled by terminator ==========
-        .nop, .set_name, .close_loc => {},
+        .nop, .set_name, .close_loc, .set_loc_uninitialized, .set_home_object => {},
         .if_false, .if_false8, .if_true, .if_true8, .goto, .goto8, .goto16 => {},
 
         // ========== Throw — delegate to interpreter, then cleanup ==========
@@ -1777,11 +1995,20 @@ fn emitThinFieldOp(tctx: *ThinCodegenCtx, func: llvm.Value, instr: Instruction) 
     // Create the string constant
     const str_ptr = c.LLVMBuildGlobalStringPtr(b.ref, name, str_label.ptr);
 
-    // For IC slots, we need a zeroed global (2 x i64). For simplicity, pass null IC for now.
-    // TODO: allocate proper IC slot globals for better perf
+    // IC slot: allocate a zeroed global {ptr, u32, u32} = {shape, offset, atom}
+    // Matches ICSlot in zig_runtime.zig (16 bytes on x86_64)
+    // shape=null means cache miss → slow path string lookup (no crash)
+    var ic_fields = [_]llvm.Type{ llvm.ptrType(), llvm.i32Type(), llvm.i32Type() };
+    const ic_ty = c.LLVMStructType(&ic_fields, ic_fields.len, 0);
+    var ic_name_buf: [64]u8 = undefined;
+    const ic_name = std.fmt.bufPrintZ(&ic_name_buf, ".ic_{d}", .{ic_idx}) catch ".ic";
+    const ic_global = c.LLVMAddGlobal(tctx.module.ref, ic_ty, ic_name.ptr);
+    c.LLVMSetInitializer(ic_global, c.LLVMConstNull(ic_ty));
+    c.LLVMSetLinkage(ic_global, c.LLVMInternalLinkage);
+
     const err_code = b.buildCall(
         llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType() }, false),
-        func, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, llvm.constNull(llvm.ptrType()), str_ptr }, "err",
+        func, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, ic_global, str_ptr }, "err",
     );
     emitErrorCheck(tctx, err_code);
 }
@@ -1805,6 +2032,13 @@ fn emitThinPutFieldOp(tctx: *ThinCodegenCtx, instr: Instruction) void {
 
 /// Emit fallback: delegate to interpreter for unsupported opcodes
 fn emitFallbackOpcode(tctx: *ThinCodegenCtx, instr: Instruction) void {
+    // Track unsafe fallbacks: exec_opcode only handles set_proto and pow.
+    // Any other opcode here means this function can't safely run LLVM-only.
+    switch (instr.opcode) {
+        .set_proto, .pow => {}, // These are supported by exec_opcode
+        else => tctx.has_unsafe_fallback = true,
+    }
+
     const b = tctx.builder;
     const opcode_val = llvm.constInt(llvm.i8Type(), @intFromEnum(instr.opcode), false);
     const operand_val = llvm.constInt32(switch (instr.operand) {
@@ -1846,53 +2080,31 @@ fn emitThinBlockTerminator(
     else
         .nop;
 
-    // Return already handled by instruction emitter
-    if (last_op == .@"return" or last_op == .return_undef or last_op == .throw) return;
+    // Return/tail_call already handled by instruction emitter (they emit ret)
+    if (last_op == .@"return" or last_op == .return_undef or last_op == .throw or
+        last_op == .tail_call or last_op == .tail_call_method) return;
 
-    // Conditional branches: pop CV from stack, convert to bool, branch
+    // Conditional branches: use runtime cv_to_bool for full JS truthiness semantics
+    // (handles empty string, NaN, -0.0, BigInt(0), etc.)
     if (last_op == .if_false or last_op == .if_false8 or last_op == .if_true or last_op == .if_true8) {
         if (successors.len >= 2) {
-            // Pop the condition value from stack and test it
-            // Load sp, decrement, load CV, test if truthy
-            const sp_val = b.buildLoad(llvm.i64Type(), tctx.sp_ptr, "sp");
-            const new_sp = b.buildSub(sp_val, llvm.constInt64(1), "sp1");
-            _ = b.buildStore(new_sp, tctx.sp_ptr);
-
-            // Load the CV value at stack[new_sp]
-            const new_sp_i32 = b.buildTrunc(new_sp, llvm.i32Type(), "spi");
-            var indices = [_]llvm.Value{new_sp_i32};
-            const elem_ptr = b.buildInBoundsGEP(llvm.i64Type(), tctx.stack_ptr, &indices, "cvp");
-            const cv_val = b.buildLoad(llvm.i64Type(), elem_ptr, "cv");
-
-            // Quick boolean test: CV.FALSE = 0x7FFA_0000_0000_0000, CV.TRUE has lo=1
-            // Simplified: check if value is "falsy" — CV with tag INT and value 0, or FALSE, or NULL, or UNDEFINED
-            // For now use a simplified check: compare against known FALSE/NULL/UNDEFINED/INT(0)
-            const cv_false = llvm.constInt64(0x7FFA_0000_0000_0000);
-            const cv_null = llvm.constInt64(0x7FFB_0000_0000_0000);
-            const cv_undef = llvm.constInt64(0x7FFC_0000_0000_0000);
-            const cv_int0 = llvm.constInt64(0x7FFF_0000_0000_0000); // INT tag with value 0
-
-            const is_false = b.buildICmp(c.LLVMIntEQ, cv_val, cv_false, "isf");
-            const is_null = b.buildICmp(c.LLVMIntEQ, cv_val, cv_null, "isn");
-            const is_undef = b.buildICmp(c.LLVMIntEQ, cv_val, cv_undef, "isu");
-            const is_int0 = b.buildICmp(c.LLVMIntEQ, cv_val, cv_int0, "isz");
-
-            var is_falsy = b.buildOr(is_false, is_null, "f1");
-            is_falsy = b.buildOr(is_falsy, is_undef, "f2");
-            is_falsy = b.buildOr(is_falsy, is_int0, "f3");
+            // Call runtime: pops CV from stack, returns 1=truthy 0=falsy
+            const bool_val = b.buildCall(
+                llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType() }, false),
+                tctx.rt.cv_to_bool,
+                &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr },
+                "bval",
+            );
+            const is_truthy = b.buildICmp(c.LLVMIntNE, bool_val, llvm.constInt32(0), "truthy");
 
             if (last_op == .if_false or last_op == .if_false8) {
                 // if_false: jump to successors[0] if false, successors[1] if true
                 const false_target = successors[0];
                 const true_target = successors[1];
                 if (false_target < llvm_blocks.len and true_target < llvm_blocks.len) {
-                    // Set block_id and branch
-                    const false_target_bb = llvm_blocks[false_target];
-                    const true_target_bb = llvm_blocks[true_target];
                     _ = block_id_ptr;
                     _ = dispatch_bb;
-                    // Direct branch to target blocks
-                    _ = b.buildCondBr(is_falsy, false_target_bb, true_target_bb);
+                    _ = b.buildCondBr(is_truthy, llvm_blocks[true_target], llvm_blocks[false_target]);
                     return;
                 }
             } else {
@@ -1900,7 +2112,6 @@ fn emitThinBlockTerminator(
                 const true_target = successors[0];
                 const false_target = successors[1];
                 if (true_target < llvm_blocks.len and false_target < llvm_blocks.len) {
-                    const is_truthy = b.buildICmp(c.LLVMIntEQ, is_falsy, llvm.constInt(llvm.i1Type(), 0, false), "truthy");
                     _ = b.buildCondBr(is_truthy, llvm_blocks[true_target], llvm_blocks[false_target]);
                     return;
                 }
@@ -1928,7 +2139,7 @@ fn emitThinBlockTerminator(
         // End of function — return undef
         _ = b.buildCall(llvm.functionType(llvm.voidType(), &.{}, false), tctx.rt.exit_stack, &.{}, "");
         const ret = b.buildCall(
-            llvm.functionType(llvm.i64Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.i64Type(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i64Type() }, false),
+            llvm.functionType(jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.i64Type(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i64Type() }, false),
             tctx.rt.returnUndef,
             &.{
                 tctx.ctx_param, tctx.locals_ptr, llvm.constInt64(tctx.local_count),
