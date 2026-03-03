@@ -3604,19 +3604,18 @@ fn emitCountedLoopFastPath(
     const typed_done_bb = llvm.appendBasicBlock(current_fn, "cl_tdone");
     _ = b.buildCondBr(t_in_bounds, typed_body_bb, typed_done_bb);
 
-    // Typed loop body: load int32, add, overflow check
+    // Typed loop body: load int32, add — NO per-iteration overflow check!
+    // Int32Array elements are guaranteed int32. Accumulating in i64 is safe
+    // (i64 can hold sum of ~4 billion int32 values without overflow).
+    // Overflow check deferred to loop exit.
     b.positionAtEnd(typed_body_bb);
     const t_ctr_i64 = b.buildSExt(t_ctr_phi, i64t, "tci64");
     const t_elem_ptr = b.buildInBoundsGEP(i32t, values_ptr, &.{t_ctr_i64}, "tep");
     const t_elem_i32 = b.buildLoad(i32t, t_elem_ptr, "tei32");
     const t_elem_i64 = b.buildSExt(t_elem_i32, i64t, "tei64");
     const t_new_acc = b.buildAdd(t_acc_phi, t_elem_i64, "tnacc");
-    const t_min_ok = b.buildICmp(c.LLVMIntSGE, t_new_acc, llvm.constInt64(std.math.minInt(i32)), "tgemin");
-    const t_max_ok = b.buildICmp(c.LLVMIntSLE, t_new_acc, llvm.constInt64(std.math.maxInt(i32)), "tlemax");
-    const t_in_range = b.buildAnd(t_min_ok, t_max_ok, "tirng");
     const t_next_ctr = b.buildAdd(t_ctr_phi, llvm.constInt32(1), "tnctr");
-    const typed_bail_bb = llvm.appendBasicBlock(current_fn, "cl_tbail");
-    _ = b.buildCondBr(t_in_range, typed_loop_bb, typed_bail_bb);
+    _ = b.buildBr(typed_loop_bb);
 
     // Typed loop back-edge phis
     {
@@ -3630,18 +3629,30 @@ fn emitCountedLoopFastPath(
         llvm.addIncoming(t_acc_phi, &vals, &bbs);
     }
 
-    // Typed loop done — store and exit
+    // Typed loop done — check if final sum fits i32, store and exit
     b.positionAtEnd(typed_done_bb);
     _ = b.buildStore(inlineNewInt(b, t_ctr_phi), ctr_ptr);
+    // Deferred overflow check: if sum fits i32, store as int CV; else store as f64 CV
+    const t_fits_min = b.buildICmp(c.LLVMIntSGE, t_acc_phi, llvm.constInt64(std.math.minInt(i32)), "tfmin");
+    const t_fits_max = b.buildICmp(c.LLVMIntSLE, t_acc_phi, llvm.constInt64(std.math.maxInt(i32)), "tfmax");
+    const t_fits_i32 = b.buildAnd(t_fits_min, t_fits_max, "tfi32");
+    const t_int_done_bb = llvm.appendBasicBlock(current_fn, "cl_tid");
+    const t_f64_done_bb = llvm.appendBasicBlock(current_fn, "cl_tf64");
+    _ = b.buildCondBr(t_fits_i32, t_int_done_bb, t_f64_done_bb);
+
+    // Fits i32: store as CV int
+    b.positionAtEnd(t_int_done_bb);
     _ = b.buildStore(inlineNewInt(b, b.buildTrunc(t_acc_phi, i32t, "tdai32")), acc_ptr_val);
     _ = b.buildStore(llvm.constInt32(@intCast(cl.exit_block)), block_id_ptr);
     _ = b.buildBr(dispatch_bb);
 
-    // Typed loop bailout (overflow)
-    b.positionAtEnd(typed_bail_bb);
-    _ = b.buildStore(inlineNewInt(b, t_ctr_phi), ctr_ptr);
-    _ = b.buildStore(inlineNewInt(b, b.buildTrunc(t_acc_phi, i32t, "tbai32")), acc_ptr_val);
-    _ = b.buildBr(normal_header_bb);
+    // Doesn't fit i32: store as f64 CV (raw bit pattern)
+    b.positionAtEnd(t_f64_done_bb);
+    const t_f64_val = b.buildSIToFP(t_acc_phi, llvm.doubleType(), "tf64");
+    const t_f64_bits = b.buildBitCast(t_f64_val, i64t, "tf64b");
+    _ = b.buildStore(t_f64_bits, acc_ptr_val);
+    _ = b.buildStore(llvm.constInt32(@intCast(cl.exit_block)), block_id_ptr);
+    _ = b.buildBr(dispatch_bb);
 
     // ===================================================================
     // Path B: Regular JSValue array loop — 16-byte elements with tag check
@@ -3674,16 +3685,14 @@ fn emitCountedLoopFastPath(
     const elem_is_int = b.buildICmp(c.LLVMIntEQ, elem_tag, llvm.constInt64(0), "eisint");
     _ = b.buildCondBr(elem_is_int, fast_add_bb, loop_bailout_bb);
 
-    // JSValue int add with overflow check
+    // JSValue int add — NO per-iteration overflow check (deferred to loop exit)
+    // i64 accumulator safely holds sum of any practical number of i32 values
     b.positionAtEnd(fast_add_bb);
     const elem_i32 = b.buildTrunc(elem_payload, i32t, "ei32");
     const elem_i64 = b.buildSExt(elem_i32, i64t, "ei64");
     const new_acc = b.buildAdd(acc_phi, elem_i64, "nacc");
-    const ge_min = b.buildICmp(c.LLVMIntSGE, new_acc, llvm.constInt64(std.math.minInt(i32)), "gemin");
-    const le_max = b.buildICmp(c.LLVMIntSLE, new_acc, llvm.constInt64(std.math.maxInt(i32)), "lemax");
-    const in_range = b.buildAnd(ge_min, le_max, "inrng");
     const next_ctr = b.buildAdd(ctr_phi, llvm.constInt32(1), "nctr");
-    _ = b.buildCondBr(in_range, fast_loop_bb, loop_bailout_bb);
+    _ = b.buildBr(fast_loop_bb);
 
     // JSValue loop back-edge phis
     {
@@ -3697,43 +3706,48 @@ fn emitCountedLoopFastPath(
         llvm.addIncoming(acc_phi, &vals, &bbs);
     }
 
-    // --- Loop done — store results, jump to exit block ---
+    // --- Loop done — deferred overflow check, store results, jump to exit ---
     b.positionAtEnd(loop_done_bb);
     _ = b.buildStore(inlineNewInt(b, ctr_phi), ctr_ptr);
+    const j_fits_min = b.buildICmp(c.LLVMIntSGE, acc_phi, llvm.constInt64(std.math.minInt(i32)), "jfmin");
+    const j_fits_max = b.buildICmp(c.LLVMIntSLE, acc_phi, llvm.constInt64(std.math.maxInt(i32)), "jfmax");
+    const j_fits_i32 = b.buildAnd(j_fits_min, j_fits_max, "jfi32");
+    const j_int_done_bb = llvm.appendBasicBlock(current_fn, "cl_jid");
+    const j_f64_done_bb = llvm.appendBasicBlock(current_fn, "cl_jf64");
+    _ = b.buildCondBr(j_fits_i32, j_int_done_bb, j_f64_done_bb);
+
+    b.positionAtEnd(j_int_done_bb);
     _ = b.buildStore(inlineNewInt(b, b.buildTrunc(acc_phi, i32t, "dai32")), acc_ptr_val);
     _ = b.buildStore(llvm.constInt32(@intCast(cl.exit_block)), block_id_ptr);
     _ = b.buildBr(dispatch_bb);
 
-    // --- Bailout — store partial results, fall through to normal header ---
+    b.positionAtEnd(j_f64_done_bb);
+    const j_f64_val = b.buildSIToFP(acc_phi, llvm.doubleType(), "jf64");
+    const j_f64_bits = b.buildBitCast(j_f64_val, i64t, "jf64b");
+    _ = b.buildStore(j_f64_bits, acc_ptr_val);
+    _ = b.buildStore(llvm.constInt32(@intCast(cl.exit_block)), block_id_ptr);
+    _ = b.buildBr(dispatch_bb);
+
+    // --- Bailout (non-int element) — store partial results, fall to normal header ---
     b.positionAtEnd(loop_bailout_bb);
-    const bail_ctr_phi = b.buildPhi(i32t, "bctr");
-    const bail_acc_phi = b.buildPhi(i64t, "bacc");
+    // Only source: fast_body_bb (JSValue element tag != 0)
+    _ = b.buildStore(inlineNewInt(b, ctr_phi), ctr_ptr);
+    // Deferred overflow check for partial accumulator too
+    const b_fits_min = b.buildICmp(c.LLVMIntSGE, acc_phi, llvm.constInt64(std.math.minInt(i32)), "bfmin");
+    const b_fits_max = b.buildICmp(c.LLVMIntSLE, acc_phi, llvm.constInt64(std.math.maxInt(i32)), "bfmax");
+    const b_fits_i32 = b.buildAnd(b_fits_min, b_fits_max, "bfi32");
+    const bail_int_bb = llvm.appendBasicBlock(current_fn, "cl_bint");
+    const bail_f64_bb = llvm.appendBasicBlock(current_fn, "cl_bf64");
+    _ = b.buildCondBr(b_fits_i32, bail_int_bb, bail_f64_bb);
 
-    // From fast_body_bb (JSValue element not int)
-    {
-        var vals = [_]llvm.Value{ctr_phi};
-        var bbs = [_]llvm.BasicBlock{fast_body_bb};
-        llvm.addIncoming(bail_ctr_phi, &vals, &bbs);
-    }
-    {
-        var vals = [_]llvm.Value{acc_phi};
-        var bbs = [_]llvm.BasicBlock{fast_body_bb};
-        llvm.addIncoming(bail_acc_phi, &vals, &bbs);
-    }
-    // From fast_add_bb (overflow)
-    {
-        var vals = [_]llvm.Value{ctr_phi};
-        var bbs = [_]llvm.BasicBlock{fast_add_bb};
-        llvm.addIncoming(bail_ctr_phi, &vals, &bbs);
-    }
-    {
-        var vals = [_]llvm.Value{acc_phi};
-        var bbs = [_]llvm.BasicBlock{fast_add_bb};
-        llvm.addIncoming(bail_acc_phi, &vals, &bbs);
-    }
+    b.positionAtEnd(bail_int_bb);
+    _ = b.buildStore(inlineNewInt(b, b.buildTrunc(acc_phi, i32t, "bai32")), acc_ptr_val);
+    _ = b.buildBr(normal_header_bb);
 
-    _ = b.buildStore(inlineNewInt(b, bail_ctr_phi), ctr_ptr);
-    _ = b.buildStore(inlineNewInt(b, b.buildTrunc(bail_acc_phi, i32t, "bai32")), acc_ptr_val);
+    b.positionAtEnd(bail_f64_bb);
+    const b_f64_val = b.buildSIToFP(acc_phi, llvm.doubleType(), "bf64");
+    const b_f64_bits = b.buildBitCast(b_f64_val, i64t, "bf64b");
+    _ = b.buildStore(b_f64_bits, acc_ptr_val);
     _ = b.buildBr(normal_header_bb);
 
     // --- Position builder at normal_header_bb for the regular block codegen ---
