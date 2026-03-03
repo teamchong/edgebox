@@ -3537,15 +3537,21 @@ fn emitCountedLoopFastPath(
     const flags_and = b.buildAnd(flags_byte, llvm.constInt(i8t, 0x08, false), "fand");
     const is_fast = b.buildICmp(c.LLVMIntNE, flags_and, llvm.constInt(i8t, 0, false), "isfa");
 
-    // Load class_id (u16) at offset 6 — JS_CLASS_ARRAY=2, JS_CLASS_ARGUMENTS=8
+    // Load class_id (u16) at offset 6
+    // Regular arrays: JS_CLASS_ARRAY=2, JS_CLASS_ARGUMENTS=8
+    // Typed arrays: JS_CLASS_INT32_ARRAY=27 (raw int32_t elements, 4 bytes each)
     const cid_ptr = b.buildInBoundsGEP(i8t, obj_ptr, &.{llvm.constInt64(6)}, "cidp");
     const cid = b.buildLoad(i16t, cid_ptr, "cid");
     const is_arr = b.buildICmp(c.LLVMIntEQ, cid, llvm.constInt(i16t, 2, false), "isa");
     const is_args = b.buildICmp(c.LLVMIntEQ, cid, llvm.constInt(i16t, 8, false), "isarg");
-    const is_arr_type = b.buildOr(is_arr, is_args, "isat");
-    const obj_ok = b.buildAnd(is_fast, is_arr_type, "objok");
+    const is_regular_arr = b.buildOr(is_arr, is_args, "isreg");
+    const is_int32_arr = b.buildICmp(c.LLVMIntEQ, cid, llvm.constInt(i16t, 27, false), "isi32a");
+    const is_supported = b.buildOr(is_regular_arr, is_int32_arr, "issup");
+    const obj_ok = b.buildAnd(is_fast, is_supported, "objok");
 
-    // Load values pointer (ptr) at offset 56 and count (u32) at offset 64
+    // Load values/data pointer (ptr) at offset 56 and count (u32) at offset 64
+    // For regular arrays: values → JSValue[] (16 bytes per element)
+    // For Int32Array: values → int32_t[] (4 bytes per element)
     const vp_ptr = b.buildInBoundsGEP(i8t, obj_ptr, &.{llvm.constInt64(56)}, "vpp");
     const values_ptr = b.buildLoad(ptr_t, vp_ptr, "vptr");
     const cp_ptr = b.buildInBoundsGEP(i8t, obj_ptr, &.{llvm.constInt64(64)}, "cpp");
@@ -3563,125 +3569,171 @@ fn emitCountedLoopFastPath(
     const acc_cv = b.buildLoad(i64t, acc_ptr_val, "acccv");
     const acc_is_int = inlineIsInt(b, acc_cv);
     const both_int = b.buildAnd(ctr_is_int, acc_is_int, "bint");
-    _ = b.buildCondBr(both_int, fast_loop_bb, normal_header_bb);
 
-    // --- Step 3: Fast loop header (phi nodes for counter and accumulator) ---
+    // Extract initial counter and accumulator i32 values
+    const init_ctr_i32 = inlineGetInt(b, ctr_cv);
+    const init_acc_i64_ext = b.buildSExt(b.buildTrunc(acc_cv, i32t, "araw"), i64t, "a64ext");
+
+    // Three-way branch: both_int → (is_int32_arr → typed_loop, else → jsv_loop), else → normal
+    const type_check_bb = llvm.appendBasicBlock(current_fn, "cl_tychk");
+    _ = b.buildCondBr(both_int, type_check_bb, normal_header_bb);
+
+    b.positionAtEnd(type_check_bb);
+    // Create separate loops for typed arrays and regular JSValue arrays
+    const typed_loop_bb = llvm.appendBasicBlock(current_fn, "cl_tloop");
+    _ = b.buildCondBr(is_int32_arr, typed_loop_bb, fast_loop_bb);
+
+    // ===================================================================
+    // Path A: Int32Array typed loop — raw int32_t[], no tag check needed
+    // ===================================================================
+    b.positionAtEnd(typed_loop_bb);
+    const t_ctr_phi = b.buildPhi(i32t, "tctr");
+    const t_acc_phi = b.buildPhi(i64t, "tacc");
+    {
+        var vals = [_]llvm.Value{init_ctr_i32};
+        var bbs = [_]llvm.BasicBlock{type_check_bb};
+        llvm.addIncoming(t_ctr_phi, &vals, &bbs);
+    }
+    {
+        var vals = [_]llvm.Value{init_acc_i64_ext};
+        var bbs = [_]llvm.BasicBlock{type_check_bb};
+        llvm.addIncoming(t_acc_phi, &vals, &bbs);
+    }
+    const t_in_bounds = b.buildICmp(c.LLVMIntSLT, t_ctr_phi, arr_count, "tinb");
+    const typed_body_bb = llvm.appendBasicBlock(current_fn, "cl_tbody");
+    const typed_done_bb = llvm.appendBasicBlock(current_fn, "cl_tdone");
+    _ = b.buildCondBr(t_in_bounds, typed_body_bb, typed_done_bb);
+
+    // Typed loop body: load int32, add, overflow check
+    b.positionAtEnd(typed_body_bb);
+    const t_ctr_i64 = b.buildSExt(t_ctr_phi, i64t, "tci64");
+    const t_elem_ptr = b.buildInBoundsGEP(i32t, values_ptr, &.{t_ctr_i64}, "tep");
+    const t_elem_i32 = b.buildLoad(i32t, t_elem_ptr, "tei32");
+    const t_elem_i64 = b.buildSExt(t_elem_i32, i64t, "tei64");
+    const t_new_acc = b.buildAdd(t_acc_phi, t_elem_i64, "tnacc");
+    const t_min_ok = b.buildICmp(c.LLVMIntSGE, t_new_acc, llvm.constInt64(std.math.minInt(i32)), "tgemin");
+    const t_max_ok = b.buildICmp(c.LLVMIntSLE, t_new_acc, llvm.constInt64(std.math.maxInt(i32)), "tlemax");
+    const t_in_range = b.buildAnd(t_min_ok, t_max_ok, "tirng");
+    const t_next_ctr = b.buildAdd(t_ctr_phi, llvm.constInt32(1), "tnctr");
+    const typed_bail_bb = llvm.appendBasicBlock(current_fn, "cl_tbail");
+    _ = b.buildCondBr(t_in_range, typed_loop_bb, typed_bail_bb);
+
+    // Typed loop back-edge phis
+    {
+        var vals = [_]llvm.Value{t_next_ctr};
+        var bbs = [_]llvm.BasicBlock{typed_body_bb};
+        llvm.addIncoming(t_ctr_phi, &vals, &bbs);
+    }
+    {
+        var vals = [_]llvm.Value{t_new_acc};
+        var bbs = [_]llvm.BasicBlock{typed_body_bb};
+        llvm.addIncoming(t_acc_phi, &vals, &bbs);
+    }
+
+    // Typed loop done — store and exit
+    b.positionAtEnd(typed_done_bb);
+    _ = b.buildStore(inlineNewInt(b, t_ctr_phi), ctr_ptr);
+    _ = b.buildStore(inlineNewInt(b, b.buildTrunc(t_acc_phi, i32t, "tdai32")), acc_ptr_val);
+    _ = b.buildStore(llvm.constInt32(@intCast(cl.exit_block)), block_id_ptr);
+    _ = b.buildBr(dispatch_bb);
+
+    // Typed loop bailout (overflow)
+    b.positionAtEnd(typed_bail_bb);
+    _ = b.buildStore(inlineNewInt(b, t_ctr_phi), ctr_ptr);
+    _ = b.buildStore(inlineNewInt(b, b.buildTrunc(t_acc_phi, i32t, "tbai32")), acc_ptr_val);
+    _ = b.buildBr(normal_header_bb);
+
+    // ===================================================================
+    // Path B: Regular JSValue array loop — 16-byte elements with tag check
+    // ===================================================================
     b.positionAtEnd(fast_loop_bb);
     const ctr_phi = b.buildPhi(i32t, "ctr");
     const acc_phi = b.buildPhi(i64t, "acc");
-
-    // Compute initial i32 values in validate_acc_bb (before its terminator)
-    const saved_bb = c.LLVMGetInsertBlock(b.ref);
-    const vacc_term = c.LLVMGetBasicBlockTerminator(validate_acc_bb);
-    if (vacc_term != null) {
-        c.LLVMPositionBuilderBefore(b.ref, vacc_term);
+    {
+        var vals = [_]llvm.Value{init_ctr_i32};
+        var bbs = [_]llvm.BasicBlock{type_check_bb};
+        llvm.addIncoming(ctr_phi, &vals, &bbs);
     }
-    const init_ctr_i32 = inlineGetInt(b, ctr_cv);
-    const init_acc_cv = acc_cv; // Already loaded in validate_acc_bb
-    const init_acc_i64 = b.buildBitCast(init_acc_cv, i64t, "a64"); // CV bits
-    // Extract i32 from CV int: low 32 bits
-    const init_acc_i32_raw = b.buildTrunc(init_acc_i64, i32t, "araw");
-    const init_acc_i64_ext = b.buildSExt(init_acc_i32_raw, i64t, "a64ext");
+    {
+        var vals = [_]llvm.Value{init_acc_i64_ext};
+        var bbs = [_]llvm.BasicBlock{type_check_bb};
+        llvm.addIncoming(acc_phi, &vals, &bbs);
+    }
 
-    // Restore position
-    b.positionAtEnd(saved_bb);
-
-    // Add phi incoming: from validate_acc_bb
-    var ctr_init_vals = [_]llvm.Value{init_ctr_i32};
-    var ctr_init_bbs = [_]llvm.BasicBlock{validate_acc_bb};
-    llvm.addIncoming(ctr_phi, &ctr_init_vals, &ctr_init_bbs);
-
-    var acc_init_vals = [_]llvm.Value{init_acc_i64_ext};
-    var acc_init_bbs = [_]llvm.BasicBlock{validate_acc_bb};
-    llvm.addIncoming(acc_phi, &acc_init_vals, &acc_init_bbs);
-
-    // Loop condition: counter < arr_count
     const ctr_in_bounds = b.buildICmp(c.LLVMIntSLT, ctr_phi, arr_count, "cltcnt");
     _ = b.buildCondBr(ctr_in_bounds, fast_body_bb, loop_done_bb);
 
-    // --- Step 4: Fast loop body — load element, check int, add ---
+    // JSValue loop body: load JSValue, check int tag, add
     b.positionAtEnd(fast_body_bb);
     const jsv_struct_ty = jsvalueType();
     const ctr_i64 = b.buildSExt(ctr_phi, i64t, "ci64");
-
-    // GEP to values_ptr[counter].payload and values_ptr[counter].tag
     const pay_ptr = b.buildInBoundsGEP(jsv_struct_ty, values_ptr, &.{ ctr_i64, llvm.constInt32(0) }, "ppay");
     const tag_ptr = b.buildInBoundsGEP(jsv_struct_ty, values_ptr, &.{ ctr_i64, llvm.constInt32(1) }, "ptag");
     const elem_payload = b.buildLoad(i64t, pay_ptr, "epay");
     const elem_tag = b.buildLoad(i64t, tag_ptr, "etag");
-
-    // Check element is int (tag == 0)
     const elem_is_int = b.buildICmp(c.LLVMIntEQ, elem_tag, llvm.constInt64(0), "eisint");
     _ = b.buildCondBr(elem_is_int, fast_add_bb, loop_bailout_bb);
 
-    // --- Step 5: Integer add with overflow check ---
+    // JSValue int add with overflow check
     b.positionAtEnd(fast_add_bb);
-    // Element value: low 32 bits of payload, sign-extended to i64
     const elem_i32 = b.buildTrunc(elem_payload, i32t, "ei32");
     const elem_i64 = b.buildSExt(elem_i32, i64t, "ei64");
     const new_acc = b.buildAdd(acc_phi, elem_i64, "nacc");
-
-    // Check i32 overflow
-    const min_i32 = llvm.constInt64(std.math.minInt(i32));
-    const max_i32 = llvm.constInt64(std.math.maxInt(i32));
-    const ge_min = b.buildICmp(c.LLVMIntSGE, new_acc, min_i32, "gemin");
-    const le_max = b.buildICmp(c.LLVMIntSLE, new_acc, max_i32, "lemax");
+    const ge_min = b.buildICmp(c.LLVMIntSGE, new_acc, llvm.constInt64(std.math.minInt(i32)), "gemin");
+    const le_max = b.buildICmp(c.LLVMIntSLE, new_acc, llvm.constInt64(std.math.maxInt(i32)), "lemax");
     const in_range = b.buildAnd(ge_min, le_max, "inrng");
-
-    // Increment counter
     const next_ctr = b.buildAdd(ctr_phi, llvm.constInt32(1), "nctr");
-
     _ = b.buildCondBr(in_range, fast_loop_bb, loop_bailout_bb);
 
-    // Add phi incoming from fast_add_bb (loop back-edge)
-    var ctr_back_vals = [_]llvm.Value{next_ctr};
-    var ctr_back_bbs = [_]llvm.BasicBlock{fast_add_bb};
-    llvm.addIncoming(ctr_phi, &ctr_back_vals, &ctr_back_bbs);
+    // JSValue loop back-edge phis
+    {
+        var vals = [_]llvm.Value{next_ctr};
+        var bbs = [_]llvm.BasicBlock{fast_add_bb};
+        llvm.addIncoming(ctr_phi, &vals, &bbs);
+    }
+    {
+        var vals = [_]llvm.Value{new_acc};
+        var bbs = [_]llvm.BasicBlock{fast_add_bb};
+        llvm.addIncoming(acc_phi, &vals, &bbs);
+    }
 
-    var acc_back_vals = [_]llvm.Value{new_acc};
-    var acc_back_bbs = [_]llvm.BasicBlock{fast_add_bb};
-    llvm.addIncoming(acc_phi, &acc_back_vals, &acc_back_bbs);
-
-    // --- Step 6: Loop done — store results, jump to exit block ---
+    // --- Loop done — store results, jump to exit block ---
     b.positionAtEnd(loop_done_bb);
-    const done_ctr_cv = inlineNewInt(b, ctr_phi);
-    _ = b.buildStore(done_ctr_cv, ctr_ptr);
-    const done_acc_i32 = b.buildTrunc(acc_phi, i32t, "dai32");
-    const done_acc_cv = inlineNewInt(b, done_acc_i32);
-    _ = b.buildStore(done_acc_cv, acc_ptr_val);
-
-    // Jump to exit block via dispatch
+    _ = b.buildStore(inlineNewInt(b, ctr_phi), ctr_ptr);
+    _ = b.buildStore(inlineNewInt(b, b.buildTrunc(acc_phi, i32t, "dai32")), acc_ptr_val);
     _ = b.buildStore(llvm.constInt32(@intCast(cl.exit_block)), block_id_ptr);
     _ = b.buildBr(dispatch_bb);
 
-    // --- Step 7: Bailout — store partial results, fall through to normal header ---
+    // --- Bailout — store partial results, fall through to normal header ---
     b.positionAtEnd(loop_bailout_bb);
-    // Phi for bailout counter and accumulator (from fast_body or fast_add)
     const bail_ctr_phi = b.buildPhi(i32t, "bctr");
     const bail_acc_phi = b.buildPhi(i64t, "bacc");
 
-    // From fast_body_bb (element not int): ctr_phi and acc_phi
-    var bail_body_ctr = [_]llvm.Value{ctr_phi};
-    var bail_body_bbs = [_]llvm.BasicBlock{fast_body_bb};
-    llvm.addIncoming(bail_ctr_phi, &bail_body_ctr, &bail_body_bbs);
-    var bail_body_acc = [_]llvm.Value{acc_phi};
-    llvm.addIncoming(bail_acc_phi, &bail_body_acc, &bail_body_bbs);
+    // From fast_body_bb (JSValue element not int)
+    {
+        var vals = [_]llvm.Value{ctr_phi};
+        var bbs = [_]llvm.BasicBlock{fast_body_bb};
+        llvm.addIncoming(bail_ctr_phi, &vals, &bbs);
+    }
+    {
+        var vals = [_]llvm.Value{acc_phi};
+        var bbs = [_]llvm.BasicBlock{fast_body_bb};
+        llvm.addIncoming(bail_acc_phi, &vals, &bbs);
+    }
+    // From fast_add_bb (overflow)
+    {
+        var vals = [_]llvm.Value{ctr_phi};
+        var bbs = [_]llvm.BasicBlock{fast_add_bb};
+        llvm.addIncoming(bail_ctr_phi, &vals, &bbs);
+    }
+    {
+        var vals = [_]llvm.Value{acc_phi};
+        var bbs = [_]llvm.BasicBlock{fast_add_bb};
+        llvm.addIncoming(bail_acc_phi, &vals, &bbs);
+    }
 
-    // From fast_add_bb (overflow): next_ctr (already incremented) and new_acc (overflowed)
-    // Actually on overflow we should store the current counter (not incremented) since the add failed
-    var bail_add_ctr = [_]llvm.Value{ctr_phi};
-    var bail_add_bbs = [_]llvm.BasicBlock{fast_add_bb};
-    llvm.addIncoming(bail_ctr_phi, &bail_add_ctr, &bail_add_bbs);
-    var bail_add_acc = [_]llvm.Value{acc_phi};
-    llvm.addIncoming(bail_acc_phi, &bail_add_acc, &bail_add_bbs);
-
-    const bail_ctr_cv = inlineNewInt(b, bail_ctr_phi);
-    _ = b.buildStore(bail_ctr_cv, ctr_ptr);
-    const bail_acc_i32 = b.buildTrunc(bail_acc_phi, i32t, "bai32");
-    const bail_acc_cv = inlineNewInt(b, bail_acc_i32);
-    _ = b.buildStore(bail_acc_cv, acc_ptr_val);
-
-    // Fall through to normal header block
+    _ = b.buildStore(inlineNewInt(b, bail_ctr_phi), ctr_ptr);
+    _ = b.buildStore(inlineNewInt(b, b.buildTrunc(bail_acc_phi, i32t, "bai32")), acc_ptr_val);
     _ = b.buildBr(normal_header_bb);
 
     // --- Position builder at normal_header_bb for the regular block codegen ---
