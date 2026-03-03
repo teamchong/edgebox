@@ -256,6 +256,10 @@ pub const Builder = struct {
         return c.LLVMBuildBitCast(self.ref, val, dest_ty, name);
     }
 
+    pub fn buildSIToFP(self: Builder, val: Value, dest_ty: Type, name: [*:0]const u8) Value {
+        return c.LLVMBuildSIToFP(self.ref, val, dest_ty, name);
+    }
+
     // Phi nodes
     pub fn buildPhi(self: Builder, ty: Type, name: [*:0]const u8) Value {
         return c.LLVMBuildPhi(self.ref, ty, name);
@@ -279,6 +283,10 @@ pub fn i8Type() Type {
     return c.LLVMInt8Type();
 }
 
+pub fn i16Type() Type {
+    return c.LLVMInt16Type();
+}
+
 pub fn i32Type() Type {
     return c.LLVMInt32Type();
 }
@@ -290,6 +298,10 @@ pub fn i64Type() Type {
 pub fn ptrType() Type {
     // LLVM opaque pointer type (since LLVM 15+)
     return c.LLVMPointerType(c.LLVMInt8Type(), 0);
+}
+
+pub fn doubleType() Type {
+    return c.LLVMDoubleType();
 }
 
 pub fn voidType() Type {

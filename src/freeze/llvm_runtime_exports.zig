@@ -544,6 +544,247 @@ export fn llvm_rt_op_put_array_el(ctx: *JSContext, stack: [*]CV, sp: *usize) cal
 }
 
 // ============================================================================
+// Fast array access helpers (zero-FFI JSArray fast path)
+// ============================================================================
+
+/// Probe a CV array value: extract raw JSValue[] pointer and element count.
+/// Returns 1 if fast array (out_values_ptr and out_count are set), 0 otherwise.
+/// The returned pointer is valid as long as the array is not modified.
+/// This is designed to be called ONCE before a loop, then use the pointer
+/// for direct element access inside the loop (avoiding per-element getFastArrayDirect).
+export fn llvm_rt_fast_array_probe(arr_cv: u64, out_values_ptr: *?[*]u8, out_count: *u32) callconv(.c) c_int {
+    const cv: CV = @bitCast(arr_cv);
+    if (!cv.isObject()) {
+        out_values_ptr.* = null;
+        out_count.* = 0;
+        return 0;
+    }
+    const jsv = cv.toJSValue();
+    const result = zig_runtime.getFastArrayDirect(jsv);
+    if (!result.success) {
+        out_values_ptr.* = null;
+        out_count.* = 0;
+        return 0;
+    }
+    if (result.values) |vals| {
+        out_values_ptr.* = @ptrCast(vals);
+        out_count.* = result.count;
+        return 1;
+    }
+    out_values_ptr.* = null;
+    out_count.* = 0;
+    return 0;
+}
+
+/// Check if a CV value is a fast array (contiguous JSValue[] backing store).
+/// Returns 1 if fast array, 0 otherwise.
+export fn llvm_rt_fast_array_is_fast(cv_bits: u64) callconv(.c) c_int {
+    const cv: CV = @bitCast(cv_bits);
+    if (!cv.isObject()) return 0;
+    const jsv = cv.toJSValue();
+    const result = zig_runtime.getFastArrayDirect(jsv);
+    return if (result.success) @as(c_int, 1) else @as(c_int, 0);
+}
+
+/// Get the raw JSValue[] pointer from a fast array CV.
+/// Caller must check is_fast first. Returns null if not a fast array.
+export fn llvm_rt_fast_array_get_values(cv_bits: u64) callconv(.c) ?[*]u8 {
+    const cv: CV = @bitCast(cv_bits);
+    const jsv = cv.toJSValue();
+    const result = zig_runtime.getFastArrayDirect(jsv);
+    if (!result.success) return null;
+    if (result.values) |vals| {
+        return @ptrCast(vals);
+    }
+    return null;
+}
+
+/// Get the element count from a fast array CV.
+/// Caller must check is_fast first. Returns 0 if not a fast array.
+export fn llvm_rt_fast_array_get_count(cv_bits: u64) callconv(.c) c_int {
+    const cv: CV = @bitCast(cv_bits);
+    const jsv = cv.toJSValue();
+    const result = zig_runtime.getFastArrayDirect(jsv);
+    if (!result.success) return 0;
+    return @intCast(result.count);
+}
+
+/// Load a JSValue at index from a raw values pointer, convert to CV (with refcount dup).
+/// The pointer must come from llvm_rt_fast_array_get_values.
+/// Each JSValue is 16 bytes on x86_64 (JSValueUnion + tag).
+export fn llvm_rt_jsvalue_to_cv(ctx: *JSContext, values_ptr: [*]const u8, index: c_int) callconv(.c) u64 {
+    const jsv_ptr: [*]const JSValue = @ptrCast(@alignCast(values_ptr));
+    const jsv = jsv_ptr[@intCast(index)];
+    // Dup the JSValue (increment refcount) since we're creating a new owned CV reference
+    const duped = JSValue.dup(ctx, jsv);
+    return @bitCast(CV.fromJSValue(duped));
+}
+
+/// Combined fast array element access: check if fast array, load element, return as CV.
+/// Returns the element CV on success, or CV_SENTINEL (0) on failure (not a fast array,
+/// index out of bounds, or index not an integer).
+/// This avoids 3 separate runtime calls per element access in the hot loop.
+const CV_SENTINEL: u64 = 0; // 0.0 as f64 — not a valid NaN-boxed value for any JS type
+export fn llvm_rt_fast_array_get_el(ctx: *JSContext, arr_cv: u64, idx_cv: u64) callconv(.c) u64 {
+    const arr: CV = @bitCast(arr_cv);
+    const idx: CV = @bitCast(idx_cv);
+
+    // Index must be an integer
+    if (!idx.isInt()) return CV_SENTINEL;
+
+    // Array must be an object
+    if (!arr.isObject()) return CV_SENTINEL;
+
+    // Get JSValue and check fast array
+    const jsv = arr.toJSValue();
+    const result = zig_runtime.getFastArrayDirect(jsv);
+    if (!result.success) return CV_SENTINEL;
+
+    const i_signed = idx.getInt();
+    if (i_signed < 0) return CV_SENTINEL;
+    const i: u32 = @intCast(i_signed);
+    if (i >= result.count) return CV_SENTINEL;
+
+    if (result.values) |vals| {
+        const elem = vals[i];
+        const duped = JSValue.dup(ctx, elem);
+        return @bitCast(CV.fromJSValue(duped));
+    }
+    return CV_SENTINEL;
+}
+
+/// Combined fast array length access: check if fast array, return count as CV int.
+/// Returns CV int on success, or CV_SENTINEL (0) on failure.
+export fn llvm_rt_fast_array_get_len(arr_cv: u64) callconv(.c) u64 {
+    const arr: CV = @bitCast(arr_cv);
+    if (!arr.isObject()) return CV_SENTINEL;
+    const jsv = arr.toJSValue();
+    const result = zig_runtime.getFastArrayDirect(jsv);
+    if (!result.success) return CV_SENTINEL;
+    return @bitCast(CV.newInt(@intCast(result.count)));
+}
+
+/// Stack-based get_array_el: pop index and array, push result.
+/// Implements: val = arr[idx] using JS_GetPropertyUint32.
+/// Returns 0 on success, non-zero on exception.
+export fn llvm_rt_get_array_el(ctx: *JSContext, stack: [*]CV, sp: *usize, locals: [*]CV, var_count: u32) callconv(.c) c_int {
+    _ = locals;
+    _ = var_count;
+    const quickjs = zig_runtime.quickjs;
+    const s = sp.*;
+    if (s < 2) return -1;
+    sp.* = s - 2;
+
+    const arr_cv = stack[s - 2];
+    const idx_cv = stack[s - 1];
+
+    // Get the index as u32
+    const idx_val: u32 = if (idx_cv.isInt()) @as(u32, @intCast(idx_cv.getInt())) else 0;
+
+    // Convert array to JSValue and get property by integer index
+    const arr_jsv = arr_cv.toJSValue();
+    const result = quickjs.JS_GetPropertyUint32(ctx, arr_jsv, idx_val);
+
+    // Free operands
+    CV.freeRef(ctx, arr_cv);
+    CV.freeRef(ctx, idx_cv);
+
+    if (result.isException()) return -1;
+
+    // Push result
+    stack[sp.*] = CV.fromJSValue(result);
+    sp.* += 1;
+    return 0;
+}
+
+/// Stack-based get_array_el2: pop index and array, push array and result.
+/// Returns 0 on success, non-zero on exception.
+export fn llvm_rt_get_array_el2(ctx: *JSContext, stack: [*]CV, sp: *usize, locals: [*]CV, var_count: u32) callconv(.c) c_int {
+    _ = locals;
+    _ = var_count;
+    const quickjs = zig_runtime.quickjs;
+    const s = sp.*;
+    if (s < 2) return -1;
+    sp.* = s - 2;
+
+    const arr_cv = stack[s - 2];
+    const idx_cv = stack[s - 1];
+
+    const idx_val: u32 = if (idx_cv.isInt()) @as(u32, @intCast(idx_cv.getInt())) else 0;
+    const arr_jsv = arr_cv.toJSValue();
+    const result = quickjs.JS_GetPropertyUint32(ctx, arr_jsv, idx_val);
+
+    CV.freeRef(ctx, idx_cv);
+
+    if (result.isException()) {
+        CV.freeRef(ctx, arr_cv);
+        return -1;
+    }
+
+    // Push array back, then result
+    stack[sp.*] = arr_cv; // keep array (don't free)
+    sp.* += 1;
+    stack[sp.*] = CV.fromJSValue(result);
+    sp.* += 1;
+    return 0;
+}
+
+/// Stack-based get_length: pop object, push .length property.
+/// Implements: val = obj.length using JS_GetPropertyStr.
+/// Returns 0 on success, non-zero on exception.
+export fn llvm_rt_get_length(ctx: *JSContext, stack: [*]CV, sp: *usize, locals: [*]CV, var_count: u32) callconv(.c) c_int {
+    _ = locals;
+    _ = var_count;
+    const quickjs = zig_runtime.quickjs;
+    const s = sp.*;
+    if (s < 1) return -1;
+    sp.* = s - 1;
+
+    const obj_cv = stack[s - 1];
+    const obj_jsv = obj_cv.toJSValue();
+    const result = quickjs.JS_GetPropertyStr(ctx, obj_jsv, "length");
+    CV.freeRef(ctx, obj_cv);
+
+    if (result.isException()) return -1;
+
+    stack[sp.*] = CV.fromJSValue(result);
+    sp.* += 1;
+    return 0;
+}
+
+/// add_loc: pop value from stack, add to locals[idx].
+/// Int fast path: both int → newInt(getInt(old) + getInt(value))
+/// Returns 0 on success, non-zero on exception.
+export fn llvm_rt_add_loc(ctx: *JSContext, stack: [*]CV, sp: *usize, locals: [*]CV, idx: u32) callconv(.c) c_int {
+    const s = sp.*;
+    if (s == 0) return 1;
+    sp.* = s - 1;
+    const val = stack[s - 1];
+    const old = locals[idx];
+
+    // Int fast path
+    if (old.isInt() and val.isInt()) {
+        const a: i64 = old.getInt();
+        const b: i64 = val.getInt();
+        const r = a + b;
+        if (r >= std.math.minInt(i32) and r <= std.math.maxInt(i32)) {
+            locals[idx] = CV.newInt(@intCast(r));
+            return 0;
+        }
+        // Overflow to float
+        locals[idx] = CV.newFloat(@floatFromInt(r));
+        return 0;
+    }
+
+    // Slow path: use full addWithCtx (handles strings, floats, etc.)
+    const result = CV.addWithCtx(ctx, old, val);
+    CV.freeRef(ctx, old);
+    CV.freeRef(ctx, val);
+    locals[idx] = result;
+    return 0;
+}
+
+// ============================================================================
 // CompressedValue operations (for JSValue ↔ CV conversion)
 // ============================================================================
 
