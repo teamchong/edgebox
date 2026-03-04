@@ -100,7 +100,8 @@ pub fn getInt32Handler(opcode: Opcode) Int32Handler {
         .add => .{ .pattern = .binary_arith_i32, .op = "+" },
         .sub => .{ .pattern = .binary_arith_i32, .op = "-" },
         .mul => .{ .pattern = .binary_arith_i32, .op = "*" },
-        .div => .{ .pattern = .binary_arith_i32, .op = "/" },
+        // div excluded from int32 tier: JS division can produce float (9/2 = 4.5)
+        .div => .{ .pattern = .unsupported },
         .mod => .{ .pattern = .binary_arith_i32, .op = "%" },
 
         // Bitwise

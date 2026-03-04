@@ -242,7 +242,7 @@ pub export fn frozen_dispatch_lookup(
 
     // Lookup frozen function by name@line_num key
     const func = lookup(func_name) orelse {
-            return 0;
+        return 0;
     };
 
     // Register this function by bytecode pointer for future bytecode-based dispatch

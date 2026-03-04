@@ -150,6 +150,10 @@ pub const Builder = struct {
         return c.LLVMBuildSRem(self.ref, lhs, rhs, name);
     }
 
+    pub fn buildFDiv(self: Builder, lhs: Value, rhs: Value, name: [*:0]const u8) Value {
+        return c.LLVMBuildFDiv(self.ref, lhs, rhs, name);
+    }
+
     pub fn buildNeg(self: Builder, val: Value, name: [*:0]const u8) Value {
         return c.LLVMBuildNeg(self.ref, val, name);
     }
@@ -165,6 +169,10 @@ pub const Builder = struct {
 
     pub fn buildAShr(self: Builder, lhs: Value, rhs: Value, name: [*:0]const u8) Value {
         return c.LLVMBuildAShr(self.ref, lhs, rhs, name);
+    }
+
+    pub fn buildLShr(self: Builder, lhs: Value, rhs: Value, name: [*:0]const u8) Value {
+        return c.LLVMBuildLShr(self.ref, lhs, rhs, name);
     }
 
     pub fn buildAnd(self: Builder, lhs: Value, rhs: Value, name: [*:0]const u8) Value {
@@ -262,6 +270,10 @@ pub const Builder = struct {
 
     pub fn buildSIToFP(self: Builder, val: Value, dest_ty: Type, name: [*:0]const u8) Value {
         return c.LLVMBuildSIToFP(self.ref, val, dest_ty, name);
+    }
+
+    pub fn buildUIToFP(self: Builder, val: Value, dest_ty: Type, name: [*:0]const u8) Value {
+        return c.LLVMBuildUIToFP(self.ref, val, dest_ty, name);
     }
 
     // Phi nodes

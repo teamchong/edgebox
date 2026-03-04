@@ -2264,7 +2264,7 @@ fn emitThinInstruction(
             }
         },
 
-        // ========== Closure Variables (flush vstack before runtime calls) ==========
+        // ========== Closure Variables ==========
         .get_var_ref_check => {
             vstackFlush(tctx);
             // get_var_ref with TDZ check — returns error code (0=ok, 1=exception)
@@ -2275,20 +2275,25 @@ fn emitThinInstruction(
             );
             emitErrorCheck(tctx, err_code);
         },
-        .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3, .get_var_ref,
+        // get_var_ref: vstack-optimized inline with int fast path
+        .get_var_ref0 => emitVstackGetVarRef(tctx, 0),
+        .get_var_ref1 => emitVstackGetVarRef(tctx, 1),
+        .get_var_ref2 => emitVstackGetVarRef(tctx, 2),
+        .get_var_ref3 => emitVstackGetVarRef(tctx, 3),
+        .get_var_ref => emitVstackGetVarRef(tctx, instr.operand.var_ref),
+        // put_var_ref / set_var_ref: flush + runtime (write ops need old-value free)
         .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3, .put_var_ref,
         .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3, .set_var_ref,
         => {
             vstackFlush(tctx);
             const idx: u32 = switch (instr.opcode) {
-                .get_var_ref0, .put_var_ref0, .set_var_ref0 => 0,
-                .get_var_ref1, .put_var_ref1, .set_var_ref1 => 1,
-                .get_var_ref2, .put_var_ref2, .set_var_ref2 => 2,
-                .get_var_ref3, .put_var_ref3, .set_var_ref3 => 3,
+                .put_var_ref0, .set_var_ref0 => 0,
+                .put_var_ref1, .set_var_ref1 => 1,
+                .put_var_ref2, .set_var_ref2 => 2,
+                .put_var_ref3, .set_var_ref3 => 3,
                 else => instr.operand.var_ref,
             };
             const rt_fn = switch (instr.opcode) {
-                .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3, .get_var_ref => rt.get_var_ref,
                 .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3, .put_var_ref => rt.put_var_ref,
                 else => rt.set_var_ref,
             };
@@ -2376,19 +2381,19 @@ fn emitThinInstruction(
         .add => emitVstackArith(tctx, .add, rt.op_add, true), // add needs ctx for string concat
         .sub => emitVstackArith(tctx, .sub, rt.op_sub, false),
         .mul => emitVstackArith(tctx, .mul, rt.op_mul, false),
-        .div => { vstackFlush(tctx); callVoid2(b, rt.op_div, stk, sp); },
-        .mod => { vstackFlush(tctx); callVoid2(b, rt.op_mod, stk, sp); },
+        .div => emitVstackDivMod(tctx, true, rt.op_div),
+        .mod => emitVstackDivMod(tctx, false, rt.op_mod),
         .pow => { vstackFlush(tctx); callVoid2(b, rt.op_pow, stk, sp); },
         .neg => { vstackFlush(tctx); callVoid2(b, rt.op_neg, stk, sp); },
         .plus => { vstackFlush(tctx); callVoid2(b, rt.op_plus, stk, sp); },
 
-        // ========== Bitwise (flush vstack) ==========
-        .@"and" => { vstackFlush(tctx); callVoid2(b, rt.op_band, stk, sp); },
-        .@"or" => { vstackFlush(tctx); callVoid2(b, rt.op_bor, stk, sp); },
-        .xor => { vstackFlush(tctx); callVoid2(b, rt.op_bxor, stk, sp); },
-        .shl => { vstackFlush(tctx); callVoid2(b, rt.op_shl, stk, sp); },
-        .sar => { vstackFlush(tctx); callVoid2(b, rt.op_sar, stk, sp); },
-        .shr => { vstackFlush(tctx); callVoid2(b, rt.op_shr, stk, sp); },
+        // ========== Bitwise (vstack: int fast path on SSA) ==========
+        .@"and" => emitVstackBitwise(tctx, .@"and", rt.op_band),
+        .@"or" => emitVstackBitwise(tctx, .@"or", rt.op_bor),
+        .xor => emitVstackBitwise(tctx, .xor, rt.op_bxor),
+        .shl => emitVstackBitwise(tctx, .shl, rt.op_shl),
+        .sar => emitVstackBitwise(tctx, .sar, rt.op_sar),
+        .shr => emitVstackBitwise(tctx, .shr, rt.op_shr),
         .not => { vstackFlush(tctx); callVoid2(b, rt.op_bnot, stk, sp); },
 
         // ========== Comparison (vstack: int fast path on SSA) ==========
@@ -2396,10 +2401,10 @@ fn emitThinInstruction(
         .lte => emitVstackCmp(tctx, c.LLVMIntSLE, rt.op_lte),
         .gt => emitVstackCmp(tctx, c.LLVMIntSGT, rt.op_gt),
         .gte => emitVstackCmp(tctx, c.LLVMIntSGE, rt.op_gte),
-        .eq => { vstackFlush(tctx); callVoid3(b, rt.op_eq, ctx_p, stk, sp); },
-        .neq => { vstackFlush(tctx); callVoid3(b, rt.op_neq, ctx_p, stk, sp); },
-        .strict_eq => { vstackFlush(tctx); callVoid3(b, rt.op_strict_eq, ctx_p, stk, sp); },
-        .strict_neq => { vstackFlush(tctx); callVoid3(b, rt.op_strict_neq, ctx_p, stk, sp); },
+        .eq => emitVstackEq(tctx, true, rt.op_eq),
+        .neq => emitVstackEq(tctx, false, rt.op_neq),
+        .strict_eq => emitVstackEq(tctx, true, rt.op_strict_eq),
+        .strict_neq => emitVstackEq(tctx, false, rt.op_strict_neq),
 
         // ========== Logical / Type (flush vstack) ==========
         .lnot => { vstackFlush(tctx); callVoid3(b, rt.op_lnot, ctx_p, stk, sp); },
@@ -2474,7 +2479,7 @@ fn emitThinInstruction(
 
         // ========== Property Access (with error check, flush vstack) ==========
         .get_field => {
-            emitThinFieldOp(tctx, rt.op_get_field_ic, instr);
+            emitVstackGetField(tctx, instr);
         },
         .get_field2 => {
             emitThinFieldOp(tctx, rt.op_get_field2_ic, instr);
@@ -3208,6 +3213,506 @@ fn emitVstackCmp(tctx: *ThinCodegenCtx, pred: c.LLVMIntPredicate, rt_slow: llvm.
     var phi_bbs = [_]llvm.BasicBlock{ int_bb, slow_final_bb };
     llvm.addIncoming(phi, &phi_vals, &phi_bbs);
 
+    vstackPush(tctx, phi, true);
+}
+
+/// Emit inline strict_eq/strict_neq/eq/neq with int fast path.
+/// For two int operands, === and == are identical (no type coercion needed).
+/// Slow path calls runtime with ctx (needed for object/string comparison).
+fn emitVstackEq(tctx: *ThinCodegenCtx, comptime is_eq: bool, rt_slow: llvm.Value) void {
+    const b = tctx.builder;
+    const rhs = vstackPop(tctx);
+    const lhs = vstackPop(tctx);
+
+    // Check both are int
+    const a_is_int = inlineIsInt(b, lhs.value);
+    const b_is_int = inlineIsInt(b, rhs.value);
+    const both_int = b.buildAnd(a_is_int, b_is_int, "bothint");
+
+    const current_fn = c.LLVMGetBasicBlockParent(c.LLVMGetInsertBlock(b.ref));
+    const int_bb = llvm.appendBasicBlock(current_fn, "veq_int");
+    const slow_bb = llvm.appendBasicBlock(current_fn, "veq_slow");
+    const merge_bb = llvm.appendBasicBlock(current_fn, "veq_merge");
+    _ = b.buildCondBr(both_int, int_bb, slow_bb);
+
+    // === Int fast path: pure SSA equality ===
+    b.positionAtEnd(int_bb);
+    const a_i32 = inlineGetInt(b, lhs.value);
+    const b_i32 = inlineGetInt(b, rhs.value);
+    const pred: c.LLVMIntPredicate = if (is_eq) c.LLVMIntEQ else c.LLVMIntNE;
+    const cmp_result = b.buildICmp(pred, a_i32, b_i32, "eq");
+    const int_result = b.buildSelect(
+        cmp_result,
+        llvm.constInt(llvm.i64Type(), CV_TRUE, false),
+        llvm.constInt(llvm.i64Type(), CV_FALSE, false),
+        "eqv",
+    );
+    _ = b.buildBr(merge_bb);
+
+    // === Slow path: write operands to physical stack, call runtime (needs ctx) ===
+    b.positionAtEnd(slow_bb);
+    {
+        const lhs_val = if (!lhs.owned) inlineDupRef(tctx, lhs.value) else lhs.value;
+        const rhs_val = if (!rhs.owned) inlineDupRef(tctx, rhs.value) else rhs.value;
+        const sp_val = inlineLoadSp(b, tctx.sp_ptr);
+        const a_slot = inlineStackSlot(b, tctx.stack_ptr, sp_val);
+        _ = b.buildStore(lhs_val, a_slot);
+        const b_slot_idx = b.buildAdd(sp_val, llvm.constInt64(1), "bsi");
+        const b_slot = inlineStackSlot(b, tctx.stack_ptr, b_slot_idx);
+        _ = b.buildStore(rhs_val, b_slot);
+        const sp_plus2 = b.buildAdd(sp_val, llvm.constInt64(2), "sp2");
+        inlineStoreSp(b, tctx.sp_ptr, sp_plus2);
+    }
+    callVoid3(b, rt_slow, tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr);
+    // Pop result from physical stack
+    const slow_sp = inlineLoadSp(b, tctx.sp_ptr);
+    const slow_nsp = b.buildSub(slow_sp, llvm.constInt64(1), "snsp");
+    const slow_slot = inlineStackSlot(b, tctx.stack_ptr, slow_nsp);
+    const slow_result = b.buildLoad(llvm.i64Type(), slow_slot, "sres");
+    inlineStoreSp(b, tctx.sp_ptr, slow_nsp);
+    const slow_final_bb = c.LLVMGetInsertBlock(b.ref);
+    _ = b.buildBr(merge_bb);
+
+    // Merge
+    b.positionAtEnd(merge_bb);
+    const phi = b.buildPhi(llvm.i64Type(), "eqres");
+    var phi_vals = [_]llvm.Value{ int_result, slow_result };
+    var phi_bbs = [_]llvm.BasicBlock{ int_bb, slow_final_bb };
+    llvm.addIncoming(phi, &phi_vals, &phi_bbs);
+
+    vstackPush(tctx, phi, true);
+}
+
+/// Emit inline bitwise op with int fast path.
+/// JS bitwise ops convert operands to i32, so for int CVs we extract the i32,
+/// apply the native op, and pack back as CV int. Result always fits i32.
+/// shr (>>>) is unsigned: result is u32, may exceed i32 range → use i64.
+fn emitVstackBitwise(tctx: *ThinCodegenCtx, comptime op: enum { @"and", @"or", xor, shl, sar, shr }, rt_slow: llvm.Value) void {
+    const b = tctx.builder;
+    const rhs = vstackPop(tctx);
+    const lhs = vstackPop(tctx);
+
+    // Check both are int
+    const a_is_int = inlineIsInt(b, lhs.value);
+    const b_is_int = inlineIsInt(b, rhs.value);
+    const both_int = b.buildAnd(a_is_int, b_is_int, "bothint");
+
+    const current_fn = c.LLVMGetBasicBlockParent(c.LLVMGetInsertBlock(b.ref));
+    const int_bb = llvm.appendBasicBlock(current_fn, "vbw_int");
+    const slow_bb = llvm.appendBasicBlock(current_fn, "vbw_slow");
+    const merge_bb = llvm.appendBasicBlock(current_fn, "vbw_merge");
+    _ = b.buildCondBr(both_int, int_bb, slow_bb);
+
+    // === Int fast path ===
+    b.positionAtEnd(int_bb);
+    const a_i32 = inlineGetInt(b, lhs.value);
+    const b_i32 = inlineGetInt(b, rhs.value);
+    const int_result = switch (op) {
+        .@"and" => inlineNewInt(b, b.buildAnd(a_i32, b_i32, "band")),
+        .@"or" => inlineNewInt(b, b.buildOr(a_i32, b_i32, "bor")),
+        .xor => inlineNewInt(b, b.buildXor(a_i32, b_i32, "bxor")),
+        .shl => blk: {
+            // JS: (a << (b & 31)) — result is i32
+            const shift = b.buildAnd(b_i32, llvm.constInt(llvm.i32Type(), 31, false), "shamt");
+            break :blk inlineNewInt(b, b.buildShl(a_i32, shift, "bshl"));
+        },
+        .sar => blk: {
+            // JS: (a >> (b & 31)) — arithmetic right shift, result is i32
+            const shift = b.buildAnd(b_i32, llvm.constInt(llvm.i32Type(), 31, false), "shamt");
+            break :blk inlineNewInt(b, b.buildAShr(a_i32, shift, "bsar"));
+        },
+        .shr => blk: {
+            // JS: (a >>> (b & 31)) — unsigned right shift, result is u32 (may not fit i32)
+            // Convert to u32, shift, result may be > 0x7fffffff → use float
+            const shift = b.buildAnd(b_i32, llvm.constInt(llvm.i32Type(), 31, false), "shamt");
+            const result_u32 = b.buildLShr(a_i32, shift, "bshr");
+            // Check if result fits in i32 (bit 31 clear)
+            const is_neg = b.buildICmp(c.LLVMIntSLT, result_u32, llvm.constInt(llvm.i32Type(), 0, false), "isneg");
+            const int_val = inlineNewInt(b, result_u32);
+            // If bit 31 set, need to represent as positive float
+            const as_u64 = b.buildZExt(result_u32, llvm.i64Type(), "u64");
+            const as_f64 = b.buildUIToFP(as_u64, llvm.doubleType(), "f64");
+            const float_bits = b.buildBitCast(as_f64, llvm.i64Type(), "fbits");
+            break :blk b.buildSelect(is_neg, float_bits, int_val, "shrv");
+        },
+    };
+    _ = b.buildBr(merge_bb);
+
+    // === Slow path ===
+    b.positionAtEnd(slow_bb);
+    {
+        const lhs_val = if (!lhs.owned) inlineDupRef(tctx, lhs.value) else lhs.value;
+        const rhs_val = if (!rhs.owned) inlineDupRef(tctx, rhs.value) else rhs.value;
+        const sp_val = inlineLoadSp(b, tctx.sp_ptr);
+        const a_slot = inlineStackSlot(b, tctx.stack_ptr, sp_val);
+        _ = b.buildStore(lhs_val, a_slot);
+        const b_slot_idx = b.buildAdd(sp_val, llvm.constInt64(1), "bsi");
+        const b_slot = inlineStackSlot(b, tctx.stack_ptr, b_slot_idx);
+        _ = b.buildStore(rhs_val, b_slot);
+        const sp_plus2 = b.buildAdd(sp_val, llvm.constInt64(2), "sp2");
+        inlineStoreSp(b, tctx.sp_ptr, sp_plus2);
+    }
+    callVoid2(b, rt_slow, tctx.stack_ptr, tctx.sp_ptr);
+    const slow_sp = inlineLoadSp(b, tctx.sp_ptr);
+    const slow_nsp = b.buildSub(slow_sp, llvm.constInt64(1), "snsp");
+    const slow_slot = inlineStackSlot(b, tctx.stack_ptr, slow_nsp);
+    const slow_result = b.buildLoad(llvm.i64Type(), slow_slot, "sres");
+    inlineStoreSp(b, tctx.sp_ptr, slow_nsp);
+    const slow_final_bb = c.LLVMGetInsertBlock(b.ref);
+    _ = b.buildBr(merge_bb);
+
+    // Merge
+    b.positionAtEnd(merge_bb);
+    const phi = b.buildPhi(llvm.i64Type(), "bwres");
+    var phi_vals = [_]llvm.Value{ int_result, slow_result };
+    var phi_bbs = [_]llvm.BasicBlock{ int_bb, slow_final_bb };
+    llvm.addIncoming(phi, &phi_vals, &phi_bbs);
+
+    vstackPush(tctx, phi, true);
+}
+
+/// Emit vstack div/mod with int fast path on SSA values.
+/// div: if both int and result is exact integer (a % b == 0), return int; otherwise float.
+/// mod: if both int and b != 0, return a % b as int.
+/// Slow path flushes to physical stack and calls runtime.
+fn emitVstackDivMod(tctx: *ThinCodegenCtx, comptime is_div: bool, rt_slow: llvm.Value) void {
+    const b = tctx.builder;
+    const rhs = vstackPop(tctx);
+    const lhs = vstackPop(tctx);
+
+    // Check both are int
+    const a_is_int = inlineIsInt(b, lhs.value);
+    const b_is_int = inlineIsInt(b, rhs.value);
+    const both_int = b.buildAnd(a_is_int, b_is_int, "bothint");
+
+    const current_fn = c.LLVMGetBasicBlockParent(c.LLVMGetInsertBlock(b.ref));
+    const int_bb = llvm.appendBasicBlock(current_fn, "vdm_int");
+    const slow_bb = llvm.appendBasicBlock(current_fn, "vdm_slow");
+    const merge_bb = llvm.appendBasicBlock(current_fn, "vdm_merge");
+    _ = b.buildCondBr(both_int, int_bb, slow_bb);
+
+    // === Int fast path ===
+    b.positionAtEnd(int_bb);
+    const a_i32 = inlineGetInt(b, lhs.value);
+    const b_i32 = inlineGetInt(b, rhs.value);
+    const zero = llvm.constInt(llvm.i32Type(), 0, false);
+
+    // Check divisor != 0
+    const not_zero = b.buildICmp(c.LLVMIntNE, b_i32, zero, "nz");
+    const int_nz_bb = llvm.appendBasicBlock(current_fn, "vdm_nz");
+    _ = b.buildCondBr(not_zero, int_nz_bb, slow_bb);
+
+    b.positionAtEnd(int_nz_bb);
+    if (is_div) {
+        // div: check if exact (a % b == 0) → return int, else float
+        const rem = b.buildSRem(a_i32, b_i32, "rem");
+        const is_exact = b.buildICmp(c.LLVMIntEQ, rem, zero, "exact");
+        const int_exact_bb = llvm.appendBasicBlock(current_fn, "vdm_exact");
+        const float_bb = llvm.appendBasicBlock(current_fn, "vdm_float");
+        _ = b.buildCondBr(is_exact, int_exact_bb, float_bb);
+
+        // Exact integer division
+        b.positionAtEnd(int_exact_bb);
+        const quot = b.buildSDiv(a_i32, b_i32, "quot");
+        const int_cv = inlineNewInt(b, quot);
+        _ = b.buildBr(merge_bb);
+
+        // Float division
+        b.positionAtEnd(float_bb);
+        const a_f64 = b.buildSIToFP(a_i32, llvm.doubleType(), "af");
+        const b_f64 = b.buildSIToFP(b_i32, llvm.doubleType(), "bf");
+        const div_f64 = b.buildFDiv(a_f64, b_f64, "divf");
+        const float_bits = b.buildBitCast(div_f64, llvm.i64Type(), "fbits");
+        _ = b.buildBr(merge_bb);
+
+        // Slow path
+        b.positionAtEnd(slow_bb);
+        {
+            const lhs_val = if (!lhs.owned) inlineDupRef(tctx, lhs.value) else lhs.value;
+            const rhs_val = if (!rhs.owned) inlineDupRef(tctx, rhs.value) else rhs.value;
+            const sp_val = inlineLoadSp(b, tctx.sp_ptr);
+            const a_slot = inlineStackSlot(b, tctx.stack_ptr, sp_val);
+            _ = b.buildStore(lhs_val, a_slot);
+            const b_slot_idx = b.buildAdd(sp_val, llvm.constInt64(1), "bsi");
+            const b_slot = inlineStackSlot(b, tctx.stack_ptr, b_slot_idx);
+            _ = b.buildStore(rhs_val, b_slot);
+            const sp_plus2 = b.buildAdd(sp_val, llvm.constInt64(2), "sp2");
+            inlineStoreSp(b, tctx.sp_ptr, sp_plus2);
+        }
+        callVoid2(b, rt_slow, tctx.stack_ptr, tctx.sp_ptr);
+        const slow_sp = inlineLoadSp(b, tctx.sp_ptr);
+        const slow_nsp = b.buildSub(slow_sp, llvm.constInt64(1), "snsp");
+        const slow_slot = inlineStackSlot(b, tctx.stack_ptr, slow_nsp);
+        const slow_result = b.buildLoad(llvm.i64Type(), slow_slot, "sres");
+        inlineStoreSp(b, tctx.sp_ptr, slow_nsp);
+        const slow_final_bb = c.LLVMGetInsertBlock(b.ref);
+        _ = b.buildBr(merge_bb);
+
+        // Merge: phi from exact-int / float / slow paths
+        b.positionAtEnd(merge_bb);
+        const phi = b.buildPhi(llvm.i64Type(), "dmres");
+        var phi_vals = [_]llvm.Value{ int_cv, float_bits, slow_result };
+        var phi_bbs = [_]llvm.BasicBlock{ int_exact_bb, float_bb, slow_final_bb };
+        llvm.addIncoming(phi, &phi_vals, &phi_bbs);
+        vstackPush(tctx, phi, true);
+    } else {
+        // mod: a % b is always int when both operands are int and b != 0
+        const rem = b.buildSRem(a_i32, b_i32, "rem");
+        const int_cv = inlineNewInt(b, rem);
+        _ = b.buildBr(merge_bb);
+
+        // Slow path
+        b.positionAtEnd(slow_bb);
+        {
+            const lhs_val = if (!lhs.owned) inlineDupRef(tctx, lhs.value) else lhs.value;
+            const rhs_val = if (!rhs.owned) inlineDupRef(tctx, rhs.value) else rhs.value;
+            const sp_val = inlineLoadSp(b, tctx.sp_ptr);
+            const a_slot = inlineStackSlot(b, tctx.stack_ptr, sp_val);
+            _ = b.buildStore(lhs_val, a_slot);
+            const b_slot_idx = b.buildAdd(sp_val, llvm.constInt64(1), "bsi");
+            const b_slot = inlineStackSlot(b, tctx.stack_ptr, b_slot_idx);
+            _ = b.buildStore(rhs_val, b_slot);
+            const sp_plus2 = b.buildAdd(sp_val, llvm.constInt64(2), "sp2");
+            inlineStoreSp(b, tctx.sp_ptr, sp_plus2);
+        }
+        callVoid2(b, rt_slow, tctx.stack_ptr, tctx.sp_ptr);
+        const slow_sp = inlineLoadSp(b, tctx.sp_ptr);
+        const slow_nsp = b.buildSub(slow_sp, llvm.constInt64(1), "snsp");
+        const slow_slot = inlineStackSlot(b, tctx.stack_ptr, slow_nsp);
+        const slow_result = b.buildLoad(llvm.i64Type(), slow_slot, "sres");
+        inlineStoreSp(b, tctx.sp_ptr, slow_nsp);
+        const slow_final_bb = c.LLVMGetInsertBlock(b.ref);
+        _ = b.buildBr(merge_bb);
+
+        // Merge: phi from int / slow paths
+        b.positionAtEnd(merge_bb);
+        const phi = b.buildPhi(llvm.i64Type(), "dmres");
+        var phi_vals = [_]llvm.Value{ int_cv, slow_result };
+        var phi_bbs = [_]llvm.BasicBlock{ int_nz_bb, slow_final_bb };
+        llvm.addIncoming(phi, &phi_vals, &phi_bbs);
+        vstackPush(tctx, phi, true);
+    }
+}
+
+/// Inline get_var_ref: load closure variable with int fast path.
+/// JSVarRef layout: offset 24 = pvalue (*JSValue).
+/// Native JSValue layout: offset 0 = payload (i64), offset 8 = tag (i64).
+/// Int fast path: tag == 0 (JS_TAG_INT) → extract i32 payload, make CV int (no dupRef needed).
+/// Non-int path: call llvm_rt_jsvalue_to_cv for proper dupRef + CV conversion.
+fn emitVstackGetVarRef(tctx: *ThinCodegenCtx, idx: u32) void {
+    const b = tctx.builder;
+    const i64t = llvm.i64Type();
+    const i32t = llvm.i32Type();
+    const ptr = llvm.ptrType();
+
+    const current_fn = c.LLVMGetBasicBlockParent(c.LLVMGetInsertBlock(b.ref));
+    const bounds_ok_bb = llvm.appendBasicBlock(current_fn, "vr_bok");
+    const int_bb = llvm.appendBasicBlock(current_fn, "vr_int");
+    const nonint_bb = llvm.appendBasicBlock(current_fn, "vr_ni");
+    const undef_bb = llvm.appendBasicBlock(current_fn, "vr_undef");
+    const merge_bb = llvm.appendBasicBlock(current_fn, "vr_merge");
+
+    // Bounds check: var_refs != null && idx < closure_var_count
+    const var_refs = tctx.var_refs_param;
+    const null_ptr = llvm.constNull(ptr);
+    const not_null = b.buildICmp(c.LLVMIntNE, var_refs, null_ptr, "vrnull");
+    const idx_val = llvm.constInt(i32t, idx, false);
+    const idx_ok = b.buildICmp(c.LLVMIntULT, idx_val, tctx.closure_var_count_param, "vridx");
+    const both_ok = b.buildAnd(not_null, idx_ok, "vrbok");
+    _ = b.buildCondBr(both_ok, bounds_ok_bb, undef_bb);
+
+    // Load var_refs[idx] → *JSVarRef
+    b.positionAtEnd(bounds_ok_bb);
+    const idx_i64 = b.buildZExt(idx_val, i64t, "vri64");
+    const var_ref_slot = b.buildGEP(ptr, var_refs, &.{idx_i64}, "vrslot");
+    const var_ref = b.buildLoad(ptr, var_ref_slot, "vref");
+
+    // Load pvalue at offset 24 of JSVarRef
+    const pvalue_addr = b.buildGEP(llvm.i8Type(), var_ref, &.{llvm.constInt64(24)}, "pvaddr");
+    const pvalue = b.buildLoad(ptr, pvalue_addr, "pval");
+
+    // Load JSValue tag at offset 8 from pvalue (native: {payload i64, tag i64})
+    const tag_addr = b.buildGEP(llvm.i8Type(), pvalue, &.{llvm.constInt64(8)}, "taddr");
+    const tag = b.buildLoad(i64t, tag_addr, "vtag");
+    const is_int = b.buildICmp(c.LLVMIntEQ, tag, llvm.constInt64(0), "vrint"); // JS_TAG_INT = 0
+    _ = b.buildCondBr(is_int, int_bb, nonint_bb);
+
+    // Int fast path: load i32 payload, make CV int (no dupRef for ints)
+    b.positionAtEnd(int_bb);
+    const payload = b.buildLoad(i32t, pvalue, "vpay");
+    const int_cv = inlineNewInt(b, payload);
+    _ = b.buildBr(merge_bb);
+
+    // Non-int path: call llvm_rt_jsvalue_to_cv(ctx, pvalue, 0) for dupRef + conversion
+    b.positionAtEnd(nonint_bb);
+    const nonint_cv = b.buildCall(
+        llvm.functionType(i64t, &.{ ptr, ptr, i32t }, false),
+        tctx.rt.jsvalue_to_cv, &.{ tctx.ctx_param, pvalue, llvm.constInt(i32t, 0, false) }, "nicv",
+    );
+    const nonint_final_bb = c.LLVMGetInsertBlock(b.ref);
+    _ = b.buildBr(merge_bb);
+
+    // Bounds-fail path: return CV_UNDEFINED
+    b.positionAtEnd(undef_bb);
+    const undef_cv = llvm.constInt(i64t, CV_UNDEFINED, false);
+    _ = b.buildBr(merge_bb);
+
+    // Merge all paths
+    b.positionAtEnd(merge_bb);
+    const phi = b.buildPhi(i64t, "vrres");
+    var phi_vals = [_]llvm.Value{ int_cv, nonint_cv, undef_cv };
+    var phi_bbs = [_]llvm.BasicBlock{ int_bb, nonint_final_bb, undef_bb };
+    llvm.addIncoming(phi, &phi_vals, &phi_bbs);
+    vstackPush(tctx, phi, true);
+}
+
+/// Inline get_field with IC (Inline Cache) hit path.
+/// On IC hit: load shape from object, compare to cached shape → direct property GEP.
+/// On IC miss: fall back to runtime op_get_field_ic (which populates the cache).
+///
+/// CV object encoding (native x86_64):
+///   QNAN|TAG_PTR|addr = 0x7FFD_xxxx_xxxx_xxxx, ptr in lower 44 bits
+/// JSObject layout: shape at offset 24, prop base at offset 32
+/// IC slot layout: {shape_ptr, offset_u32, atom_u32} (16 bytes)
+/// JSProperty layout: 16 bytes each, JSValue at offset 0
+fn emitVstackGetField(tctx: *ThinCodegenCtx, instr: Instruction) void {
+    const b = tctx.builder;
+    const i64t = llvm.i64Type();
+    const i32t = llvm.i32Type();
+    const ptr = llvm.ptrType();
+
+    // Get atom string for this field access
+    const atom_idx = instr.operand.atom;
+    const name = getAtomStringStatic(tctx.func, atom_idx) orelse return;
+
+    // Create global string constant for field name
+    const ic_idx = tctx.nextIcSlot();
+    var str_label_buf: [64]u8 = undefined;
+    const str_label = std.fmt.bufPrintZ(&str_label_buf, ".field_{d}", .{ic_idx}) catch ".field";
+    const str_ptr = c.LLVMBuildGlobalStringPtr(b.ref, name, str_label.ptr);
+
+    // IC slot: global {ptr, u32, u32} = {shape, offset, atom}
+    var ic_fields = [_]llvm.Type{ ptr, i32t, i32t };
+    const ic_ty = c.LLVMStructType(&ic_fields, ic_fields.len, 0);
+    var ic_name_buf: [64]u8 = undefined;
+    const ic_name = std.fmt.bufPrintZ(&ic_name_buf, ".ic_{d}", .{ic_idx}) catch ".ic";
+    const ic_global = c.LLVMAddGlobal(tctx.module.ref, ic_ty, ic_name.ptr);
+    c.LLVMSetInitializer(ic_global, c.LLVMConstNull(ic_ty));
+    c.LLVMSetLinkage(ic_global, c.LLVMInternalLinkage);
+
+    // Pop obj from vstack
+    const obj_entry = vstackPop(tctx);
+    const obj_cv = obj_entry.value;
+
+    const current_fn = c.LLVMGetBasicBlockParent(c.LLVMGetInsertBlock(b.ref));
+    const shape_bb = llvm.appendBasicBlock(current_fn, "gf_shape");
+    const hit_bb = llvm.appendBasicBlock(current_fn, "gf_hit");
+    const hit_int_bb = llvm.appendBasicBlock(current_fn, "gf_hint");
+    const hit_ni_bb = llvm.appendBasicBlock(current_fn, "gf_hni");
+    const miss_bb = llvm.appendBasicBlock(current_fn, "gf_miss");
+    const merge_bb = llvm.appendBasicBlock(current_fn, "gf_merge");
+
+    // Check if obj is a CV object: (cv & 0xFFFFF00000000000) == 0x7FFD000000000000
+    // This checks TAG_PTR + PTR_SUBTYPE_OBJECT (subtype 0)
+    const CV_OBJ_MASK: u64 = 0xFFFFF00000000000;
+    const CV_OBJ_TAG: u64 = 0x7FFD000000000000; // QNAN | TAG_PTR | SUBTYPE_OBJECT(0)
+    const masked = b.buildAnd(obj_cv, llvm.constInt(i64t, CV_OBJ_MASK, false), "gfmask");
+    const is_obj = b.buildICmp(c.LLVMIntEQ, masked, llvm.constInt(i64t, CV_OBJ_TAG, false), "gfobj");
+    _ = b.buildCondBr(is_obj, shape_bb, miss_bb);
+
+    // Shape check: load obj shape, compare to IC cached shape
+    b.positionAtEnd(shape_bb);
+    // Extract object pointer from CV (lower 44 bits)
+    const CV_PTR_ADDR_MASK: u64 = 0x00000FFFFFFFFFFF;
+    const obj_addr = b.buildAnd(obj_cv, llvm.constInt(i64t, CV_PTR_ADDR_MASK, false), "oaddr");
+    const obj_ptr = b.buildIntToPtr(obj_addr, ptr, "optr");
+    // Load shape at offset 24
+    const shape_addr = b.buildGEP(llvm.i8Type(), obj_ptr, &.{llvm.constInt64(24)}, "saddr");
+    const shape = b.buildLoad(ptr, shape_addr, "shape");
+    // Load cached shape from IC slot (first field)
+    const cached_shape = b.buildLoad(ptr, ic_global, "cshape");
+    // Check: cached_shape != null && shape == cached_shape
+    const null_ptr = llvm.constNull(ptr);
+    const cache_valid = b.buildICmp(c.LLVMIntNE, cached_shape, null_ptr, "cvalid");
+    const shape_match = b.buildICmp(c.LLVMIntEQ, shape, cached_shape, "smatch");
+    const ic_hit = b.buildAnd(cache_valid, shape_match, "ichit");
+    _ = b.buildCondBr(ic_hit, hit_bb, miss_bb);
+
+    // IC HIT: direct property access
+    b.positionAtEnd(hit_bb);
+    // Load prop_base at offset 32
+    const pbase_addr = b.buildGEP(llvm.i8Type(), obj_ptr, &.{llvm.constInt64(32)}, "pbaddr");
+    const prop_base = b.buildLoad(ptr, pbase_addr, "pbase");
+    // Load offset from IC slot (second field at byte 8)
+    const off_addr = b.buildGEP(llvm.i8Type(), ic_global, &.{llvm.constInt64(8)}, "offaddr");
+    const offset = b.buildLoad(i32t, off_addr, "off");
+    // GEP to property: prop_base + offset * 16 (each JSProperty is 16 bytes)
+    const off_ext = b.buildZExt(offset, i64t, "offext");
+    const byte_off = b.buildMul(off_ext, llvm.constInt64(16), "boff");
+    const prop_addr = b.buildGEP(llvm.i8Type(), prop_base, &.{byte_off}, "paddr");
+    // Load JSValue tag at prop_addr + 8 (native: {payload i64, tag i64})
+    const tag_addr = b.buildGEP(llvm.i8Type(), prop_addr, &.{llvm.constInt64(8)}, "taddr");
+    const tag = b.buildLoad(i64t, tag_addr, "ptag");
+    const is_int = b.buildICmp(c.LLVMIntEQ, tag, llvm.constInt64(0), "pint");
+    _ = b.buildCondBr(is_int, hit_int_bb, hit_ni_bb);
+
+    // Hit + int: load i32 payload, make CV int, free old obj
+    b.positionAtEnd(hit_int_bb);
+    const payload = b.buildLoad(i32t, prop_addr, "ppay");
+    const int_cv = inlineNewInt(b, payload);
+    // Free old obj CV (owned entries need freeRef, borrowed skip)
+    if (obj_entry.owned) inlineFreeRef(tctx, obj_cv);
+    const int_final_bb = c.LLVMGetInsertBlock(b.ref);
+    _ = b.buildBr(merge_bb);
+
+    // Hit + non-int: call jsvalue_to_cv for dup + conversion, free old obj
+    b.positionAtEnd(hit_ni_bb);
+    const ni_cv = b.buildCall(
+        llvm.functionType(i64t, &.{ ptr, ptr, i32t }, false),
+        tctx.rt.jsvalue_to_cv, &.{ tctx.ctx_param, prop_addr, llvm.constInt(i32t, 0, false) }, "nicv",
+    );
+    if (obj_entry.owned) inlineFreeRef(tctx, obj_cv);
+    const ni_final_bb = c.LLVMGetInsertBlock(b.ref);
+    _ = b.buildBr(merge_bb);
+
+    // IC MISS: write obj to physical stack, call runtime, read result back
+    b.positionAtEnd(miss_bb);
+    {
+        // Write obj CV to physical stack (dup if borrowed, runtime will free it)
+        const obj_to_store = if (!obj_entry.owned) inlineDupRef(tctx, obj_cv) else obj_cv;
+        const sp_val = inlineLoadSp(b, tctx.sp_ptr);
+        const slot = inlineStackSlot(b, tctx.stack_ptr, sp_val);
+        _ = b.buildStore(obj_to_store, slot);
+        const sp_plus1 = b.buildAdd(sp_val, llvm.constInt64(1), "sp1");
+        inlineStoreSp(b, tctx.sp_ptr, sp_plus1);
+    }
+    // Call runtime: op_get_field_ic(ctx, stack, sp, ic, name) -> i32 error
+    const err_code = b.buildCall(
+        llvm.functionType(i32t, &.{ ptr, ptr, ptr, ptr, ptr }, false),
+        tctx.rt.op_get_field_ic, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, ic_global, str_ptr }, "gferr",
+    );
+    // Error check: on exception, branch to cleanup
+    const is_err = b.buildICmp(c.LLVMIntNE, err_code, llvm.constInt(i32t, 0, false), "gfe");
+    const miss_ok_bb = llvm.appendBasicBlock(current_fn, "gf_mok");
+    _ = b.buildCondBr(is_err, tctx.cleanup_bb, miss_ok_bb);
+
+    b.positionAtEnd(miss_ok_bb);
+    // Runtime replaced stack[sp-1] with result, sp unchanged
+    // Load result and "pop" from physical stack
+    const miss_sp = inlineLoadSp(b, tctx.sp_ptr);
+    const miss_nsp = b.buildSub(miss_sp, llvm.constInt64(1), "mnsp");
+    const miss_slot = inlineStackSlot(b, tctx.stack_ptr, miss_nsp);
+    const miss_result = b.buildLoad(i64t, miss_slot, "mres");
+    inlineStoreSp(b, tctx.sp_ptr, miss_nsp);
+    const miss_final_bb = c.LLVMGetInsertBlock(b.ref);
+    _ = b.buildBr(merge_bb);
+
+    // Merge all paths
+    b.positionAtEnd(merge_bb);
+    const phi = b.buildPhi(i64t, "gfres");
+    var phi_vals = [_]llvm.Value{ int_cv, ni_cv, miss_result };
+    var phi_bbs = [_]llvm.BasicBlock{ int_final_bb, ni_final_bb, miss_final_bb };
+    llvm.addIncoming(phi, &phi_vals, &phi_bbs);
     vstackPush(tctx, phi, true);
 }
 
