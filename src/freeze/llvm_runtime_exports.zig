@@ -981,16 +981,18 @@ export fn llvm_rt_post_inc(stack: [*]CV, sp: *usize) callconv(.c) void {
     const v = stack[sp.* - 1];
     if (v.isInt()) {
         const n = v.getInt();
+        // QuickJS post_inc: sp[-1] = old value, sp[0] = incremented value, sp++
+        // After: stack has [old, new] with new on top
         if (n < 0x7fffffff) {
-            stack[sp.* - 1] = CV.newInt(n + 1);
+            stack[sp.*] = CV.newInt(n + 1);
         } else {
-            stack[sp.* - 1] = CV.newFloat(@as(f64, @floatFromInt(n)) + 1.0);
+            stack[sp.*] = CV.newFloat(@as(f64, @floatFromInt(n)) + 1.0);
         }
-        stack[sp.*] = v; // push old value
+        // sp[-1] keeps old value (v) unchanged
         sp.* += 1;
     } else if (v.isFloat()) {
-        stack[sp.* - 1] = CV.newFloat(v.getFloat() + 1.0);
-        stack[sp.*] = v;
+        stack[sp.*] = CV.newFloat(v.getFloat() + 1.0);
+        // sp[-1] keeps old value (v) unchanged
         sp.* += 1;
     }
 }
@@ -999,16 +1001,15 @@ export fn llvm_rt_post_dec(stack: [*]CV, sp: *usize) callconv(.c) void {
     const v = stack[sp.* - 1];
     if (v.isInt()) {
         const n = v.getInt();
+        // QuickJS post_dec: sp[-1] = old value, sp[0] = decremented value, sp++
         if (n > -0x7fffffff) {
-            stack[sp.* - 1] = CV.newInt(n - 1);
+            stack[sp.*] = CV.newInt(n - 1);
         } else {
-            stack[sp.* - 1] = CV.newFloat(@as(f64, @floatFromInt(n)) - 1.0);
+            stack[sp.*] = CV.newFloat(@as(f64, @floatFromInt(n)) - 1.0);
         }
-        stack[sp.*] = v;
         sp.* += 1;
     } else if (v.isFloat()) {
-        stack[sp.* - 1] = CV.newFloat(v.getFloat() - 1.0);
-        stack[sp.*] = v;
+        stack[sp.*] = CV.newFloat(v.getFloat() - 1.0);
         sp.* += 1;
     }
 }
