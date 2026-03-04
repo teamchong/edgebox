@@ -23,12 +23,21 @@ const zig_hotpath_codegen = @import("zig_hotpath_codegen.zig");
 const zig_codegen_full = @import("zig_codegen_full.zig");
 const zig_codegen_relooper = @import("zig_codegen_relooper.zig");
 const llvm_codegen = @import("llvm_codegen.zig");
+const call_profile = @import("call_profile.zig");
 
 const JSValue = jsvalue.JSValue;
 const JSContext = jsvalue.JSContext;
 const FrozenFn = jsvalue.FrozenFn;
 const FrozenEntry = jsvalue.FrozenEntry;
 const Allocator = std.mem.Allocator;
+
+/// Look up a function's call count in the PGO profile map.
+/// Key format matches call_profile.zig dump: "name@line_num"
+fn lookupProfile(map: *const std.StringHashMapUnmanaged(u64), name: []const u8, line_num: u32) u64 {
+    var buf: [256]u8 = undefined;
+    const key = std.fmt.bufPrint(&buf, "{s}@{d}", .{ name, line_num }) catch return 0;
+    return map.get(key) orelse 0;
+}
 
 /// Sanitize a name to be a valid Zig identifier
 /// Replaces colons and other invalid characters with underscores
@@ -734,8 +743,6 @@ pub fn generateModuleZigShardedWithBackend(
 ) !ShardedOutput {
     _ = module_name;
     _ = manifest_json;
-    _ = profile_path;
-
     // Collect all freezable functions
     const GeneratedFunc = struct {
         func: AnalyzedFunction,
@@ -752,11 +759,66 @@ pub fn generateModuleZigShardedWithBackend(
         try generated_all.append(allocator, .{ .func = func, .idx = idx });
     }
 
-    // Selective freezing: limit to top N functions if requested
+    // PGO: sort functions by profile hotness so top-N truncation keeps the hottest
+    if (profile_path) |pp| {
+        if (call_profile.parseProfileJson(allocator, pp)) |pm_val| {
+            var pm = pm_val;
+            defer {
+                var it = pm.iterator();
+                while (it.next()) |kv| allocator.free(kv.key_ptr.*);
+                pm.deinit(allocator);
+            }
+
+            // Sort by descending call count (hottest first)
+            const SortCtx = struct {
+                map: *const std.StringHashMapUnmanaged(u64),
+            };
+            const ctx = SortCtx{ .map = &pm };
+            std.mem.sort(GeneratedFunc, generated_all.items, ctx, struct {
+                fn lessThan(c: SortCtx, a: GeneratedFunc, b: GeneratedFunc) bool {
+                    const a_count = lookupProfile(c.map, a.func.name, a.func.line_num);
+                    const b_count = lookupProfile(c.map, b.func.name, b.func.line_num);
+                    return a_count > b_count; // descending: hottest first
+                }
+            }.lessThan);
+
+            // Print PGO statistics
+            var total_calls: u64 = 0;
+            for (generated_all.items) |gf| {
+                total_calls += lookupProfile(&pm, gf.func.name, gf.func.line_num);
+            }
+
+            const effective_limit = if (max_functions > 0 and generated_all.items.len > max_functions)
+                max_functions
+            else
+                generated_all.items.len;
+
+            var hot_calls: u64 = 0;
+            for (generated_all.items[0..effective_limit]) |gf| {
+                hot_calls += lookupProfile(&pm, gf.func.name, gf.func.line_num);
+            }
+
+            if (total_calls > 0) {
+                const pct = @as(f64, @floatFromInt(hot_calls)) / @as(f64, @floatFromInt(total_calls)) * 100.0;
+                std.debug.print("[freeze-pgo] Sorted {d} functions by profile hotness\n", .{generated_all.items.len});
+                std.debug.print("[freeze-pgo] Top {d} functions cover {d:.1}% of total calls ({d} / {d})\n", .{ effective_limit, pct, hot_calls, total_calls });
+                if (effective_limit > 0) {
+                    const coldest = generated_all.items[effective_limit - 1];
+                    const coldest_count = lookupProfile(&pm, coldest.func.name, coldest.func.line_num);
+                    std.debug.print("[freeze-pgo] Coldest included: {s}@{d} ({d} calls)\n", .{ coldest.func.name, coldest.func.line_num, coldest_count });
+                }
+                if (generated_all.items.len > effective_limit) {
+                    std.debug.print("[freeze-pgo] Skipping {d} cold functions (interpreter fallback)\n", .{ generated_all.items.len - effective_limit });
+                }
+            } else {
+                std.debug.print("[freeze-pgo] Sorted {d} functions by profile (no matching call counts found)\n", .{generated_all.items.len});
+            }
+        }
+    }
+
+    // Selective freezing: limit to top N functions (after PGO sort, this keeps the hottest)
     if (max_functions > 0 and generated_all.items.len > max_functions) {
         const total_before = generated_all.items.len;
-        // LLVM handles all functions as int32 or thin internally,
-        // so just truncate the list to max_functions
         generated_all.items.len = max_functions;
         std.debug.print("[freeze] Limited to {d} of {d} freezable functions\n", .{ max_functions, total_before });
     }
