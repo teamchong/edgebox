@@ -811,7 +811,10 @@ export fn llvm_rt_cv_to_bool(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv
     if (s == 0) return 0;
     sp.* = s - 1;
     const cv = stack[s - 1];
-    return if (cv.toBoolWithCtx(ctx)) @as(i32, 1) else @as(i32, 0);
+    const result: i32 = if (cv.toBoolWithCtx(ctx)) 1 else 0;
+    // Free the popped value (must happen AFTER toBoolWithCtx reads it)
+    CV.freeRef(ctx, cv);
+    return result;
 }
 
 // ============================================================================

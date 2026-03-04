@@ -1205,7 +1205,6 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         if (v.isRefType()) {
             if (profile.PROFILE) profile.vinc(profile.prof.ref_dups(), 1);
             const ptr = v.decompressPtr() orelse return v;
-            // JSRefCountHeader.ref_count is an i32 at offset 0 of JSObject/JSString
             const ref_count: *i32 = @ptrCast(@alignCast(ptr));
             ref_count.* += 1;
         }
@@ -1222,10 +1221,8 @@ pub const CompressedValue = if (is_wasm32) extern struct {
             const ptr = v.decompressPtr() orelse return;
             const ref_count: *i32 = @ptrCast(@alignCast(ptr));
             if (ref_count.* > 1) {
-                // Fast path: just decrement, no freeing needed
                 ref_count.* -= 1;
             } else {
-                // Slow path: object may need destruction, delegate to C
                 quickjs.JS_FreeValue(ctx, v.toJSValue());
             }
         }

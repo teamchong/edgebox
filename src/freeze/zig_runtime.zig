@@ -1370,8 +1370,12 @@ pub const thin = struct {
         const arr_jsv = arr.toJSValueWithCtx(ctx);
         const idx_jsv = idx.toJSValueWithCtx(ctx);
         const atom = quickjs.JS_ValueToAtom(ctx, idx_jsv);
-        _ = quickjs.JS_SetProperty(ctx, arr_jsv, atom, JSValue.dup(ctx, val.toJSValueWithCtx(ctx)));
+        // JS_SetProperty CONSUMES val (takes ownership). Pass the stack's ref directly.
+        _ = quickjs.JS_SetProperty(ctx, arr_jsv, atom, val.toJSValueWithCtx(ctx));
         quickjs.JS_FreeAtom(ctx, atom);
+        // Free arr and idx (not consumed by JS_SetProperty). Val was consumed.
+        CV.freeRef(ctx, arr);
+        CV.freeRef(ctx, idx);
         sp.* -= 3;
     }
 };

@@ -1379,6 +1379,7 @@ const ThinRuntimeDecls = struct {
             // Combined tail_call+return: (ctx, stack, sp, argc, locals, local_count, arg_shadow, arg_count) -> JSValue
             .tail_call_return = declareExtern(module, "llvm_rt_tail_call_return", llvm.functionType(jsv_ty, &.{ ptr, ptr, ptr, i32t, ptr, i64t, ptr, i64t }, false)),
             .tail_call_method_return = declareExtern(module, "llvm_rt_tail_call_method_return", llvm.functionType(jsv_ty, &.{ ptr, ptr, ptr, i32t, ptr, i64t, ptr, i64t }, false)),
+
         };
     }
 };
@@ -1532,6 +1533,17 @@ fn arrayCacheInvalidate(tctx: *ThinCodegenCtx, local_idx: u32) void {
     if (tctx.array_cache.get(local_idx)) |entry| {
         // Set populated flag to 0
         _ = tctx.builder.buildStore(llvm.constInt32(0), entry.populated_alloca);
+    }
+}
+
+/// Invalidate ALL array cache entries. Called after any function call (op_call,
+/// call_method, call_constructor, etc.) because the callee could modify any array's
+/// internal storage (e.g., array.push() may reallocate the values buffer), making
+/// cached values_ptr pointers dangling.
+fn arrayCacheInvalidateAll(tctx: *ThinCodegenCtx) void {
+    var it = tctx.array_cache.iterator();
+    while (it.next()) |kv| {
+        _ = tctx.builder.buildStore(llvm.constInt32(0), kv.value_ptr.populated_alloca);
     }
 }
 
@@ -1799,7 +1811,17 @@ fn generateThinFunction(
                 rt.cv_from_jsvalue, &.{argv_val}, "cv",
             );
 
-            const shadow_val = builder.buildSelect(in_bounds, cv_val, cv_undefined, "shv");
+            // DupRef the CV to properly own the reference.
+            // Frozen functions are dispatched BEFORE JS_CALL_FLAG_COPY_ARGV
+            // takes effect, so argv[] contains borrowed references from the caller.
+            // The arg_shadow cleanup (returnFromStack/exceptionCleanup) will freeRef
+            // these values, so we must dup to avoid over-decrementing the caller's refs.
+            const cv_duped = builder.buildCall(
+                llvm.functionType(llvm.i64Type(), &.{llvm.i64Type()}, false),
+                rt.cv_dup_ref, &.{cv_val}, "cvdup",
+            );
+
+            const shadow_val = builder.buildSelect(in_bounds, cv_duped, cv_undefined, "shv");
             var shadow_idx = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(@intCast(i)) };
             const shadow_elem = builder.buildInBoundsGEP(
                 llvm.arrayType(llvm.i64Type(), func.arg_count),
@@ -2371,6 +2393,7 @@ fn emitThinInstruction(
                 rt.op_apply, &.{ ctx_p, stk, sp }, "err",
             );
             emitErrorCheck(tctx, err_code);
+            arrayCacheInvalidateAll(tctx);
         },
 
         // ========== Return (flush vstack first) ==========
@@ -2403,7 +2426,11 @@ fn emitThinInstruction(
                 &.{
                     ctx_p, locs, llvm.constInt64(tctx.local_count),
                     llvm.constNull(llvm.ptrType()), llvm.constNull(llvm.ptrType()),
-                    llvm.constNull(llvm.ptrType()), llvm.constInt64(0),
+                    if (tctx.arg_shadow_ptr) |asp| blk: {
+                        var si = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(0) };
+                        break :blk b.buildInBoundsGEP(llvm.arrayType(llvm.i64Type(), tctx.func.arg_count), asp, &si, "asp");
+                    } else llvm.constNull(llvm.ptrType()),
+                    llvm.constInt64(if (tctx.has_put_arg) tctx.func.arg_count else 0),
                 },
                 "ret",
             );
@@ -2425,8 +2452,8 @@ fn emitThinInstruction(
         },
 
         // ========== Array operations ==========
-        .append => { vstackFlush(tctx); callVoid3(b, rt.op_append, ctx_p, stk, sp); },
-        .put_array_el => { vstackFlush(tctx); callVoid3(b, rt.op_put_array_el, ctx_p, stk, sp); },
+        .append => { vstackFlush(tctx); callVoid3(b, rt.op_append, ctx_p, stk, sp); arrayCacheInvalidateAll(tctx); },
+        .put_array_el => { vstackFlush(tctx); callVoid3(b, rt.op_put_array_el, ctx_p, stk, sp); arrayCacheInvalidateAll(tctx); },
         .get_array_el => emitVstackGetArrayEl(tctx, false),
         .get_array_el2 => emitVstackGetArrayEl(tctx, true),
         .get_length => emitVstackGetLength(tctx),
@@ -2462,6 +2489,10 @@ fn emitThinCallOp(tctx: *ThinCodegenCtx, func: llvm.Value, argc: u16) void {
         func, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, llvm.constInt32(@intCast(argc)) }, "err",
     );
     emitErrorCheck(tctx, err_code);
+
+    // Invalidate array caches — callee could have modified any array's internal storage
+    arrayCacheInvalidateAll(tctx);
+
 }
 
 /// Emit get_field_ic / get_field2_ic with error check
@@ -2519,6 +2550,8 @@ fn emitThinPutFieldOp(tctx: *ThinCodegenCtx, instr: Instruction) void {
         tctx.rt.op_put_field, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, str_ptr }, "err",
     );
     emitErrorCheck(tctx, err_code);
+    // put_field("length") on an array could resize internal storage
+    arrayCacheInvalidateAll(tctx);
 }
 
 /// Emit fallback: delegate to interpreter for unsupported opcodes
@@ -2554,6 +2587,8 @@ fn emitFallbackOpcode(tctx: *ThinCodegenCtx, instr: Instruction) void {
         tctx.rt.exec_opcode, &.{ tctx.ctx_param, opcode_val, operand_val, tctx.stack_ptr, tctx.sp_ptr, tctx.locals_ptr, llvm.constInt32(@intCast(tctx.func.var_count)) }, "err",
     );
     emitErrorCheck(tctx, err_code);
+    // Fallback opcodes could modify any array's internal storage
+    arrayCacheInvalidateAll(tctx);
 }
 
 /// Emit block terminator for thin codegen (branch/return).
