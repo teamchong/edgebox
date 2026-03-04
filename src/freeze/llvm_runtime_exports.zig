@@ -300,6 +300,48 @@ export fn llvm_rt_op_call_method(
     return 0;
 }
 
+/// Specialized charCodeAt: stack has [str, method, idx] → [charCode]
+/// Fast path for str.charCodeAt(idx) — avoids full JS method dispatch.
+/// The str CV is converted to JSValue and passed to js_frozen_char_code_at (C helper)
+/// which handles both 8-bit and 16-bit strings, normal and slice strings.
+/// Falls back to normal call_method(1) on non-string or non-int index.
+/// Returns 0 on success, non-zero on exception.
+export fn llvm_rt_call_method_char_code_at(
+    ctx: *JSContext,
+    stack: [*]CV,
+    sp: *usize,
+) callconv(.c) c_int {
+    const s = sp.*;
+    if (s >= 3) {
+        const str_cv = stack[s - 3];
+        const idx_cv = stack[s - 1];
+
+        // Fast path: string CV + int index
+        if (str_cv.isStr() and idx_cv.isInt()) {
+            const str_jsv = str_cv.toJSValueWithCtx(ctx);
+            const idx = idx_cv.getInt();
+            const char_code = zig_runtime.quickjs.js_frozen_char_code_at(str_jsv, idx);
+            if (char_code >= 0) {
+                // Success: free method (sp-2) and str (sp-3), idx is int (no refcount)
+                CV.freeRef(ctx, stack[s - 2]); // free the charCodeAt function ref
+                CV.freeRef(ctx, stack[s - 3]); // free the string ref
+                sp.* = s - 3;
+                stack[sp.*] = @bitCast(CV.newInt(char_code));
+                sp.* += 1;
+                return 0;
+            }
+            // char_code == -1: out of bounds → return NaN (standard charCodeAt behavior)
+            // But we can't distinguish "not a string" from "out of bounds" with -1.
+            // For out-of-bounds, charCodeAt returns NaN. Fall through to slow path
+            // which handles this correctly via the actual JS method call.
+        }
+    }
+
+    // Slow path: normal call_method(1)
+    thin.op_call_method(ctx, stack, sp, 1, null, null, 0, null, &.{}) catch return 1;
+    return 0;
+}
+
 /// Call constructor: stack has [constructor, arg0..argN-1] → [result]
 /// Returns 0 on success, non-zero on exception.
 export fn llvm_rt_op_call_constructor(

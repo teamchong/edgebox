@@ -1291,6 +1291,9 @@ const ThinRuntimeDecls = struct {
     // Boolean conversion (handles strings, NaN, 0.0 — full JS semantics)
     cv_to_bool: llvm.Value,
 
+    // Specialized charCodeAt (stack-based: str, method, idx → charCode)
+    call_method_char_code_at: llvm.Value,
+
     // Combined tail_call+return
     tail_call_return: llvm.Value,
     tail_call_method_return: llvm.Value,
@@ -1472,6 +1475,9 @@ const ThinRuntimeDecls = struct {
 
             .cv_to_bool = declareExtern(module, "llvm_rt_cv_to_bool", llvm.functionType(i32t, &.{ ptr, ptr, ptr }, false)),
 
+            // Specialized charCodeAt: (ctx, stack, sp) -> i32 error code
+            .call_method_char_code_at = declareExtern(module, "llvm_rt_call_method_char_code_at", llvm.functionType(i32t, &.{ ptr, ptr, ptr }, false)),
+
             .exec_opcode = declareExtern(module, "llvm_rt_exec_opcode", llvm.functionType(i32t, &.{ ptr, llvm.i8Type(), i32t, ptr, ptr, ptr, i32t }, false)),
 
             // Combined tail_call+return: (ctx, stack, sp, argc, locals, local_count, arg_shadow, arg_count) -> JSValue
@@ -1532,6 +1538,9 @@ const ThinCodegenCtx = struct {
     // Tracks whether any fallback opcode was emitted that exec_opcode can't handle
     // (exec_opcode only supports set_proto and pow — everything else crashes at runtime)
     has_unsafe_fallback: bool = false,
+
+    // Set when get_field2("charCodeAt") is emitted — next call_method(1) uses fast path
+    pending_char_code_at: bool = false,
 
     // Exception cleanup block
     cleanup_bb: llvm.BasicBlock,
@@ -2098,6 +2107,7 @@ fn generateThinFunction(
 
             // SSA values can't cross LLVM basic blocks without phis — reset vstack
             tctx.vstack.clearRetainingCapacity();
+            tctx.pending_char_code_at = false;
 
             // Check if this block is a counted loop header → emit fast-path preheader
             if (counted_loop_map.get(block.id)) |cl| {
@@ -2434,7 +2444,26 @@ fn emitThinInstruction(
         .call2 => emitThinCallOp(tctx, rt.op_call, 2),
         .call3 => emitThinCallOp(tctx, rt.op_call, 3),
         .call => emitThinCallOp(tctx, rt.op_call, instr.operand.u16),
-        .call_method => emitThinCallOp(tctx, rt.op_call_method, instr.operand.u16),
+        .call_method => {
+            const argc = instr.operand.u16;
+            if (argc == 1 and tctx.pending_char_code_at) {
+                // charCodeAt pattern: get_field2("charCodeAt") → [idx] → call_method(1)
+                // Use specialized fast path that avoids full JS method dispatch
+                tctx.pending_char_code_at = false;
+                vstackFlush(tctx);
+                const err_code = b.buildCall(
+                    llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType() }, false),
+                    rt.call_method_char_code_at,
+                    &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr },
+                    "err",
+                );
+                emitErrorCheck(tctx, err_code);
+                arrayCacheInvalidateAll(tctx);
+            } else {
+                tctx.pending_char_code_at = false;
+                emitThinCallOp(tctx, rt.op_call_method, argc);
+            }
+        },
         .tail_call => {
             vstackFlush(tctx);
             // Combined: call + cleanup + return in one runtime function
@@ -2483,6 +2512,14 @@ fn emitThinInstruction(
         },
         .get_field2 => {
             emitThinFieldOp(tctx, rt.op_get_field2_ic, instr);
+            // Detect charCodeAt pattern: get_field2("charCodeAt") → ... → call_method(1)
+            const atom_idx = instr.operand.atom;
+            const name = getAtomStringStatic(tctx.func, atom_idx);
+            if (name) |n| {
+                if (std.mem.eql(u8, std.mem.span(n), "charCodeAt")) {
+                    tctx.pending_char_code_at = true;
+                }
+            }
         },
         .put_field => {
             emitThinPutFieldOp(tctx, instr);

@@ -3095,6 +3095,11 @@ pub const quickjs = struct {
     }
     pub extern fn JS_FreeCString(ctx: *JSContext, ptr: [*:0]const u8) void;
 
+    /// Fast charCodeAt: returns char code at idx in string, or -1 on failure.
+    /// Handles both 8-bit and 16-bit (wide) strings, normal and slice strings.
+    /// No allocation, no refcount changes — pure read-only access.
+    pub extern fn js_frozen_char_code_at(str_val: JSValue, idx: i32) i32;
+
     /// Zero-copy string access - returns slice to QuickJS internal storage
     /// IMPORTANT: The returned slice is only valid while val is live and not modified.
     /// Caller must NOT free this - it's borrowed from QuickJS.
