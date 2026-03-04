@@ -385,6 +385,59 @@ export fn llvm_rt_call_method_array_push(
     return 0;
 }
 
+/// Specialized Math.abs/sqrt/floor/ceil/round: stack has [Math, method, arg] → [result]
+/// op: 0=abs, 1=sqrt, 2=floor, 3=ceil, 4=round
+/// Fast path for numeric args — applies the math operation directly.
+/// Falls back to normal call_method(1) for non-numeric args.
+/// Returns 0 on success, non-zero on exception.
+export fn llvm_rt_call_method_math_unary(
+    ctx: *JSContext,
+    stack: [*]CV,
+    sp: *usize,
+    op: i32,
+) callconv(.c) c_int {
+    const s = sp.*;
+    if (s >= 3) {
+        const arg_cv = stack[s - 1];
+        // Fast path: arg is int or float → extract f64, apply math op
+        var f: f64 = undefined;
+        var is_numeric = false;
+        if (arg_cv.isFloat()) {
+            f = arg_cv.getFloat();
+            is_numeric = true;
+        } else if (arg_cv.isInt()) {
+            f = @floatFromInt(arg_cv.getInt());
+            is_numeric = true;
+        }
+        if (is_numeric) {
+            const result: f64 = switch (op) {
+                0 => @abs(f),
+                1 => @sqrt(f),
+                2 => @floor(f),
+                3 => @ceil(f),
+                4 => blk: {
+                    // JS Math.round: round half towards +Infinity (not banker's rounding)
+                    break :blk @floor(f + 0.5);
+                },
+                else => unreachable,
+            };
+            // No freeRef needed for int/float args (they're not ref-counted)
+            // But the method (stack[s-2]) and Math object (stack[s-3]) may be ref-counted
+            CV.freeRef(ctx, stack[s - 1]); // arg (no-op for int/float)
+            CV.freeRef(ctx, stack[s - 2]); // method function
+            CV.freeRef(ctx, stack[s - 3]); // Math object
+            sp.* = s - 3;
+            stack[sp.*] = @bitCast(CV.newFloat(result));
+            sp.* += 1;
+            return 0;
+        }
+    }
+
+    // Slow path: normal call_method(1)
+    thin.op_call_method(ctx, stack, sp, 1, null, null, 0, null, &.{}) catch return 1;
+    return 0;
+}
+
 /// Call constructor: stack has [constructor, arg0..argN-1] → [result]
 /// Returns 0 on success, non-zero on exception.
 export fn llvm_rt_op_call_constructor(

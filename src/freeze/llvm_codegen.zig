@@ -1294,6 +1294,7 @@ const ThinRuntimeDecls = struct {
     // Specialized method inlines (stack-based, with slow-path fallback)
     call_method_char_code_at: llvm.Value,
     call_method_array_push: llvm.Value,
+    call_method_math_unary: llvm.Value,
 
     // Combined tail_call+return
     tail_call_return: llvm.Value,
@@ -1479,6 +1480,7 @@ const ThinRuntimeDecls = struct {
             // Specialized method inlines: (ctx, stack, sp) -> i32 error code
             .call_method_char_code_at = declareExtern(module, "llvm_rt_call_method_char_code_at", llvm.functionType(i32t, &.{ ptr, ptr, ptr }, false)),
             .call_method_array_push = declareExtern(module, "llvm_rt_call_method_array_push", llvm.functionType(i32t, &.{ ptr, ptr, ptr }, false)),
+            .call_method_math_unary = declareExtern(module, "llvm_rt_call_method_math_unary", llvm.functionType(i32t, &.{ ptr, ptr, ptr, i32t }, false)),
 
             .exec_opcode = declareExtern(module, "llvm_rt_exec_opcode", llvm.functionType(i32t, &.{ ptr, llvm.i8Type(), i32t, ptr, ptr, ptr, i32t }, false)),
 
@@ -1505,7 +1507,7 @@ const VStackEntry = struct {
 };
 
 /// Pending method inline kind — tracks which method pattern was detected at get_field2
-const PendingMethodKind = enum { none, char_code_at, array_push };
+const PendingMethodKind = enum { none, char_code_at, array_push, math_abs, math_sqrt, math_floor, math_ceil, math_round };
 
 /// Thin codegen context — holds LLVM references for the current function being generated
 const ThinCodegenCtx = struct {
@@ -1546,6 +1548,9 @@ const ThinCodegenCtx = struct {
 
     // Pending method inline: set by get_field2, consumed by call_method
     pending_method: PendingMethodKind = .none,
+
+    // 2-phase Math detection: set by get_var("Math"), consumed by get_field2
+    pending_math_obj: bool = false,
 
     // Exception cleanup block
     cleanup_bb: llvm.BasicBlock,
@@ -2113,6 +2118,7 @@ fn generateThinFunction(
             // SSA values can't cross LLVM basic blocks without phis — reset vstack
             tctx.vstack.clearRetainingCapacity();
             tctx.pending_method = .none;
+            tctx.pending_math_obj = false;
 
             // Check if this block is a counted loop header → emit fast-path preheader
             if (counted_loop_map.get(block.id)) |cl| {
@@ -2467,6 +2473,17 @@ fn emitThinInstruction(
                 const err_code = b.buildCall(method_sig, rt.call_method_array_push, method_args, "err");
                 emitErrorCheck(tctx, err_code);
                 arrayCacheInvalidateAll(tctx);
+            } else if (argc == 1 and @intFromEnum(tctx.pending_method) >= @intFromEnum(PendingMethodKind.math_abs) and
+                @intFromEnum(tctx.pending_method) <= @intFromEnum(PendingMethodKind.math_round))
+            {
+                // Math.abs/sqrt/floor/ceil/round fast path
+                const op_id: i32 = @as(i32, @intCast(@intFromEnum(tctx.pending_method))) - @as(i32, @intCast(@intFromEnum(PendingMethodKind.math_abs)));
+                tctx.pending_method = .none;
+                vstackFlush(tctx);
+                const math_sig = llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false);
+                const err_code = b.buildCall(math_sig, rt.call_method_math_unary, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, llvm.constInt32(@intCast(op_id)) }, "err");
+                emitErrorCheck(tctx, err_code);
+                arrayCacheInvalidateAll(tctx);
             } else {
                 tctx.pending_method = .none;
                 emitThinCallOp(tctx, rt.op_call_method, argc);
@@ -2529,8 +2546,22 @@ fn emitThinInstruction(
                     tctx.pending_method = .char_code_at;
                 } else if (std.mem.eql(u8, span, "push")) {
                     tctx.pending_method = .array_push;
+                } else if (tctx.pending_math_obj) {
+                    // Phase 2 of Math detection: get_var("Math") was seen, now check method name
+                    if (std.mem.eql(u8, span, "abs")) {
+                        tctx.pending_method = .math_abs;
+                    } else if (std.mem.eql(u8, span, "sqrt")) {
+                        tctx.pending_method = .math_sqrt;
+                    } else if (std.mem.eql(u8, span, "floor")) {
+                        tctx.pending_method = .math_floor;
+                    } else if (std.mem.eql(u8, span, "ceil")) {
+                        tctx.pending_method = .math_ceil;
+                    } else if (std.mem.eql(u8, span, "round")) {
+                        tctx.pending_method = .math_round;
+                    }
                 }
             }
+            tctx.pending_math_obj = false;
         },
         .put_field => {
             emitThinPutFieldOp(tctx, instr);
@@ -2639,6 +2670,8 @@ fn emitThinInstruction(
                 rt.op_get_var, &.{ ctx_p, stk, sp, str_ptr }, "err",
             );
             emitErrorCheck(tctx, err_code);
+            // Phase 1 of Math detection: track get_var("Math")
+            tctx.pending_math_obj = std.mem.eql(u8, std.mem.span(name), "Math");
         },
         .get_var_undef => {
             vstackFlush(tctx);
@@ -2650,6 +2683,8 @@ fn emitThinInstruction(
                 rt.op_get_var_undef, &.{ ctx_p, stk, sp, str_ptr }, "err",
             );
             emitErrorCheck(tctx, err_code);
+            // Phase 1 of Math detection: track get_var_undef("Math")
+            tctx.pending_math_obj = std.mem.eql(u8, std.mem.span(name), "Math");
         },
 
         // ========== Push atom as string value ==========
