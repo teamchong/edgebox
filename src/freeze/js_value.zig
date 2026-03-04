@@ -3100,6 +3100,10 @@ pub const quickjs = struct {
     /// No allocation, no refcount changes — pure read-only access.
     pub extern fn js_frozen_char_code_at(str_val: JSValue, idx: i32) i32;
 
+    /// Fast array push: append val to arr (must be a fast array).
+    /// Returns new length on success, -1 on failure. Dups val internally.
+    pub extern fn js_frozen_array_push(ctx: *JSContext, arr: JSValue, val: JSValue) i32;
+
     /// Zero-copy string access - returns slice to QuickJS internal storage
     /// IMPORTANT: The returned slice is only valid while val is live and not modified.
     /// Caller must NOT free this - it's borrowed from QuickJS.

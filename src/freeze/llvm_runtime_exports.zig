@@ -342,6 +342,49 @@ export fn llvm_rt_call_method_char_code_at(
     return 0;
 }
 
+/// Specialized Array.push(val): stack has [arr, method, val] → [new_length]
+/// Fast path for arr.push(val) on fast arrays — directly appends via add_fast_array_element.
+/// Falls back to normal call_method(1) on non-fast-arrays.
+/// Returns 0 on success, non-zero on exception.
+export fn llvm_rt_call_method_array_push(
+    ctx: *JSContext,
+    stack: [*]CV,
+    sp: *usize,
+) callconv(.c) c_int {
+    const s = sp.*;
+    if (s >= 3) {
+        const arr_cv = stack[s - 3];
+
+        // Fast path: arr is an object (ptr CV)
+        if (arr_cv.isPtr()) {
+            // Use toJSValue (no dup) for arr — we just read from it
+            const arr_jsv = arr_cv.toJSValue();
+            // Use toJSValueWithCtx (with dup) for val — transfers ownership to array
+            const val_jsv = stack[s - 1].toJSValueWithCtx(ctx);
+            // js_frozen_array_push CONSUMES val_jsv on success (array takes ownership)
+            // On failure (-1), val_jsv is NOT consumed — we must free it
+            const new_len = zig_runtime.quickjs.js_frozen_array_push(ctx, arr_jsv, val_jsv);
+            if (new_len >= 0) {
+                // Success: val_jsv was consumed by array. Free stack CVs.
+                CV.freeRef(ctx, stack[s - 1]); // val CV (stack's reference)
+                CV.freeRef(ctx, stack[s - 2]); // method (push function)
+                CV.freeRef(ctx, stack[s - 3]); // arr
+                sp.* = s - 3;
+                stack[sp.*] = @bitCast(CV.newInt(new_len));
+                sp.* += 1;
+                return 0;
+            }
+            // new_len == -1: not a fast array. val_jsv was NOT consumed — free it
+            zig_runtime.quickjs.JS_FreeValue(ctx, val_jsv);
+            // Fall through to slow path
+        }
+    }
+
+    // Slow path: normal call_method(1)
+    thin.op_call_method(ctx, stack, sp, 1, null, null, 0, null, &.{}) catch return 1;
+    return 0;
+}
+
 /// Call constructor: stack has [constructor, arg0..argN-1] → [result]
 /// Returns 0 on success, non-zero on exception.
 export fn llvm_rt_op_call_constructor(
