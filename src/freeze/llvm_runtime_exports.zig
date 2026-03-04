@@ -1139,3 +1139,137 @@ export fn llvm_rt_op_apply(
     thin.op_apply(ctx, stack, sp, null, null, 0, null, &.{}) catch return 1;
     return 0;
 }
+
+// ============================================================================
+// TDZ (Temporal Dead Zone) helpers
+// ============================================================================
+
+/// Throw a ReferenceError for accessing an uninitialized variable (TDZ).
+/// Returns 1 always (signals exception to caller).
+export fn llvm_rt_throw_tdz(ctx: *JSContext) callconv(.c) c_int {
+    _ = zig_runtime.quickjs.JS_ThrowReferenceError(ctx, "Cannot access variable before initialization");
+    return 1;
+}
+
+// ============================================================================
+// Push atom value (string creation)
+// ============================================================================
+
+/// Push a string value created from a property name onto the stack.
+/// Used by push_atom_value opcode.
+export fn llvm_rt_push_atom_value(ctx: *JSContext, stack: [*]CV, sp: *usize, name: [*:0]const u8) callconv(.c) void {
+    const str = JSValue.newString(ctx, name);
+    stack[sp.*] = CV.fromJSValue(str);
+    sp.* += 1;
+}
+
+// ============================================================================
+// Define field
+// ============================================================================
+
+/// Define a property on an object: stack has [obj, val], after: [obj] (val consumed).
+/// Returns 0 on success, non-zero on exception.
+export fn llvm_rt_define_field(ctx: *JSContext, stack: [*]CV, sp: *usize, name: [*:0]const u8) callconv(.c) c_int {
+    const quickjs = zig_runtime.quickjs;
+    const s = sp.*;
+    if (s < 2) return 1;
+
+    const val_cv = stack[s - 1];
+
+    // Convert to JSValue: obj borrows from stack (stays), val dup'd for definePropertyStr
+    const obj_jsv = stack[s - 2].toJSValue();
+    const val_jsv = val_cv.toJSValue();
+    const val_duped = JSValue.dup(ctx, val_jsv);
+
+    // definePropertyStr takes ownership of val_duped
+    const rc = quickjs.JS_DefinePropertyValueStr(ctx, obj_jsv, name, val_duped, quickjs.JS_PROP_C_W_E);
+
+    // Free the val CV (consumed from stack)
+    CV.freeRef(ctx, val_cv);
+
+    // Pop val, keep obj
+    sp.* = s - 1;
+
+    if (rc < 0) return 1;
+    return 0;
+}
+
+// ============================================================================
+// typeof_is_function check
+// ============================================================================
+
+/// Check if TOS typeof == "function". Replaces TOS with boolean result.
+export fn llvm_rt_typeof_is_function(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    const quickjs = zig_runtime.quickjs;
+    const s = sp.*;
+    if (s == 0) return;
+
+    const v = stack[s - 1];
+    const jsv = v.toJSValueWithCtx(ctx);
+    const is_func: bool = quickjs.JS_IsFunction(ctx, jsv) != 0;
+    CV.freeRef(ctx, v);
+    stack[s - 1] = if (is_func) CV.TRUE else CV.FALSE;
+}
+
+// ============================================================================
+// get_var_undef (global lookup, returns undefined for missing, no throw)
+// ============================================================================
+
+/// Get global variable, returning undefined for missing (no ReferenceError).
+/// Returns 0 on success, non-zero on exception.
+export fn llvm_rt_op_get_var_undef(ctx: *JSContext, stack: [*]CV, sp: *usize, name: [*:0]const u8) callconv(.c) c_int {
+    // In frozen mode, get_var_undef is the same as get_var —
+    // JS_GetPropertyStr returns undefined for missing properties, no throw.
+    thin.op_get_var(ctx, stack, sp, name) catch return 1;
+    return 0;
+}
+
+// ============================================================================
+// Closure creation (fclosure / fclosure8)
+// ============================================================================
+
+/// Create a closure from a constant pool function.
+/// Stack effect: pushes the closure onto the stack.
+/// Returns 0 on success, non-zero on exception.
+export fn llvm_rt_fclosure(
+    ctx: *JSContext,
+    stack: [*]CV,
+    sp: *usize,
+    cpool: ?[*]JSValue,
+    func_idx: u32,
+    var_refs: ?[*]*JSVarRef,
+    locals: [*]CV,
+    local_count: u32,
+    argv: ?[*]JSValue,
+    argc: c_int,
+) callconv(.c) c_int {
+    const quickjs = zig_runtime.quickjs;
+
+    // Get the bytecode function from cpool
+    const bfunc = if (cpool) |cp| cp[func_idx] else JSValue.UNDEFINED;
+
+    // Convert locals CVs to JSValues for closure capture
+    var locals_jsv: [256]JSValue = undefined;
+    const lc: usize = @min(local_count, 256);
+    for (0..lc) |i| {
+        locals_jsv[i] = CV.toJSValuePtr(&locals[i]);
+    }
+
+    // Create the closure using QuickJS API
+    const closure = quickjs.js_frozen_create_closure(
+        ctx,
+        bfunc,
+        var_refs,
+        if (lc > 0) @ptrCast(&locals_jsv) else null,
+        @intCast(lc),
+        if (argv != null and argc > 0) argv else null,
+        argc,
+    );
+
+    if (closure.isException()) return 1;
+
+    // Push closure onto stack
+    stack[sp.*] = CV.fromJSValue(closure);
+    sp.* += 1;
+    return 0;
+}

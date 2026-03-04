@@ -62,6 +62,7 @@ const CV_NULL: u64 = 0x7FFB_0000_0000_0000;
 const CV_TRUE: u64 = 0x7FFA_0000_0000_0001;
 const CV_FALSE: u64 = 0x7FFA_0000_0000_0000;
 const CV_PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF; // lower 48 bits
+const CV_UNINITIALIZED: u64 = 0x7FFE_0000_0000_0000; // QNAN | TAG_UNINIT (TDZ sentinel)
 
 /// Create a CV integer constant at comptime: QNAN_INT | (val & 0xFFFFFFFF)
 fn cvConstInt(val: i32) u64 {
@@ -1005,6 +1006,7 @@ pub fn generateThinShard(
     defer generated_infos.deinit(allocator);
 
     var skipped_unsafe: u32 = 0;
+    var unsafe_opcode_counts: [256]u32 = [_]u32{0} ** 256;
     for (functions) |sf| {
         if (generateThinFunction(allocator, native.module, builder, sf, &rt_decls)) |has_unsafe_fallback| {
             if (has_unsafe_fallback) {
@@ -1015,6 +1017,49 @@ pub fn generateThinShard(
                 const fn_name_z = std.fmt.bufPrintZ(&fn_name_buf, "{s}", .{sf.llvm_func_name}) catch continue;
                 if (native.module.getNamedFunction(fn_name_z)) |func_val| {
                     llvm.setLinkage(func_val, c.LLVMInternalLinkage);
+                }
+                // Count which unsafe opcodes caused this function to be skipped
+                for (sf.cfg.blocks.items) |block| {
+                    for (block.instructions) |bi| {
+                        switch (bi.opcode) {
+                            // All opcodes handled by emitThinInstruction (safe):
+                            .push_i32, .push_const, .push_const8,
+                            .push_0, .push_1, .push_2, .push_3, .push_4, .push_5, .push_6, .push_7,
+                            .push_i8, .push_i16, .push_minus1, .push_true, .push_false, .null, .undefined,
+                            .push_this, .push_empty_string,
+                            .get_loc0, .get_loc1, .get_loc2, .get_loc3, .get_loc, .get_loc8,
+                            .put_loc0, .put_loc1, .put_loc2, .put_loc3, .put_loc, .put_loc8,
+                            .set_loc0, .set_loc1, .set_loc2, .set_loc3, .set_loc, .set_loc8,
+                            .get_loc0_loc1,
+                            .get_arg0, .get_arg1, .get_arg2, .get_arg3, .get_arg,
+                            .put_arg0, .put_arg1, .put_arg2, .put_arg3, .put_arg,
+                            .get_var_ref_check, .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3,
+                            .get_var_ref, .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3,
+                            .put_var_ref, .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3, .set_var_ref,
+                            .dup, .dup1, .dup2, .dup3, .drop, .nip, .nip1, .swap, .insert2, .insert3, .insert4,
+                            .perm3, .perm4, .perm5, .rot3l, .rot3r,
+                            .add, .sub, .mul, .div, .mod, .neg, .plus, .pow,
+                            .@"and", .@"or", .xor, .shl, .sar, .shr, .not,
+                            .lt, .lte, .gt, .gte, .eq, .neq, .strict_eq, .strict_neq,
+                            .lnot, .typeof, .is_undefined, .is_null, .is_undefined_or_null,
+                            .inc, .dec, .post_inc, .post_dec, .inc_loc, .dec_loc,
+                            .object, .append, .put_array_el, .get_array_el, .get_array_el2, .get_length, .add_loc,
+                            .call0, .call1, .call2, .call3, .call, .call_method,
+                            .call_constructor, .tail_call, .tail_call_method,
+                            .get_field, .get_field2, .put_field,
+                            .apply,
+                            .get_loc_check, .put_loc_check, .put_loc_check_init,
+                            .get_var, .get_var_undef, .push_atom_value, .define_field,
+                            .typeof_is_function, .fclosure8, .fclosure,
+                            .@"return", .return_undef,
+                            .if_false, .if_false8, .if_true, .if_true8, .goto, .goto8, .goto16,
+                            .throw, .nop, .set_name, .close_loc, .set_loc_uninitialized, .set_home_object,
+                            .set_proto,
+                            => {},
+                            // Everything else is unsafe
+                            else => unsafe_opcode_counts[@intFromEnum(bi.opcode)] += 1,
+                        }
+                    }
                 }
                 skipped_unsafe += 1;
                 continue;
@@ -1048,6 +1093,27 @@ pub fn generateThinShard(
     }
     if (skipped_unsafe > 0) {
         std.debug.print("[llvm-thin] Skipped {d} functions with unsafe fallback opcodes (keeping Zig versions)\n", .{skipped_unsafe});
+        // Print top unsafe opcodes sorted by frequency
+        const OpcodeCount = struct { idx: u8, count: u32 };
+        var top: [256]OpcodeCount = undefined;
+        for (0..256) |i| top[i] = .{ .idx = @intCast(i), .count = unsafe_opcode_counts[i] };
+        // Simple bubble sort for top entries (good enough for 256 items)
+        for (0..256) |i| {
+            for (i + 1..256) |j| {
+                if (top[j].count > top[i].count) {
+                    const tmp = top[i];
+                    top[i] = top[j];
+                    top[j] = tmp;
+                }
+            }
+        }
+        var printed: u32 = 0;
+        for (top[0..]) |entry| {
+            if (entry.count == 0 or printed >= 15) break;
+            const op: opcodes.Opcode = @enumFromInt(entry.idx);
+            std.debug.print("  {s}: {d}\n", .{ @tagName(op), entry.count });
+            printed += 1;
+        }
     }
     if (generated_count == 0) {
         return .{ .func_count = 0, .has_functions = false };
@@ -1168,7 +1234,23 @@ const ThinRuntimeDecls = struct {
     op_get_field2_ic: llvm.Value,
     op_put_field: llvm.Value,
     op_get_var: llvm.Value,
+    op_get_var_undef: llvm.Value,
     op_apply: llvm.Value,
+
+    // TDZ helpers
+    throw_tdz: llvm.Value,
+
+    // Atom/string push
+    push_atom_value: llvm.Value,
+
+    // Define field
+    define_field: llvm.Value,
+
+    // typeof_is_function
+    typeof_is_function: llvm.Value,
+
+    // Closure creation
+    fclosure: llvm.Value,
 
     // Return helpers
     returnFromStack: llvm.Value,
@@ -1339,7 +1421,23 @@ const ThinRuntimeDecls = struct {
             .op_get_field2_ic = declareExtern(module, "llvm_rt_op_get_field2_ic", field_ic_op),
             .op_put_field = declareExtern(module, "llvm_rt_op_put_field", field_op),
             .op_get_var = declareExtern(module, "llvm_rt_op_get_var", field_op),
+            .op_get_var_undef = declareExtern(module, "llvm_rt_op_get_var_undef", field_op),
             .op_apply = declareExtern(module, "llvm_rt_op_apply", llvm.functionType(i32t, &.{ ptr, ptr, ptr }, false)),
+
+            // TDZ: i32(ctx) — throws ReferenceError, always returns 1
+            .throw_tdz = declareExtern(module, "llvm_rt_throw_tdz", llvm.functionType(i32t, &.{ptr}, false)),
+
+            // push_atom_value: void(ctx, stack, sp, name)
+            .push_atom_value = declareExtern(module, "llvm_rt_push_atom_value", llvm.functionType(voidt, &.{ ptr, ptr, ptr, ptr }, false)),
+
+            // define_field: i32(ctx, stack, sp, name) — returns error code
+            .define_field = declareExtern(module, "llvm_rt_define_field", field_op),
+
+            // typeof_is_function: void(ctx, stack, sp)
+            .typeof_is_function = declareExtern(module, "llvm_rt_typeof_is_function", ctx_stack_sp),
+
+            // fclosure: i32(ctx, stack, sp, cpool, func_idx, var_refs, locals, local_count, argv, argc)
+            .fclosure = declareExtern(module, "llvm_rt_fclosure", llvm.functionType(i32t, &.{ ptr, ptr, ptr, ptr, i32t, ptr, ptr, i32t, ptr, i32t }, false)),
 
             .returnFromStack = declareExtern(module, "llvm_rt_returnFromStack", return_helper),
             .returnUndef = declareExtern(module, "llvm_rt_returnUndef", cleanup_helper),
@@ -2438,7 +2536,15 @@ fn emitThinInstruction(
         },
 
         // ========== No-op / Control flow handled by terminator ==========
-        .nop, .set_name, .close_loc, .set_loc_uninitialized, .set_home_object => {},
+        .nop, .set_name, .close_loc, .set_home_object => {},
+
+        // TDZ: mark local as uninitialized (required for get_loc_check/put_loc_check)
+        .set_loc_uninitialized => {
+            const idx = instr.operand.loc;
+            const loc_ptr = inlineLocalSlot(b, locs, idx);
+            _ = b.buildStore(llvm.constInt(llvm.i64Type(), CV_UNINITIALIZED, false), loc_ptr);
+            vstackInvalidateLocal(tctx, idx);
+        },
         .if_false, .if_false8, .if_true, .if_true8, .goto, .goto8, .goto16 => {},
 
         // ========== Throw — flush vstack, delegate to interpreter, then cleanup ==========
@@ -2460,6 +2566,88 @@ fn emitThinInstruction(
 
         // ========== add_loc (vstack: int fast path) ==========
         .add_loc => emitVstackAddLoc(tctx, instr.operand.loc),
+
+        // ========== TDZ (Temporal Dead Zone) checks ==========
+        .get_loc_check => emitVstackGetLocCheck(tctx, instr.operand.loc),
+        .put_loc_check => emitVstackPutLocCheck(tctx, instr.operand.loc),
+        .put_loc_check_init => {
+            // First initialization of a TDZ variable — no check needed, just put_loc
+            emitVstackPutLoc(tctx, instr.operand.loc);
+        },
+
+        // ========== Global variable lookup ==========
+        .get_var => {
+            vstackFlush(tctx);
+            const atom_idx = instr.operand.atom;
+            const name = getAtomStringStatic(tctx.func, atom_idx) orelse return CodegenError.UnsupportedOpcode;
+            const str_ptr = c.LLVMBuildGlobalStringPtr(b.ref, name, ".gv");
+            const err_code = b.buildCall(
+                llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType() }, false),
+                rt.op_get_var, &.{ ctx_p, stk, sp, str_ptr }, "err",
+            );
+            emitErrorCheck(tctx, err_code);
+        },
+        .get_var_undef => {
+            vstackFlush(tctx);
+            const atom_idx = instr.operand.atom;
+            const name = getAtomStringStatic(tctx.func, atom_idx) orelse return CodegenError.UnsupportedOpcode;
+            const str_ptr = c.LLVMBuildGlobalStringPtr(b.ref, name, ".gvu");
+            const err_code = b.buildCall(
+                llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType() }, false),
+                rt.op_get_var_undef, &.{ ctx_p, stk, sp, str_ptr }, "err",
+            );
+            emitErrorCheck(tctx, err_code);
+        },
+
+        // ========== Push atom as string value ==========
+        .push_atom_value => {
+            vstackFlush(tctx);
+            const atom_idx = instr.operand.atom;
+            const name = getAtomStringStatic(tctx.func, atom_idx) orelse return CodegenError.UnsupportedOpcode;
+            const str_ptr = c.LLVMBuildGlobalStringPtr(b.ref, name, ".atom");
+            _ = b.buildCall(
+                llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType() }, false),
+                rt.push_atom_value, &.{ ctx_p, stk, sp, str_ptr }, "",
+            );
+        },
+
+        // ========== Define field (property definition) ==========
+        .define_field => {
+            vstackFlush(tctx);
+            const atom_idx = instr.operand.atom;
+            const name = getAtomStringStatic(tctx.func, atom_idx) orelse return CodegenError.UnsupportedOpcode;
+            const str_ptr = c.LLVMBuildGlobalStringPtr(b.ref, name, ".df");
+            const err_code = b.buildCall(
+                llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType() }, false),
+                rt.define_field, &.{ ctx_p, stk, sp, str_ptr }, "err",
+            );
+            emitErrorCheck(tctx, err_code);
+        },
+
+        // ========== typeof_is_function ==========
+        .typeof_is_function => {
+            vstackFlush(tctx);
+            callVoid3(b, rt.typeof_is_function, ctx_p, stk, sp);
+        },
+
+        // ========== Closure creation ==========
+        .fclosure8, .fclosure => {
+            vstackFlush(tctx);
+            const func_idx: u32 = instr.operand.const_idx;
+            const err_code = b.buildCall(
+                llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.i32Type() }, false),
+                rt.fclosure,
+                &.{
+                    ctx_p, stk, sp, tctx.cpool_param,
+                    llvm.constInt32(@intCast(func_idx)),
+                    tctx.var_refs_param,
+                    locs, llvm.constInt32(@intCast(tctx.local_count)),
+                    tctx.argv_param, tctx.argc_param,
+                },
+                "err",
+            );
+            emitErrorCheck(tctx, err_code);
+        },
 
         // ========== Unsupported — use fallback ==========
         else => return CodegenError.UnsupportedOpcode,
@@ -2793,6 +2981,71 @@ fn emitVstackSetLoc(tctx: *ThinCodegenCtx, idx: u32) void {
     // Invalidate before freeing old
     vstackInvalidateLocal(tctx, idx);
     inlineFreeRef(tctx, old_val);
+}
+
+// ============================================================================
+// TDZ (Temporal Dead Zone) check helpers
+// ============================================================================
+
+/// get_loc_check: load locals[idx], check for UNINITIALIZED, throw TDZ error if so.
+/// Otherwise push to vstack as borrowed (same as get_loc).
+fn emitVstackGetLocCheck(tctx: *ThinCodegenCtx, idx: u32) void {
+    const b = tctx.builder;
+    const loc_ptr = inlineLocalSlot(b, tctx.locals_ptr, idx);
+    const val = b.buildLoad(llvm.i64Type(), loc_ptr, "locv");
+
+    // Compare with CV_UNINITIALIZED
+    const is_uninit = b.buildICmp(c.LLVMIntEQ, val, llvm.constInt(llvm.i64Type(), CV_UNINITIALIZED, false), "isuninit");
+
+    const current_fn = c.LLVMGetBasicBlockParent(c.LLVMGetInsertBlock(b.ref));
+    const tdz_bb = llvm.appendBasicBlock(current_fn, "tdz_err");
+    const ok_bb = llvm.appendBasicBlock(current_fn, "tdz_ok");
+    _ = b.buildCondBr(is_uninit, tdz_bb, ok_bb);
+
+    // TDZ error path: throw ReferenceError, branch to cleanup
+    b.positionAtEnd(tdz_bb);
+    _ = b.buildCall(
+        llvm.functionType(llvm.i32Type(), &.{llvm.ptrType()}, false),
+        tctx.rt.throw_tdz, &.{tctx.ctx_param}, "",
+    );
+    _ = b.buildBr(tctx.cleanup_bb);
+
+    // OK path: push value as borrowed (same as get_loc)
+    b.positionAtEnd(ok_bb);
+    vstackPushLocal(tctx, val, idx);
+}
+
+/// put_loc_check: check locals[idx] for UNINITIALIZED before storing.
+/// If uninitialized, throw TDZ error. Otherwise, normal put_loc via runtime.
+/// Must flush vstack first since the check is runtime-branching.
+fn emitVstackPutLocCheck(tctx: *ThinCodegenCtx, idx: u32) void {
+    vstackFlush(tctx);
+    const b = tctx.builder;
+    const loc_ptr = inlineLocalSlot(b, tctx.locals_ptr, idx);
+    const old_val = b.buildLoad(llvm.i64Type(), loc_ptr, "oldv");
+
+    // Compare with CV_UNINITIALIZED
+    const is_uninit = b.buildICmp(c.LLVMIntEQ, old_val, llvm.constInt(llvm.i64Type(), CV_UNINITIALIZED, false), "isuninit");
+
+    const current_fn = c.LLVMGetBasicBlockParent(c.LLVMGetInsertBlock(b.ref));
+    const tdz_bb = llvm.appendBasicBlock(current_fn, "tdz_err");
+    const ok_bb = llvm.appendBasicBlock(current_fn, "tdz_ok");
+    _ = b.buildCondBr(is_uninit, tdz_bb, ok_bb);
+
+    // TDZ error path: throw and branch to cleanup
+    b.positionAtEnd(tdz_bb);
+    _ = b.buildCall(
+        llvm.functionType(llvm.i32Type(), &.{llvm.ptrType()}, false),
+        tctx.rt.throw_tdz, &.{tctx.ctx_param}, "",
+    );
+    _ = b.buildBr(tctx.cleanup_bb);
+
+    // OK path: call runtime put_loc (vstack already flushed, value is on physical stack)
+    b.positionAtEnd(ok_bb);
+    _ = b.buildCall(
+        llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false),
+        tctx.rt.put_loc, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, tctx.locals_ptr, llvm.constInt32(@intCast(idx)) }, "",
+    );
 }
 
 // ============================================================================
