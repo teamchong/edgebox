@@ -646,6 +646,14 @@ pub const thin = struct {
         CV.freeRef(ctx, old);
     }
 
+    /// set_arg: copy stack top → arg_shadow (keep value on stack), free old entry
+    pub inline fn set_arg(ctx: *JSContext, stack: [*]CV, sp: *usize, arg_shadow: [*]CV, idx: u32) void {
+        const v = stack[sp.* - 1];
+        const old = arg_shadow[idx];
+        arg_shadow[idx] = CV.dupRef(v);
+        CV.freeRef(ctx, old);
+    }
+
     // ================================================================
     // Inline Helpers — Closure Variable Access
     // ================================================================

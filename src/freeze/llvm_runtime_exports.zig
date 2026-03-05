@@ -85,6 +85,10 @@ export fn llvm_rt_put_arg(ctx: *JSContext, stack: [*]CV, sp: *usize, arg_shadow:
     thin.put_arg(ctx, stack, sp, arg_shadow, idx);
 }
 
+export fn llvm_rt_set_arg(ctx: *JSContext, stack: [*]CV, sp: *usize, arg_shadow: [*]CV, idx: u32) callconv(.c) void {
+    thin.set_arg(ctx, stack, sp, arg_shadow, idx);
+}
+
 // ============================================================================
 // Closure variable access
 // ============================================================================
@@ -1195,21 +1199,68 @@ export fn llvm_rt_exec_opcode(
     sp: *usize,
     locals: [*]CV,
     var_count: u32,
+    var_refs: ?[*]*JSVarRef,
+    closure_var_count: i32,
+    argv: ?[*]const JSValue,
+    argc: i32,
+    arg_buf: ?[*]JSValue,
+    func_obj: JSValue,
+    new_target: JSValue,
+    cpool: ?[*]JSValue,
+    operand2: i32,
 ) callconv(.c) c_int {
     const quickjs = zig_runtime.quickjs;
-    // Convert usize SP to c_int for QuickJS C API, then write back
-    var sp_i: c_int = @intCast(sp.*);
+    // CVs are 8 bytes (NaN-boxed i64), JSValues are 16 bytes ({i64, i64}).
+    // We must convert between them — @ptrCast is wrong since element sizes differ.
+    const old_sp = sp.*;
+    // Convert stack CVs to JSValues. toJSValuePtr does NOT dup — transfers
+    // ownership temporarily. The C function operates on JSValues and manages
+    // refs internally (frees popped values, creates refs for pushed values).
+    var jsv_stack: [512]JSValue = undefined;
+    for (0..old_sp) |i| {
+        jsv_stack[i] = CV.toJSValuePtr(&stack[i]);
+    }
+    // Convert locals CVs to JSValues (some opcodes may read locals)
+    const lc: usize = @intCast(var_count);
+    var jsv_locals: [256]JSValue = undefined;
+    const local_max = if (lc < 256) lc else 256;
+    for (0..local_max) |i| {
+        jsv_locals[i] = CV.toJSValuePtr(&locals[i]);
+    }
+
+    var sp_i: c_int = @intCast(old_sp);
     const result = quickjs.js_frozen_exec_opcode(
         ctx,
         op,
         @bitCast(operand),
-        @ptrCast(stack),
+        @ptrCast(&jsv_stack),
         &sp_i,
-        @ptrCast(locals),
+        @ptrCast(&jsv_locals),
         @intCast(var_count),
+        var_refs,
+        closure_var_count,
+        argv,
+        argc,
+        arg_buf,
+        func_obj,
+        new_target,
+        cpool,
+        operand2,
     );
-    sp.* = @intCast(sp_i);
-    // js_frozen_exec_opcode returns JSValue; check for exception
+    const new_sp: usize = @intCast(sp_i);
+
+    // Write back JSValue stack to CV stack.
+    // toJSValuePtr does NOT dup — ownership was transferred to JSValue space.
+    // The C function manages refs for consumed (popped) values internally,
+    // so we must NOT call CV.freeRef on old CVs at popped positions (that
+    // would double-free since C already freed them).
+    // For untouched positions, the roundtrip CV→JSValue→CV is ref-neutral.
+    // For new positions (pushed by C), we take ownership of the new refs.
+    for (0..new_sp) |i| {
+        stack[i] = CV.fromJSValue(jsv_stack[i]);
+    }
+    sp.* = new_sp;
+
     if (result.isException()) return -1;
     return 0;
 }

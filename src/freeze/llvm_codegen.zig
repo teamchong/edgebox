@@ -1008,21 +1008,24 @@ pub fn generateThinShard(
     var skipped_unsafe: u32 = 0;
     var unsafe_opcode_counts: [256]u32 = [_]u32{0} ** 256;
     for (functions) |sf| {
+        // Skip very large functions — they can have codegen bugs in edge cases
+        // and the LLVM compile time is disproportionate. The interpreter handles them correctly.
+        if (sf.func.instructions.len > 10000) {
+            skipped_unsafe += 1;
+            continue;
+        }
         if (generateThinFunction(allocator, native.module, builder, sf, &rt_decls)) |has_unsafe_fallback| {
             if (has_unsafe_fallback) {
-                // Function uses opcodes that exec_opcode can't handle —
-                // don't register it, let the Zig version handle this function.
-                // Change linkage to internal so it doesn't conflict with the Zig symbol.
+                // Function uses opcodes that js_frozen_exec_opcode can't handle —
+                // don't register it, let the interpreter handle this function.
                 var fn_name_buf: [512]u8 = undefined;
                 const fn_name_z = std.fmt.bufPrintZ(&fn_name_buf, "{s}", .{sf.llvm_func_name}) catch continue;
                 if (native.module.getNamedFunction(fn_name_z)) |func_val| {
                     llvm.setLinkage(func_val, c.LLVMInternalLinkage);
                 }
-                // Count which unsafe opcodes caused this function to be skipped
                 for (sf.cfg.blocks.items) |block| {
                     for (block.instructions) |bi| {
                         switch (bi.opcode) {
-                            // All opcodes handled by emitThinInstruction (safe):
                             .push_i32, .push_const, .push_const8,
                             .push_0, .push_1, .push_2, .push_3, .push_4, .push_5, .push_6, .push_7,
                             .push_i8, .push_i16, .push_minus1, .push_true, .push_false, .null, .undefined,
@@ -1033,6 +1036,9 @@ pub fn generateThinShard(
                             .get_loc0_loc1,
                             .get_arg0, .get_arg1, .get_arg2, .get_arg3, .get_arg,
                             .put_arg0, .put_arg1, .put_arg2, .put_arg3, .put_arg,
+                            // NOTE: set_arg* deliberately excluded — functions with set_arg
+                            // have a pre-existing codegen bug in other opcodes.
+                            // set_arg IS inline-handled but we skip these functions for now.
                             .get_var_ref_check, .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3,
                             .get_var_ref, .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3,
                             .put_var_ref, .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3, .set_var_ref,
@@ -1055,8 +1061,21 @@ pub fn generateThinShard(
                             .if_false, .if_false8, .if_true, .if_true8, .goto, .goto8, .goto16,
                             .throw, .nop, .set_name, .close_loc, .set_loc_uninitialized, .set_home_object,
                             .set_proto,
+                            // exec_opcode-handled opcodes (safe to delegate to C):
+                            .to_propkey, .to_propkey2, .to_object,
+                            .instanceof, .in, .delete, .typeof_is_undefined,
+                            .get_super, .define_array_el, .set_name_computed, .copy_data_properties,
+                            .put_var_ref_check,
+                            .rest, .regexp, .push_bigint_i32,
+                            .check_ctor, .init_ctor, .special_object,
+                            .define_method, .define_method_computed,
+                            .put_ref_value,
+                            .check_define_var, .define_var, .define_func,
+                            // .get_var, .get_var_undef already inline-handled above
+                            .put_var, .put_var_init, .put_var_strict, .check_var,
+                            .for_of_start, .for_of_next, .for_in_start, .for_in_next,
+                            .iterator_close,
                             => {},
-                            // Everything else is unsafe
                             else => unsafe_opcode_counts[@intFromEnum(bi.opcode)] += 1,
                         }
                     }
@@ -1092,12 +1111,10 @@ pub fn generateThinShard(
         }
     }
     if (skipped_unsafe > 0) {
-        std.debug.print("[llvm-thin] Skipped {d} functions with unsafe fallback opcodes (keeping Zig versions)\n", .{skipped_unsafe});
-        // Print top unsafe opcodes sorted by frequency
+        std.debug.print("[llvm-thin] Skipped {d} functions with unsafe fallback opcodes (keeping interpreter versions)\n", .{skipped_unsafe});
         const OpcodeCount = struct { idx: u8, count: u32 };
         var top: [256]OpcodeCount = undefined;
         for (0..256) |i| top[i] = .{ .idx = @intCast(i), .count = unsafe_opcode_counts[i] };
-        // Simple bubble sort for top entries (good enough for 256 items)
         for (0..256) |i| {
             for (i + 1..256) |j| {
                 if (top[j].count > top[i].count) {
@@ -1148,6 +1165,7 @@ const ThinRuntimeDecls = struct {
     get_arg: llvm.Value,
     get_arg_shadow: llvm.Value,
     put_arg: llvm.Value,
+    set_arg: llvm.Value,
 
     // Closure variable access
     get_var_ref: llvm.Value,
@@ -1362,6 +1380,7 @@ const ThinRuntimeDecls = struct {
             .get_arg = declareExtern(module, "llvm_rt_get_arg", llvm.functionType(voidt, &.{ ptr, ptr, ptr, i32t, ptr, i32t }, false)),
             .get_arg_shadow = declareExtern(module, "llvm_rt_get_arg_shadow", llvm.functionType(voidt, &.{ ptr, ptr, ptr, i32t }, false)),
             .put_arg = declareExtern(module, "llvm_rt_put_arg", ctx_stack_sp_loc_u32),
+            .set_arg = declareExtern(module, "llvm_rt_set_arg", ctx_stack_sp_loc_u32),
 
             .get_var_ref = declareExtern(module, "llvm_rt_get_var_ref", llvm.functionType(voidt, &.{ ptr, ptr, ptr, ptr, i32t, i32t }, false)),
             .get_var_ref_check = declareExtern(module, "llvm_rt_get_var_ref_check", llvm.functionType(i32t, &.{ ptr, ptr, ptr, ptr, i32t, i32t }, false)),
@@ -1482,7 +1501,8 @@ const ThinRuntimeDecls = struct {
             .call_method_array_push = declareExtern(module, "llvm_rt_call_method_array_push", llvm.functionType(i32t, &.{ ptr, ptr, ptr }, false)),
             .call_method_math_unary = declareExtern(module, "llvm_rt_call_method_math_unary", llvm.functionType(i32t, &.{ ptr, ptr, ptr, i32t }, false)),
 
-            .exec_opcode = declareExtern(module, "llvm_rt_exec_opcode", llvm.functionType(i32t, &.{ ptr, llvm.i8Type(), i32t, ptr, ptr, ptr, i32t }, false)),
+            // exec_opcode: i32(ctx, op, operand, stack, sp, locals, var_count, var_refs, closure_var_count, argv, argc, arg_buf, func_obj{i64,i64}, new_target{i64,i64}, cpool, operand2)
+            .exec_opcode = declareExtern(module, "llvm_rt_exec_opcode", llvm.functionType(i32t, &.{ ptr, llvm.i8Type(), i32t, ptr, ptr, ptr, i32t, ptr, i32t, ptr, i32t, ptr, jsv_ty, jsv_ty, ptr, i32t }, false)),
 
             // Combined tail_call+return: (ctx, stack, sp, argc, locals, local_count, arg_shadow, arg_count) -> JSValue
             .tail_call_return = declareExtern(module, "llvm_rt_tail_call_return", llvm.functionType(jsv_ty, &.{ ptr, ptr, ptr, i32t, ptr, i64t, ptr, i64t }, false)),
@@ -1542,8 +1562,8 @@ const ThinCodegenCtx = struct {
     // Arg shadow
     arg_shadow_ptr: ?llvm.Value = null,
 
-    // Tracks whether any fallback opcode was emitted that exec_opcode can't handle
-    // (exec_opcode only supports set_proto and pow — everything else crashes at runtime)
+    // Tracks whether any fallback opcode was emitted that js_frozen_exec_opcode can't handle.
+    // If true, this function should not be registered as frozen (falls back to interpreter).
     has_unsafe_fallback: bool = false,
 
     // Pending method inline: set by get_field2, consumed by call_method
@@ -1857,10 +1877,8 @@ fn generateThinFunction(
     const argc_param = c.LLVMGetParam(wrapper_fn, 2);
     const argv_param = c.LLVMGetParam(wrapper_fn, 3);
     const var_refs_param = c.LLVMGetParam(wrapper_fn, 4);
-    const closure_var_count_param = c.LLVMGetParam(wrapper_fn, 5);
+    // closure_var_count is param 5, accessed via tctx.closure_var_count_param
     const cpool_param = c.LLVMGetParam(wrapper_fn, 6);
-
-    _ = closure_var_count_param;
 
     // Stack overflow check: if (check_stack()) return throwRangeError
     {
@@ -2282,6 +2300,29 @@ fn emitThinInstruction(
                     asp, &si, "asp",
                 );
                 callVoid4u(b, rt.put_arg, ctx_p, stk, sp, asp_flat, idx);
+            }
+        },
+
+        .set_arg0, .set_arg1, .set_arg2, .set_arg3, .set_arg => {
+            vstackFlush(tctx);
+            // Mark as unsafe: functions with set_arg cause "not a function"
+            // crashes in TSC. Handler is correct but enabling these functions
+            // exposes ref counting bugs in other inline opcodes.
+            tctx.has_unsafe_fallback = true;
+            const idx: u32 = switch (instr.opcode) {
+                .set_arg0 => 0,
+                .set_arg1 => 1,
+                .set_arg2 => 2,
+                .set_arg3 => 3,
+                else => instr.operand.arg,
+            };
+            if (tctx.arg_shadow_ptr) |asp| {
+                var si = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(0) };
+                const asp_flat = b.buildInBoundsGEP(
+                    llvm.arrayType(llvm.i64Type(), tctx.func.arg_count),
+                    asp, &si, "asp",
+                );
+                callVoid4u(b, rt.set_arg, ctx_p, stk, sp, asp_flat, idx);
             }
         },
 
@@ -2830,13 +2871,31 @@ fn emitThinPutFieldOp(tctx: *ThinCodegenCtx, instr: Instruction) void {
     arrayCacheInvalidateAll(tctx);
 }
 
-/// Emit fallback: delegate to interpreter for unsupported opcodes
+/// Emit fallback: delegate to interpreter for unsupported opcodes.
+/// Opcodes handled by js_frozen_exec_opcode in C are safe; others are flagged.
 fn emitFallbackOpcode(tctx: *ThinCodegenCtx, instr: Instruction) void {
     vstackFlush(tctx);
-    // Track unsafe fallbacks: exec_opcode only handles set_proto and pow.
-    // Any other opcode here means this function can't safely run LLVM-only.
+    // Track unsafe fallbacks: only opcodes implemented in js_frozen_exec_opcode are safe.
+    // If an opcode is NOT in this list, the function falls back to interpreter.
     switch (instr.opcode) {
-        .set_proto, .pow => {}, // These are supported by exec_opcode
+        .set_proto,
+        // exec_opcode-handled opcodes (safe to delegate to C):
+        .to_propkey, .to_propkey2, .to_object,
+        .instanceof, .in, .delete, .typeof_is_undefined,
+        .get_super, .define_array_el, .set_name_computed, .copy_data_properties,
+        .put_var_ref_check,
+        .rest, .regexp, .push_bigint_i32,
+        .check_ctor, .init_ctor, .special_object,
+        .define_method, .define_method_computed,
+        .put_ref_value,
+        .check_define_var, .define_var, .define_func,
+        .get_var, .get_var_undef,
+        .put_var, .put_var_init, .put_var_strict,
+        .check_var,
+        .for_of_start, .for_of_next, .for_in_start, .for_in_next,
+        .iterator_close,
+        // NOTE: array_from excluded — enables functions with ref counting bugs
+        => {}, // Handled by js_frozen_exec_opcode
         else => tctx.has_unsafe_fallback = true,
     }
 
@@ -2855,12 +2914,53 @@ fn emitFallbackOpcode(tctx: *ThinCodegenCtx, instr: Instruction) void {
         .var_ref => |v| @as(i32, @intCast(v)),
         .const_idx => |v| @as(i32, @intCast(v)),
         .label => |v| v,
+        .atom_u8 => |v| @as(i32, @intCast(v.atom)), // atom only; flags in operand2
+        else => 0,
+    });
+    // Second operand for atom_u8 format: the flags byte
+    const operand2_val = llvm.constInt32(switch (instr.operand) {
+        .atom_u8 => |v| @as(i32, @intCast(v.value)),
         else => 0,
     });
 
+    // Build JS_UNDEFINED as {0, JS_TAG_UNDEFINED(3)} for func_obj and new_target
+    const jsv_ty = jsvalueType();
+    var undef_jsv = c.LLVMGetUndef(jsv_ty);
+    undef_jsv = c.LLVMBuildInsertValue(b.ref, undef_jsv, llvm.constInt64(0), 0, "undef0");
+    undef_jsv = c.LLVMBuildInsertValue(b.ref, undef_jsv, llvm.constInt64(3), 1, "undef1"); // JS_TAG_UNDEFINED = 3
+
+    // arg_buf: use arg_shadow if available, otherwise null
+    const null_ptr = llvm.constNull(llvm.ptrType());
+    const arg_buf_val = tctx.arg_shadow_ptr orelse null_ptr;
+
+    const exec_fn_ty = llvm.functionType(llvm.i32Type(), &.{
+        llvm.ptrType(), llvm.i8Type(), llvm.i32Type(), llvm.ptrType(), llvm.ptrType(),
+        llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(),
+        llvm.i32Type(), llvm.ptrType(), jsv_ty, jsv_ty, llvm.ptrType(), llvm.i32Type(),
+    }, false);
+
     const err_code = b.buildCall(
-        llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.i8Type(), llvm.i32Type(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false),
-        tctx.rt.exec_opcode, &.{ tctx.ctx_param, opcode_val, operand_val, tctx.stack_ptr, tctx.sp_ptr, tctx.locals_ptr, llvm.constInt32(@intCast(tctx.func.var_count)) }, "err",
+        exec_fn_ty,
+        tctx.rt.exec_opcode,
+        &.{
+            tctx.ctx_param,                                         // ctx
+            opcode_val,                                             // op
+            operand_val,                                            // operand
+            tctx.stack_ptr,                                         // stack
+            tctx.sp_ptr,                                            // sp
+            tctx.locals_ptr,                                        // locals
+            llvm.constInt32(@intCast(tctx.func.var_count)),         // var_count
+            tctx.var_refs_param,                                    // var_refs
+            tctx.closure_var_count_param,                           // closure_var_count
+            tctx.argv_param,                                        // argv
+            tctx.argc_param,                                        // argc
+            arg_buf_val,                                            // arg_buf
+            undef_jsv,                                              // func_obj (JS_UNDEFINED)
+            undef_jsv,                                              // new_target (JS_UNDEFINED)
+            tctx.cpool_param,                                       // cpool
+            operand2_val,                                           // operand2 (flags for atom_u8)
+        },
+        "err",
     );
     emitErrorCheck(tctx, err_code);
     // Fallback opcodes could modify any array's internal storage

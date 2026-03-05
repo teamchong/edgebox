@@ -464,6 +464,12 @@ fn hasKillerOpcodes(instructions: []const bytecode_parser.Instruction, is_self_r
             .eval, .with_get_var, .with_put_var, .with_delete_var,
             // Generators (yield not supported, but await IS supported via trampoline)
             .initial_yield, .yield, .yield_star,
+            // Exception handling (requires bytecode PC which frozen code doesn't have)
+            .@"catch", .nip_catch, .gosub, .ret,
+            // Variable references (requires get_var_ref which needs JSStackFrame)
+            .make_loc_ref, .make_arg_ref, .make_var_ref_ref, .make_var_ref,
+            // put_ref_value is dependent on make_*_ref (pushes 2 values)
+            .put_ref_value,
             // Other unsupported
             .import,
             => {
