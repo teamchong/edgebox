@@ -1421,6 +1421,8 @@ export fn llvm_rt_op_get_var_undef(ctx: *JSContext, stack: [*]CV, sp: *usize, na
 /// Create a closure from a constant pool function.
 /// Stack effect: pushes the closure onto the stack.
 /// Returns 0 on success, non-zero on exception.
+const ListHead = zig_runtime.ListHead;
+
 export fn llvm_rt_fclosure(
     ctx: *JSContext,
     stack: [*]CV,
@@ -1462,4 +1464,76 @@ export fn llvm_rt_fclosure(
     stack[sp.*] = CV.fromJSValue(closure);
     sp.* += 1;
     return 0;
+}
+
+/// Create a closure with shared var_refs (v2 API).
+/// Unlike v1, var_refs POINT INTO the locals_jsv array so closures see live local values.
+/// Requires syncLocalsTo before calls and js_frozen_var_ref_list_detach at function return.
+export fn llvm_rt_fclosure_v2(
+    ctx: *JSContext,
+    stack: [*]CV,
+    sp: *usize,
+    cpool: ?[*]JSValue,
+    func_idx: u32,
+    var_refs: ?[*]*JSVarRef,
+    locals: [*]CV,
+    local_count: u32,
+    argv: ?[*]JSValue,
+    argc: c_int,
+    locals_jsv: [*]JSValue,
+    var_ref_list: *ListHead,
+) callconv(.c) c_int {
+    const quickjs = zig_runtime.quickjs;
+    const lc: usize = @intCast(local_count);
+
+    // Sync CV locals → JSValue locals_jsv so closure sees current values
+    for (0..lc) |i| {
+        locals_jsv[i] = CV.toJSValuePtr(&locals[i]);
+    }
+
+    const bfunc = if (cpool) |cp| cp[func_idx] else JSValue.UNDEFINED;
+    const closure = quickjs.js_frozen_create_closure_v2(
+        ctx,
+        bfunc,
+        var_refs,
+        var_ref_list,
+        @ptrCast(locals_jsv),
+        @intCast(lc),
+        if (argv != null and argc > 0) argv else null,
+        argc,
+    );
+
+    if (closure.isException()) return 1;
+
+    // Sync back: closure creation may have modified locals_jsv (e.g. for captured vars)
+    for (0..lc) |i| {
+        locals[i] = CV.fromJSValue(locals_jsv[i]);
+    }
+
+    stack[sp.*] = CV.fromJSValue(closure);
+    sp.* += 1;
+    return 0;
+}
+
+/// Sync CV locals → JSValue locals_jsv (before calls, so closures see current values).
+export fn llvm_rt_sync_locals_to(locals: [*]CV, locals_jsv: [*]JSValue, local_count: u32) callconv(.c) void {
+    const lc: usize = @intCast(local_count);
+    for (0..lc) |i| {
+        locals_jsv[i] = CV.toJSValuePtr(&locals[i]);
+    }
+}
+
+/// Sync JSValue locals_jsv → CV locals (after calls, so parent sees closure modifications).
+export fn llvm_rt_sync_locals_from(locals: [*]CV, locals_jsv: [*]JSValue, local_count: u32) callconv(.c) void {
+    const lc: usize = @intCast(local_count);
+    for (0..lc) |i| {
+        locals[i] = CV.fromJSValue(locals_jsv[i]);
+    }
+}
+
+/// Detach shared var_refs before function return or tail_call.
+export fn llvm_rt_var_ref_list_detach(ctx: *JSContext, var_ref_list: ?*ListHead) callconv(.c) void {
+    if (var_ref_list) |vrl| {
+        zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, vrl);
+    }
 }

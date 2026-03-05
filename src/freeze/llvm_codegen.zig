@@ -1075,6 +1075,7 @@ pub fn generateThinShard(
                             .put_var, .put_var_init, .put_var_strict, .check_var,
                             .for_of_start, .for_of_next, .for_in_start, .for_in_next,
                             .iterator_close,
+                            .array_from,
                             => {},
                             else => unsafe_opcode_counts[@intFromEnum(bi.opcode)] += 1,
                         }
@@ -1269,6 +1270,12 @@ const ThinRuntimeDecls = struct {
 
     // Closure creation
     fclosure: llvm.Value,
+    fclosure_v2: llvm.Value,
+
+    // Closure sync
+    sync_locals_to: llvm.Value,
+    sync_locals_from: llvm.Value,
+    var_ref_list_detach: llvm.Value,
 
     // Return helpers
     returnFromStack: llvm.Value,
@@ -1463,6 +1470,16 @@ const ThinRuntimeDecls = struct {
             // fclosure: i32(ctx, stack, sp, cpool, func_idx, var_refs, locals, local_count, argv, argc)
             .fclosure = declareExtern(module, "llvm_rt_fclosure", llvm.functionType(i32t, &.{ ptr, ptr, ptr, ptr, i32t, ptr, ptr, i32t, ptr, i32t }, false)),
 
+            // fclosure_v2: i32(ctx, stack, sp, cpool, func_idx, var_refs, locals, local_count, argv, argc, locals_jsv, var_ref_list)
+            .fclosure_v2 = declareExtern(module, "llvm_rt_fclosure_v2", llvm.functionType(i32t, &.{ ptr, ptr, ptr, ptr, i32t, ptr, ptr, i32t, ptr, i32t, ptr, ptr }, false)),
+
+            // sync_locals_to/from: void(locals, locals_jsv, local_count)
+            .sync_locals_to = declareExtern(module, "llvm_rt_sync_locals_to", llvm.functionType(voidt, &.{ ptr, ptr, i32t }, false)),
+            .sync_locals_from = declareExtern(module, "llvm_rt_sync_locals_from", llvm.functionType(voidt, &.{ ptr, ptr, i32t }, false)),
+
+            // var_ref_list_detach: void(ctx, var_ref_list)
+            .var_ref_list_detach = declareExtern(module, "llvm_rt_var_ref_list_detach", llvm.functionType(voidt, &.{ ptr, ptr }, false)),
+
             .returnFromStack = declareExtern(module, "llvm_rt_returnFromStack", return_helper),
             .returnUndef = declareExtern(module, "llvm_rt_returnUndef", cleanup_helper),
             .exceptionCleanup = declareExtern(module, "llvm_rt_exceptionCleanup", cleanup_helper),
@@ -1561,6 +1578,10 @@ const ThinCodegenCtx = struct {
 
     // Arg shadow
     arg_shadow_ptr: ?llvm.Value = null,
+
+    // Closure sync: allocated only for functions with fclosure/fclosure8 opcodes
+    locals_jsv_ptr: ?llvm.Value = null,
+    var_ref_list_ptr: ?llvm.Value = null,
 
     // Tracks whether any fallback opcode was emitted that js_frozen_exec_opcode can't handle.
     // If true, this function should not be registered as frozen (falls back to interpreter).
@@ -1976,6 +1997,31 @@ fn generateThinFunction(
     // IC slots are handled per-instruction in emitThinFieldOp
     // (each get_field/get_field2 gets a null IC for now, string-based lookup fallback)
 
+    // Allocate locals_jsv and var_ref_list for closure sync (v2 shared var_refs)
+    // Only allocated for functions that create closures (fclosure/fclosure8).
+    var locals_jsv_ptr_val: ?llvm.Value = null;
+    var var_ref_list_ptr_val: ?llvm.Value = null;
+    if (has_fclosure and local_count > 0) {
+        // locals_jsv: array of JSValue (16 bytes each = 2 x i64), but stored as [local_count * 2 x i64]
+        const jsv_array_ty = llvm.arrayType(llvm.i64Type(), local_count * 2);
+        const jsv_alloca = builder.buildAlloca(jsv_array_ty, "locals_jsv");
+        var jsv_gep_idx = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(0) };
+        locals_jsv_ptr_val = builder.buildInBoundsGEP(jsv_array_ty, jsv_alloca, &jsv_gep_idx, "ljv");
+
+        // var_ref_list: ListHead = { prev, next } = 2 pointers
+        // Initialize as empty list (prev = next = &self)
+        const list_ty = llvm.arrayType(llvm.ptrType(), 2);
+        const list_alloca = builder.buildAlloca(list_ty, "var_ref_list");
+        var list_gep_idx = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(0) };
+        const list_flat = builder.buildInBoundsGEP(list_ty, list_alloca, &list_gep_idx, "vrl");
+        var_ref_list_ptr_val = list_flat;
+        // Initialize: prev = &self, next = &self (empty list)
+        _ = builder.buildStore(list_flat, list_flat);
+        var next_idx = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(1) };
+        const next_ptr = builder.buildInBoundsGEP(list_ty, list_alloca, &next_idx, "vrl_next");
+        _ = builder.buildStore(list_flat, next_ptr);
+    }
+
     // Save the no_overflow insertion point
     const no_overflow_bb = c.LLVMGetInsertBlock(builder.ref);
 
@@ -1992,8 +2038,8 @@ fn generateThinFunction(
                 ctx_param,
                 locals_flat,
                 llvm.constInt64(local_count),
-                llvm.constNull(llvm.ptrType()), // locals_jsv (null for non-closure)
-                llvm.constNull(llvm.ptrType()), // var_ref_list (null)
+                locals_jsv_ptr_val orelse llvm.constNull(llvm.ptrType()),
+                var_ref_list_ptr_val orelse llvm.constNull(llvm.ptrType()),
                 if (arg_shadow_ptr) |sp2| blk: {
                     var si = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(0) };
                     break :blk builder.buildInBoundsGEP(llvm.arrayType(llvm.i64Type(), func.arg_count), sp2, &si, "asp");
@@ -2029,6 +2075,8 @@ fn generateThinFunction(
         .has_fclosure = has_fclosure,
         .has_for_of = has_for_of,
         .arg_shadow_ptr = arg_shadow_ptr,
+        .locals_jsv_ptr = locals_jsv_ptr_val,
+        .var_ref_list_ptr = var_ref_list_ptr_val,
         .cleanup_bb = cleanup_bb,
         .entry_bb = no_overflow_bb,
         .stack_array_size = stack_array_size,
@@ -2532,6 +2580,13 @@ fn emitThinInstruction(
         },
         .tail_call => {
             vstackFlush(tctx);
+            // Sync locals and detach var_refs before tail call (closures must be detached)
+            if (tctx.locals_jsv_ptr) |ljv| {
+                const sync_fn_ty = llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false);
+                _ = b.buildCall(sync_fn_ty, rt.sync_locals_to, &.{ locs, ljv, llvm.constInt32(@intCast(tctx.local_count)) }, "");
+                const detach_fn_ty = llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType() }, false);
+                _ = b.buildCall(detach_fn_ty, rt.var_ref_list_detach, &.{ ctx_p, tctx.var_ref_list_ptr.? }, "");
+            }
             // Combined: call + cleanup + return in one runtime function
             const tc_fn_ty = llvm.functionType(jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.i64Type(), llvm.ptrType(), llvm.i64Type() }, false);
             const ret = b.buildCall(
@@ -2552,6 +2607,13 @@ fn emitThinInstruction(
         },
         .tail_call_method => {
             vstackFlush(tctx);
+            // Sync locals and detach var_refs before tail call (closures must be detached)
+            if (tctx.locals_jsv_ptr) |ljv| {
+                const sync_fn_ty = llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false);
+                _ = b.buildCall(sync_fn_ty, rt.sync_locals_to, &.{ locs, ljv, llvm.constInt32(@intCast(tctx.local_count)) }, "");
+                const detach_fn_ty = llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType() }, false);
+                _ = b.buildCall(detach_fn_ty, rt.var_ref_list_detach, &.{ ctx_p, tctx.var_ref_list_ptr.? }, "");
+            }
             // Combined: call_method + cleanup + return in one runtime function
             const tc_fn_ty = llvm.functionType(jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.i64Type(), llvm.ptrType(), llvm.i64Type() }, false);
             const ret = b.buildCall(
@@ -2628,7 +2690,8 @@ fn emitThinInstruction(
                 rt.returnFromStack,
                 &.{
                     ctx_p, stk, sp, locs, llvm.constInt64(tctx.local_count),
-                    llvm.constNull(llvm.ptrType()), llvm.constNull(llvm.ptrType()),
+                    tctx.locals_jsv_ptr orelse llvm.constNull(llvm.ptrType()),
+                    tctx.var_ref_list_ptr orelse llvm.constNull(llvm.ptrType()),
                     if (tctx.arg_shadow_ptr) |asp| blk: {
                         var si = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(0) };
                         break :blk b.buildInBoundsGEP(llvm.arrayType(llvm.i64Type(), tctx.func.arg_count), asp, &si, "asp");
@@ -2648,7 +2711,8 @@ fn emitThinInstruction(
                 rt.returnUndef,
                 &.{
                     ctx_p, locs, llvm.constInt64(tctx.local_count),
-                    llvm.constNull(llvm.ptrType()), llvm.constNull(llvm.ptrType()),
+                    tctx.locals_jsv_ptr orelse llvm.constNull(llvm.ptrType()),
+                    tctx.var_ref_list_ptr orelse llvm.constNull(llvm.ptrType()),
                     if (tctx.arg_shadow_ptr) |asp| blk: {
                         var si = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(0) };
                         break :blk b.buildInBoundsGEP(llvm.arrayType(llvm.i64Type(), tctx.func.arg_count), asp, &si, "asp");
@@ -2763,19 +2827,38 @@ fn emitThinInstruction(
         .fclosure8, .fclosure => {
             vstackFlush(tctx);
             const func_idx: u32 = instr.operand.const_idx;
-            const err_code = b.buildCall(
-                llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.i32Type() }, false),
-                rt.fclosure,
-                &.{
-                    ctx_p, stk, sp, tctx.cpool_param,
-                    llvm.constInt32(@intCast(func_idx)),
-                    tctx.var_refs_param,
-                    locs, llvm.constInt32(@intCast(tctx.local_count)),
-                    tctx.argv_param, tctx.argc_param,
-                },
-                "err",
-            );
-            emitErrorCheck(tctx, err_code);
+            if (tctx.locals_jsv_ptr) |ljv| {
+                // V2: shared var_refs pointing into locals_jsv array
+                const err_code = b.buildCall(
+                    llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.ptrType() }, false),
+                    rt.fclosure_v2,
+                    &.{
+                        ctx_p, stk, sp, tctx.cpool_param,
+                        llvm.constInt32(@intCast(func_idx)),
+                        tctx.var_refs_param,
+                        locs, llvm.constInt32(@intCast(tctx.local_count)),
+                        tctx.argv_param, tctx.argc_param,
+                        ljv, tctx.var_ref_list_ptr.?,
+                    },
+                    "err",
+                );
+                emitErrorCheck(tctx, err_code);
+            } else {
+                // V1 fallback: detached var_refs (snapshot at creation time)
+                const err_code = b.buildCall(
+                    llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.i32Type() }, false),
+                    rt.fclosure,
+                    &.{
+                        ctx_p, stk, sp, tctx.cpool_param,
+                        llvm.constInt32(@intCast(func_idx)),
+                        tctx.var_refs_param,
+                        locs, llvm.constInt32(@intCast(tctx.local_count)),
+                        tctx.argv_param, tctx.argc_param,
+                    },
+                    "err",
+                );
+                emitErrorCheck(tctx, err_code);
+            }
         },
 
         // ========== Unsupported — use fallback ==========
@@ -2801,11 +2884,23 @@ fn emitErrorCheck(tctx: *ThinCodegenCtx, err_code: llvm.Value) void {
 fn emitThinCallOp(tctx: *ThinCodegenCtx, func: llvm.Value, argc: u16) void {
     vstackFlush(tctx);
     const b = tctx.builder;
+    const sync_fn_ty = llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false);
+
+    // Sync locals → locals_jsv before call (closures see current values)
+    if (tctx.locals_jsv_ptr) |ljv| {
+        _ = b.buildCall(sync_fn_ty, tctx.rt.sync_locals_to, &.{ tctx.locals_ptr, ljv, llvm.constInt32(@intCast(tctx.local_count)) }, "");
+    }
+
     const err_code = b.buildCall(
         llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false),
         func, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, llvm.constInt32(@intCast(argc)) }, "err",
     );
     emitErrorCheck(tctx, err_code);
+
+    // Sync locals_jsv → locals after call (parent sees closure modifications)
+    if (tctx.locals_jsv_ptr) |ljv| {
+        _ = b.buildCall(sync_fn_ty, tctx.rt.sync_locals_from, &.{ tctx.locals_ptr, ljv, llvm.constInt32(@intCast(tctx.local_count)) }, "");
+    }
 
     // Invalidate array caches — callee could have modified any array's internal storage
     arrayCacheInvalidateAll(tctx);
@@ -2894,7 +2989,7 @@ fn emitFallbackOpcode(tctx: *ThinCodegenCtx, instr: Instruction) void {
         .check_var,
         .for_of_start, .for_of_next, .for_in_start, .for_in_next,
         .iterator_close,
-        // NOTE: array_from excluded — enables functions with ref counting bugs
+        .array_from,
         => {}, // Handled by js_frozen_exec_opcode
         else => tctx.has_unsafe_fallback = true,
     }
@@ -2939,6 +3034,13 @@ fn emitFallbackOpcode(tctx: *ThinCodegenCtx, instr: Instruction) void {
         llvm.i32Type(), llvm.ptrType(), jsv_ty, jsv_ty, llvm.ptrType(), llvm.i32Type(),
     }, false);
 
+    const sync_fn_ty = llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false);
+
+    // Sync locals → locals_jsv before fallback (closures see current values)
+    if (tctx.locals_jsv_ptr) |ljv| {
+        _ = b.buildCall(sync_fn_ty, tctx.rt.sync_locals_to, &.{ tctx.locals_ptr, ljv, llvm.constInt32(@intCast(tctx.local_count)) }, "");
+    }
+
     const err_code = b.buildCall(
         exec_fn_ty,
         tctx.rt.exec_opcode,
@@ -2963,6 +3065,12 @@ fn emitFallbackOpcode(tctx: *ThinCodegenCtx, instr: Instruction) void {
         "err",
     );
     emitErrorCheck(tctx, err_code);
+
+    // Sync locals_jsv → locals after fallback (parent sees closure modifications)
+    if (tctx.locals_jsv_ptr) |ljv| {
+        _ = b.buildCall(sync_fn_ty, tctx.rt.sync_locals_from, &.{ tctx.locals_ptr, ljv, llvm.constInt32(@intCast(tctx.local_count)) }, "");
+    }
+
     // Fallback opcodes could modify any array's internal storage
     arrayCacheInvalidateAll(tctx);
 }
