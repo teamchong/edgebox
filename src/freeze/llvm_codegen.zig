@@ -1470,8 +1470,8 @@ const ThinRuntimeDecls = struct {
             // fclosure: i32(ctx, stack, sp, cpool, func_idx, var_refs, locals, local_count, argv, argc)
             .fclosure = declareExtern(module, "llvm_rt_fclosure", llvm.functionType(i32t, &.{ ptr, ptr, ptr, ptr, i32t, ptr, ptr, i32t, ptr, i32t }, false)),
 
-            // fclosure_v2: i32(ctx, stack, sp, cpool, func_idx, var_refs, locals, local_count, argv, argc, locals_jsv, var_ref_list)
-            .fclosure_v2 = declareExtern(module, "llvm_rt_fclosure_v2", llvm.functionType(i32t, &.{ ptr, ptr, ptr, ptr, i32t, ptr, ptr, i32t, ptr, i32t, ptr, ptr }, false)),
+            // fclosure_v2: i32(ctx, stack, sp, cpool, func_idx, var_refs, locals, local_count, argv, argc, locals_jsv, var_ref_list, arg_shadow, arg_count)
+            .fclosure_v2 = declareExtern(module, "llvm_rt_fclosure_v2", llvm.functionType(i32t, &.{ ptr, ptr, ptr, ptr, i32t, ptr, ptr, i32t, ptr, i32t, ptr, ptr, ptr, i32t }, false)),
 
             // sync_locals_to/from: void(locals, locals_jsv, local_count)
             .sync_locals_to = declareExtern(module, "llvm_rt_sync_locals_to", llvm.functionType(voidt, &.{ ptr, ptr, i32t }, false)),
@@ -1950,34 +1950,51 @@ fn generateThinFunction(
     if (has_put_arg and func.arg_count > 0) {
         const shadow_ty = llvm.arrayType(llvm.i64Type(), func.arg_count);
         arg_shadow_ptr = builder.buildAlloca(shadow_ty, "arg_shadow");
-        // Initialize: arg_shadow[i] = i < argc ? cv_from_jsvalue(argv[i]) : UNDEFINED
+        // Initialize: arg_shadow[i] = i < argc ? dup(cv_from_jsvalue(argv[i])) : UNDEFINED
+        // CRITICAL: Must use conditional branching, NOT select. LLVM select evaluates
+        // both operands unconditionally, which causes OOB reads from argv when i >= argc.
+        // Those OOB reads hit stale stack data (freed JSValues), causing phantom dupRef
+        // on freed objects and corrupting GC refcounts.
+        const current_fn = c.LLVMGetBasicBlockParent(c.LLVMGetInsertBlock(builder.ref));
         for (0..func.arg_count) |i| {
             const idx_val = llvm.constInt32(@intCast(i));
             const in_bounds = builder.buildICmp(c.LLVMIntSLT, idx_val, argc_param, "inb");
 
-            // Load argv[i] — argv is a [*]JSValue where JSValue is {i64, i64}
+            const arg_load_bb = llvm.appendBasicBlock(current_fn, "arg_load");
+            const arg_undef_bb = llvm.appendBasicBlock(current_fn, "arg_undef");
+            const arg_merge_bb = llvm.appendBasicBlock(current_fn, "arg_merge");
+            _ = builder.buildCondBr(in_bounds, arg_load_bb, arg_undef_bb);
+
+            // In-bounds path: load argv[i], convert to CV, dupRef
+            builder.positionAtEnd(arg_load_bb);
             const jsv_el_ty = jsvalueType();
             var argv_idx = [_]llvm.Value{llvm.constInt(llvm.i64Type(), i, false)};
             const argv_elem_ptr = builder.buildInBoundsGEP(jsv_el_ty, argv_param, &argv_idx, "avp");
             const argv_val = builder.buildLoad(jsv_el_ty, argv_elem_ptr, "av");
-
-            // Convert JSValue to CV (CompressedValue)
             const cv_val = builder.buildCall(
                 llvm.functionType(llvm.i64Type(), &.{jsv_el_ty}, false),
                 rt.cv_from_jsvalue, &.{argv_val}, "cv",
             );
-
-            // DupRef the CV to properly own the reference.
-            // Frozen functions are dispatched BEFORE JS_CALL_FLAG_COPY_ARGV
-            // takes effect, so argv[] contains borrowed references from the caller.
-            // The arg_shadow cleanup (returnFromStack/exceptionCleanup) will freeRef
-            // these values, so we must dup to avoid over-decrementing the caller's refs.
+            // DupRef: frozen functions are dispatched BEFORE JS_CALL_FLAG_COPY_ARGV,
+            // so argv[] contains borrowed references. We must dup to own them.
             const cv_duped = builder.buildCall(
                 llvm.functionType(llvm.i64Type(), &.{llvm.i64Type()}, false),
                 rt.cv_dup_ref, &.{cv_val}, "cvdup",
             );
+            const load_final_bb = c.LLVMGetInsertBlock(builder.ref);
+            _ = builder.buildBr(arg_merge_bb);
 
-            const shadow_val = builder.buildSelect(in_bounds, cv_duped, cv_undefined, "shv");
+            // Out-of-bounds path: use UNDEFINED
+            builder.positionAtEnd(arg_undef_bb);
+            _ = builder.buildBr(arg_merge_bb);
+
+            // Merge with phi
+            builder.positionAtEnd(arg_merge_bb);
+            const shadow_val = builder.buildPhi(llvm.i64Type(), "shv");
+            var phi_vals = [_]llvm.Value{ cv_duped, cv_undefined };
+            var phi_bbs = [_]llvm.BasicBlock{ load_final_bb, arg_undef_bb };
+            llvm.addIncoming(shadow_val, &phi_vals, &phi_bbs);
+
             var shadow_idx = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(@intCast(i)) };
             const shadow_elem = builder.buildInBoundsGEP(
                 llvm.arrayType(llvm.i64Type(), func.arg_count),
@@ -2440,7 +2457,8 @@ fn emitThinInstruction(
             const top = vstackPop(tctx);
             const second = vstackPop(tctx);
             vstackFreeEntry(tctx, second);
-            vstackPush(tctx, top.value, top.owned);
+            // Preserve local_idx when re-pushing (critical for borrowed-entry tracking)
+            tctx.vstack.appendAssumeCapacity(.{ .value = top.value, .owned = top.owned, .local_idx = top.local_idx });
         },
         .swap => {
             // Swap top two entries
@@ -2452,10 +2470,11 @@ fn emitThinInstruction(
                 tctx.vstack.items[len - 2] = tmp;
             } else {
                 // Pop both (may underflow to physical stack), push in reverse order
+                // Preserve local_idx when re-pushing (critical for borrowed-entry tracking)
                 const top = vstackPop(tctx);
                 const second = vstackPop(tctx);
-                vstackPush(tctx, top.value, top.owned);
-                vstackPush(tctx, second.value, second.owned);
+                tctx.vstack.appendAssumeCapacity(.{ .value = top.value, .owned = top.owned, .local_idx = top.local_idx });
+                tctx.vstack.appendAssumeCapacity(.{ .value = second.value, .owned = second.owned, .local_idx = second.local_idx });
             }
         },
         .insert2, .insert3, .insert4 => {
@@ -2829,8 +2848,12 @@ fn emitThinInstruction(
             const func_idx: u32 = instr.operand.const_idx;
             if (tctx.locals_jsv_ptr) |ljv| {
                 // V2: shared var_refs pointing into locals_jsv array
+                // Pass arg_shadow (if exists) so is_arg captures read post-put_arg values
+                // (e.g., rest parameter array stored via put_arg after rest opcode)
+                const null_ptr = llvm.constNull(llvm.ptrType());
+                const shadow_ptr = tctx.arg_shadow_ptr orelse null_ptr;
                 const err_code = b.buildCall(
-                    llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.ptrType() }, false),
+                    llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false),
                     rt.fclosure_v2,
                     &.{
                         ctx_p, stk, sp, tctx.cpool_param,
@@ -2839,6 +2862,7 @@ fn emitThinInstruction(
                         locs, llvm.constInt32(@intCast(tctx.local_count)),
                         tctx.argv_param, tctx.argc_param,
                         ljv, tctx.var_ref_list_ptr.?,
+                        shadow_ptr, llvm.constInt32(@intCast(tctx.func.arg_count)),
                     },
                     "err",
                 );

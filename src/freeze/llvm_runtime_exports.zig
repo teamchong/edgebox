@@ -363,13 +363,16 @@ export fn llvm_rt_call_method_array_push(
         if (arr_cv.isPtr()) {
             // Use toJSValue (no dup) for arr — we just read from it
             const arr_jsv = arr_cv.toJSValue();
-            // Use toJSValueWithCtx (with dup) for val — transfers ownership to array
-            const val_jsv = stack[s - 1].toJSValueWithCtx(ctx);
-            // js_frozen_array_push CONSUMES val_jsv on success (array takes ownership)
-            // On failure (-1), val_jsv is NOT consumed — we must free it
-            const new_len = zig_runtime.quickjs.js_frozen_array_push(ctx, arr_jsv, val_jsv);
+            // Convert val to JSValue and DUP it — js_frozen_array_push CONSUMES its argument
+            // (stores directly in array without dup). toJSValue is a bitwise conversion that
+            // does NOT dup, so we must explicitly dup to create a separate reference for the array.
+            const val_jsv = stack[s - 1].toJSValue();
+            const val_duped = zig_runtime.quickjs.JS_DupValue(ctx, val_jsv);
+            // js_frozen_array_push CONSUMES val_duped on success (array takes ownership)
+            // On failure (-1), val_duped is NOT consumed — we must free it
+            const new_len = zig_runtime.quickjs.js_frozen_array_push(ctx, arr_jsv, val_duped);
             if (new_len >= 0) {
-                // Success: val_jsv was consumed by array. Free stack CVs.
+                // Success: val_duped was consumed by array. Free stack CVs.
                 CV.freeRef(ctx, stack[s - 1]); // val CV (stack's reference)
                 CV.freeRef(ctx, stack[s - 2]); // method (push function)
                 CV.freeRef(ctx, stack[s - 3]); // arr
@@ -378,9 +381,9 @@ export fn llvm_rt_call_method_array_push(
                 sp.* += 1;
                 return 0;
             }
-            // new_len == -1: not a fast array. val_jsv was NOT consumed — free it
-            zig_runtime.quickjs.JS_FreeValue(ctx, val_jsv);
-            // Fall through to slow path
+            // new_len == -1: not a fast array. val_duped was NOT consumed — free the dup
+            zig_runtime.quickjs.JS_FreeValue(ctx, val_duped);
+            // Fall through to slow path (stack CVs remain valid)
         }
     }
 
@@ -1482,6 +1485,8 @@ export fn llvm_rt_fclosure_v2(
     argc: c_int,
     locals_jsv: [*]JSValue,
     var_ref_list: *ListHead,
+    arg_shadow: ?[*]CV,
+    arg_count: u32,
 ) callconv(.c) c_int {
     const quickjs = zig_runtime.quickjs;
     const lc: usize = @intCast(local_count);
@@ -1491,6 +1496,19 @@ export fn llvm_rt_fclosure_v2(
         locals_jsv[i] = CV.toJSValuePtr(&locals[i]);
     }
 
+    // If arg_shadow exists, convert to JSValues for is_arg closure captures.
+    // arg_shadow reflects put_arg mutations (e.g., rest opcode stores array there),
+    // while argv is the original arguments before any modifications.
+    const ac: usize = @intCast(arg_count);
+    var args_jsv_buf: [256]JSValue = undefined;
+    const args_ptr: ?[*]JSValue = if (arg_shadow) |shadow| blk: {
+        for (0..ac) |i| {
+            args_jsv_buf[i] = CV.toJSValuePtr(&shadow[i]);
+        }
+        break :blk @ptrCast(&args_jsv_buf);
+    } else if (argv != null and argc > 0) argv else null;
+    const args_count: c_int = if (arg_shadow != null) @intCast(arg_count) else argc;
+
     const bfunc = if (cpool) |cp| cp[func_idx] else JSValue.UNDEFINED;
     const closure = quickjs.js_frozen_create_closure_v2(
         ctx,
@@ -1499,8 +1517,8 @@ export fn llvm_rt_fclosure_v2(
         var_ref_list,
         @ptrCast(locals_jsv),
         @intCast(lc),
-        if (argv != null and argc > 0) argv else null,
-        argc,
+        args_ptr,
+        args_count,
     );
 
     if (closure.isException()) return 1;

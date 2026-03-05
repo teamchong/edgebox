@@ -36,12 +36,18 @@ pub const FROZEN_MAX_CALL_DEPTH: usize = 10000;
 /// Global call depth counter - tracks frozen function recursion
 pub var frozen_call_depth: usize = 0;
 
+/// C-visible mirror of frozen_call_depth — used by QuickJS to defer GC
+/// cycle collection while frozen functions are active (CVs are invisible
+/// to the cycle collector and would be incorrectly collected).
+extern var js_frozen_call_depth_c: c_int;
+
 /// Check and increment call depth, return true if stack overflow
 pub inline fn checkStack() bool {
     if (frozen_call_depth >= FROZEN_MAX_CALL_DEPTH) {
         return true; // Stack overflow
     }
     frozen_call_depth += 1;
+    js_frozen_call_depth_c = @intCast(frozen_call_depth);
     return false;
 }
 
@@ -50,11 +56,13 @@ pub inline fn exitStack() void {
     if (frozen_call_depth > 0) {
         frozen_call_depth -= 1;
     }
+    js_frozen_call_depth_c = @intCast(frozen_call_depth);
 }
 
 /// Reset call depth (call at start of each request)
 pub fn frozen_reset_call_depth_zig() void {
     frozen_call_depth = 0;
+    js_frozen_call_depth_c = 0;
 }
 
 // ============================================================================
