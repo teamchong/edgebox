@@ -3085,6 +3085,7 @@ pub const quickjs = struct {
     }
     pub extern fn JS_ToFloat64(ctx: *JSContext, pres: *f64, val: JSValue) c_int;
     pub extern fn JS_ToString(ctx: *JSContext, val: JSValue) JSValue;
+    pub extern fn JS_ToPropertyKey(ctx: *JSContext, val: JSValue) JSValue;
     pub extern fn JS_ToCStringLen2(ctx: *JSContext, plen: ?*usize, val: JSValue, cesu8: bool) ?[*:0]const u8;
     pub fn JS_ToCString(ctx: *JSContext, val: JSValue) ?[*:0]const u8 {
         return JS_ToCStringLen2(ctx, null, val, false);

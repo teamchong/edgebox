@@ -43,7 +43,7 @@ index ae01300..587c949 100644
  }
  
 diff --git a/quickjs.c b/quickjs.c
-index 62f4381..3cf9a4e 100644
+index 62f4381..f326694 100644
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -29,6 +29,10 @@
@@ -305,7 +305,7 @@ index 62f4381..3cf9a4e 100644
  #define GLOBAL_VAR_OFFSET 0x40000000
  #define ARGUMENT_VAR_OFFSET 0x20000000
  
-@@ -15598,6 +15718,1633 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
+@@ -15598,6 +15718,1738 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
      return 0;
  }
  
@@ -1169,6 +1169,63 @@ index 62f4381..3cf9a4e 100644
 +        (*sp)--;
 +        break;
 +
++    case OP_get_field:
++        {
++            JSAtom atom = (JSAtom)operand;
++            JSValue val = JS_GetPropertyInternal(ctx, stack[*sp - 1], atom, stack[*sp - 1], false);
++            if (JS_IsException(val))
++                return JS_EXCEPTION;
++            JS_FreeValue(ctx, stack[*sp - 1]);
++            stack[*sp - 1] = val;
++        }
++        break;
++
++    case OP_get_field2:
++        {
++            JSAtom atom = (JSAtom)operand;
++            JSValue val = JS_GetPropertyInternal(ctx, stack[*sp - 1], atom, stack[*sp - 1], false);
++            if (JS_IsException(val))
++                return JS_EXCEPTION;
++            /* obj stays at sp-1, method goes at sp */
++            stack[*sp] = val;
++            (*sp)++;
++        }
++        break;
++
++    case OP_put_field:
++        {
++            JSAtom atom = (JSAtom)operand;
++            JSValue val2 = stack[*sp - 1];
++            JSValue obj2 = stack[*sp - 2];
++            int ret2 = JS_SetPropertyInternal(ctx, obj2, atom, val2, JS_PROP_THROW);
++            JS_FreeValue(ctx, obj2);
++            *sp -= 2;
++            if (ret2 < 0) return JS_EXCEPTION;
++        }
++        break;
++
++    case OP_get_array_el:
++        {
++            JSValue val = JS_GetPropertyValue(ctx, stack[*sp - 2], stack[*sp - 1]);
++            stack[*sp - 2] = val;
++            (*sp)--;
++            if (JS_IsException(val))
++                return JS_EXCEPTION;
++        }
++        break;
++
++    case OP_put_array_el:
++        {
++            JSValue val3 = stack[*sp - 1];
++            JSValue idx3 = stack[*sp - 2];
++            JSValue obj3 = stack[*sp - 3];
++            int ret3 = JS_SetPropertyValue(ctx, obj3, idx3, val3, JS_PROP_THROW);
++            JS_FreeValue(ctx, obj3);
++            *sp -= 3;
++            if (ret3 < 0) return JS_EXCEPTION;
++        }
++        break;
++
 +    default:
 +        /* Unknown opcode - return exception with helpful message */
 +        return JS_ThrowTypeError(ctx, "Unsupported opcode %d in frozen function fallback", opcode);
@@ -1273,6 +1330,28 @@ index 62f4381..3cf9a4e 100644
 +                }
 +            }
 +            var_refs[i] = var_ref;
++        }
++
++        /* DEBUG: trace addFileIncludeReason closure creation */
++        if (b->line_num >= 110500 && b->line_num <= 110520 && b->closure_var_count >= 3) {
++            char fn_name[128];
++            JS_AtomGetStr(ctx, fn_name, sizeof(fn_name), b->func_name);
++            fprintf(stderr, "[CLOSURE_V1] Created '%s'@%d closure_var_count=%d num_locals=%d num_args=%d\n",
++                    fn_name, b->line_num, b->closure_var_count, num_locals, num_args);
++            for (int j = 0; j < b->closure_var_count; j++) {
++                JSClosureVar *cv2 = &b->closure_var[j];
++                char cv_name[64];
++                JS_AtomGetStr(ctx, cv_name, sizeof(cv_name), cv2->var_name);
++                JSVarRef *vr = var_refs[j];
++                JSValue cv_val = *vr->pvalue;
++                int32_t tag = JS_VALUE_GET_TAG(cv_val);
++                fprintf(stderr, "[CLOSURE_V1]   cv[%d] name='%s' is_local=%d is_arg=%d var_idx=%d tag=%d detached=%d\n",
++                        j, cv_name, cv2->is_local, cv2->is_arg, cv2->var_idx, tag, vr->is_detached);
++                if (tag == JS_TAG_OBJECT) {
++                    const char *str = JS_ToCString(ctx, cv_val);
++                    if (str) { fprintf(stderr, "[CLOSURE_V1]     toString='%s'\n", str); JS_FreeCString(ctx, str); }
++                }
++            }
 +        }
 +    }
 +
@@ -1529,6 +1608,32 @@ index 62f4381..3cf9a4e 100644
 +                }
 +            }
 +            var_refs[i] = var_ref;
++        }
++
++        /* DEBUG: trace addFileIncludeReason closure creation */
++        if (b->line_num >= 110500 && b->line_num <= 110520 && b->closure_var_count >= 3) {
++            char fn_name[128];
++            JS_AtomGetStr(ctx, fn_name, sizeof(fn_name), b->func_name);
++            fprintf(stderr, "[CLOSURE_V2] Created '%s'@%d closure_var_count=%d num_locals=%d num_args=%d\n",
++                    fn_name, b->line_num, b->closure_var_count, num_locals, num_args);
++            for (int j = 0; j < b->closure_var_count; j++) {
++                JSClosureVar *cv2 = &b->closure_var[j];
++                char cv_name[64];
++                JS_AtomGetStr(ctx, cv_name, sizeof(cv_name), cv2->var_name);
++                JSVarRef *vr = var_refs[j];
++                JSValue cv_val = *vr->pvalue;
++                int32_t tag = JS_VALUE_GET_TAG(cv_val);
++                fprintf(stderr, "[CLOSURE_V2]   cv[%d] name='%s' is_local=%d is_arg=%d var_idx=%d tag=%d detached=%d pvalue=%p &value=%p\n",
++                        j, cv_name, cv2->is_local, cv2->is_arg, cv2->var_idx, tag, vr->is_detached,
++                        (void*)vr->pvalue, (void*)&vr->value);
++                if (tag == JS_TAG_OBJECT) {
++                    const char *str = JS_ToCString(ctx, cv_val);
++                    if (str) { fprintf(stderr, "[CLOSURE_V2]     toString='%s'\n", str); JS_FreeCString(ctx, str); }
++                } else if (tag == JS_TAG_FUNCTION_BYTECODE || tag == -1) {
++                    const char *str = JS_ToCString(ctx, cv_val);
++                    if (str) { fprintf(stderr, "[CLOSURE_V2]     toString='%s'\n", str); JS_FreeCString(ctx, str); }
++                }
++            }
 +        }
 +    }
 +
@@ -1939,7 +2044,7 @@ index 62f4381..3cf9a4e 100644
  static JSValue JS_IteratorGetCompleteValue(JSContext *ctx, JSValue obj,
                                             int *pdone)
  {
-@@ -15853,7 +17600,7 @@ static __exception int JS_CopyDataProperties(JSContext *ctx,
+@@ -15853,7 +17705,7 @@ static __exception int JS_CopyDataProperties(JSContext *ctx,
  }
  
  /* only valid inside C functions */
@@ -1948,7 +2053,7 @@ index 62f4381..3cf9a4e 100644
  {
      return ctx->rt->current_stack_frame->cur_func;
  }
-@@ -15955,15 +17702,16 @@ static const uint16_t func_kind_to_class_id[] = {
+@@ -15955,15 +17807,16 @@ static const uint16_t func_kind_to_class_id[] = {
      [JS_FUNC_ASYNC_GENERATOR] = JS_CLASS_ASYNC_GENERATOR_FUNCTION,
  };
  
@@ -1968,7 +2073,7 @@ index 62f4381..3cf9a4e 100644
      func_obj = JS_NewObjectClass(ctx, func_kind_to_class_id[b->func_kind]);
      if (JS_IsException(func_obj)) {
          JS_FreeValue(ctx, bfunc);
-@@ -16383,6 +18131,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16383,6 +18236,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  
      if (js_poll_interrupts(caller_ctx))
          return JS_EXCEPTION;
@@ -1976,7 +2081,7 @@ index 62f4381..3cf9a4e 100644
      if (unlikely(JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT)) {
          if (flags & JS_CALL_FLAG_GENERATOR) {
              JSAsyncFunctionState *s = JS_VALUE_GET_PTR(func_obj);
-@@ -16415,12 +18164,163 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16415,12 +18269,166 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          call_func = rt->class_array[p->class_id].call;
          if (!call_func) {
          not_a_function:
@@ -2069,6 +2174,9 @@ index 62f4381..3cf9a4e 100644
 +                }
 +                fprintf(stderr, "[DEBUG]   === End trace ===\n");
 +            }
++            fprintf(stderr, "[DEBUG]   flags=0x%x\n", flags);
++            /* Trap to get native stack via debugger/core */
++            __builtin_trap();
              return JS_ThrowTypeErrorNotAFunction(caller_ctx);
          }
          return call_func(caller_ctx, func_obj, this_obj, argc,
@@ -2140,7 +2248,7 @@ index 62f4381..3cf9a4e 100644
  
      if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
          arg_allocated_size = b->arg_count;
-@@ -16781,7 +18681,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16781,7 +18789,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  
          CASE(OP_fclosure):
              {
@@ -2150,13 +2258,13 @@ index 62f4381..3cf9a4e 100644
                  pc += 4;
                  *sp++ = js_closure(ctx, bfunc, var_refs, sf);
                  if (unlikely(JS_IsException(sp[-1])))
-@@ -16803,6 +18704,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16803,6 +18812,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              has_call_argc:
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
-+                if (JS_IsUndefined(call_argv[-1]) && b->line_num == 110351) {
-+                    fprintf(stderr, "[interp_debug] OP_call: func UNDEFINED in line=110351 argc=%d cvar=%d opcode=%d\n",
-+                            call_argc, b->closure_var_count, opcode);
++                if (JS_IsUndefined(call_argv[-1])) {
++                    fprintf(stderr, "[interp_debug] OP_call: func UNDEFINED in line=%d argc=%d cvar=%d opcode=%d\n",
++                            b->line_num, call_argc, b->closure_var_count, opcode);
 +                    fprintf(stderr, "[interp_debug]   sp=%d stack_base=%d\n",
 +                            (int)(sp - stack_buf), (int)(stack_buf - var_buf));
 +                    for (int vi = 0; vi < (int)b->closure_var_count && var_refs && vi < 5; vi++) {
@@ -2169,7 +2277,7 @@ index 62f4381..3cf9a4e 100644
                  ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                            JS_UNDEFINED, call_argc,
                                            vc(call_argv), 0);
-@@ -16840,6 +18753,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16840,6 +18861,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                  pc += 2;
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -2195,7 +2303,41 @@ index 62f4381..3cf9a4e 100644
                  ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
                                            JS_UNDEFINED, call_argc,
                                            vc(call_argv), 0);
-@@ -17281,11 +19213,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -17190,6 +19230,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                 int idx;
+                 idx = get_u16(pc);
+                 pc += 2;
++                /* DEBUG: find where real programDiagnostics is stored */
++                if (b->line_num >= 109000 && b->line_num <= 109050 && JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
++                    JSValue gfr = JS_GetPropertyStr(ctx, sp[-1], "getFileReasons");
++                    int has_gfr = (JS_VALUE_GET_TAG(gfr) != 3);
++                    JS_FreeValue(ctx, gfr);
++                    if (has_gfr) {
++                        fprintf(stderr, "[PUT_LOC] FOUND programDiagnostics at var_buf[%d] addr=%p\n",
++                                idx, (void*)&var_buf[idx]);
++                    }
++                }
+                 set_value(ctx, &var_buf[idx], sp[-1]);
+                 sp--;
+             }
+@@ -17199,6 +19249,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                 int idx;
+                 idx = get_u16(pc);
+                 pc += 2;
++                /* DEBUG: find where real programDiagnostics is stored */
++                if (b->line_num >= 109000 && b->line_num <= 109050 && JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
++                    JSValue gfr = JS_GetPropertyStr(ctx, sp[-1], "getFileReasons");
++                    int has_gfr = (JS_VALUE_GET_TAG(gfr) != 3);
++                    JS_FreeValue(ctx, gfr);
++                    if (has_gfr) {
++                        fprintf(stderr, "[SET_LOC] FOUND programDiagnostics at var_buf[%d] addr=%p\n",
++                                idx, (void*)&var_buf[idx]);
++                    }
++                }
+                 set_value(ctx, &var_buf[idx], js_dup(sp[-1]));
+             }
+             BREAK;
+@@ -17281,11 +19341,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          CASE(OP_get_var_ref):
              {
                  int idx;
@@ -2208,7 +2350,24 @@ index 62f4381..3cf9a4e 100644
                  sp++;
              }
              BREAK;
-@@ -29006,7 +30936,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
+@@ -17393,6 +19451,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                                            "'this' can be initialized only once");
+                     goto exception;
+                 }
++                /* DEBUG: find where real programDiagnostics is stored */
++                if (b->line_num >= 109000 && b->line_num <= 109050 && JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT) {
++                    JSValue gfr = JS_GetPropertyStr(ctx, sp[-1], "getFileReasons");
++                    int has_gfr = (JS_VALUE_GET_TAG(gfr) != 3);
++                    JS_FreeValue(ctx, gfr);
++                    if (has_gfr) {
++                        fprintf(stderr, "[PUT_LOC_INIT] FOUND programDiagnostics at var_buf[%d] addr=%p\n",
++                                idx, (void*)&var_buf[idx]);
++                    }
++                }
+                 set_value(ctx, &var_buf[idx], sp[-1]);
+                 sp--;
+             }
+@@ -29006,7 +31074,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
      return promise;
  }
  
@@ -2217,7 +2376,7 @@ index 62f4381..3cf9a4e 100644
                                       int argc, JSValueConst *argv)
  {
      JSValueConst *resolving_funcs = argv;
-@@ -29041,7 +30971,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
+@@ -29041,7 +31109,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
      return JS_UNDEFINED;
  }
  
@@ -2226,7 +2385,7 @@ index 62f4381..3cf9a4e 100644
  {
      JSAtom basename;
      JSValue promise, resolving_funcs[2], basename_val;
-@@ -33979,6 +35909,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+@@ -33979,6 +36047,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
      b->has_prototype = fd->has_prototype;
      b->has_simple_parameter_list = fd->has_simple_parameter_list;
      b->is_strict_mode = fd->is_strict_mode;
@@ -2234,7 +2393,7 @@ index 62f4381..3cf9a4e 100644
      b->is_derived_class_constructor = fd->is_derived_class_constructor;
      b->func_kind = fd->func_kind;
      b->need_home_object = (fd->home_object_var_idx >= 0 ||
-@@ -35616,6 +37547,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+@@ -35616,6 +37685,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
      assert(idx <= 16);
      bc_put_u16(s, flags);
      bc_put_u8(s, b->is_strict_mode);
@@ -2242,7 +2401,7 @@ index 62f4381..3cf9a4e 100644
      bc_put_atom(s, b->func_name);
  
      bc_put_leb128(s, b->arg_count);
-@@ -36552,6 +38484,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -36552,6 +38622,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
      if (bc_get_u8(s, &v8))
          goto fail;
      bc.is_strict_mode = (v8 > 0);
@@ -2252,7 +2411,7 @@ index 62f4381..3cf9a4e 100644
      if (bc_get_atom(s, &bc.func_name))
          goto fail;
      if (bc_get_leb128_u16(s, &bc.arg_count))
-@@ -45524,6 +47459,12 @@ static JSValue js_regexp_constructor_internal(JSContext *ctx, JSValueConst ctor,
+@@ -45524,6 +47597,12 @@ static JSValue js_regexp_constructor_internal(JSContext *ctx, JSValueConst ctor,
      return obj;
  }
  

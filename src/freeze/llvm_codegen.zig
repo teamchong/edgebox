@@ -1062,6 +1062,7 @@ pub fn generateThinShard(
                             .throw, .nop, .set_name, .close_loc, .set_loc_uninitialized, .set_home_object,
                             .set_proto,
                             // exec_opcode-handled opcodes (safe to delegate to C):
+                            // .to_propkey, .to_propkey2 now inline-handled
                             .to_propkey, .to_propkey2, .to_object,
                             .instanceof, .in, .delete, .typeof_is_undefined,
                             .get_super, .define_array_el, .set_name_computed, .copy_data_properties,
@@ -1073,6 +1074,7 @@ pub fn generateThinShard(
                             .check_define_var, .define_var, .define_func,
                             // .get_var, .get_var_undef already inline-handled above
                             .put_var, .put_var_init, .put_var_strict, .check_var,
+                            // .for_in_start, .for_in_next now inline-handled
                             .for_of_start, .for_of_next, .for_in_start, .for_in_next,
                             .iterator_close,
                             .array_from,
@@ -1297,6 +1299,8 @@ const ThinRuntimeDecls = struct {
     op_iterator_close: llvm.Value,
     op_for_in_start: llvm.Value,
     op_for_in_next: llvm.Value,
+    op_to_propkey: llvm.Value,
+    op_to_propkey2: llvm.Value,
 
     // Array ops
     op_append: llvm.Value,
@@ -1494,8 +1498,10 @@ const ThinRuntimeDecls = struct {
             .op_for_of_start = declareExtern(module, "llvm_rt_op_for_of_start", llvm.functionType(i32t, &.{ ptr, ptr, ptr, ptr, ptr }, false)),
             .op_for_of_next = declareExtern(module, "llvm_rt_op_for_of_next", llvm.functionType(i32t, &.{ ptr, ptr, ptr, ptr, ptr }, false)),
             .op_iterator_close = declareExtern(module, "llvm_rt_op_iterator_close", llvm.functionType(voidt, &.{ ptr, ptr, ptr, ptr, ptr }, false)),
-            .op_for_in_start = declareExtern(module, "llvm_rt_op_for_in_start", field_op),
-            .op_for_in_next = declareExtern(module, "llvm_rt_op_for_in_next", field_op),
+            .op_for_in_start = declareExtern(module, "llvm_rt_op_for_in_start", llvm.functionType(i32t, &.{ ptr, ptr, ptr }, false)),
+            .op_for_in_next = declareExtern(module, "llvm_rt_op_for_in_next", llvm.functionType(i32t, &.{ ptr, ptr, ptr }, false)),
+            .op_to_propkey = declareExtern(module, "llvm_rt_op_to_propkey", llvm.functionType(i32t, &.{ ptr, ptr, ptr }, false)),
+            .op_to_propkey2 = declareExtern(module, "llvm_rt_op_to_propkey2", llvm.functionType(i32t, &.{ ptr, ptr, ptr }, false)),
 
             .op_append = declareExtern(module, "llvm_rt_op_append", ctx_stack_sp),
             .op_put_array_el = declareExtern(module, "llvm_rt_op_put_array_el", ctx_stack_sp),
@@ -1518,8 +1524,8 @@ const ThinRuntimeDecls = struct {
             .call_method_array_push = declareExtern(module, "llvm_rt_call_method_array_push", llvm.functionType(i32t, &.{ ptr, ptr, ptr }, false)),
             .call_method_math_unary = declareExtern(module, "llvm_rt_call_method_math_unary", llvm.functionType(i32t, &.{ ptr, ptr, ptr, i32t }, false)),
 
-            // exec_opcode: i32(ctx, op, operand, stack, sp, locals, var_count, var_refs, closure_var_count, argv, argc, arg_buf, func_obj{i64,i64}, new_target{i64,i64}, cpool, operand2)
-            .exec_opcode = declareExtern(module, "llvm_rt_exec_opcode", llvm.functionType(i32t, &.{ ptr, llvm.i8Type(), i32t, ptr, ptr, ptr, i32t, ptr, i32t, ptr, i32t, ptr, jsv_ty, jsv_ty, ptr, i32t }, false)),
+            // exec_opcode: i32(ctx, op, operand, stack, sp, locals, var_count, var_refs, closure_var_count, argv, argc, arg_buf, func_obj{i64,i64}, new_target{i64,i64}, cpool, operand2, atom_name)
+            .exec_opcode = declareExtern(module, "llvm_rt_exec_opcode", llvm.functionType(i32t, &.{ ptr, llvm.i8Type(), i32t, ptr, ptr, ptr, i32t, ptr, i32t, ptr, i32t, ptr, jsv_ty, jsv_ty, ptr, i32t, ptr }, false)),
 
             // Combined tail_call+return: (ctx, stack, sp, argc, locals, local_count, arg_shadow, arg_count) -> JSValue
             .tail_call_return = declareExtern(module, "llvm_rt_tail_call_return", llvm.functionType(jsv_ty, &.{ ptr, ptr, ptr, i32t, ptr, i64t, ptr, i64t }, false)),
@@ -2765,6 +2771,40 @@ fn emitThinInstruction(
             _ = b.buildBr(tctx.cleanup_bb);
         },
 
+        // ========== for_in / to_propkey — dedicated CV-native handlers (bypass exec_opcode) ==========
+        .for_in_start => {
+            vstackFlush(tctx);
+            const err_code = b.buildCall(
+                llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType() }, false),
+                rt.op_for_in_start, &.{ ctx_p, stk, sp }, "err",
+            );
+            emitErrorCheck(tctx, err_code);
+        },
+        .for_in_next => {
+            vstackFlush(tctx);
+            const err_code = b.buildCall(
+                llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType() }, false),
+                rt.op_for_in_next, &.{ ctx_p, stk, sp }, "err",
+            );
+            emitErrorCheck(tctx, err_code);
+        },
+        .to_propkey => {
+            vstackFlush(tctx);
+            const err_code = b.buildCall(
+                llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType() }, false),
+                rt.op_to_propkey, &.{ ctx_p, stk, sp }, "err",
+            );
+            emitErrorCheck(tctx, err_code);
+        },
+        .to_propkey2 => {
+            vstackFlush(tctx);
+            const err_code = b.buildCall(
+                llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType() }, false),
+                rt.op_to_propkey2, &.{ ctx_p, stk, sp }, "err",
+            );
+            emitErrorCheck(tctx, err_code);
+        },
+
         // ========== Array operations ==========
         .append => { vstackFlush(tctx); callVoid3(b, rt.op_append, ctx_p, stk, sp); arrayCacheInvalidateAll(tctx); },
         .put_array_el => { vstackFlush(tctx); callVoid3(b, rt.op_put_array_el, ctx_p, stk, sp); arrayCacheInvalidateAll(tctx); },
@@ -2938,7 +2978,10 @@ fn emitThinFieldOp(tctx: *ThinCodegenCtx, func: llvm.Value, instr: Instruction) 
     const atom_idx = instr.operand.atom;
 
     // Get atom string for this field access
-    const name = getAtomStringStatic(tctx.func, atom_idx) orelse return;
+    const name = getAtomStringStatic(tctx.func, atom_idx) orelse {
+        std.debug.print("[CODEGEN_WARN] get_field: atom {d} unresolved in '{s}' — opcode SKIPPED!\n", .{ atom_idx, tctx.func.name });
+        return;
+    };
 
     // Create global string for field name
     const current_bb = c.LLVMGetInsertBlock(b.ref);
@@ -2975,7 +3018,10 @@ fn emitThinPutFieldOp(tctx: *ThinCodegenCtx, instr: Instruction) void {
     vstackFlush(tctx);
     const b = tctx.builder;
     const atom_idx = instr.operand.atom;
-    const name = getAtomStringStatic(tctx.func, atom_idx) orelse return;
+    const name = getAtomStringStatic(tctx.func, atom_idx) orelse {
+        std.debug.print("[CODEGEN_WARN] put_field: atom {d} unresolved in '{s}' — opcode SKIPPED!\n", .{ atom_idx, tctx.func.name });
+        return;
+    };
 
     var str_label_buf: [64]u8 = undefined;
     const str_label = std.fmt.bufPrintZ(&str_label_buf, ".put_field_{d}", .{tctx.ic_count}) catch ".pf";
@@ -3014,6 +3060,7 @@ fn emitFallbackOpcode(tctx: *ThinCodegenCtx, instr: Instruction) void {
         .for_of_start, .for_of_next, .for_in_start, .for_in_next,
         .iterator_close,
         .array_from,
+        .get_field, .get_field2, .put_field, .get_array_el, .put_array_el,
         => {}, // Handled by js_frozen_exec_opcode
         else => tctx.has_unsafe_fallback = true,
     }
@@ -3052,10 +3099,33 @@ fn emitFallbackOpcode(tctx: *ThinCodegenCtx, instr: Instruction) void {
     const null_ptr = llvm.constNull(llvm.ptrType());
     const arg_buf_val = tctx.arg_shadow_ptr orelse null_ptr;
 
+    // Atom remapping: serialized bytecodes use module-local atom indices which
+    // differ from QuickJS's runtime global atom table. For atom-format operands,
+    // resolve the atom string at compile time and pass it so the runtime wrapper
+    // can call JS_NewAtom to get the correct runtime atom index.
+    const atom_name_val: llvm.Value = switch (instr.operand) {
+        .atom => |v| blk: {
+            const name = getAtomStringStatic(tctx.func, v);
+            if (name) |n| {
+                break :blk c.LLVMBuildGlobalStringPtr(b.ref, n, ".atom_name");
+            }
+            break :blk null_ptr;
+        },
+        .atom_u8 => |v| blk: {
+            const name = getAtomStringStatic(tctx.func, v.atom);
+            if (name) |n| {
+                break :blk c.LLVMBuildGlobalStringPtr(b.ref, n, ".atom_name");
+            }
+            break :blk null_ptr;
+        },
+        else => null_ptr,
+    };
+
     const exec_fn_ty = llvm.functionType(llvm.i32Type(), &.{
         llvm.ptrType(), llvm.i8Type(), llvm.i32Type(), llvm.ptrType(), llvm.ptrType(),
         llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(),
         llvm.i32Type(), llvm.ptrType(), jsv_ty, jsv_ty, llvm.ptrType(), llvm.i32Type(),
+        llvm.ptrType(),
     }, false);
 
     const sync_fn_ty = llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false);
@@ -3085,6 +3155,7 @@ fn emitFallbackOpcode(tctx: *ThinCodegenCtx, instr: Instruction) void {
             undef_jsv,                                              // new_target (JS_UNDEFINED)
             tctx.cpool_param,                                       // cpool
             operand2_val,                                           // operand2 (flags for atom_u8)
+            atom_name_val,                                          // atom_name (for runtime remapping)
         },
         "err",
     );
@@ -3235,7 +3306,7 @@ fn getAtomStringStatic(func: AnalyzedFunction, atom_idx: u32) ?[*:0]const u8 {
     if (atom_idx < module_parser.JS_ATOM_END) {
         if (atom_idx < module_parser.BUILTIN_ATOMS.len) {
             const name = module_parser.BUILTIN_ATOMS[atom_idx];
-            if (name.len > 0 and (name.len < 1 or name[0] != '<')) {
+            if (name.len > 0 and name[0] != '<') {
                 // BUILTIN_ATOMS are comptime string literals — always null-terminated
                 return @ptrCast(name.ptr);
             }
@@ -3249,6 +3320,10 @@ fn getAtomStringStatic(func: AnalyzedFunction, atom_idx: u32) ?[*:0]const u8 {
             // atom_strings are null-terminated from the parser
             return @ptrCast(str.ptr);
         }
+        // User atom with empty string — log for debugging
+        std.debug.print("[ATOM_WARN] User atom {d} (adjusted {d}) has empty string in func '{s}'\n", .{ atom_idx, adjusted_idx, func.name });
+    } else {
+        std.debug.print("[ATOM_WARN] User atom {d} (adjusted {d}) out of range (atom_strings.len={d}) in func '{s}'\n", .{ atom_idx, adjusted_idx, func.atom_strings.len, func.name });
     }
     return null;
 }

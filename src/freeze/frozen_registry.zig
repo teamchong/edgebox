@@ -965,11 +965,23 @@ pub fn generateModuleZigShardedWithBackend(
         var thin_infos = std.ArrayListUnmanaged(ThinFuncInfo){};
         defer thin_infos.deinit(allocator);
 
+        var thin_skipped_int32: usize = 0;
         for (generated_all.items, 0..) |gf, gi| {
+            if (gf.func.line_num == 41871) {
+                std.debug.print("[TRACE-41871] gen_idx={d} name='{s}' line={d} is_int32={} instrs={d}\n", .{
+                    gi, gf.func.name, gf.func.line_num, isPureInt32Function(gf.func), gf.func.instructions.len,
+                });
+            }
             // Skip int32 functions (already handled above)
-            if (isPureInt32Function(gf.func)) continue;
+            if (isPureInt32Function(gf.func)) {
+                thin_skipped_int32 += 1;
+                continue;
+            }
 
-            const cfg = cfg_builder.buildCFG(allocator, gf.func.instructions) catch continue;
+            const cfg = cfg_builder.buildCFG(allocator, gf.func.instructions) catch |err| {
+                std.debug.print("[freeze-debug] CFG build failed for '{s}'@{d} (gen_idx={d}): {}\n", .{ gf.func.name, gf.func.line_num, gi, err });
+                continue;
+            };
             const cfg_idx = thin_cfgs.items.len;
             try thin_cfgs.append(allocator, cfg);
 
@@ -985,6 +997,10 @@ pub fn generateModuleZigShardedWithBackend(
                 .func_name_idx = func_name_idx,
             });
         }
+
+        std.debug.print("[freeze-debug] Thin loop: {d} generated_all, {d} skipped int32, {d} thin infos, {d} CFG fail\n", .{
+            generated_all.items.len, thin_skipped_int32, thin_infos.items.len, generated_all.items.len - thin_skipped_int32 - thin_infos.items.len,
+        });
 
         // Pass 2: Build ThinShardFunction structs
         for (thin_infos.items) |info| {

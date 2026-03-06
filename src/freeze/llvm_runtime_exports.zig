@@ -671,6 +671,34 @@ export fn llvm_rt_op_for_in_next(ctx: *JSContext, stack: [*]CV, sp: *usize) call
     return 0;
 }
 
+export fn llvm_rt_op_to_propkey(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) c_int {
+    // to_propkey: convert TOS to property key. Strings, ints, and symbols are no-ops.
+    const top = stack[sp.* - 1];
+    if (top.isInt() or top.isStr()) {
+        return 0; // Already a valid property key
+    }
+    // Convert to JSValue to check tag and call JS_ToPropertyKey if needed
+    const jsval = top.toJSValueWithCtx(ctx);
+    const tag = jsval.tag;
+    // JS_TAG_SYMBOL = -8: symbols are already valid property keys
+    if (tag == -8) return 0;
+    const key = zig_runtime.quickjs.JS_ToPropertyKey(ctx, jsval);
+    if (key.isException()) return 1;
+    zig_runtime.quickjs.JS_FreeValue(ctx, jsval);
+    stack[sp.* - 1] = CV.fromJSValue(key);
+    return 0;
+}
+
+export fn llvm_rt_op_to_propkey2(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) c_int {
+    // to_propkey2: like to_propkey but also checks sp[-2] is not null/undefined
+    const obj = stack[sp.* - 2];
+    if (obj.isUndefined() or obj.isNull()) {
+        _ = zig_runtime.quickjs.JS_ThrowTypeError(ctx, "value has no property");
+        return 1;
+    }
+    return llvm_rt_op_to_propkey(ctx, stack, sp);
+}
+
 export fn llvm_rt_op_in(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) c_int {
     thin.op_in(ctx, stack, sp) catch return 1;
     return 0;
@@ -810,7 +838,8 @@ export fn llvm_rt_fast_array_get_len(arr_cv: u64) callconv(.c) u64 {
 }
 
 /// Stack-based get_array_el: pop index and array, push result.
-/// Implements: val = arr[idx] using JS_GetPropertyUint32.
+/// Implements: val = arr[idx] using JS_GetPropertyValue (handles all key types:
+/// integers, strings, symbols — matching QuickJS's OP_get_array_el semantics).
 /// Returns 0 on success, non-zero on exception.
 export fn llvm_rt_get_array_el(ctx: *JSContext, stack: [*]CV, sp: *usize, locals: [*]CV, var_count: u32) callconv(.c) c_int {
     _ = locals;
@@ -823,16 +852,22 @@ export fn llvm_rt_get_array_el(ctx: *JSContext, stack: [*]CV, sp: *usize, locals
     const arr_cv = stack[s - 2];
     const idx_cv = stack[s - 1];
 
-    // Get the index as u32
-    const idx_val: u32 = if (idx_cv.isInt()) @as(u32, @intCast(idx_cv.getInt())) else 0;
+    // Convert both operands to JSValue for general property access.
+    // This must handle ALL key types (integers, strings, symbols) to match
+    // QuickJS's OP_get_array_el semantics (which uses JS_GetPropertyValue).
+    const arr_jsv = arr_cv.toJSValueWithCtx(ctx);
+    const idx_jsv = idx_cv.toJSValueWithCtx(ctx);
 
-    // Convert array to JSValue and get property by integer index
-    const arr_jsv = arr_cv.toJSValue();
-    const result = quickjs.JS_GetPropertyUint32(ctx, arr_jsv, idx_val);
-
-    // Free operands
-    CV.freeRef(ctx, arr_cv);
-    CV.freeRef(ctx, idx_cv);
+    // Convert index to atom (handles integers, strings, symbols)
+    const atom = quickjs.JS_ValueToAtom(ctx, idx_jsv);
+    quickjs.JS_FreeValue(ctx, idx_jsv);
+    if (atom == 0) {
+        quickjs.JS_FreeValue(ctx, arr_jsv);
+        return -1;
+    }
+    const result = quickjs.JS_GetProperty(ctx, arr_jsv, atom);
+    quickjs.JS_FreeAtom(ctx, atom);
+    quickjs.JS_FreeValue(ctx, arr_jsv);
 
     if (result.isException()) return -1;
 
@@ -1211,8 +1246,20 @@ export fn llvm_rt_exec_opcode(
     new_target: JSValue,
     cpool: ?[*]JSValue,
     operand2: i32,
+    atom_name: ?[*:0]const u8,
 ) callconv(.c) c_int {
     const quickjs = zig_runtime.quickjs;
+
+    // Atom remapping: serialized bytecodes use module-local atom indices, but
+    // QuickJS at runtime uses its own global atom table with different indices.
+    // For opcodes with atom operands, the LLVM codegen resolves the atom string
+    // at compile time and passes it here. We call JS_NewAtom to get the runtime
+    // atom index. For non-atom opcodes, atom_name is null and operand is used as-is.
+    const resolved_operand: i32 = if (atom_name) |name| blk: {
+        const atom = quickjs.JS_NewAtom(ctx, name);
+        break :blk @bitCast(atom);
+    } else operand;
+
     // CVs are 8 bytes (NaN-boxed i64), JSValues are 16 bytes ({i64, i64}).
     // We must convert between them — @ptrCast is wrong since element sizes differ.
     const old_sp = sp.*;
@@ -1235,7 +1282,7 @@ export fn llvm_rt_exec_opcode(
     const result = quickjs.js_frozen_exec_opcode(
         ctx,
         op,
-        @bitCast(operand),
+        @bitCast(resolved_operand),
         @ptrCast(&jsv_stack),
         &sp_i,
         @ptrCast(&jsv_locals),
@@ -1253,16 +1300,17 @@ export fn llvm_rt_exec_opcode(
     const new_sp: usize = @intCast(sp_i);
 
     // Write back JSValue stack to CV stack.
-    // toJSValuePtr does NOT dup — ownership was transferred to JSValue space.
-    // The C function manages refs for consumed (popped) values internally,
-    // so we must NOT call CV.freeRef on old CVs at popped positions (that
-    // would double-free since C already freed them).
-    // For untouched positions, the roundtrip CV→JSValue→CV is ref-neutral.
-    // For new positions (pushed by C), we take ownership of the new refs.
     for (0..new_sp) |i| {
         stack[i] = CV.fromJSValue(jsv_stack[i]);
     }
     sp.* = new_sp;
+
+    // Free the runtime atom we created via JS_NewAtom.
+    // js_frozen_exec_opcode uses the atom internally but doesn't take ownership
+    // (it uses JS_DupAtom where needed), so we must free our ref.
+    if (atom_name != null) {
+        quickjs.JS_FreeAtom(ctx, @bitCast(resolved_operand));
+    }
 
     if (result.isException()) return -1;
     return 0;
