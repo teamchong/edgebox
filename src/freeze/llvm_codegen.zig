@@ -1014,6 +1014,22 @@ pub fn generateThinShard(
             skipped_unsafe += 1;
             continue;
         }
+        // Skip functions that have both close_loc AND fclosure — close_loc needs
+        // proper var_ref detachment that we can't fully guarantee yet.
+        {
+            var has_close = false;
+            var has_fc = false;
+            for (sf.cfg.blocks.items) |block| {
+                for (block.instructions) |bi| {
+                    if (bi.opcode == .close_loc) has_close = true;
+                    if (bi.opcode == .fclosure or bi.opcode == .fclosure8) has_fc = true;
+                }
+            }
+            if (has_close and has_fc) {
+                skipped_unsafe += 1;
+                continue;
+            }
+        }
         if (generateThinFunction(allocator, native.module, builder, sf, &rt_decls)) |has_unsafe_fallback| {
             if (has_unsafe_fallback) {
                 // Function uses opcodes that js_frozen_exec_opcode can't handle —
@@ -2758,9 +2774,27 @@ fn emitThinInstruction(
         // ========== No-op / Control flow handled by terminator ==========
         .nop, .set_name, .set_home_object => {},
 
-        // close_loc: TODO — properly implement var_ref detachment for closure locals.
-        // For now treated as nop; locals are freed at function return via cleanupLocals.
-        .close_loc => {},
+        // close_loc: detach var_refs pointing to this local, then free value + set undefined.
+        // This is critical for correct closure capture semantics — without it, closures
+        // that capture a closed local may read overwritten/stale values instead of the
+        // value at the point where close_loc was executed.
+        .close_loc => {
+            const idx = instr.operand.loc;
+            if (tctx.var_ref_list_ptr != null and tctx.locals_jsv_ptr != null) {
+                // Full close_loc: detach var_refs + free value + set undefined
+                const close_fn_ty = llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false);
+                _ = b.buildCall(close_fn_ty, rt.close_loc, &.{
+                    ctx_p, locs,
+                    tctx.locals_jsv_ptr.?,
+                    tctx.var_ref_list_ptr.?,
+                    llvm.constInt32(@intCast(idx)),
+                }, "");
+                // Invalidate vstack entries referencing this local
+                vstackInvalidateLocal(tctx, idx);
+            }
+            // For non-closure functions (no var_ref_list), close_loc is a nop:
+            // no var_refs to detach, and cleanupLocals frees everything at return.
+        },
 
         // TDZ: mark local as uninitialized (required for get_loc_check/put_loc_check)
         .set_loc_uninitialized => {

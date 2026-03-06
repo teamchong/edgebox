@@ -825,16 +825,6 @@ pub fn generateModuleZigShardedWithBackend(
     // Selective freezing: limit to top N functions (after PGO sort, this keeps the hottest)
     if (max_functions > 0 and generated_all.items.len > max_functions) {
         const total_before = generated_all.items.len;
-        // Debug: show functions around the cutoff
-        const start = if (max_functions >= 3) max_functions - 3 else 0;
-        const end = @min(max_functions + 3, total_before);
-        for (start..end) |di| {
-            const gf = generated_all.items[di];
-            const marker: []const u8 = if (di == max_functions) " <<<CUTOFF" else "";
-            std.debug.print("[freeze-cutoff] func[{d}] = '{s}'@{d} line={d}{s}\n", .{
-                di, gf.func.name, gf.func.line_num, gf.func.line_num, marker,
-            });
-        }
         generated_all.items.len = max_functions;
         std.debug.print("[freeze] Limited to {d} of {d} freezable functions\n", .{ max_functions, total_before });
     }
