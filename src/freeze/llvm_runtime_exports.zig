@@ -1344,6 +1344,26 @@ export fn llvm_rt_exit_stack() callconv(.c) void {
     zig_runtime.exitStack();
 }
 
+/// close_loc: detach var_refs pointing to locals[idx], then set locals[idx] = undefined.
+/// This is the frozen equivalent of OP_close_loc (close_var_refs + set_value).
+/// Operates on CV locals + JSValue locals_jsv pair. Syncs CV → JSValue before
+/// calling the C helper, which handles var_ref detachment and freeing.
+export fn llvm_rt_close_loc(ctx: *JSContext, locals: [*]CV, locals_jsv: ?[*]JSValue, var_ref_list: ?*zig_runtime.ListHead, idx: c_int) callconv(.c) void {
+    const quickjs = zig_runtime.quickjs;
+    const i: usize = @intCast(idx);
+
+    // Sync CV → JSValue for the specific local
+    if (locals_jsv) |ljv| {
+        ljv[i] = CV.toJSValuePtr(&locals[i]);
+    }
+
+    // Call C helper: detach var_refs pointing to this local, then free + set undefined
+    quickjs.js_frozen_close_loc(ctx, var_ref_list, locals_jsv, idx);
+
+    // Sync back: set CV local to undefined
+    locals[i] = CV.UNDEFINED;
+}
+
 export fn llvm_rt_get_closure_var_safe(ctx: *JSContext, var_refs: ?[*]*JSVarRef, idx: u32, closure_var_count: c_int) callconv(.c) JSValue {
     return zig_runtime.getClosureVarSafe(ctx, var_refs, idx, closure_var_count);
 }

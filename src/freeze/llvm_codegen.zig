@@ -1293,6 +1293,9 @@ const ThinRuntimeDecls = struct {
     check_stack: llvm.Value,
     exit_stack: llvm.Value,
 
+    // close_loc: detach var_refs for a specific local, then set to undefined
+    close_loc: llvm.Value,
+
     // Iterator ops
     op_for_of_start: llvm.Value,
     op_for_of_next: llvm.Value,
@@ -1494,6 +1497,9 @@ const ThinRuntimeDecls = struct {
 
             .check_stack = declareExtern(module, "llvm_rt_check_stack", llvm.functionType(llvm.i1Type(), &.{}, false)),
             .exit_stack = declareExtern(module, "llvm_rt_exit_stack", llvm.functionType(voidt, &.{}, false)),
+
+            // close_loc: void(ctx, locals_cv, locals_jsv, var_ref_list, idx)
+            .close_loc = declareExtern(module, "llvm_rt_close_loc", llvm.functionType(voidt, &.{ ptr, ptr, ptr, ptr, i32t }, false)),
 
             .op_for_of_start = declareExtern(module, "llvm_rt_op_for_of_start", llvm.functionType(i32t, &.{ ptr, ptr, ptr, ptr, ptr }, false)),
             .op_for_of_next = declareExtern(module, "llvm_rt_op_for_of_next", llvm.functionType(i32t, &.{ ptr, ptr, ptr, ptr, ptr }, false)),
@@ -2750,7 +2756,11 @@ fn emitThinInstruction(
         },
 
         // ========== No-op / Control flow handled by terminator ==========
-        .nop, .set_name, .close_loc, .set_home_object => {},
+        .nop, .set_name, .set_home_object => {},
+
+        // close_loc: TODO — properly implement var_ref detachment for closure locals.
+        // For now treated as nop; locals are freed at function return via cleanupLocals.
+        .close_loc => {},
 
         // TDZ: mark local as uninitialized (required for get_loc_check/put_loc_check)
         .set_loc_uninitialized => {

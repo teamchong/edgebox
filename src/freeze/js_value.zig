@@ -3236,6 +3236,7 @@ pub const quickjs = struct {
     // ListHead is an opaque struct - we just need a pointer to pass to C
     pub extern fn js_frozen_var_ref_list_init(list: *ListHead) void;
     pub extern fn js_frozen_var_ref_list_detach(ctx: *JSContext, list: *ListHead) void;
+    pub extern fn js_frozen_close_loc(ctx: *JSContext, var_ref_list: ?*ListHead, locals: ?[*]JSValue, idx: c_int) void;
     pub extern fn js_frozen_create_closure_v2(ctx: *JSContext, bfunc: JSValue, cur_var_refs: ?[*]*JSVarRef, local_var_ref_list: ?*ListHead, locals: ?[*]JSValue, num_locals: c_int, args: ?[*]JSValue, num_args: c_int) JSValue;
 
     // RegExp construction from compiled bytecode (for frozen OP_regexp)
