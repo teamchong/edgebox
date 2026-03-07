@@ -176,11 +176,11 @@ function downloadProject(project: Project): string | null {
 
 function buildEdgeboxTsc(): string | null {
   const edgeboxcPath = join(PROJECT_ROOT, "zig-out/bin/edgeboxc");
-  const tscSourceAbs = join(BENCHMARK_DIR, "node_modules/typescript/lib/tsc.js");
+  const tscSourceAbs = join(BENCHMARK_DIR, "node_modules/typescript/lib/_tsc.js");
   // Use relative path from PROJECT_ROOT to avoid path.join issues with absolute paths
   const tscSourceRel = relative(PROJECT_ROOT, tscSourceAbs);
   const outputDir = join(PROJECT_ROOT, "zig-out/bin", tscSourceRel);
-  const compiled = join(outputDir, "tsc");
+  const compiled = join(outputDir, "_tsc");
 
   // Check if already compiled
   if (existsSync(compiled)) {
@@ -201,7 +201,7 @@ function buildEdgeboxTsc(): string | null {
   // Compile tsc with EdgeBox
   console.log("Compiling tsc with EdgeBox AOT...");
   try {
-    execSync(`"${edgeboxcPath}" --binary-only --allocator=arena "${tscSource}"`, {
+    execSync(`"${edgeboxcPath}" --binary-only --allocator=arena "${tscSourceRel}"`, {
       cwd: PROJECT_ROOT,
       stdio: "pipe",  // Suppress build output
       timeout: 600000,
