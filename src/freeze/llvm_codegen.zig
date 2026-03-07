@@ -1014,22 +1014,9 @@ pub fn generateThinShard(
             skipped_unsafe += 1;
             continue;
         }
-        // Skip functions that have both close_loc AND fclosure — close_loc needs
-        // proper var_ref detachment that we can't fully guarantee yet.
-        {
-            var has_close = false;
-            var has_fc = false;
-            for (sf.cfg.blocks.items) |block| {
-                for (block.instructions) |bi| {
-                    if (bi.opcode == .close_loc) has_close = true;
-                    if (bi.opcode == .fclosure or bi.opcode == .fclosure8) has_fc = true;
-                }
-            }
-            if (has_close and has_fc) {
-                skipped_unsafe += 1;
-                continue;
-            }
-        }
+        // close_loc + fclosure combination is now supported:
+        // close_loc properly detaches var_refs via llvm_rt_close_loc,
+        // and fclosure creates closures with correct var_ref sharing.
         if (generateThinFunction(allocator, native.module, builder, sf, &rt_decls)) |has_unsafe_fallback| {
             if (has_unsafe_fallback) {
                 // Function uses opcodes that js_frozen_exec_opcode can't handle —
@@ -1052,9 +1039,7 @@ pub fn generateThinShard(
                             .get_loc0_loc1,
                             .get_arg0, .get_arg1, .get_arg2, .get_arg3, .get_arg,
                             .put_arg0, .put_arg1, .put_arg2, .put_arg3, .put_arg,
-                            // NOTE: set_arg* deliberately excluded — functions with set_arg
-                            // have a pre-existing codegen bug in other opcodes.
-                            // set_arg IS inline-handled but we skip these functions for now.
+                            .set_arg0, .set_arg1, .set_arg2, .set_arg3, .set_arg,
                             .get_var_ref_check, .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3,
                             .get_var_ref, .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3,
                             .put_var_ref, .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3, .set_var_ref,
@@ -2398,10 +2383,6 @@ fn emitThinInstruction(
 
         .set_arg0, .set_arg1, .set_arg2, .set_arg3, .set_arg => {
             vstackFlush(tctx);
-            // Mark as unsafe: functions with set_arg cause "not a function"
-            // crashes in TSC. Handler is correct but enabling these functions
-            // exposes ref counting bugs in other inline opcodes.
-            tctx.has_unsafe_fallback = true;
             const idx: u32 = switch (instr.opcode) {
                 .set_arg0 => 0,
                 .set_arg1 => 1,
