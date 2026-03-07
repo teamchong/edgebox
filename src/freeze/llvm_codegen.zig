@@ -2797,11 +2797,15 @@ fn emitThinInstruction(
         },
 
         // TDZ: mark local as uninitialized (required for get_loc_check/put_loc_check)
+        // CRITICAL: must free the old value before overwriting, otherwise block-scoped
+        // variables (let/const) inside loops leak their value on every iteration.
         .set_loc_uninitialized => {
             const idx = instr.operand.loc;
-            const loc_ptr = inlineLocalSlot(b, locs, idx);
-            _ = b.buildStore(llvm.constInt(llvm.i64Type(), CV_UNINITIALIZED, false), loc_ptr);
             vstackInvalidateLocal(tctx, idx);
+            const loc_ptr = inlineLocalSlot(b, locs, idx);
+            const old_val = b.buildLoad(llvm.i64Type(), loc_ptr, "oldv");
+            inlineFreeRef(tctx, old_val);
+            _ = b.buildStore(llvm.constInt(llvm.i64Type(), CV_UNINITIALIZED, false), loc_ptr);
         },
         .if_false, .if_false8, .if_true, .if_true8, .goto, .goto8, .goto16 => {},
 
