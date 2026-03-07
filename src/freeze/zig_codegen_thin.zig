@@ -639,7 +639,7 @@ pub const ThinCodeGen = struct {
             .mod => try self.writeLine("zig_runtime.thin.op_mod(&stack, &sp);"),
             .pow => try self.writeLine("zig_runtime.thin.op_pow(&stack, &sp);"),
             .neg => try self.writeLine("zig_runtime.thin.op_neg(&stack, &sp);"),
-            .plus => try self.writeLine("zig_runtime.thin.op_plus(&stack, &sp);"),
+            .plus => try self.writeLine("zig_runtime.thin.op_plus(ctx, &stack, &sp);"),
 
             // ========== Bitwise ==========
             .@"and" => try self.writeLine("zig_runtime.thin.op_band(&stack, &sp);"),

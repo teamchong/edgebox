@@ -2009,6 +2009,42 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         return newFloat(std.math.nan(f64));
     }
 
+    /// Convert to number using QuickJS context for proper string→number conversion.
+    /// Unlike toNumber(), this handles strings correctly (e.g., +"30000" → 30000).
+    /// Consumes self: frees the old value if it's a ref type and returns a new value.
+    pub inline fn toNumberWithCtx(self: CompressedValue, ctx: *JSContext) CompressedValue {
+        if (self.isInt() or self.isFloat()) {
+            return self;
+        }
+        if (self.bits == TRUE.bits) {
+            return newInt(1);
+        }
+        if (self.bits == FALSE.bits or self.bits == NULL.bits) {
+            return newInt(0);
+        }
+        if (self.bits == UNDEFINED.bits) {
+            return newFloat(std.math.nan(f64));
+        }
+        // For reference types (string, object), use QuickJS JS_ToFloat64 for proper conversion.
+        // toJSValue() does NOT dup — it's a bitwise conversion. JS_ToFloat64 reads but
+        // doesn't consume the value. We free our ref afterwards since we're replacing it.
+        const jsv = self.toJSValue();
+        var result: f64 = undefined;
+        if (quickjs.JS_ToFloat64(ctx, &result, jsv) == 0) {
+            freeRef(ctx, self);
+            // Check if result fits in i32 for int representation
+            const i_result = @as(i64, @intFromFloat(result));
+            if (@as(f64, @floatFromInt(i_result)) == result and
+                i_result >= std.math.minInt(i32) and i_result <= std.math.maxInt(i32))
+            {
+                return newInt(@intCast(i_result));
+            }
+            return newFloat(result);
+        }
+        freeRef(ctx, self);
+        return newFloat(std.math.nan(f64));
+    }
+
     /// Check if value is a boolean
     pub inline fn isBool(self: CompressedValue) bool {
         return self.bits == TRUE.bits or self.bits == FALSE.bits;

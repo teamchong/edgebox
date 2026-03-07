@@ -779,8 +779,8 @@ pub const thin = struct {
         stack[sp.* - 1] = CV.sub(CV.newInt(0), stack[sp.* - 1]);
     }
 
-    pub inline fn op_plus(stack: [*]CV, sp: *usize) void {
-        stack[sp.* - 1] = CV.toNumber(stack[sp.* - 1]);
+    pub inline fn op_plus(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        stack[sp.* - 1] = stack[sp.* - 1].toNumberWithCtx(ctx);
     }
 
     // ================================================================

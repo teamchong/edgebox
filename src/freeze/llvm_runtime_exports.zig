@@ -179,8 +179,8 @@ export fn llvm_rt_op_neg(stack: [*]CV, sp: *usize) callconv(.c) void {
     thin.op_neg(stack, sp);
 }
 
-export fn llvm_rt_op_plus(stack: [*]CV, sp: *usize) callconv(.c) void {
-    thin.op_plus(stack, sp);
+export fn llvm_rt_op_plus(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    thin.op_plus(ctx, stack, sp);
 }
 
 // ============================================================================

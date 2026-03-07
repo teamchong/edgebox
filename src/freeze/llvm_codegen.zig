@@ -1432,7 +1432,7 @@ const ThinRuntimeDecls = struct {
             .op_mod = declareExtern(module, "llvm_rt_op_mod", stack_sp),
             .op_pow = declareExtern(module, "llvm_rt_op_pow", stack_sp),
             .op_neg = declareExtern(module, "llvm_rt_op_neg", stack_sp),
-            .op_plus = declareExtern(module, "llvm_rt_op_plus", stack_sp),
+            .op_plus = declareExtern(module, "llvm_rt_op_plus", ctx_stack_sp),
 
             .op_band = declareExtern(module, "llvm_rt_op_band", stack_sp),
             .op_bor = declareExtern(module, "llvm_rt_op_bor", stack_sp),
@@ -2542,7 +2542,7 @@ fn emitThinInstruction(
         .mod => emitVstackDivMod(tctx, false, rt.op_mod),
         .pow => { vstackFlush(tctx); callVoid2(b, rt.op_pow, stk, sp); },
         .neg => { vstackFlush(tctx); callVoid2(b, rt.op_neg, stk, sp); },
-        .plus => { vstackFlush(tctx); callVoid2(b, rt.op_plus, stk, sp); },
+        .plus => { vstackFlush(tctx); callVoid3(b, rt.op_plus, ctx_p, stk, sp); },
 
         // ========== Bitwise (vstack: int fast path on SSA) ==========
         .@"and" => emitVstackBitwise(tctx, .@"and", rt.op_band),
