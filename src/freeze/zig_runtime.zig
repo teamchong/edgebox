@@ -174,7 +174,7 @@ pub const getVarRef = js_ops.getVarRef;
 /// When called normally, this_val is the actual this value (undefined/object).
 pub inline fn isConstructorCall(ctx: *JSContext, this_val: JSValue) bool {
     // When called as constructor, this_val is new.target which is a function/constructor
-    return quickjs.JS_IsFunction(ctx, this_val) != 0;
+    return quickjs.JS_IsFunction(ctx, this_val);
 }
 
 // ============================================================================

@@ -781,7 +781,7 @@ pub const ThinCodeGen = struct {
             .is_undefined => try self.writeLine("stack[sp-1] = if (stack[sp-1].isUndefined()) CV.TRUE else CV.FALSE;"),
             .is_null => try self.writeLine("stack[sp-1] = if (stack[sp-1].isNull()) CV.TRUE else CV.FALSE;"),
             .is_undefined_or_null => try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = if (v.isUndefined() or v.isNull()) CV.TRUE else CV.FALSE; }"),
-            .typeof_is_function => try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = if (zig_runtime.quickjs.JS_IsFunction(ctx, v.toJSValueWithCtx(ctx)) != 0) CV.TRUE else CV.FALSE; }"),
+            .typeof_is_function => try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = if (zig_runtime.quickjs.JS_IsFunction(ctx, v.toJSValueWithCtx(ctx))) CV.TRUE else CV.FALSE; }"),
             .typeof_is_undefined => try self.writeLine("stack[sp-1] = if (stack[sp-1].isUndefined()) CV.TRUE else CV.FALSE;"),
 
             // ========== Length ==========

@@ -553,13 +553,13 @@ pub extern fn JS_NewArguments(ctx: *JSContext, argc: c_int, argv: [*]const JSVal
 // ============================================================================
 
 /// Check if value is an array
-pub extern fn JS_IsArray(ctx: *JSContext, val: JSValue) c_int;
+pub extern fn JS_IsArray(val: JSValue) bool;
 
 /// Check if value is a function
-pub extern fn JS_IsFunction(ctx: *JSContext, val: JSValue) c_int;
+pub extern fn JS_IsFunction(ctx: *JSContext, val: JSValue) bool;
 
 /// Check if value is a constructor
-pub extern fn JS_IsConstructor(ctx: *JSContext, val: JSValue) c_int;
+pub extern fn JS_IsConstructor(ctx: *JSContext, val: JSValue) bool;
 
 /// Get typeof string
 pub extern fn JS_TypeOf(ctx: *JSContext, val: JSValue) JSValue;

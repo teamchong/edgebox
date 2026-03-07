@@ -2300,7 +2300,7 @@ const JSValueWasm32 = extern struct {
             JS_TAG_SYMBOL => "symbol",
             JS_TAG_BIG_INT => "bigint",
             JS_TAG_OBJECT, JS_TAG_FUNCTION_BYTECODE => blk: {
-                if (quickjs.JS_IsFunction(ctx, val) != 0) {
+                if (quickjs.JS_IsFunction(ctx, val)) {
                     break :blk "function";
                 }
                 break :blk "object";
@@ -2761,7 +2761,7 @@ const JSValueNative = extern struct {
             JS_TAG_SYMBOL => "symbol",
             JS_TAG_BIG_INT => "bigint",
             JS_TAG_OBJECT, JS_TAG_FUNCTION_BYTECODE => blk: {
-                if (quickjs.JS_IsFunction(ctx, val) != 0) {
+                if (quickjs.JS_IsFunction(ctx, val)) {
                     break :blk "function";
                 }
                 break :blk "object";
@@ -3223,7 +3223,7 @@ pub const quickjs = struct {
     pub extern fn JS_AtomToString(ctx: *JSContext, atom: u32) JSValue;
 
     // Type checks
-    pub extern fn JS_IsFunction(ctx: *JSContext, val: JSValue) c_int;
+    pub extern fn JS_IsFunction(ctx: *JSContext, val: JSValue) bool;
     pub extern fn JS_IsInstanceOf(ctx: *JSContext, val: JSValue, obj: JSValue) c_int;
     pub extern fn JS_IsEqual(ctx: *JSContext, op1: JSValue, op2: JSValue) c_int;
     pub extern fn JS_IsStrictEqual(ctx: *JSContext, op1: JSValue, op2: JSValue) bool;
@@ -3324,7 +3324,7 @@ pub fn isThenable(ctx: *JSContext, val: JSValue) bool {
     if (!val.isObject()) return false;
     const then_prop = quickjs.JS_GetPropertyStr(ctx, val, "then");
     defer quickjs.JS_FreeValue(ctx, then_prop);
-    return quickjs.JS_IsFunction(ctx, then_prop) != 0;
+    return quickjs.JS_IsFunction(ctx, then_prop);
 }
 
 /// Convert a value to a Promise (wrap non-promises in Promise.resolve)

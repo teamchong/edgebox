@@ -737,7 +737,7 @@ pub fn generateFrozen(
                         const result = jsvalue.JS_IsInstanceOf(ctx, obj, ctor);
                         freeValue(ctx, obj);
                         freeValue(ctx, ctor);
-                        stack[sp - 1] = JSValue.initBool(result > 0);
+                        stack[sp - 1] = JSValue.initBool(result);
                     },
                     .in => {
                         sp -= 1;
@@ -752,7 +752,7 @@ pub fn generateFrozen(
                         }
                         freeValue(ctx, obj);
                         freeValue(ctx, prop_val);
-                        stack[sp - 1] = JSValue.initBool(result > 0);
+                        stack[sp - 1] = JSValue.initBool(result);
                     },
                     .is_undefined => {
                         const val = stack[sp - 1];
@@ -777,7 +777,7 @@ pub fn generateFrozen(
                     .typeof_is_function => {
                         const val = stack[sp - 1];
                         const result = jsvalue.JS_IsFunction(ctx, val);
-                        stack[sp - 1] = JSValue.initBool(result > 0);
+                        stack[sp - 1] = JSValue.initBool(result);
                         freeValue(ctx, val);
                     },
 
@@ -1679,7 +1679,7 @@ pub fn generateFrozenCFG(
                     const result = jsvalue.JS_IsInstanceOf(ctx, obj, ctor);
                     freeValue(ctx, obj);
                     freeValue(ctx, ctor);
-                    stack[sp.* - 1] = JSValue.initBool(result > 0);
+                    stack[sp.* - 1] = JSValue.initBool(result);
                 },
                 .in => {
                     // pop property and object, push boolean (prop in obj)
@@ -1697,7 +1697,7 @@ pub fn generateFrozenCFG(
                     }
                     freeValue(ctx, obj);
                     freeValue(ctx, prop_val);
-                    stack[sp.* - 1] = JSValue.initBool(result > 0);
+                    stack[sp.* - 1] = JSValue.initBool(result);
                 },
                 .is_undefined => {
                     const val = stack[sp.* - 1];
@@ -1722,7 +1722,7 @@ pub fn generateFrozenCFG(
                 .typeof_is_function => {
                     const val = stack[sp.* - 1];
                     const result = jsvalue.JS_IsFunction(ctx, val);
-                    stack[sp.* - 1] = JSValue.initBool(result > 0);
+                    stack[sp.* - 1] = JSValue.initBool(result);
                     freeValue(ctx, val);
                 },
 
@@ -2463,7 +2463,7 @@ pub fn generateFrozenTrampoline(
                         const result = jsvalue.JS_IsInstanceOf(ctx, obj, ctor);
                         freeValue(ctx, obj);
                         freeValue(ctx, ctor);
-                        stack[sp - 1] = JSValue.initBool(result > 0);
+                        stack[sp - 1] = JSValue.initBool(result);
                     },
                     .in => {
                         sp -= 1;
@@ -2478,7 +2478,7 @@ pub fn generateFrozenTrampoline(
                         }
                         freeValue(ctx, obj);
                         freeValue(ctx, prop_val);
-                        stack[sp - 1] = JSValue.initBool(result > 0);
+                        stack[sp - 1] = JSValue.initBool(result);
                     },
                     .is_undefined => {
                         const val = stack[sp - 1];
@@ -2503,7 +2503,7 @@ pub fn generateFrozenTrampoline(
                     .typeof_is_function => {
                         const val = stack[sp - 1];
                         const result = jsvalue.JS_IsFunction(ctx, val);
-                        stack[sp - 1] = JSValue.initBool(result > 0);
+                        stack[sp - 1] = JSValue.initBool(result);
                         freeValue(ctx, val);
                     },
 

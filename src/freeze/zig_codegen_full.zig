@@ -5488,7 +5488,7 @@ pub const ZigCodeGen = struct {
             // which properly checks object class_id (bytecode function, proxy, or callable object)
             // Must free the value if it's a ref type before overwriting with boolean result
             .typeof_is_function => {
-                try self.writeLine("{ const v = stack[sp-1]; const v_jsv = v.toJSValueWithCtx(ctx); const result = if (zig_runtime.quickjs.JS_IsFunction(ctx, v_jsv) != 0) CV.TRUE else CV.FALSE; if (v.isRefType()) JSValue.free(ctx, v_jsv); stack[sp-1] = result; }");
+                try self.writeLine("{ const v = stack[sp-1]; const v_jsv = v.toJSValueWithCtx(ctx); const result = if (zig_runtime.quickjs.JS_IsFunction(ctx, v_jsv)) CV.TRUE else CV.FALSE; if (v.isRefType()) JSValue.free(ctx, v_jsv); stack[sp-1] = result; }");
             },
 
             // typeof_is_undefined: check if typeof == "undefined" - use CV's isUndefined method

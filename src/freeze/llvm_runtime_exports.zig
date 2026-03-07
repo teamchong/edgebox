@@ -1467,7 +1467,7 @@ export fn llvm_rt_typeof_is_function(ctx: *JSContext, stack: [*]CV, sp: *usize) 
 
     const v = stack[s - 1];
     const jsv = v.toJSValueWithCtx(ctx);
-    const is_func: bool = quickjs.JS_IsFunction(ctx, jsv) != 0;
+    const is_func: bool = quickjs.JS_IsFunction(ctx, jsv);
     CV.freeRef(ctx, v);
     stack[s - 1] = if (is_func) CV.TRUE else CV.FALSE;
 }
@@ -1623,3 +1623,4 @@ export fn llvm_rt_var_ref_list_detach(ctx: *JSContext, var_ref_list: ?*ListHead)
         zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, vrl);
     }
 }
+
