@@ -1014,9 +1014,23 @@ pub fn generateThinShard(
             skipped_unsafe += 1;
             continue;
         }
-        // close_loc + fclosure combination is now supported:
-        // close_loc properly detaches var_refs via llvm_rt_close_loc,
-        // and fclosure creates closures with correct var_ref sharing.
+        // Skip functions that have both close_loc AND fclosure — close_loc needs
+        // proper var_ref detachment that we can't fully guarantee yet.
+        // Enabling these causes "cannot read property 'flags' of undefined" in TSC.
+        {
+            var has_close = false;
+            var has_fc = false;
+            for (sf.cfg.blocks.items) |block| {
+                for (block.instructions) |bi| {
+                    if (bi.opcode == .close_loc) has_close = true;
+                    if (bi.opcode == .fclosure or bi.opcode == .fclosure8) has_fc = true;
+                }
+            }
+            if (has_close and has_fc) {
+                skipped_unsafe += 1;
+                continue;
+            }
+        }
         if (generateThinFunction(allocator, native.module, builder, sf, &rt_decls)) |has_unsafe_fallback| {
             if (has_unsafe_fallback) {
                 // Function uses opcodes that js_frozen_exec_opcode can't handle —
