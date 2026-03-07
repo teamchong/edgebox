@@ -45,9 +45,9 @@ var using_reservation: bool = false; // true if using contiguous reservation
 var first_block: ?*Block = null;
 var current_block: ?*Block = null;
 
-// Virtual reservation size: 8GB — covers even huge TSC-like workloads.
+// Virtual reservation size: 32GB — covers large TSC workloads (date-fns, typeorm, playwright).
 // Only virtual address space is reserved (no physical memory until committed).
-const RESERVED_SIZE: usize = 8 * 1024 * 1024 * 1024;
+const RESERVED_SIZE: usize = 32 * 1024 * 1024 * 1024;
 // Initial commit size
 const INITIAL_COMMIT: usize = 64 * 1024 * 1024;
 // Commit growth granularity

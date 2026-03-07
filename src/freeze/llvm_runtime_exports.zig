@@ -155,28 +155,28 @@ export fn llvm_rt_op_add(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c)
     thin.op_add(ctx, stack, sp);
 }
 
-export fn llvm_rt_op_sub(stack: [*]CV, sp: *usize) callconv(.c) void {
-    thin.op_sub(stack, sp);
+export fn llvm_rt_op_sub(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    thin.op_sub(ctx, stack, sp);
 }
 
-export fn llvm_rt_op_mul(stack: [*]CV, sp: *usize) callconv(.c) void {
-    thin.op_mul(stack, sp);
+export fn llvm_rt_op_mul(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    thin.op_mul(ctx, stack, sp);
 }
 
-export fn llvm_rt_op_div(stack: [*]CV, sp: *usize) callconv(.c) void {
-    thin.op_div(stack, sp);
+export fn llvm_rt_op_div(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    thin.op_div(ctx, stack, sp);
 }
 
-export fn llvm_rt_op_mod(stack: [*]CV, sp: *usize) callconv(.c) void {
-    thin.op_mod(stack, sp);
+export fn llvm_rt_op_mod(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    thin.op_mod(ctx, stack, sp);
 }
 
-export fn llvm_rt_op_pow(stack: [*]CV, sp: *usize) callconv(.c) void {
-    thin.op_pow(stack, sp);
+export fn llvm_rt_op_pow(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    thin.op_pow(ctx, stack, sp);
 }
 
-export fn llvm_rt_op_neg(stack: [*]CV, sp: *usize) callconv(.c) void {
-    thin.op_neg(stack, sp);
+export fn llvm_rt_op_neg(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    thin.op_neg(ctx, stack, sp);
 }
 
 export fn llvm_rt_op_plus(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
@@ -187,52 +187,52 @@ export fn llvm_rt_op_plus(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c
 // Bitwise operations
 // ============================================================================
 
-export fn llvm_rt_op_band(stack: [*]CV, sp: *usize) callconv(.c) void {
-    thin.op_band(stack, sp);
+export fn llvm_rt_op_band(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    thin.op_band(ctx, stack, sp);
 }
 
-export fn llvm_rt_op_bor(stack: [*]CV, sp: *usize) callconv(.c) void {
-    thin.op_bor(stack, sp);
+export fn llvm_rt_op_bor(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    thin.op_bor(ctx, stack, sp);
 }
 
-export fn llvm_rt_op_bxor(stack: [*]CV, sp: *usize) callconv(.c) void {
-    thin.op_bxor(stack, sp);
+export fn llvm_rt_op_bxor(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    thin.op_bxor(ctx, stack, sp);
 }
 
-export fn llvm_rt_op_bnot(stack: [*]CV, sp: *usize) callconv(.c) void {
-    thin.op_bnot(stack, sp);
+export fn llvm_rt_op_bnot(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    thin.op_bnot(ctx, stack, sp);
 }
 
-export fn llvm_rt_op_shl(stack: [*]CV, sp: *usize) callconv(.c) void {
-    thin.op_shl(stack, sp);
+export fn llvm_rt_op_shl(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    thin.op_shl(ctx, stack, sp);
 }
 
-export fn llvm_rt_op_sar(stack: [*]CV, sp: *usize) callconv(.c) void {
-    thin.op_sar(stack, sp);
+export fn llvm_rt_op_sar(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    thin.op_sar(ctx, stack, sp);
 }
 
-export fn llvm_rt_op_shr(stack: [*]CV, sp: *usize) callconv(.c) void {
-    thin.op_shr(stack, sp);
+export fn llvm_rt_op_shr(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    thin.op_shr(ctx, stack, sp);
 }
 
 // ============================================================================
 // Comparison operations
 // ============================================================================
 
-export fn llvm_rt_op_lt(stack: [*]CV, sp: *usize) callconv(.c) void {
-    thin.op_lt(stack, sp);
+export fn llvm_rt_op_lt(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    thin.op_lt(ctx, stack, sp);
 }
 
-export fn llvm_rt_op_lte(stack: [*]CV, sp: *usize) callconv(.c) void {
-    thin.op_lte(stack, sp);
+export fn llvm_rt_op_lte(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    thin.op_lte(ctx, stack, sp);
 }
 
-export fn llvm_rt_op_gt(stack: [*]CV, sp: *usize) callconv(.c) void {
-    thin.op_gt(stack, sp);
+export fn llvm_rt_op_gt(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    thin.op_gt(ctx, stack, sp);
 }
 
-export fn llvm_rt_op_gte(stack: [*]CV, sp: *usize) callconv(.c) void {
-    thin.op_gte(stack, sp);
+export fn llvm_rt_op_gte(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
+    thin.op_gte(ctx, stack, sp);
 }
 
 export fn llvm_rt_op_eq(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {

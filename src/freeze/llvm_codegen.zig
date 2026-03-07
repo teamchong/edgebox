@@ -2536,12 +2536,12 @@ fn emitThinInstruction(
 
         // ========== Arithmetic (vstack: int fast path on SSA, slow path flushes) ==========
         .add => emitVstackArith(tctx, .add, rt.op_add, true), // add needs ctx for string concat
-        .sub => emitVstackArith(tctx, .sub, rt.op_sub, false),
-        .mul => emitVstackArith(tctx, .mul, rt.op_mul, false),
+        .sub => emitVstackArith(tctx, .sub, rt.op_sub, true),
+        .mul => emitVstackArith(tctx, .mul, rt.op_mul, true),
         .div => emitVstackDivMod(tctx, true, rt.op_div),
         .mod => emitVstackDivMod(tctx, false, rt.op_mod),
-        .pow => { vstackFlush(tctx); callVoid2(b, rt.op_pow, stk, sp); },
-        .neg => { vstackFlush(tctx); callVoid2(b, rt.op_neg, stk, sp); },
+        .pow => { vstackFlush(tctx); callVoid3(b, rt.op_pow, ctx_p, stk, sp); },
+        .neg => { vstackFlush(tctx); callVoid3(b, rt.op_neg, ctx_p, stk, sp); },
         .plus => { vstackFlush(tctx); callVoid3(b, rt.op_plus, ctx_p, stk, sp); },
 
         // ========== Bitwise (vstack: int fast path on SSA) ==========
@@ -2551,7 +2551,7 @@ fn emitThinInstruction(
         .shl => emitVstackBitwise(tctx, .shl, rt.op_shl),
         .sar => emitVstackBitwise(tctx, .sar, rt.op_sar),
         .shr => emitVstackBitwise(tctx, .shr, rt.op_shr),
-        .not => { vstackFlush(tctx); callVoid2(b, rt.op_bnot, stk, sp); },
+        .not => { vstackFlush(tctx); callVoid3(b, rt.op_bnot, ctx_p, stk, sp); },
 
         // ========== Comparison (vstack: int fast path on SSA) ==========
         .lt => emitVstackCmp(tctx, c.LLVMIntSLT, rt.op_lt),
@@ -3630,7 +3630,7 @@ fn emitVstackCmp(tctx: *ThinCodegenCtx, pred: c.LLVMIntPredicate, rt_slow: llvm.
         const sp_plus2 = b.buildAdd(sp_val, llvm.constInt64(2), "sp2");
         inlineStoreSp(b, tctx.sp_ptr, sp_plus2);
     }
-    callVoid2(b, rt_slow, tctx.stack_ptr, tctx.sp_ptr);
+    callVoid3(b, rt_slow, tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr);
     // Pop result from physical stack
     const slow_sp = inlineLoadSp(b, tctx.sp_ptr);
     const slow_nsp = b.buildSub(slow_sp, llvm.constInt64(1), "snsp");
@@ -3786,7 +3786,7 @@ fn emitVstackBitwise(tctx: *ThinCodegenCtx, comptime op: enum { @"and", @"or", x
         const sp_plus2 = b.buildAdd(sp_val, llvm.constInt64(2), "sp2");
         inlineStoreSp(b, tctx.sp_ptr, sp_plus2);
     }
-    callVoid2(b, rt_slow, tctx.stack_ptr, tctx.sp_ptr);
+    callVoid3(b, rt_slow, tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr);
     const slow_sp = inlineLoadSp(b, tctx.sp_ptr);
     const slow_nsp = b.buildSub(slow_sp, llvm.constInt64(1), "snsp");
     const slow_slot = inlineStackSlot(b, tctx.stack_ptr, slow_nsp);
@@ -3873,7 +3873,7 @@ fn emitVstackDivMod(tctx: *ThinCodegenCtx, comptime is_div: bool, rt_slow: llvm.
             const sp_plus2 = b.buildAdd(sp_val, llvm.constInt64(2), "sp2");
             inlineStoreSp(b, tctx.sp_ptr, sp_plus2);
         }
-        callVoid2(b, rt_slow, tctx.stack_ptr, tctx.sp_ptr);
+        callVoid3(b, rt_slow, tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr);
         const slow_sp = inlineLoadSp(b, tctx.sp_ptr);
         const slow_nsp = b.buildSub(slow_sp, llvm.constInt64(1), "snsp");
         const slow_slot = inlineStackSlot(b, tctx.stack_ptr, slow_nsp);
@@ -3909,7 +3909,7 @@ fn emitVstackDivMod(tctx: *ThinCodegenCtx, comptime is_div: bool, rt_slow: llvm.
             const sp_plus2 = b.buildAdd(sp_val, llvm.constInt64(2), "sp2");
             inlineStoreSp(b, tctx.sp_ptr, sp_plus2);
         }
-        callVoid2(b, rt_slow, tctx.stack_ptr, tctx.sp_ptr);
+        callVoid3(b, rt_slow, tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr);
         const slow_sp = inlineLoadSp(b, tctx.sp_ptr);
         const slow_nsp = b.buildSub(slow_sp, llvm.constInt64(1), "snsp");
         const slow_slot = inlineStackSlot(b, tctx.stack_ptr, slow_nsp);

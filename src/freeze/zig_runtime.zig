@@ -734,49 +734,63 @@ pub const thin = struct {
     // ================================================================
 
     pub inline fn op_add(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
-        const b = stack[sp.* - 1];
         const a = stack[sp.* - 2];
+        const b = stack[sp.* - 1];
         stack[sp.* - 2] = CV.addWithCtx(ctx, a, b);
+        CV.freeRef(ctx, a);
+        CV.freeRef(ctx, b);
         sp.* -= 1;
     }
 
-    pub inline fn op_sub(stack: [*]CV, sp: *usize) void {
-        const b = stack[sp.* - 1];
+    pub inline fn op_sub(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
         const a = stack[sp.* - 2];
+        const b = stack[sp.* - 1];
         stack[sp.* - 2] = CV.sub(a, b);
+        CV.freeRef(ctx, a);
+        CV.freeRef(ctx, b);
         sp.* -= 1;
     }
 
-    pub inline fn op_mul(stack: [*]CV, sp: *usize) void {
-        const b = stack[sp.* - 1];
+    pub inline fn op_mul(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
         const a = stack[sp.* - 2];
+        const b = stack[sp.* - 1];
         stack[sp.* - 2] = CV.mul(a, b);
+        CV.freeRef(ctx, a);
+        CV.freeRef(ctx, b);
         sp.* -= 1;
     }
 
-    pub inline fn op_div(stack: [*]CV, sp: *usize) void {
-        const b = stack[sp.* - 1];
+    pub inline fn op_div(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
         const a = stack[sp.* - 2];
+        const b = stack[sp.* - 1];
         stack[sp.* - 2] = CV.div(a, b);
+        CV.freeRef(ctx, a);
+        CV.freeRef(ctx, b);
         sp.* -= 1;
     }
 
-    pub inline fn op_mod(stack: [*]CV, sp: *usize) void {
-        const b = stack[sp.* - 1];
+    pub inline fn op_mod(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
         const a = stack[sp.* - 2];
+        const b = stack[sp.* - 1];
         stack[sp.* - 2] = CV.mod(a, b);
+        CV.freeRef(ctx, a);
+        CV.freeRef(ctx, b);
         sp.* -= 1;
     }
 
-    pub inline fn op_pow(stack: [*]CV, sp: *usize) void {
-        const b = stack[sp.* - 1];
+    pub inline fn op_pow(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
         const a = stack[sp.* - 2];
+        const b = stack[sp.* - 1];
         stack[sp.* - 2] = CV.pow(a, b);
+        CV.freeRef(ctx, a);
+        CV.freeRef(ctx, b);
         sp.* -= 1;
     }
 
-    pub inline fn op_neg(stack: [*]CV, sp: *usize) void {
-        stack[sp.* - 1] = CV.sub(CV.newInt(0), stack[sp.* - 1]);
+    pub inline fn op_neg(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        const old = stack[sp.* - 1];
+        stack[sp.* - 1] = CV.sub(CV.newInt(0), old);
+        CV.freeRef(ctx, old);
     }
 
     pub inline fn op_plus(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
@@ -787,37 +801,63 @@ pub const thin = struct {
     // Inline Helpers — Bitwise
     // ================================================================
 
-    pub inline fn op_band(stack: [*]CV, sp: *usize) void {
-        stack[sp.* - 2] = CV.band(stack[sp.* - 2], stack[sp.* - 1]);
+    pub inline fn op_band(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        const a = stack[sp.* - 2];
+        const b = stack[sp.* - 1];
+        stack[sp.* - 2] = CV.band(a, b);
+        CV.freeRef(ctx, a);
+        CV.freeRef(ctx, b);
         sp.* -= 1;
     }
 
-    pub inline fn op_bor(stack: [*]CV, sp: *usize) void {
-        stack[sp.* - 2] = CV.bor(stack[sp.* - 2], stack[sp.* - 1]);
+    pub inline fn op_bor(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        const a = stack[sp.* - 2];
+        const b = stack[sp.* - 1];
+        stack[sp.* - 2] = CV.bor(a, b);
+        CV.freeRef(ctx, a);
+        CV.freeRef(ctx, b);
         sp.* -= 1;
     }
 
-    pub inline fn op_bxor(stack: [*]CV, sp: *usize) void {
-        stack[sp.* - 2] = CV.bxor(stack[sp.* - 2], stack[sp.* - 1]);
+    pub inline fn op_bxor(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        const a = stack[sp.* - 2];
+        const b = stack[sp.* - 1];
+        stack[sp.* - 2] = CV.bxor(a, b);
+        CV.freeRef(ctx, a);
+        CV.freeRef(ctx, b);
         sp.* -= 1;
     }
 
-    pub inline fn op_bnot(stack: [*]CV, sp: *usize) void {
-        stack[sp.* - 1] = CV.bnot(stack[sp.* - 1]);
+    pub inline fn op_bnot(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        const old = stack[sp.* - 1];
+        stack[sp.* - 1] = CV.bnot(old);
+        CV.freeRef(ctx, old);
     }
 
-    pub inline fn op_shl(stack: [*]CV, sp: *usize) void {
-        stack[sp.* - 2] = CV.shl(stack[sp.* - 2], stack[sp.* - 1]);
+    pub inline fn op_shl(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        const a = stack[sp.* - 2];
+        const b = stack[sp.* - 1];
+        stack[sp.* - 2] = CV.shl(a, b);
+        CV.freeRef(ctx, a);
+        CV.freeRef(ctx, b);
         sp.* -= 1;
     }
 
-    pub inline fn op_sar(stack: [*]CV, sp: *usize) void {
-        stack[sp.* - 2] = CV.sar(stack[sp.* - 2], stack[sp.* - 1]);
+    pub inline fn op_sar(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        const a = stack[sp.* - 2];
+        const b = stack[sp.* - 1];
+        stack[sp.* - 2] = CV.sar(a, b);
+        CV.freeRef(ctx, a);
+        CV.freeRef(ctx, b);
         sp.* -= 1;
     }
 
-    pub inline fn op_shr(stack: [*]CV, sp: *usize) void {
-        stack[sp.* - 2] = CV.ushr(stack[sp.* - 2], stack[sp.* - 1]);
+    pub inline fn op_shr(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        const a = stack[sp.* - 2];
+        const b = stack[sp.* - 1];
+        stack[sp.* - 2] = CV.ushr(a, b);
+        CV.freeRef(ctx, a);
+        CV.freeRef(ctx, b);
         sp.* -= 1;
     }
 
@@ -825,43 +865,75 @@ pub const thin = struct {
     // Inline Helpers — Comparison
     // ================================================================
 
-    pub inline fn op_lt(stack: [*]CV, sp: *usize) void {
-        stack[sp.* - 2] = CV.lt(stack[sp.* - 2], stack[sp.* - 1]);
+    pub inline fn op_lt(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        const a = stack[sp.* - 2];
+        const b = stack[sp.* - 1];
+        stack[sp.* - 2] = CV.lt(a, b);
+        CV.freeRef(ctx, a);
+        CV.freeRef(ctx, b);
         sp.* -= 1;
     }
 
-    pub inline fn op_lte(stack: [*]CV, sp: *usize) void {
-        stack[sp.* - 2] = CV.lte(stack[sp.* - 2], stack[sp.* - 1]);
+    pub inline fn op_lte(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        const a = stack[sp.* - 2];
+        const b = stack[sp.* - 1];
+        stack[sp.* - 2] = CV.lte(a, b);
+        CV.freeRef(ctx, a);
+        CV.freeRef(ctx, b);
         sp.* -= 1;
     }
 
-    pub inline fn op_gt(stack: [*]CV, sp: *usize) void {
-        stack[sp.* - 2] = CV.gt(stack[sp.* - 2], stack[sp.* - 1]);
+    pub inline fn op_gt(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        const a = stack[sp.* - 2];
+        const b = stack[sp.* - 1];
+        stack[sp.* - 2] = CV.gt(a, b);
+        CV.freeRef(ctx, a);
+        CV.freeRef(ctx, b);
         sp.* -= 1;
     }
 
-    pub inline fn op_gte(stack: [*]CV, sp: *usize) void {
-        stack[sp.* - 2] = CV.gte(stack[sp.* - 2], stack[sp.* - 1]);
+    pub inline fn op_gte(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
+        const a = stack[sp.* - 2];
+        const b = stack[sp.* - 1];
+        stack[sp.* - 2] = CV.gte(a, b);
+        CV.freeRef(ctx, a);
+        CV.freeRef(ctx, b);
         sp.* -= 1;
     }
 
     pub inline fn op_eq(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
-        stack[sp.* - 2] = CV.eqWithCtx(ctx, stack[sp.* - 2], stack[sp.* - 1]);
+        const a = stack[sp.* - 2];
+        const b = stack[sp.* - 1];
+        stack[sp.* - 2] = CV.eqWithCtx(ctx, a, b);
+        CV.freeRef(ctx, a);
+        CV.freeRef(ctx, b);
         sp.* -= 1;
     }
 
     pub inline fn op_neq(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
-        stack[sp.* - 2] = CV.neqWithCtx(ctx, stack[sp.* - 2], stack[sp.* - 1]);
+        const a = stack[sp.* - 2];
+        const b = stack[sp.* - 1];
+        stack[sp.* - 2] = CV.neqWithCtx(ctx, a, b);
+        CV.freeRef(ctx, a);
+        CV.freeRef(ctx, b);
         sp.* -= 1;
     }
 
     pub inline fn op_strict_eq(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
-        stack[sp.* - 2] = strictEqWithCtx(ctx, stack[sp.* - 2], stack[sp.* - 1]);
+        const a = stack[sp.* - 2];
+        const b = stack[sp.* - 1];
+        stack[sp.* - 2] = strictEqWithCtx(ctx, a, b);
+        CV.freeRef(ctx, a);
+        CV.freeRef(ctx, b);
         sp.* -= 1;
     }
 
     pub inline fn op_strict_neq(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
-        stack[sp.* - 2] = strictNeqWithCtx(ctx, stack[sp.* - 2], stack[sp.* - 1]);
+        const a = stack[sp.* - 2];
+        const b = stack[sp.* - 1];
+        stack[sp.* - 2] = strictNeqWithCtx(ctx, a, b);
+        CV.freeRef(ctx, a);
+        CV.freeRef(ctx, b);
         sp.* -= 1;
     }
 
@@ -1246,9 +1318,12 @@ pub const thin = struct {
         closure_alive: ?*bool,
         captured_indices: []const u16,
     ) GetFieldError!void {
-        const args_array = stack[sp.* - 1].toJSValueWithCtx(ctx);
-        const this_arg = stack[sp.* - 2].toJSValueWithCtx(ctx);
-        const func = stack[sp.* - 3].toJSValueWithCtx(ctx);
+        const args_array_cv = stack[sp.* - 1];
+        const this_arg_cv = stack[sp.* - 2];
+        const func_cv = stack[sp.* - 3];
+        const args_array = args_array_cv.toJSValueWithCtx(ctx);
+        const this_arg = this_arg_cv.toJSValueWithCtx(ctx);
+        const func = func_cv.toJSValueWithCtx(ctx);
         var len: i64 = 0;
         _ = JSValue.getLength(ctx, &len, args_array);
         const argc_val: u32 = @intCast(@min(len, 32));
@@ -1257,6 +1332,14 @@ pub const thin = struct {
             args[i] = JSValue.getPropertyUint32(ctx, args_array, @intCast(i));
         }
         const result = JSValue.call(ctx, func, this_arg, @intCast(argc_val), &args);
+        // Free args elements (getPropertyUint32 returns owned refs, JS_Call is non-consuming)
+        for (0..argc_val) |i| {
+            JSValue.free(ctx, args[i]);
+        }
+        // Free the three stack CVs (JS_Call is non-consuming for func/this)
+        CV.freeRef(ctx, args_array_cv);
+        CV.freeRef(ctx, this_arg_cv);
+        CV.freeRef(ctx, func_cv);
         if (result.isException()) return error.JsException;
         sp.* -= 3;
         stack[sp.*] = CV.fromJSValue(result);
@@ -1309,9 +1392,11 @@ pub const thin = struct {
     }
 
     pub noinline fn op_iterator_get_value_done(ctx: *JSContext, stack: [*]CV, sp: *usize) void {
-        const result = stack[sp.* - 1].toJSValueWithCtx(ctx);
+        const old = stack[sp.* - 1];
+        const result = old.toJSValueWithCtx(ctx);
         var done: i32 = 0;
         const val = quickjs.js_frozen_iterator_get_value_done(ctx, result, &done);
+        CV.freeRef(ctx, old); // free the iterator result object {value, done}
         stack[sp.* - 1] = CV.fromJSValue(val);
         stack[sp.*] = if (done != 0) CV.TRUE else CV.FALSE;
         sp.* += 1;
@@ -1336,11 +1421,15 @@ pub const thin = struct {
     }
 
     pub noinline fn op_in(ctx: *JSContext, stack: [*]CV, sp: *usize) GetFieldError!void {
-        const obj = stack[sp.* - 1].toJSValueWithCtx(ctx);
-        const prop = stack[sp.* - 2].toJSValueWithCtx(ctx);
+        const obj_cv = stack[sp.* - 1];
+        const prop_cv = stack[sp.* - 2];
+        const obj = obj_cv.toJSValueWithCtx(ctx);
+        const prop = prop_cv.toJSValueWithCtx(ctx);
         const atom = quickjs.JS_ValueToAtom(ctx, prop);
         const result = quickjs.JS_HasProperty(ctx, obj, atom);
         quickjs.JS_FreeAtom(ctx, atom);
+        CV.freeRef(ctx, prop_cv); // JS_ValueToAtom is non-consuming
+        CV.freeRef(ctx, obj_cv); // JS_HasProperty is non-consuming
         if (result < 0) return error.JsException;
         stack[sp.* - 2] = CV.fromJSValue(JSValue.newBool(result > 0));
         sp.* -= 1;
