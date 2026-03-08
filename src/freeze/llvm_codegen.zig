@@ -224,11 +224,12 @@ fn finalizeAndEmitShard(
         std.debug.print("=== PRE-OPT IR ({s}) ===\n{s}\n=== END PRE-OPT ===\n", .{ label, ir });
     }
 
-    // Run optimization passes (-O2)
+    // Run optimization passes (-O1: produces smaller code that fits better in
+    // L1 icache; O2's unrolling/speculation hurts recursive functions like fib)
     {
         const pass_opts = c.LLVMCreatePassBuilderOptions();
         defer c.LLVMDisposePassBuilderOptions(pass_opts);
-        const err_ref = c.LLVMRunPasses(native.module.ref, "default<O2>", native.tm.ref, pass_opts);
+        const err_ref = c.LLVMRunPasses(native.module.ref, "default<O1>", native.tm.ref, pass_opts);
         if (err_ref) |err| {
             const msg = c.LLVMGetErrorMessage(err);
             if (msg) |m| {
