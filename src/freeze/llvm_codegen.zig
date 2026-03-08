@@ -2684,7 +2684,7 @@ fn emitThinInstruction(
             emitVstackGetField(tctx, instr);
         },
         .get_field2 => {
-            emitThinFieldOp(tctx, rt.op_get_field2_ic, instr);
+            emitVstackGetField2(tctx, instr);
             // Detect method patterns: get_field2("name") → ... → call_method(argc)
             const atom_idx = instr.operand.atom;
             const name = getAtomStringStatic(tctx.func, atom_idx);
@@ -4162,6 +4162,148 @@ fn emitVstackGetField(tctx: *ThinCodegenCtx, instr: Instruction) void {
     // Merge all paths
     b.positionAtEnd(merge_bb);
     const phi = b.buildPhi(i64t, "gfres");
+    var phi_vals = [_]llvm.Value{ int_cv, ni_cv, miss_result };
+    var phi_bbs = [_]llvm.BasicBlock{ int_final_bb, ni_final_bb, miss_final_bb };
+    llvm.addIncoming(phi, &phi_vals, &phi_bbs);
+    vstackPush(tctx, phi, true);
+}
+
+/// Emit inline get_field2 with poly IC (4-way shape cache).
+/// Flushes vstack first so obj is on physical stack, then does inline IC check.
+/// obj stays at stack[sp-1], result is pushed on top.
+/// Used for method call patterns: obj.method(args) where obj stays as `this`.
+fn emitVstackGetField2(tctx: *ThinCodegenCtx, instr: Instruction) void {
+    const b = tctx.builder;
+    const i64t = llvm.i64Type();
+    const i32t = llvm.i32Type();
+    const ptr = llvm.ptrType();
+
+    // Get atom string for this field access
+    const atom_idx = instr.operand.atom;
+    const name = getAtomStringStatic(tctx.func, atom_idx) orelse return;
+
+    // Create global string constant for field name
+    const ic_idx = tctx.nextIcSlot();
+    var str_label_buf: [64]u8 = undefined;
+    const str_label = std.fmt.bufPrintZ(&str_label_buf, ".field2_{d}", .{ic_idx}) catch ".field2";
+    const str_ptr = c.LLVMBuildGlobalStringPtr(b.ref, name, str_label.ptr);
+
+    // IC slot: poly IC (4-way), 56 bytes — matches ICSlot in zig_runtime.zig
+    const ic_global = createPolyIcGlobal(tctx, ic_idx);
+
+    // Flush vstack so obj is on physical stack — avoids hit/miss path inconsistency
+    vstackFlush(tctx);
+
+    // Load obj from physical stack[sp-1] (peek, don't pop)
+    const sp_val = inlineLoadSp(b, tctx.sp_ptr);
+    const obj_sp = b.buildSub(sp_val, llvm.constInt64(1), "objsp");
+    const obj_slot = inlineStackSlot(b, tctx.stack_ptr, obj_sp);
+    const obj_cv = b.buildLoad(i64t, obj_slot, "objcv");
+
+    const current_fn = c.LLVMGetBasicBlockParent(c.LLVMGetInsertBlock(b.ref));
+    const shape_bb = llvm.appendBasicBlock(current_fn, "gf2_shape");
+    var check_bbs: [4]llvm.BasicBlock = undefined;
+    for (0..4) |i| {
+        var buf: [16]u8 = undefined;
+        const lbl = std.fmt.bufPrintZ(&buf, "gf2_chk{d}", .{i}) catch "gf2_chk";
+        check_bbs[i] = llvm.appendBasicBlock(current_fn, lbl);
+    }
+    const hit_bb = llvm.appendBasicBlock(current_fn, "gf2_hit");
+    const hit_int_bb = llvm.appendBasicBlock(current_fn, "gf2_hint");
+    const hit_ni_bb = llvm.appendBasicBlock(current_fn, "gf2_hni");
+    const miss_bb = llvm.appendBasicBlock(current_fn, "gf2_miss");
+    const merge_bb = llvm.appendBasicBlock(current_fn, "gf2_merge");
+
+    // Check if obj is a CV object: (cv & 0xFFFFF00000000000) == 0x7FFD000000000000
+    const CV_OBJ_MASK: u64 = 0xFFFFF00000000000;
+    const CV_OBJ_TAG: u64 = 0x7FFD000000000000;
+    const masked = b.buildAnd(obj_cv, llvm.constInt(i64t, CV_OBJ_MASK, false), "gf2mask");
+    const is_obj = b.buildICmp(c.LLVMIntEQ, masked, llvm.constInt(i64t, CV_OBJ_TAG, false), "gf2obj");
+    _ = b.buildCondBr(is_obj, shape_bb, miss_bb);
+
+    // Extract object pointer and load shape
+    b.positionAtEnd(shape_bb);
+    const CV_PTR_ADDR_MASK: u64 = 0x00000FFFFFFFFFFF;
+    const obj_addr = b.buildAnd(obj_cv, llvm.constInt(i64t, CV_PTR_ADDR_MASK, false), "o2addr");
+    const obj_ptr = b.buildIntToPtr(obj_addr, ptr, "o2ptr");
+    const shape_addr = b.buildGEP(llvm.i8Type(), obj_ptr, &.{llvm.constInt64(24)}, "s2addr");
+    const shape = b.buildLoad(ptr, shape_addr, "shape2");
+    _ = b.buildBr(check_bbs[0]);
+
+    // 4-way shape check cascade
+    const shape_offsets = [4]i64{ 0, 8, 16, 24 };
+    const offset_byte_offsets = [4]i64{ 32, 36, 40, 44 };
+    var hit_from_bbs: [4]llvm.BasicBlock = undefined;
+    var hit_offsets: [4]llvm.Value = undefined;
+
+    for (0..4) |i| {
+        b.positionAtEnd(check_bbs[i]);
+        const cs_addr = b.buildGEP(llvm.i8Type(), ic_global, &.{llvm.constInt64(shape_offsets[i])}, "cs2addr");
+        const cached_shape = b.buildLoad(ptr, cs_addr, "cs2hp");
+        const off_addr_i = b.buildGEP(llvm.i8Type(), ic_global, &.{llvm.constInt64(offset_byte_offsets[i])}, "off2addr");
+        hit_offsets[i] = b.buildLoad(i32t, off_addr_i, "off2");
+        const shape_match = b.buildICmp(c.LLVMIntEQ, shape, cached_shape, "sm2atch");
+        const next_bb = if (i < 3) check_bbs[i + 1] else miss_bb;
+        _ = b.buildCondBr(shape_match, hit_bb, next_bb);
+        hit_from_bbs[i] = check_bbs[i];
+    }
+
+    // IC HIT: merge offset from whichever shape matched
+    b.positionAtEnd(hit_bb);
+    const offset_phi = b.buildPhi(i32t, "off2phi");
+    llvm.addIncoming(offset_phi, &hit_offsets, &hit_from_bbs);
+
+    // Load prop_base at offset 32 and GEP to property
+    const pbase_addr = b.buildGEP(llvm.i8Type(), obj_ptr, &.{llvm.constInt64(32)}, "pb2addr");
+    const prop_base = b.buildLoad(ptr, pbase_addr, "pbase2");
+    const off_ext = b.buildZExt(offset_phi, i64t, "off2ext");
+    const byte_off = b.buildMul(off_ext, llvm.constInt64(16), "b2off");
+    const prop_addr = b.buildGEP(llvm.i8Type(), prop_base, &.{byte_off}, "p2addr");
+    // Load JSValue tag at prop_addr + 8
+    const tag_addr = b.buildGEP(llvm.i8Type(), prop_addr, &.{llvm.constInt64(8)}, "t2addr");
+    const tag = b.buildLoad(i64t, tag_addr, "p2tag");
+    const is_int = b.buildICmp(c.LLVMIntEQ, tag, llvm.constInt64(0), "p2int");
+    _ = b.buildCondBr(is_int, hit_int_bb, hit_ni_bb);
+
+    // Hit + int: load i32 payload, make CV int
+    b.positionAtEnd(hit_int_bb);
+    const payload = b.buildLoad(i32t, prop_addr, "p2pay");
+    const int_cv = inlineNewInt(b, payload);
+    const int_final_bb = c.LLVMGetInsertBlock(b.ref);
+    _ = b.buildBr(merge_bb);
+
+    // Hit + non-int: call jsvalue_to_cv for dup + conversion
+    b.positionAtEnd(hit_ni_bb);
+    const ni_cv = b.buildCall(
+        llvm.functionType(i64t, &.{ ptr, ptr, i32t }, false),
+        tctx.rt.jsvalue_to_cv, &.{ tctx.ctx_param, prop_addr, llvm.constInt(i32t, 0, false) }, "ni2cv",
+    );
+    const ni_final_bb = c.LLVMGetInsertBlock(b.ref);
+    _ = b.buildBr(merge_bb);
+
+    // IC MISS: call runtime op_get_field2_ic (vstack already flushed, obj on physical stack)
+    b.positionAtEnd(miss_bb);
+    const err_code = b.buildCall(
+        llvm.functionType(i32t, &.{ ptr, ptr, ptr, ptr, ptr }, false),
+        tctx.rt.op_get_field2_ic, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, ic_global, str_ptr }, "gf2err",
+    );
+    const is_err = b.buildICmp(c.LLVMIntNE, err_code, llvm.constInt(i32t, 0, false), "gf2e");
+    const miss_ok_bb = llvm.appendBasicBlock(current_fn, "gf2_mok");
+    _ = b.buildCondBr(is_err, tctx.cleanup_bb, miss_ok_bb);
+
+    // Miss OK: read result from stack[sp-1] (op_get_field2_ic pushed it), pop back to vstack
+    b.positionAtEnd(miss_ok_bb);
+    const miss_sp = inlineLoadSp(b, tctx.sp_ptr);
+    const miss_nsp = b.buildSub(miss_sp, llvm.constInt64(1), "m2nsp");
+    const miss_slot = inlineStackSlot(b, tctx.stack_ptr, miss_nsp);
+    const miss_result = b.buildLoad(i64t, miss_slot, "m2res");
+    inlineStoreSp(b, tctx.sp_ptr, miss_nsp);
+    const miss_final_bb = c.LLVMGetInsertBlock(b.ref);
+    _ = b.buildBr(merge_bb);
+
+    // Merge all paths — push result onto vstack
+    b.positionAtEnd(merge_bb);
+    const phi = b.buildPhi(i64t, "gf2res");
     var phi_vals = [_]llvm.Value{ int_cv, ni_cv, miss_result };
     var phi_bbs = [_]llvm.BasicBlock{ int_final_bb, ni_final_bb, miss_final_bb };
     llvm.addIncoming(phi, &phi_vals, &phi_bbs);
