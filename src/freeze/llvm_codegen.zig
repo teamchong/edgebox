@@ -1006,17 +1006,20 @@ pub fn generateThinShard(
     defer generated_infos.deinit(allocator);
 
     var skipped_unsafe: u32 = 0;
+    var skipped_large: u32 = 0;
+    var skipped_close_fc: u32 = 0;
+    var skipped_opcode: u32 = 0;
     var unsafe_opcode_counts: [256]u32 = [_]u32{0} ** 256;
     for (functions) |sf| {
         // Skip very large functions — they can have codegen bugs in edge cases
         // and the LLVM compile time is disproportionate. The interpreter handles them correctly.
         if (sf.func.instructions.len > 10000) {
             skipped_unsafe += 1;
+            skipped_large += 1;
             continue;
         }
-        // Skip functions that have both close_loc AND fclosure — close_loc needs
-        // proper var_ref detachment that we can't fully guarantee yet.
-        // Enabling these causes "cannot read property 'flags' of undefined" in TSC.
+        // close_loc+fclosure: previously skipped, now enabled with proper
+        // locals_jsv sync in set_loc/put_loc when has_fclosure is true.
         {
             var has_close = false;
             var has_fc = false;
@@ -1027,8 +1030,7 @@ pub fn generateThinShard(
                 }
             }
             if (has_close and has_fc) {
-                skipped_unsafe += 1;
-                continue;
+                skipped_close_fc += 1; // Track count but don't skip
             }
         }
         if (generateThinFunction(allocator, native.module, builder, sf, &rt_decls)) |has_unsafe_fallback| {
@@ -1099,6 +1101,7 @@ pub fn generateThinShard(
                     }
                 }
                 skipped_unsafe += 1;
+                skipped_opcode += 1;
                 continue;
             }
             // Check if function has tail_call opcodes
@@ -1129,7 +1132,7 @@ pub fn generateThinShard(
         }
     }
     if (skipped_unsafe > 0) {
-        std.debug.print("[llvm-thin] Skipped {d} functions with unsafe fallback opcodes (keeping interpreter versions)\n", .{skipped_unsafe});
+        std.debug.print("[llvm-thin] Skipped {d} functions (large:{d} opcode:{d}), {d} close_loc+fc compiled\n", .{ skipped_unsafe, skipped_large, skipped_opcode, skipped_close_fc });
         const OpcodeCount = struct { idx: u8, count: u32 };
         var top: [256]OpcodeCount = undefined;
         for (0..256) |i| top[i] = .{ .idx = @intCast(i), .count = unsafe_opcode_counts[i] };

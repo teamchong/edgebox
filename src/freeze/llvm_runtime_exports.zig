@@ -1357,11 +1357,16 @@ export fn llvm_rt_close_loc(ctx: *JSContext, locals: [*]CV, locals_jsv: ?[*]JSVa
         ljv[i] = CV.toJSValuePtr(&locals[i]);
     }
 
-    // Call C helper: detach var_refs pointing to this local, then free + set undefined
+    // Call C helper: detach var_refs pointing to this local.
+    // NOTE: Unlike the original implementation, we do NOT set the local to undefined.
+    // The interpreter's close_lexical_var() only detaches var_refs — the local keeps
+    // its value. Setting to undefined broke for-loop `let` patterns where close_loc
+    // runs mid-loop and the next instruction reads the variable (e.g., i++ after close_loc i).
     quickjs.js_frozen_close_loc(ctx, var_ref_list, locals_jsv, idx);
 
-    // Sync back: set CV local to undefined
-    locals[i] = CV.UNDEFINED;
+    // Do NOT set locals[i] = CV.UNDEFINED — the local must retain its value.
+    // The variable's lifetime ends when set_loc_uninitialized (TDZ) runs in the next
+    // iteration, which properly frees the old value before overwriting.
 }
 
 export fn llvm_rt_get_closure_var_safe(ctx: *JSContext, var_refs: ?[*]*JSVarRef, idx: u32, closure_var_count: c_int) callconv(.c) JSValue {
