@@ -500,6 +500,22 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
+    // Parse size values with K/M suffix (e.g., "1500K", "2M", "3145728")
+    const parseSizeValue = struct {
+        fn parse(s: []const u8) !u32 {
+            if (s.len == 0) return error.InvalidValue;
+            const last = s[s.len - 1];
+            if (last == 'K' or last == 'k') {
+                const n = try std.fmt.parseInt(u32, s[0 .. s.len - 1], 10);
+                return n * 1024;
+            } else if (last == 'M' or last == 'm') {
+                const n = try std.fmt.parseInt(u32, s[0 .. s.len - 1], 10);
+                return n * 1024 * 1024;
+            }
+            return std.fmt.parseInt(u32, s, 10);
+        }
+    }.parse;
+
     // Parse arguments
     var dynamic_mode = false;
     var force_rebuild = false;
@@ -513,6 +529,7 @@ pub fn main() !void {
     var output_prefix: ?[]const u8 = null; // Custom output prefix (default: zig-out)
     var freeze_max_functions: u32 = 0; // 0 = freeze all, N = freeze only top N largest
     var freeze_profile_path: ?[]const u8 = null; // PGO: path to call profile JSON
+    var freeze_code_budget: u32 = 0; // 0 = auto-detect L2, N = max frozen code bytes
     var app_dir: ?[]const u8 = null;
 
     var i: usize = 1;
@@ -557,6 +574,13 @@ pub fn main() !void {
             const prefix_len = "--freeze-max-functions=".len;
             freeze_max_functions = std.fmt.parseInt(u32, arg[prefix_len..], 10) catch {
                 std.debug.print("Invalid --freeze-max-functions value: {s}\n", .{arg[prefix_len..]});
+                std.process.exit(1);
+            };
+        } else if (std.mem.startsWith(u8, arg, "--freeze-code-budget=")) {
+            const val_str = arg["--freeze-code-budget=".len..];
+            // Parse size with K/M suffix (e.g., "1500K", "2M", "3145728")
+            freeze_code_budget = parseSizeValue(val_str) catch {
+                std.debug.print("Invalid --freeze-code-budget value: {s} (use e.g., 1500K, 2M, or bytes)\n", .{val_str});
                 std.process.exit(1);
             };
         } else if (std.mem.startsWith(u8, arg, "--freeze-profile=")) {
@@ -613,6 +637,7 @@ pub fn main() !void {
             .output_prefix = output_prefix,
             .freeze_max_functions = freeze_max_functions,
             .freeze_profile_path = freeze_profile_path,
+            .freeze_code_budget = freeze_code_budget,
         });
     }
 }
@@ -638,7 +663,8 @@ fn printUsage() void {
         \\  --debug          Use Debug optimization (faster compile, slower runtime)
         \\  --allocator=X    Allocator for native binary: gpa (default), c, arena
         \\  --output-dir=X   Custom output directory (default: zig-out)
-        \\  --freeze-max-functions=N  Freeze only top N largest functions (0=all)
+        \\  --freeze-max-functions=N  Freeze only top N functions (0=all, requires --freeze-profile)
+        \\  --freeze-code-budget=SIZE  Max frozen code size (e.g., 1500K, 2M; 0=auto-detect L2)
         \\  --freeze-profile=PATH    PGO: sort functions by call profile (from --profile-out)
         \\  --minimal        All of the above (fastest, for test262)
         \\  -h, --help       Show this help
@@ -905,6 +931,7 @@ const BuildOptions = struct {
     output_prefix: ?[]const u8 = null, // Custom output prefix (default: zig-out)
     freeze_max_functions: u32 = 0, // 0 = freeze all, N = freeze only top N largest functions
     freeze_profile_path: ?[]const u8 = null, // PGO: path to call profile JSON from --profile-out
+    freeze_code_budget: u32 = 0, // 0 = auto (L2 cache size), N = max frozen code bytes
 };
 
 /// Static build: compile JS to C bytecode with qjsc, embed in WASM
@@ -1447,7 +1474,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
 
         // Generate frozen module via LLVM IR backend
         zig_gen: {
-            var sharded = freeze.generateModuleZigShardedWithBackend(allocator, &analysis, "frozen", manifest_content, options.freeze_max_functions, options.freeze_profile_path, cache_dir) catch |err| {
+            var sharded = freeze.generateModuleZigShardedWithBackend(allocator, &analysis, "frozen", manifest_content, options.freeze_max_functions, options.freeze_profile_path, cache_dir, options.freeze_code_budget) catch |err| {
                 std.debug.print("[warn] LLVM codegen failed: {}\n", .{err});
                 break :zig_gen;
             };

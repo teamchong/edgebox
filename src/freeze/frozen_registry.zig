@@ -33,6 +33,28 @@ const Allocator = std.mem.Allocator;
 
 /// Look up a function's call count in the PGO profile map.
 /// Key format matches call_profile.zig dump: "name@line_num"
+/// Detect L2 cache size per core from /sys/devices/system/cpu.
+/// Returns bytes, or 0 if detection fails. Falls back to 1.5MB default.
+fn detectL2CacheSize() u64 {
+    // Try Linux sysfs: /sys/devices/system/cpu/cpu0/cache/index2/size
+    const f = std.fs.openFileAbsolute("/sys/devices/system/cpu/cpu0/cache/index2/size", .{}) catch return 1536 * 1024;
+    defer f.close();
+    var buf: [64]u8 = undefined;
+    const len = f.read(&buf) catch return 1536 * 1024;
+    const content = std.mem.trim(u8, buf[0..len], &[_]u8{ ' ', '\n', '\r', '\t' });
+    if (content.len == 0) return 1536 * 1024;
+    // Parse "1536K" or "2048K" format
+    const last = content[content.len - 1];
+    if (last == 'K' or last == 'k') {
+        const n = std.fmt.parseInt(u64, content[0 .. content.len - 1], 10) catch return 1536 * 1024;
+        return n * 1024;
+    } else if (last == 'M' or last == 'm') {
+        const n = std.fmt.parseInt(u64, content[0 .. content.len - 1], 10) catch return 1536 * 1024;
+        return n * 1024 * 1024;
+    }
+    return std.fmt.parseInt(u64, content, 10) catch 1536 * 1024;
+}
+
 fn lookupProfile(map: *const std.StringHashMapUnmanaged(u64), name: []const u8, line_num: u32) u64 {
     var buf: [256]u8 = undefined;
     const key = std.fmt.bufPrint(&buf, "{s}@{d}", .{ name, line_num }) catch return 0;
@@ -746,6 +768,7 @@ pub fn generateModuleZigShardedWithBackend(
     max_functions: u32,
     profile_path: ?[]const u8,
     output_dir: ?[]const u8,
+    code_budget: u32,
 ) !ShardedOutput {
     _ = module_name;
     _ = manifest_json;
@@ -822,11 +845,61 @@ pub fn generateModuleZigShardedWithBackend(
         }
     }
 
-    // Selective freezing: limit to top N functions (after PGO sort, this keeps the hottest)
-    if (max_functions > 0 and generated_all.items.len > max_functions) {
+    // Selective freezing: limit by code budget or function count
+    // Code budget auto-sizing: estimate native code size per function from bytecode instruction count
+    // Empirical ratio: ~7 bytes of native code per bytecode instruction (from TSC measurements)
+    const BYTES_PER_INSTRUCTION: u32 = 7;
+
+    var effective_max = max_functions;
+    if (effective_max == 0 and code_budget > 0 and profile_path != null) {
+        // Auto-compute function limit from code budget
+        var cumulative_size: u64 = 0;
+        for (generated_all.items, 0..) |gf, i| {
+            const est_size = @as(u64, gf.func.instructions.len) * BYTES_PER_INSTRUCTION;
+            cumulative_size += est_size;
+            if (cumulative_size > code_budget) {
+                effective_max = @intCast(i);
+                std.debug.print("[freeze-pgo] Auto-sized to {d} functions for {d}KB code budget ({d}KB estimated)\n", .{
+                    effective_max,
+                    code_budget / 1024,
+                    (cumulative_size - est_size) / 1024,
+                });
+                break;
+            }
+        }
+        if (effective_max == 0) {
+            // All functions fit within budget
+            std.debug.print("[freeze-pgo] All {d} functions fit within {d}KB code budget ({d}KB estimated)\n", .{
+                generated_all.items.len,
+                code_budget / 1024,
+                cumulative_size / 1024,
+            });
+        }
+    } else if (effective_max == 0 and code_budget == 0 and profile_path != null) {
+        // Auto-detect L2 cache size and use as default budget
+        const l2_budget = detectL2CacheSize();
+        if (l2_budget > 0) {
+            var cumulative_size: u64 = 0;
+            for (generated_all.items, 0..) |gf, i| {
+                const est_size = @as(u64, gf.func.instructions.len) * BYTES_PER_INSTRUCTION;
+                cumulative_size += est_size;
+                if (cumulative_size > l2_budget) {
+                    effective_max = @intCast(i);
+                    std.debug.print("[freeze-pgo] Auto-sized to {d} functions for L2 cache ({d}KB, {d}KB estimated code)\n", .{
+                        effective_max,
+                        l2_budget / 1024,
+                        (cumulative_size - est_size) / 1024,
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
+    if (effective_max > 0 and generated_all.items.len > effective_max) {
         const total_before = generated_all.items.len;
-        generated_all.items.len = max_functions;
-        std.debug.print("[freeze] Limited to {d} of {d} freezable functions\n", .{ max_functions, total_before });
+        generated_all.items.len = effective_max;
+        std.debug.print("[freeze] Limited to {d} of {d} freezable functions\n", .{ effective_max, total_before });
     }
 
     // Generate int32 functions as LLVM IR .o files
