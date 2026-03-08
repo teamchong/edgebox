@@ -2314,14 +2314,7 @@ fn emitThinInstruction(
         },
 
         .push_const8, .push_const => {
-            vstackFlush(tctx);
-            const idx: u32 = instr.operand.const_idx;
-            _ = b.buildCall(
-                llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false),
-                rt.push_const,
-                &.{ ctx_p, stk, sp, tctx.cpool_param, llvm.constInt32(@intCast(idx)) },
-                "",
-            );
+            emitVstackPushConst(tctx, instr.operand.const_idx);
         },
 
         // ========== Local Variables (vstack-optimized) ==========
@@ -3389,6 +3382,56 @@ fn getAtomStringStatic(func: AnalyzedFunction, atom_idx: u32) ?[*:0]const u8 {
 
 /// get_loc: load locals[idx], push as borrowed (no dupRef!).
 /// The local still holds the reference. DupRef deferred until flush or consumption.
+/// Inline push_const: load cpool[idx] (JSValue) → CV, push onto vstack.
+/// Int fast path: tag==0 → pack as CV int (no dup needed).
+/// Non-int: call jsvalue_to_cv for dup + conversion.
+fn emitVstackPushConst(tctx: *ThinCodegenCtx, idx: u32) void {
+    const b = tctx.builder;
+    const i64t = llvm.i64Type();
+    const i32t = llvm.i32Type();
+    const ptr = llvm.ptrType();
+
+    // cpool is a JSValue* array. Each JSValue is 16 bytes on native: {payload i64, tag i64}
+    // GEP to &cpool[idx]: cpool_ptr + idx * 16
+    const byte_offset = @as(i64, @intCast(@as(u64, idx) * 16));
+    const cpool_addr = b.buildGEP(llvm.i8Type(), tctx.cpool_param, &.{llvm.constInt64(byte_offset)}, "cpaddr");
+
+    // Load tag at offset 8 from cpool entry
+    const tag_addr = b.buildGEP(llvm.i8Type(), cpool_addr, &.{llvm.constInt64(8)}, "cptaddr");
+    const tag = b.buildLoad(i64t, tag_addr, "cptag");
+    const is_int = b.buildICmp(c.LLVMIntEQ, tag, llvm.constInt64(0), "cpint");
+
+    const current_fn = c.LLVMGetBasicBlockParent(c.LLVMGetInsertBlock(b.ref));
+    const int_bb = llvm.appendBasicBlock(current_fn, "cp_int");
+    const nonint_bb = llvm.appendBasicBlock(current_fn, "cp_ni");
+    const merge_bb = llvm.appendBasicBlock(current_fn, "cp_merge");
+    _ = b.buildCondBr(is_int, int_bb, nonint_bb);
+
+    // Int path: load i32 payload, pack as CV int (no refcount needed)
+    b.positionAtEnd(int_bb);
+    const payload = b.buildLoad(i32t, cpool_addr, "cppay");
+    const int_cv = inlineNewInt(b, payload);
+    const int_final_bb = c.LLVMGetInsertBlock(b.ref);
+    _ = b.buildBr(merge_bb);
+
+    // Non-int path: call jsvalue_to_cv(ctx, &cpool[idx], 0) for dup + conversion
+    b.positionAtEnd(nonint_bb);
+    const ni_cv = b.buildCall(
+        llvm.functionType(i64t, &.{ ptr, ptr, i32t }, false),
+        tctx.rt.jsvalue_to_cv, &.{ tctx.ctx_param, cpool_addr, llvm.constInt(i32t, 0, false) }, "cpcv",
+    );
+    const ni_final_bb = c.LLVMGetInsertBlock(b.ref);
+    _ = b.buildBr(merge_bb);
+
+    // Merge
+    b.positionAtEnd(merge_bb);
+    const phi = b.buildPhi(i64t, "cpres");
+    var phi_vals = [_]llvm.Value{ int_cv, ni_cv };
+    var phi_bbs = [_]llvm.BasicBlock{ int_final_bb, ni_final_bb };
+    llvm.addIncoming(phi, &phi_vals, &phi_bbs);
+    vstackPush(tctx, phi, true);
+}
+
 fn emitVstackGetLoc(tctx: *ThinCodegenCtx, idx: u32) void {
     const b = tctx.builder;
     const loc_ptr = inlineLocalSlot(b, tctx.locals_ptr, idx);
