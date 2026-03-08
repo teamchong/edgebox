@@ -2553,9 +2553,29 @@ fn emitThinInstruction(
         .typeof => { vstackFlush(tctx); callVoid3(b, rt.op_typeof, ctx_p, stk, sp); },
 
         // ========== Type Checks (flush vstack) ==========
-        .is_undefined => { vstackFlush(tctx); callVoid3(b, rt.is_undefined, ctx_p, stk, sp); },
-        .is_null => { vstackFlush(tctx); callVoid3(b, rt.is_null, ctx_p, stk, sp); },
-        .is_undefined_or_null => { vstackFlush(tctx); callVoid3(b, rt.is_undefined_or_null, ctx_p, stk, sp); },
+        .is_undefined => {
+            const entry = vstackPop(tctx);
+            vstackFreeEntry(tctx, entry);
+            const is_undef = b.buildICmp(c.LLVMIntEQ, entry.value, llvm.constInt(llvm.i64Type(), CV_UNDEFINED, false), "isundef");
+            const result = b.buildSelect(is_undef, llvm.constInt(llvm.i64Type(), CV_TRUE, false), llvm.constInt(llvm.i64Type(), CV_FALSE, false), "isundefv");
+            vstackPush(tctx, result, true);
+        },
+        .is_null => {
+            const entry = vstackPop(tctx);
+            vstackFreeEntry(tctx, entry);
+            const is_null_v = b.buildICmp(c.LLVMIntEQ, entry.value, llvm.constInt(llvm.i64Type(), CV_NULL, false), "isnull");
+            const result = b.buildSelect(is_null_v, llvm.constInt(llvm.i64Type(), CV_TRUE, false), llvm.constInt(llvm.i64Type(), CV_FALSE, false), "isnullv");
+            vstackPush(tctx, result, true);
+        },
+        .is_undefined_or_null => {
+            const entry = vstackPop(tctx);
+            vstackFreeEntry(tctx, entry);
+            const is_undef = b.buildICmp(c.LLVMIntEQ, entry.value, llvm.constInt(llvm.i64Type(), CV_UNDEFINED, false), "isundef");
+            const is_null_v = b.buildICmp(c.LLVMIntEQ, entry.value, llvm.constInt(llvm.i64Type(), CV_NULL, false), "isnull");
+            const either = b.buildOr(is_undef, is_null_v, "isun");
+            const result = b.buildSelect(either, llvm.constInt(llvm.i64Type(), CV_TRUE, false), llvm.constInt(llvm.i64Type(), CV_FALSE, false), "isunv");
+            vstackPush(tctx, result, true);
+        },
 
         // ========== Stack-based Increment / Decrement (flush vstack) ==========
         .inc => { vstackFlush(tctx); callVoid2(b, rt.inc, stk, sp); },
