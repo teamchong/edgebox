@@ -316,20 +316,30 @@ pub inline fn getFieldChecked(ctx: *JSContext, obj: JSValue, name: [*:0]const u8
 // Inline Cache for Property Access
 // ============================================================================
 
-/// Inline cache slot for a single property access site.
-/// Stores cached shape pointer, property offset, and resolved atom.
-/// Must be initialized to zeroes (null shape, 0 offset, 0 atom).
+/// Polymorphic inline cache slot (4-way) for a single property access site.
+/// Stores up to 4 cached {shape, offset} pairs plus a resolved atom.
+/// Must be initialized to zeroes (all shapes null, count 0).
+///
+/// Layout (56 bytes): {shapes[4]ptr, offsets[4]u32, atom u32, count u32}
+/// Byte offsets: shapes=0,8,16,24  offsets=32,36,40,44  atom=48  count=52
 pub const ICSlot = extern struct {
-    shape: ?*anyopaque = null,
-    offset: u32 = 0,
+    shape0: ?*anyopaque = null,
+    shape1: ?*anyopaque = null,
+    shape2: ?*anyopaque = null,
+    shape3: ?*anyopaque = null,
+    offset0: u32 = 0,
+    offset1: u32 = 0,
+    offset2: u32 = 0,
+    offset3: u32 = 0,
     atom: u32 = 0,
+    count: u32 = 0,
 
-    pub const ZERO = ICSlot{ .shape = null, .offset = 0, .atom = 0 };
+    pub const ZERO = ICSlot{};
 };
 
-/// Load a property using an inline cache slot.
+/// Load a property using a polymorphic inline cache slot (4-way).
 /// Fast path (IC hit): O(1) direct property read entirely in Zig — no C FFI call.
-/// Slow path (IC miss): C function resolves atom, populates cache, returns value.
+/// Checks all 4 cached shapes before falling back to C slow path.
 ///
 /// JSObject layout on 64-bit native (from quickjs.c):
 ///   offset 24: JSShape *shape
@@ -337,26 +347,28 @@ pub const ICSlot = extern struct {
 pub inline fn icLoad(ctx: *JSContext, obj: JSValue, ic: *ICSlot, name: [*:0]const u8) GetFieldError!JSValue {
     if (PROFILE) vinc(prof.getfield_calls(), 1);
     const t0 = if (PROFILE) cycles() else 0;
-    // IC fast path: check shape match and read property directly (zero FFI calls)
+    // IC fast path: check all 4 shapes for a match
     if (!is_wasm32 and obj.tag == JS_TAG_OBJECT) {
-        if (ic.shape) |cached_shape| {
-            const obj_bytes: [*]const u8 = @ptrCast(obj.u.ptr.?);
-            // Read shape pointer at offset 24
-            const shape_ptr: *const ?*anyopaque = @ptrCast(@alignCast(obj_bytes + 24));
-            if (shape_ptr.* == cached_shape) {
-                if (PROFILE) vinc(prof.ic_hits(), 1);
-                if (PROFILE) vinc(prof.getfield_cycles(), cycles() - t0);
-                // Read prop base pointer at offset 32
-                const prop_base: *const [*]const u8 = @ptrCast(@alignCast(obj_bytes + 32));
-                // Read JSValue at prop[offset] (each JSProperty = 16 bytes)
-                const prop_value: *const JSValue = @ptrCast(@alignCast(prop_base.* + @as(usize, ic.offset) * 16));
-                return JSValue.dup(ctx, prop_value.*);
+        const obj_bytes: [*]const u8 = @ptrCast(obj.u.ptr.?);
+        const shape_ptr: *const ?*anyopaque = @ptrCast(@alignCast(obj_bytes + 24));
+        const shape = shape_ptr.*;
+        if (shape != null) {
+            const shapes = [4]?*anyopaque{ ic.shape0, ic.shape1, ic.shape2, ic.shape3 };
+            const offsets = [4]u32{ ic.offset0, ic.offset1, ic.offset2, ic.offset3 };
+            inline for (0..4) |i| {
+                if (shapes[i] == shape) {
+                    if (PROFILE) vinc(prof.ic_hits(), 1);
+                    if (PROFILE) vinc(prof.getfield_cycles(), cycles() - t0);
+                    const prop_base: *const [*]const u8 = @ptrCast(@alignCast(obj_bytes + 32));
+                    const prop_value: *const JSValue = @ptrCast(@alignCast(prop_base.* + @as(usize, offsets[i]) * 16));
+                    return JSValue.dup(ctx, prop_value.*);
+                }
             }
         }
     }
     if (PROFILE) vinc(prof.ic_misses(), 1);
-    // Slow path: C function handles atom resolution, cache population, and proto chain
-    const result = quickjs.js_frozen_ic_load(ctx, obj, &ic.shape, &ic.offset, &ic.atom, name);
+    // Slow path: C function resolves atom, populates next IC slot, returns value
+    const result = quickjs.js_frozen_ic_load(ctx, obj, @ptrCast(ic), name);
     if (PROFILE) vinc(prof.getfield_cycles(), cycles() - t0);
     if (result.isException()) return error.JsException;
     return result;
