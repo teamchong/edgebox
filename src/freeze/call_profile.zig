@@ -24,6 +24,7 @@ var stored_path: ?[*:0]const u8 = null;
 /// Enable call profiling. Called from native_main_embed when --profile-out is set.
 pub fn enable() void {
     enabled = true;
+    edgebox_call_profile_is_enabled = 1;
 }
 
 /// Store context/path for later dump (called from native_main_embed after ctx is ready)
@@ -40,10 +41,9 @@ pub export fn edgebox_call_profile_flush() void {
     }
 }
 
-/// C-callable: check if profiling is active (branch-predicted not-taken).
-pub export fn edgebox_call_profile_enabled() c_int {
-    return if (enabled) 1 else 0;
-}
+/// Global variable checked by QuickJS JS_CallInternal (avoids function call overhead).
+/// A load from a global is ~1 cycle vs ~10 cycles for an extern function call.
+pub export var edgebox_call_profile_is_enabled: c_int = 0;
 
 /// C-callable: increment call count for function identified by (atom, line_num).
 pub export fn edgebox_call_profile_increment(atom: u32, line_num: u32) void {

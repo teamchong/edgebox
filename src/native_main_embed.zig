@@ -39,7 +39,7 @@ const native_bindings = @import("native_bindings.zig");
 const call_profile = @import("freeze/call_profile.zig");
 comptime {
     // Force link C-callable profile symbols so QuickJS patch and process.exit can call them
-    _ = &call_profile.edgebox_call_profile_enabled;
+    _ = &call_profile.edgebox_call_profile_is_enabled;
     _ = &call_profile.edgebox_call_profile_increment;
     _ = &call_profile.edgebox_call_profile_flush;
 }

@@ -95,7 +95,7 @@ const call_profile = if (is_wasm32) null else @import("freeze/call_profile.zig")
 comptime {
     if (!is_wasm32) {
         // Force link C-callable profile symbols so QuickJS patch can call them
-        _ = &call_profile.?.edgebox_call_profile_enabled;
+        _ = &call_profile.?.edgebox_call_profile_is_enabled;
         _ = &call_profile.?.edgebox_call_profile_increment;
         _ = &call_profile.?.edgebox_call_profile_flush;
     }

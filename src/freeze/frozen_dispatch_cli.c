@@ -85,9 +85,7 @@ void native_shapes_debug_stats(void) {
 }
 
 // Call profiling stubs - weak symbols overridden by Zig exports in CLI builds
-__attribute__((weak)) int edgebox_call_profile_enabled(void) {
-    return 0;
-}
+__attribute__((weak)) int edgebox_call_profile_is_enabled = 0;
 
 __attribute__((weak)) void edgebox_call_profile_increment(uint32_t atom, uint32_t line_num) {
     (void)atom;

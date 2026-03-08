@@ -43,7 +43,7 @@ index ae01300..587c949 100644
  }
  
 diff --git a/quickjs.c b/quickjs.c
-index 62f4381..c95fe74 100644
+index 62f4381..efad7ca 100644
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -29,6 +29,10 @@
@@ -107,8 +107,8 @@ index 62f4381..c95fe74 100644
 +/* Get frozen function pointer for caching in JSFunctionBytecode.frozen_impl */
 +extern void *frozen_dispatch_get_impl(void *bytecode_ptr);
 +
-+/* PGO call profiling (from call_profile.zig) */
-+extern int edgebox_call_profile_enabled(void);
++/* PGO call profiling (from call_profile.zig) — global variable avoids function call overhead */
++extern int edgebox_call_profile_is_enabled;
 +extern void edgebox_call_profile_increment(uint32_t atom, uint32_t line_num);
 +
  static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref);
@@ -2230,7 +2230,7 @@ index 62f4381..c95fe74 100644
      }
      b = p->u.func.function_bytecode;
 +    /* PGO call profiling: count every interpreted function call */
-+    if (unlikely(edgebox_call_profile_enabled()))
++    if (unlikely(edgebox_call_profile_is_enabled))
 +        edgebox_call_profile_increment(b->func_name, b->line_num);
 +    /* Frozen function dispatch with inline caching in JSFunctionBytecode.frozen_impl */
 +    /* NULL = not looked up yet, (void*)1 = miss cached, other = frozen function pointer */
