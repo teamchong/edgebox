@@ -2342,7 +2342,6 @@ fn emitThinInstruction(
 
         // ========== Arguments (flush vstack before runtime calls) ==========
         .get_arg0, .get_arg1, .get_arg2, .get_arg3, .get_arg => {
-            vstackFlush(tctx);
             const idx: u32 = switch (instr.opcode) {
                 .get_arg0 => 0,
                 .get_arg1 => 1,
@@ -2351,24 +2350,19 @@ fn emitThinInstruction(
                 else => instr.operand.arg,
             };
             if (tctx.has_put_arg) {
-                // get_arg_shadow(stack, sp, arg_shadow, idx)
+                // Inline arg_shadow read: load CV, dupRef, push to vstack
                 if (tctx.arg_shadow_ptr) |asp| {
-                    var si = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(0) };
-                    const asp_flat = b.buildInBoundsGEP(
+                    var si = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(@intCast(idx)) };
+                    const elem_ptr = b.buildInBoundsGEP(
                         llvm.arrayType(llvm.i64Type(), tctx.func.arg_count),
-                        asp, &si, "asp",
+                        asp, &si, "aselem",
                     );
-                    _ = b.buildCall(
-                        llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false),
-                        rt.get_arg_shadow, &.{ stk, sp, asp_flat, llvm.constInt32(@intCast(idx)) }, "",
-                    );
+                    const cv_val = b.buildLoad(llvm.i64Type(), elem_ptr, "ascv");
+                    const duped = inlineDupRef(tctx, cv_val);
+                    vstackPush(tctx, duped, true);
                 }
             } else {
-                // get_arg(ctx, stack, sp, argc, argv, idx)
-                _ = b.buildCall(
-                    llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.i32Type() }, false),
-                    rt.get_arg, &.{ ctx_p, stk, sp, tctx.argc_param, tctx.argv_param, llvm.constInt32(@intCast(idx)) }, "",
-                );
+                emitVstackGetArg(tctx, idx);
             }
         },
 
@@ -3382,6 +3376,69 @@ fn getAtomStringStatic(func: AnalyzedFunction, atom_idx: u32) ?[*:0]const u8 {
 
 /// get_loc: load locals[idx], push as borrowed (no dupRef!).
 /// The local still holds the reference. DupRef deferred until flush or consumption.
+/// Inline get_arg: load argv[idx] (JSValue) → CV, push onto vstack.
+/// Bounds check: if idx >= argc, push CV_UNDEFINED.
+/// Int fast path: tag==0 → pack as CV int (no dup needed for ints).
+fn emitVstackGetArg(tctx: *ThinCodegenCtx, idx: u32) void {
+    const b = tctx.builder;
+    const i64t = llvm.i64Type();
+    const i32t = llvm.i32Type();
+    const ptr = llvm.ptrType();
+
+    // Bounds check: idx < argc
+    const idx_val = llvm.constInt(i32t, idx, false);
+    const in_bounds = b.buildICmp(c.LLVMIntULT, idx_val, tctx.argc_param, "argib");
+
+    const current_fn = c.LLVMGetBasicBlockParent(c.LLVMGetInsertBlock(b.ref));
+    const ok_bb = llvm.appendBasicBlock(current_fn, "ga_ok");
+    const undef_bb = llvm.appendBasicBlock(current_fn, "ga_undef");
+    const merge_bb = llvm.appendBasicBlock(current_fn, "ga_merge");
+    _ = b.buildCondBr(in_bounds, ok_bb, undef_bb);
+
+    // In bounds: load argv[idx] (JSValue is 16 bytes: {payload i64, tag i64})
+    b.positionAtEnd(ok_bb);
+    const byte_offset = @as(i64, @intCast(@as(u64, idx) * 16));
+    const argv_addr = b.buildGEP(llvm.i8Type(), tctx.argv_param, &.{llvm.constInt64(byte_offset)}, "avaddr");
+    // Load tag at offset 8
+    const tag_addr = b.buildGEP(llvm.i8Type(), argv_addr, &.{llvm.constInt64(8)}, "avtaddr");
+    const tag = b.buildLoad(i64t, tag_addr, "avtag");
+    const is_int = b.buildICmp(c.LLVMIntEQ, tag, llvm.constInt64(0), "avint");
+
+    const int_bb = llvm.appendBasicBlock(current_fn, "ga_int");
+    const nonint_bb = llvm.appendBasicBlock(current_fn, "ga_ni");
+    _ = b.buildCondBr(is_int, int_bb, nonint_bb);
+
+    // Int path: load i32 payload, pack as CV int
+    b.positionAtEnd(int_bb);
+    const payload = b.buildLoad(i32t, argv_addr, "avpay");
+    const int_cv = inlineNewInt(b, payload);
+    const int_final_bb = c.LLVMGetInsertBlock(b.ref);
+    _ = b.buildBr(merge_bb);
+
+    // Non-int path: call jsvalue_to_cv for dup + conversion
+    b.positionAtEnd(nonint_bb);
+    const ni_cv = b.buildCall(
+        llvm.functionType(i64t, &.{ ptr, ptr, i32t }, false),
+        tctx.rt.jsvalue_to_cv, &.{ tctx.ctx_param, argv_addr, llvm.constInt(i32t, 0, false) }, "avcv",
+    );
+    const ni_final_bb = c.LLVMGetInsertBlock(b.ref);
+    _ = b.buildBr(merge_bb);
+
+    // Out of bounds: push CV_UNDEFINED
+    b.positionAtEnd(undef_bb);
+    const undef_cv = llvm.constInt(i64t, CV_UNDEFINED, false);
+    const undef_final_bb = c.LLVMGetInsertBlock(b.ref);
+    _ = b.buildBr(merge_bb);
+
+    // Merge
+    b.positionAtEnd(merge_bb);
+    const phi = b.buildPhi(i64t, "gares");
+    var phi_vals = [_]llvm.Value{ int_cv, ni_cv, undef_cv };
+    var phi_bbs = [_]llvm.BasicBlock{ int_final_bb, ni_final_bb, undef_final_bb };
+    llvm.addIncoming(phi, &phi_vals, &phi_bbs);
+    vstackPush(tctx, phi, true);
+}
+
 /// Inline push_const: load cpool[idx] (JSValue) → CV, push onto vstack.
 /// Int fast path: tag==0 → pack as CV int (no dup needed).
 /// Non-int: call jsvalue_to_cv for dup + conversion.
