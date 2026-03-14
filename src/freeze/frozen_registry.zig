@@ -57,8 +57,15 @@ fn detectL2CacheSize() u64 {
 
 fn lookupProfile(map: *const std.StringHashMapUnmanaged(u64), name: []const u8, line_num: u32) u64 {
     var buf: [256]u8 = undefined;
+    // Try exact match first (name@line_num)
     const key = std.fmt.bufPrint(&buf, "{s}@{d}", .{ name, line_num }) catch return 0;
-    return map.get(key) orelse 0;
+    if (map.get(key)) |c| return c;
+    // Fallback: profile often has line_num=0 (bundled JS strips line info)
+    if (line_num != 0) {
+        const key0 = std.fmt.bufPrint(&buf, "{s}@0", .{name}) catch return 0;
+        if (map.get(key0)) |c| return c;
+    }
+    return 0;
 }
 
 /// Sanitize a name to be a valid Zig identifier

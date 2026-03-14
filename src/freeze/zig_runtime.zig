@@ -189,7 +189,7 @@ pub inline fn strictEqWithCtx(ctx: *JSContext, a: CompressedValue, b: Compressed
     const a_eq_b = if (comptime is_wasm32)
         (a.lo == b.lo and a.hi == b.hi)
     else
-        (a.bits == b.bits);
+        (a.u == b.u and a.tag == b.tag);
 
     if (a_eq_b) {
         // Exception: NaN !== NaN
@@ -241,7 +241,7 @@ pub inline fn strictNeqWithCtx(ctx: *JSContext, a: CompressedValue, b: Compresse
     const is_true = if (comptime is_wasm32)
         (result.lo == CompressedValue.TRUE.lo and result.hi == CompressedValue.TRUE.hi)
     else
-        (result.bits == CompressedValue.TRUE.bits);
+        (result.u == CompressedValue.TRUE.u and result.tag == CompressedValue.TRUE.tag);
     return if (is_true) CompressedValue.FALSE else CompressedValue.TRUE;
 }
 

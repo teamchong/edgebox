@@ -19,8 +19,7 @@ const thin = zig_runtime.thin;
 // Debug trace for diagnosing codegen bugs
 // ============================================================================
 
-export fn llvm_rt_debug_trace_cv(label: [*:0]const u8, cv_bits: u64) callconv(.c) void {
-    const cv: CV = @bitCast(cv_bits);
+export fn llvm_rt_debug_trace_cv(label: [*:0]const u8, cv: CV) callconv(.c) void {
     if (cv.isInt()) {
         std.debug.print("[TRACE] {s}: int({d})\n", .{ std.mem.span(label), cv.getInt() });
     } else if (cv.isUndefined()) {
@@ -28,13 +27,13 @@ export fn llvm_rt_debug_trace_cv(label: [*:0]const u8, cv_bits: u64) callconv(.c
     } else if (cv.isNull()) {
         std.debug.print("[TRACE] {s}: null\n", .{std.mem.span(label)});
     } else if (cv.isObject()) {
-        std.debug.print("[TRACE] {s}: object(0x{x:0>12})\n", .{ std.mem.span(label), cv.bits & 0x0000FFFFFFFFFC });
+        std.debug.print("[TRACE] {s}: object({?*})\n", .{ std.mem.span(label), cv.getPtr() });
     } else if (cv.isRefType()) {
-        std.debug.print("[TRACE] {s}: ref(0x{x:0>16})\n", .{ std.mem.span(label), cv.bits });
+        std.debug.print("[TRACE] {s}: ref({?*})\n", .{ std.mem.span(label), cv.getPtr() });
     } else if (cv.isBool()) {
-        std.debug.print("[TRACE] {s}: bool({any})\n", .{ std.mem.span(label), cv.bits & 1 == 1 });
+        std.debug.print("[TRACE] {s}: bool({any})\n", .{ std.mem.span(label), cv.getBool() });
     } else {
-        std.debug.print("[TRACE] {s}: 0x{x:0>16}\n", .{ std.mem.span(label), cv.bits });
+        std.debug.print("[TRACE] {s}: other\n", .{std.mem.span(label)});
     }
 }
 
@@ -747,8 +746,7 @@ export fn llvm_rt_op_put_array_el(ctx: *JSContext, stack: [*]CV, sp: *usize) cal
 /// The returned pointer is valid as long as the array is not modified.
 /// This is designed to be called ONCE before a loop, then use the pointer
 /// for direct element access inside the loop (avoiding per-element getFastArrayDirect).
-export fn llvm_rt_fast_array_probe(arr_cv: u64, out_values_ptr: *?[*]u8, out_count: *u32) callconv(.c) c_int {
-    const cv: CV = @bitCast(arr_cv);
+export fn llvm_rt_fast_array_probe(cv: CV, out_values_ptr: *?[*]u8, out_count: *u32) callconv(.c) c_int {
     if (!cv.isObject()) {
         out_values_ptr.* = null;
         out_count.* = 0;
@@ -773,8 +771,7 @@ export fn llvm_rt_fast_array_probe(arr_cv: u64, out_values_ptr: *?[*]u8, out_cou
 
 /// Check if a CV value is a fast array (contiguous JSValue[] backing store).
 /// Returns 1 if fast array, 0 otherwise.
-export fn llvm_rt_fast_array_is_fast(cv_bits: u64) callconv(.c) c_int {
-    const cv: CV = @bitCast(cv_bits);
+export fn llvm_rt_fast_array_is_fast(cv: CV) callconv(.c) c_int {
     if (!cv.isObject()) return 0;
     const jsv = cv.toJSValue();
     const result = zig_runtime.getFastArrayDirect(jsv);
@@ -783,8 +780,7 @@ export fn llvm_rt_fast_array_is_fast(cv_bits: u64) callconv(.c) c_int {
 
 /// Get the raw JSValue[] pointer from a fast array CV.
 /// Caller must check is_fast first. Returns null if not a fast array.
-export fn llvm_rt_fast_array_get_values(cv_bits: u64) callconv(.c) ?[*]u8 {
-    const cv: CV = @bitCast(cv_bits);
+export fn llvm_rt_fast_array_get_values(cv: CV) callconv(.c) ?[*]u8 {
     const jsv = cv.toJSValue();
     const result = zig_runtime.getFastArrayDirect(jsv);
     if (!result.success) return null;
@@ -796,8 +792,7 @@ export fn llvm_rt_fast_array_get_values(cv_bits: u64) callconv(.c) ?[*]u8 {
 
 /// Get the element count from a fast array CV.
 /// Caller must check is_fast first. Returns 0 if not a fast array.
-export fn llvm_rt_fast_array_get_count(cv_bits: u64) callconv(.c) c_int {
-    const cv: CV = @bitCast(cv_bits);
+export fn llvm_rt_fast_array_get_count(cv: CV) callconv(.c) c_int {
     const jsv = cv.toJSValue();
     const result = zig_runtime.getFastArrayDirect(jsv);
     if (!result.success) return 0;
@@ -807,23 +802,20 @@ export fn llvm_rt_fast_array_get_count(cv_bits: u64) callconv(.c) c_int {
 /// Load a JSValue at index from a raw values pointer, convert to CV (with refcount dup).
 /// The pointer must come from llvm_rt_fast_array_get_values.
 /// Each JSValue is 16 bytes on x86_64 (JSValueUnion + tag).
-export fn llvm_rt_jsvalue_to_cv(ctx: *JSContext, values_ptr: [*]const u8, index: c_int) callconv(.c) u64 {
+export fn llvm_rt_jsvalue_to_cv(ctx: *JSContext, values_ptr: [*]const u8, index: c_int) callconv(.c) CV {
     const jsv_ptr: [*]const JSValue = @ptrCast(@alignCast(values_ptr));
     const jsv = jsv_ptr[@intCast(index)];
     // Dup the JSValue (increment refcount) since we're creating a new owned CV reference
     const duped = JSValue.dup(ctx, jsv);
-    return @bitCast(CV.fromJSValue(duped));
+    return CV.fromJSValue(duped);
 }
 
 /// Combined fast array element access: check if fast array, load element, return as CV.
 /// Returns the element CV on success, or CV_SENTINEL (0) on failure (not a fast array,
 /// index out of bounds, or index not an integer).
 /// This avoids 3 separate runtime calls per element access in the hot loop.
-const CV_SENTINEL: u64 = 0; // 0.0 as f64 — not a valid NaN-boxed value for any JS type
-export fn llvm_rt_fast_array_get_el(ctx: *JSContext, arr_cv: u64, idx_cv: u64) callconv(.c) u64 {
-    const arr: CV = @bitCast(arr_cv);
-    const idx: CV = @bitCast(idx_cv);
-
+const CV_SENTINEL: CV = CV.newInt(0); // Sentinel value for failed fast array access
+export fn llvm_rt_fast_array_get_el(ctx: *JSContext, arr: CV, idx: CV) callconv(.c) CV {
     // Index must be an integer
     if (!idx.isInt()) return CV_SENTINEL;
 
@@ -843,20 +835,19 @@ export fn llvm_rt_fast_array_get_el(ctx: *JSContext, arr_cv: u64, idx_cv: u64) c
     if (result.values) |vals| {
         const elem = vals[i];
         const duped = JSValue.dup(ctx, elem);
-        return @bitCast(CV.fromJSValue(duped));
+        return CV.fromJSValue(duped);
     }
     return CV_SENTINEL;
 }
 
 /// Combined fast array length access: check if fast array, return count as CV int.
-/// Returns CV int on success, or CV_SENTINEL (0) on failure.
-export fn llvm_rt_fast_array_get_len(arr_cv: u64) callconv(.c) u64 {
-    const arr: CV = @bitCast(arr_cv);
+/// Returns CV int on success, or CV_SENTINEL on failure.
+export fn llvm_rt_fast_array_get_len(arr: CV) callconv(.c) CV {
     if (!arr.isObject()) return CV_SENTINEL;
     const jsv = arr.toJSValue();
     const result = zig_runtime.getFastArrayDirect(jsv);
     if (!result.success) return CV_SENTINEL;
-    return @bitCast(CV.newInt(@intCast(result.count)));
+    return CV.newInt(@intCast(result.count));
 }
 
 /// Stack-based get_array_el: pop index and array, push result.
@@ -1342,11 +1333,11 @@ export fn llvm_rt_exec_opcode(
             if (cv.isUndefined()) {
                 std.debug.print("  stack[{d}] = undefined\n", .{si});
             } else if (cv.isObject()) {
-                std.debug.print("  stack[{d}] = object(0x{x:0>12})\n", .{ si, cv.bits & 0x0000FFFFFFFFFC });
+                std.debug.print("  stack[{d}] = object({?*})\n", .{ si, cv.getPtr() });
             } else if (cv.isInt()) {
                 std.debug.print("  stack[{d}] = int({d})\n", .{ si, cv.getInt() });
             } else {
-                std.debug.print("  stack[{d}] = 0x{x:0>16}\n", .{ si, cv.bits });
+                std.debug.print("  stack[{d}] = other\n", .{si});
             }
         }
         return -1;
@@ -1376,8 +1367,7 @@ export fn llvm_rt_js_dup_value(ctx: *JSContext, val: JSValue) callconv(.c) JSVal
 
 /// Debug: print a CV value with a label (for tracing codegen bugs)
 var debug_trace_invocation: u32 = 0;
-export fn llvm_rt_debug_trace(label: c_int, cv_val: u64) callconv(.c) void {
-    const v: CV = @bitCast(cv_val);
+export fn llvm_rt_debug_trace(label: c_int, v: CV) callconv(.c) void {
     // Increment invocation counter when we see label 0 (start of locals dump)
     if (label == 0) debug_trace_invocation += 1;
     const inv = debug_trace_invocation;
@@ -1390,9 +1380,9 @@ export fn llvm_rt_debug_trace(label: c_int, cv_val: u64) callconv(.c) void {
     } else if (v.isBool()) {
         std.debug.print("[TRACE #{d}] L{d}: BOOL\n", .{ inv, label });
     } else if (v.isRefType()) {
-        std.debug.print("[TRACE #{d}] L{d}: REF(0x{x})\n", .{ inv, label, cv_val });
+        std.debug.print("[TRACE #{d}] L{d}: REF({?*})\n", .{ inv, label, v.getPtr() });
     } else {
-        std.debug.print("[TRACE #{d}] L{d}: OTHER(0x{x})\n", .{ inv, label, cv_val });
+        std.debug.print("[TRACE #{d}] L{d}: OTHER\n", .{ inv, label });
     }
 }
 
