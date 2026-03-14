@@ -611,11 +611,12 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    // On Linux, frozen builds require the arena allocator for contiguous memory.
-    // CompressedValue's 44-bit pointer encoding breaks with scattered heap addresses.
+    // Use libc malloc by default for frozen builds.
+    // Arena can't free individual allocations → unbounded memory growth (1.3GB for TSC)
+    // which thrashes caches and causes 7.5x slowdown vs libc malloc.
     if (comptime builtin.os.tag == .linux) {
         if (!no_freeze and !allocator_explicitly_set) {
-            allocator_type = .arena;
+            allocator_type = .c;
         }
     }
 
@@ -1542,6 +1543,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
     const exit_code_bin = try qjsc_wrapper.compileJsToBytecode(allocator, &.{
         "qjsc",
         "-b", // Raw bytecode output (no C wrapper, just bytes)
+        "-s", "-s", // Strip source code AND debug info (index-based dispatch doesn't need line numbers)
         "-o", bundle_bin_path,
         runtime_bundle_path,
     });
@@ -1604,11 +1606,11 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         std.debug.print("[build] Building WASM static with embedded bytecode...\n", .{});
         const wasm_result = if (source_dir_arg.len > 0)
             try runCommand(allocator, &.{
-                "zig", "build", "-j4", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "wasm-static", optimize_arg, source_dir_arg, bytecode_arg, cache_prefix_arg,
+                "zig", "build", "-j4", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "wasm-static", "-Doptimize=ReleaseSmall", source_dir_arg, bytecode_arg, cache_prefix_arg,
             })
         else
             try runCommand(allocator, &.{
-                "zig", "build", "-j4", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "wasm-static", optimize_arg, bytecode_arg, cache_prefix_arg,
+                "zig", "build", "-j4", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "wasm-static", "-Doptimize=ReleaseSmall", bytecode_arg, cache_prefix_arg,
             });
         defer {
             if (wasm_result.stdout) |s| allocator.free(s);

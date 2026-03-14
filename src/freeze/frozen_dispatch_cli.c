@@ -13,53 +13,16 @@ void edgebox_set_compressed_heap_base(size_t base) {
     edgebox_compressed_heap_base = base;
 }
 
-// Forward declaration of JSContext and JSValue (opaque types)
-typedef struct JSContext JSContext;
-typedef uint64_t JSValue;
-typedef struct JSVarRef JSVarRef;
-
-// Name-based dispatch (with var_refs, cpool, and bytecode_ptr for closure/fclosure support)
-// Returns 0 (no frozen function found) - real dispatch is in Zig runtime
-int frozen_dispatch_lookup(JSContext *ctx, const char *func_name,
-                           JSValue this_val, int argc, JSValue *argv,
-                           JSVarRef **var_refs, JSValue *cpool,
-                           void *bytecode_ptr, JSValue *result_out) {
-    (void)ctx;
-    (void)func_name;
-    (void)this_val;
-    (void)argc;
-    (void)argv;
-    (void)var_refs;
-    (void)cpool;
-    (void)bytecode_ptr;
-    (void)result_out;
-    return 0;  // No frozen function found in CLI mode
+// Check if frozen dispatch is enabled - always false in CLI mode
+int frozen_dispatch_is_enabled(void) {
+    return 0;
 }
 
-// Bytecode-based dispatch (for closure/fclosure support)
-// Returns 0 (no frozen function found) - real dispatch is in Zig runtime
-int frozen_dispatch_lookup_bytecode(JSContext *ctx, void *bytecode_ptr,
-                                    JSValue this_val, int argc, JSValue *argv,
-                                    JSVarRef **var_refs, int closure_var_count,
-                                    JSValue *cpool,
-                                    JSValue *result_out) {
-    (void)ctx;
-    (void)bytecode_ptr;
-    (void)this_val;
-    (void)argc;
-    (void)argv;
-    (void)var_refs;
-    (void)closure_var_count;
-    (void)cpool;
-    (void)result_out;
-    return 0;  // No frozen function found in CLI mode
-}
-
-// Get frozen function pointer for a bytecode (for caching in JSFunctionBytecode.frozen_impl)
+// Get frozen function pointer by parser index
 // Returns NULL - real dispatch is in Zig runtime
-void *frozen_dispatch_get_impl(void *bytecode_ptr) {
-    (void)bytecode_ptr;
-    return NULL;  // No frozen function in CLI mode
+void *frozen_dispatch_get_by_index(int idx) {
+    (void)idx;
+    return NULL;
 }
 
 // Native Shapes fast path for AST property access

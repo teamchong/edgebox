@@ -355,13 +355,22 @@ pub inline fn icLoad(ctx: *JSContext, obj: JSValue, ic: *ICSlot, name: [*:0]cons
         if (shape != null) {
             const shapes = [4]?*anyopaque{ ic.shape0, ic.shape1, ic.shape2, ic.shape3 };
             const offsets = [4]u32{ ic.offset0, ic.offset1, ic.offset2, ic.offset3 };
+            // Read shape->prop_count at offset 40 for bounds validation
+            const shape_bytes_for_count: [*]const u8 = @ptrCast(shape.?);
+            const shape_prop_count: u32 = @as(*const u32, @ptrCast(@alignCast(shape_bytes_for_count + 40))).*;
             inline for (0..4) |i| {
-                if (shapes[i] == shape) {
-                    if (PROFILE) vinc(prof.ic_hits(), 1);
-                    if (PROFILE) vinc(prof.getfield_cycles(), cycles() - t0);
-                    const prop_base: *const [*]const u8 = @ptrCast(@alignCast(obj_bytes + 32));
-                    const prop_value: *const JSValue = @ptrCast(@alignCast(prop_base.* + @as(usize, offsets[i]) * 16));
-                    return JSValue.dup(ctx, prop_value.*);
+                if (shapes[i] == shape and
+                    offsets[i] < shape_prop_count)
+                {
+                    const shape_bytes: [*]const u8 = @ptrCast(shape.?);
+                    const shape_prop_atom: *const u32 = @ptrCast(@alignCast(shape_bytes + 64 + @as(usize, offsets[i]) * 8 + 4));
+                    if (ic.atom == 0 or shape_prop_atom.* == ic.atom) {
+                        if (PROFILE) vinc(prof.ic_hits(), 1);
+                        if (PROFILE) vinc(prof.getfield_cycles(), cycles() - t0);
+                        const prop_base: *const [*]const u8 = @ptrCast(@alignCast(obj_bytes + 32));
+                        const prop_value: *const JSValue = @ptrCast(@alignCast(prop_base.* + @as(usize, offsets[i]) * 16));
+                        return JSValue.dup(ctx, prop_value.*);
+                    }
                 }
             }
         }

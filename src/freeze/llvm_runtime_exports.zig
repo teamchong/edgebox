@@ -16,6 +16,29 @@ const JSVarRef = zig_runtime.JSVarRef;
 const thin = zig_runtime.thin;
 
 // ============================================================================
+// Debug trace for diagnosing codegen bugs
+// ============================================================================
+
+export fn llvm_rt_debug_trace_cv(label: [*:0]const u8, cv_bits: u64) callconv(.c) void {
+    const cv: CV = @bitCast(cv_bits);
+    if (cv.isInt()) {
+        std.debug.print("[TRACE] {s}: int({d})\n", .{ std.mem.span(label), cv.getInt() });
+    } else if (cv.isUndefined()) {
+        std.debug.print("[TRACE] {s}: undefined\n", .{std.mem.span(label)});
+    } else if (cv.isNull()) {
+        std.debug.print("[TRACE] {s}: null\n", .{std.mem.span(label)});
+    } else if (cv.isObject()) {
+        std.debug.print("[TRACE] {s}: object(0x{x:0>12})\n", .{ std.mem.span(label), cv.bits & 0x0000FFFFFFFFFC });
+    } else if (cv.isRefType()) {
+        std.debug.print("[TRACE] {s}: ref(0x{x:0>16})\n", .{ std.mem.span(label), cv.bits });
+    } else if (cv.isBool()) {
+        std.debug.print("[TRACE] {s}: bool({any})\n", .{ std.mem.span(label), cv.bits & 1 == 1 });
+    } else {
+        std.debug.print("[TRACE] {s}: 0x{x:0>16}\n", .{ std.mem.span(label), cv.bits });
+    }
+}
+
+// ============================================================================
 // Stack operations (simple — inlined in LLVM IR, but exported as fallback)
 // ============================================================================
 
@@ -679,9 +702,8 @@ export fn llvm_rt_op_to_propkey(ctx: *JSContext, stack: [*]CV, sp: *usize) callc
     }
     // Convert to JSValue to check tag and call JS_ToPropertyKey if needed
     const jsval = top.toJSValueWithCtx(ctx);
-    const tag = jsval.tag;
     // JS_TAG_SYMBOL = -8: symbols are already valid property keys
-    if (tag == -8) return 0;
+    if (jsval.isSymbol()) return 0;
     const key = zig_runtime.quickjs.JS_ToPropertyKey(ctx, jsval);
     if (key.isException()) return 1;
     zig_runtime.quickjs.JS_FreeValue(ctx, jsval);
@@ -1312,7 +1334,23 @@ export fn llvm_rt_exec_opcode(
         quickjs.JS_FreeAtom(ctx, @bitCast(resolved_operand));
     }
 
-    if (result.isException()) return -1;
+    if (result.isException()) {
+        // DEBUG: Trace exec_opcode failures
+        std.debug.print("[exec_opcode FAIL] op={d} sp={d}\n", .{ op, old_sp });
+        for (0..old_sp) |si| {
+            const cv = stack[si];
+            if (cv.isUndefined()) {
+                std.debug.print("  stack[{d}] = undefined\n", .{si});
+            } else if (cv.isObject()) {
+                std.debug.print("  stack[{d}] = object(0x{x:0>12})\n", .{ si, cv.bits & 0x0000FFFFFFFFFC });
+            } else if (cv.isInt()) {
+                std.debug.print("  stack[{d}] = int({d})\n", .{ si, cv.getInt() });
+            } else {
+                std.debug.print("  stack[{d}] = 0x{x:0>16}\n", .{ si, cv.bits });
+            }
+        }
+        return -1;
+    }
     return 0;
 }
 
@@ -1335,6 +1373,52 @@ export fn llvm_rt_js_dup_value(ctx: *JSContext, val: JSValue) callconv(.c) JSVal
 // ============================================================================
 // Higher-level frozen helpers
 // ============================================================================
+
+/// Debug: print a CV value with a label (for tracing codegen bugs)
+var debug_trace_invocation: u32 = 0;
+export fn llvm_rt_debug_trace(label: c_int, cv_val: u64) callconv(.c) void {
+    const v: CV = @bitCast(cv_val);
+    // Increment invocation counter when we see label 0 (start of locals dump)
+    if (label == 0) debug_trace_invocation += 1;
+    const inv = debug_trace_invocation;
+    if (v.isUndefined()) {
+        std.debug.print("[TRACE #{d}] L{d}: UNDEFINED\n", .{ inv, label });
+    } else if (v.isNull()) {
+        std.debug.print("[TRACE #{d}] L{d}: NULL\n", .{ inv, label });
+    } else if (v.isInt()) {
+        std.debug.print("[TRACE #{d}] L{d}: INT({d})\n", .{ inv, label, v.getInt() });
+    } else if (v.isBool()) {
+        std.debug.print("[TRACE #{d}] L{d}: BOOL\n", .{ inv, label });
+    } else if (v.isRefType()) {
+        std.debug.print("[TRACE #{d}] L{d}: REF(0x{x})\n", .{ inv, label, cv_val });
+    } else {
+        std.debug.print("[TRACE #{d}] L{d}: OTHER(0x{x})\n", .{ inv, label, cv_val });
+    }
+}
+
+/// Dedicated array_from handler — bypasses exec_opcode's full-stack CV↔JSValue round-trip.
+/// JS_NewArrayFrom takes ownership of values via memcpy (no dup, no free on success).
+export fn llvm_rt_array_from(ctx: *JSContext, stack: [*]CV, sp: *usize, count: c_int) callconv(.c) c_int {
+    const quickjs = zig_runtime.quickjs;
+    const n: usize = @intCast(count);
+    const old_sp = sp.*;
+
+    // Convert top n CVs to JSValues
+    var jsv_buf: [64]JSValue = undefined;
+    for (0..n) |i| {
+        jsv_buf[i] = stack[old_sp - n + i].toJSValue();
+    }
+
+    // JS_NewArrayFrom takes ownership via memcpy — no dup needed
+    const result = quickjs.JS_NewArrayFrom(ctx, @intCast(n), @ptrCast(&jsv_buf));
+    if (result.isException()) return -1;
+
+    // Pop n elements, push result (refs for old CVs transferred to array via memcpy)
+    sp.* = old_sp - n;
+    stack[sp.*] = CV.fromJSValue(result);
+    sp.* += 1;
+    return 0;
+}
 
 export fn llvm_rt_check_stack() callconv(.c) bool {
     return zig_runtime.checkStack();

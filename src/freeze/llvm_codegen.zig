@@ -30,11 +30,49 @@ const AnalyzedFunction = frozen_registry.AnalyzedFunction;
 
 const c = llvm.c;
 
-// JSValue on native x86_64 is a 16-byte struct: { JSValueUnion(i64), tag(i64) }
-// Must use this in LLVM IR for correct C ABI (passed in 2 registers: rsi+rdx)
+/// Target-dependent type information for frozen codegen.
+/// On native x86_64: JSValue = {i64, i64} (16 bytes), usize = i64
+/// On WASM32: JSValue = i64 (NaN-boxed, 8 bytes), usize = i32
+pub const TargetInfo = struct {
+    is_wasm32: bool = false,
+
+    /// JSValue type for the target platform's C ABI.
+    pub fn jsvalueType(self: TargetInfo) llvm.Type {
+        if (self.is_wasm32) return llvm.i64Type(); // NaN-boxed uint64_t
+        var fields = [_]llvm.Type{ llvm.i64Type(), llvm.i64Type() };
+        return c.LLVMStructType(&fields, fields.len, 0);
+    }
+
+    /// usize type: i64 on native, i32 on WASM32
+    pub fn usizeType(self: TargetInfo) llvm.Type {
+        return if (self.is_wasm32) llvm.i32Type() else llvm.i64Type();
+    }
+
+    /// Create a usize constant
+    pub fn constUsize(self: TargetInfo, val: u64) llvm.Value {
+        return if (self.is_wasm32) llvm.constInt32(@intCast(val)) else llvm.constInt64(@intCast(val));
+    }
+
+    /// Create a JS_EXCEPTION return value
+    pub fn makeException(self: TargetInfo, builder: llvm.Builder) llvm.Value {
+        if (self.is_wasm32) {
+            // NaN-boxed: JS_MKVAL(JS_TAG_EXCEPTION, 0) = (6 << 32)
+            return llvm.constInt64(@as(u64, 6) << 32);
+        }
+        const jsv_ty = self.jsvalueType();
+        var exc_val = c.LLVMGetUndef(jsv_ty);
+        exc_val = c.LLVMBuildInsertValue(builder.ref, exc_val, llvm.constInt64(0), 0, "exc0");
+        exc_val = c.LLVMBuildInsertValue(builder.ref, exc_val, llvm.constInt64(6), 1, "exc1");
+        return exc_val;
+    }
+};
+
+/// Default native target
+const native_target = TargetInfo{ .is_wasm32 = false };
+
+// Legacy wrapper for int32 tier (always native)
 fn jsvalueType() llvm.Type {
-    var fields = [_]llvm.Type{ llvm.i64Type(), llvm.i64Type() };
-    return c.LLVMStructType(&fields, fields.len, 0); // packed=0 (not packed)
+    return native_target.jsvalueType();
 }
 
 // JS_TAG_INT on native = 0 (tag field)
@@ -55,7 +93,7 @@ pub const CodegenError = error{
 // On x86_64, CV is a 64-bit NaN-boxed value. The upper 16 bits encode the type tag.
 const CV_QNAN_INT: u64 = 0x7FF9_0000_0000_0000; // integer tag
 const CV_TAG_MASK: u64 = 0xFFFF_0000_0000_0000; // mask for type tag
-const CV_QNAN_PTR: u64 = 0x7FFD_0000_0000_0000; // object/symbol/bigint/func
+const CV_QNAN_PTR: u64 = 0x7FFD_0000_0000_0000; // object pointer (TAG_PTR)
 const CV_QNAN_STR: u64 = 0x7FFF_0000_0000_0000; // string
 const CV_UNDEFINED: u64 = 0x7FFC_0000_0000_0000;
 const CV_NULL: u64 = 0x7FFB_0000_0000_0000;
@@ -63,6 +101,10 @@ const CV_TRUE: u64 = 0x7FFA_0000_0000_0001;
 const CV_FALSE: u64 = 0x7FFA_0000_0000_0000;
 const CV_PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF; // lower 48 bits
 const CV_UNINITIALIZED: u64 = 0x7FFE_0000_0000_0000; // QNAN | TAG_UNINIT (TDZ sentinel)
+// Negative NaN space ref types (sign bit set)
+const CV_QNAN_SYMBOL: u64 = 0xFFF9_0000_0000_0000; // symbol pointer
+const CV_QNAN_BIGINT: u64 = 0xFFFA_0000_0000_0000; // bigint pointer
+const CV_QNAN_FUNCBC: u64 = 0xFFFB_0000_0000_0000; // function bytecode pointer
 
 /// Create a CV integer constant at comptime: QNAN_INT | (val & 0xFFFFFFFF)
 fn cvConstInt(val: i32) u64 {
@@ -73,9 +115,13 @@ fn cvConstInt(val: i32) u64 {
 // Inline LLVM IR helpers for CV operations
 // ============================================================================
 
-/// Load the stack pointer value: sp = *sp_ptr
+/// Load the stack pointer value: sp = *sp_ptr (usize: i64 native, i32 wasm32)
 fn inlineLoadSp(b: llvm.Builder, sp_ptr: llvm.Value) llvm.Value {
     return b.buildLoad(llvm.i64Type(), sp_ptr, "sp");
+}
+
+fn inlineLoadSpTarget(b: llvm.Builder, sp_ptr: llvm.Value, target: TargetInfo) llvm.Value {
+    return b.buildLoad(target.usizeType(), sp_ptr, "sp");
 }
 
 /// Store the stack pointer value: *sp_ptr = sp
@@ -133,11 +179,14 @@ fn inlineNewInt(b: llvm.Builder, i32_val: llvm.Value) llvm.Value {
 fn inlineDupRef(tctx: *ThinCodegenCtx, val: llvm.Value) llvm.Value {
     const b = tctx.builder;
 
-    // Check if ref type: tag == QNAN_PTR || tag == QNAN_STR
+    // Check if ref type: any pointer-based tag (PTR, STR, SYMBOL, BIGINT, FUNCBC)
     const tag = b.buildAnd(val, llvm.constInt(llvm.i64Type(), CV_TAG_MASK, false), "dtag");
     const is_ptr = b.buildICmp(c.LLVMIntEQ, tag, llvm.constInt(llvm.i64Type(), CV_QNAN_PTR, false), "isptr");
     const is_str = b.buildICmp(c.LLVMIntEQ, tag, llvm.constInt(llvm.i64Type(), CV_QNAN_STR, false), "isstr");
-    const is_ref = b.buildOr(is_ptr, is_str, "isref");
+    const is_sym = b.buildICmp(c.LLVMIntEQ, tag, llvm.constInt(llvm.i64Type(), CV_QNAN_SYMBOL, false), "issym");
+    const is_big = b.buildICmp(c.LLVMIntEQ, tag, llvm.constInt(llvm.i64Type(), CV_QNAN_BIGINT, false), "isbig");
+    const is_fbc = b.buildICmp(c.LLVMIntEQ, tag, llvm.constInt(llvm.i64Type(), CV_QNAN_FUNCBC, false), "isfbc");
+    const is_ref = b.buildOr(b.buildOr(b.buildOr(b.buildOr(is_ptr, is_str, "r1"), is_sym, "r2"), is_big, "r3"), is_fbc, "isref");
 
     // Branch
     const current_bb = c.LLVMGetInsertBlock(b.ref);
@@ -171,7 +220,10 @@ fn inlineFreeRef(tctx: *ThinCodegenCtx, val: llvm.Value) void {
     const tag = b.buildAnd(val, llvm.constInt(llvm.i64Type(), CV_TAG_MASK, false), "ftag");
     const is_ptr = b.buildICmp(c.LLVMIntEQ, tag, llvm.constInt(llvm.i64Type(), CV_QNAN_PTR, false), "fisptr");
     const is_str = b.buildICmp(c.LLVMIntEQ, tag, llvm.constInt(llvm.i64Type(), CV_QNAN_STR, false), "fisstr");
-    const is_ref = b.buildOr(is_ptr, is_str, "fisref");
+    const is_sym = b.buildICmp(c.LLVMIntEQ, tag, llvm.constInt(llvm.i64Type(), CV_QNAN_SYMBOL, false), "fissym");
+    const is_big = b.buildICmp(c.LLVMIntEQ, tag, llvm.constInt(llvm.i64Type(), CV_QNAN_BIGINT, false), "fisbig");
+    const is_fbc = b.buildICmp(c.LLVMIntEQ, tag, llvm.constInt(llvm.i64Type(), CV_QNAN_FUNCBC, false), "fisfbc");
+    const is_ref = b.buildOr(b.buildOr(b.buildOr(b.buildOr(is_ptr, is_str, "fr1"), is_sym, "fr2"), is_big, "fr3"), is_fbc, "fisref");
 
     const current_bb = c.LLVMGetInsertBlock(b.ref);
     _ = current_bb;
@@ -274,7 +326,7 @@ pub fn generateShard(
     const builder = llvm.Builder.create(native.ctx);
     defer builder.dispose();
 
-    const register_fn = declareNativeDispatchRegister(native.module);
+    const register_fn = declareNativeDispatchRegisterByIndex(native.module);
 
     // Generate each function
     var generated_count: u32 = 0;
@@ -286,6 +338,7 @@ pub fn generateShard(
             generated_infos.append(allocator, .{
                 .name = sf.name,
                 .func_index = sf.func_index,
+                .parser_index = sf.parser_index,
                 .line_num = sf.line_num,
                 .llvm_func_name = sf.llvm_func_name,
             }) catch continue;
@@ -309,11 +362,13 @@ pub fn generateShard(
 
 /// Information about a function to generate in a shard
 pub const ShardFunction = struct {
-    /// Original JS function name (for dispatch key)
+    /// Original JS function name (for debug/naming)
     name: []const u8,
-    /// Function index in the module
+    /// Function index in the analysis (for LLVM symbol naming)
     func_index: usize,
-    /// Line number (for dispatch key)
+    /// Parser index for index-based dispatch (matches JS_ReadFunctionTag counter)
+    parser_index: u32 = 0,
+    /// Line number (for debug output)
     line_num: u32,
     /// Sanitized LLVM function name (e.g., "__frozen_42_isDigit")
     llvm_func_name: []const u8,
@@ -326,6 +381,7 @@ pub const ShardFunction = struct {
 const GeneratedFuncInfo = struct {
     name: []const u8,
     func_index: usize,
+    parser_index: u32 = 0,
     line_num: u32,
     llvm_func_name: []const u8,
     has_tail_call: bool = false,
@@ -335,11 +391,11 @@ const GeneratedFuncInfo = struct {
 // External function declarations
 // ============================================================================
 
-fn declareNativeDispatchRegister(module: llvm.Module) llvm.Value {
-    // void native_dispatch_register(const char* name, FrozenFnPtr func)
-    const param_types = [_]llvm.Type{ llvm.ptrType(), llvm.ptrType() };
+fn declareNativeDispatchRegisterByIndex(module: llvm.Module) llvm.Value {
+    // void native_dispatch_register_by_index(u32 idx, FrozenFnPtr func)
+    const param_types = [_]llvm.Type{ llvm.i32Type(), llvm.ptrType() };
     const fn_ty = llvm.functionType(llvm.voidType(), &param_types, false);
-    const func = module.addFunction("native_dispatch_register", fn_ty);
+    const func = module.addFunction("native_dispatch_register_by_index", fn_ty);
     llvm.setLinkage(func, c.LLVMExternalLinkage);
     return func;
 }
@@ -941,26 +997,20 @@ fn generateShardInit(
     const entry = llvm.appendBasicBlock(init_fn, "entry");
     builder.positionAtEnd(entry);
 
-    // For each function, create a string constant and call native_dispatch_register
+    // For each function, register by parser index for O(1) dispatch lookup
     var count: i32 = 0;
     for (funcs) |fi| {
-        // Create dispatch key string: "name@line_num\0"
-        var key_buf: [512]u8 = undefined;
-        const key = std.fmt.bufPrintZ(&key_buf, "{s}@{d}", .{ fi.name, fi.line_num }) catch continue;
-
-        // Use LLVMBuildGlobalStringPtr — handles string constant + GEP automatically
-        var str_name_buf: [256]u8 = undefined;
-        const str_name = std.fmt.bufPrintZ(&str_name_buf, ".str.{s}", .{fi.llvm_func_name}) catch continue;
-        const str_ptr = c.LLVMBuildGlobalStringPtr(builder.ref, key.ptr, str_name.ptr);
+        // Skip Phase 2 (byte-scanned) functions — they have no valid runtime index
+        if (fi.parser_index == 0xFFFFFFFF) continue;
 
         // Get pointer to the frozen function
         var func_name_buf: [512]u8 = undefined;
         const func_name = std.fmt.bufPrintZ(&func_name_buf, "{s}", .{fi.llvm_func_name}) catch continue;
         const frozen_fn = module.getNamedFunction(func_name) orelse continue;
 
-        // Build call: native_dispatch_register(str_ptr, frozen_fn)
-        const reg_fn_ty = llvm.functionType(llvm.voidType(), &[_]llvm.Type{ llvm.ptrType(), llvm.ptrType() }, false);
-        var call_args = [_]llvm.Value{ str_ptr, frozen_fn };
+        // Build call: native_dispatch_register_by_index(parser_index, frozen_fn)
+        const reg_fn_ty = llvm.functionType(llvm.voidType(), &[_]llvm.Type{ llvm.i32Type(), llvm.ptrType() }, false);
+        var call_args = [_]llvm.Value{ llvm.constInt32(@intCast(fi.parser_index)), frozen_fn };
         _ = builder.buildCall(reg_fn_ty, register_fn, &call_args, "");
 
         count += 1;
@@ -984,12 +1034,34 @@ pub fn generateThinShard(
     shard_idx: usize,
     obj_path: [*:0]const u8,
 ) CodegenError!LLVMShardResult {
+    return generateThinShardWithTarget(allocator, functions, shard_idx, obj_path, native_target);
+}
+
+pub fn generateThinShardWasm(
+    allocator: Allocator,
+    functions: []const ThinShardFunction,
+    shard_idx: usize,
+    obj_path: [*:0]const u8,
+) CodegenError!LLVMShardResult {
+    return generateThinShardWithTarget(allocator, functions, shard_idx, obj_path, TargetInfo{ .is_wasm32 = true });
+}
+
+fn generateThinShardWithTarget(
+    allocator: Allocator,
+    functions: []const ThinShardFunction,
+    shard_idx: usize,
+    obj_path: [*:0]const u8,
+    target: TargetInfo,
+) CodegenError!LLVMShardResult {
     var name_buf: [64]u8 = undefined;
     const mod_name = std.fmt.bufPrintZ(&name_buf, "frozen_thin_shard_{d}", .{shard_idx}) catch
         return CodegenError.FormatError;
 
-    // With inline CV operations, thin codegen benefits from O2 optimization
-    const native = llvm.createNativeModuleWithOpt(mod_name, c.LLVMCodeGenLevelDefault) catch return CodegenError.LLVMError;
+    // Create LLVM module for the target (native or wasm32)
+    const native = if (target.is_wasm32)
+        llvm.createWasmModule(mod_name, c.LLVMCodeGenLevelDefault) catch return CodegenError.LLVMError
+    else
+        llvm.createNativeModuleWithOpt(mod_name, c.LLVMCodeGenLevelDefault) catch return CodegenError.LLVMError;
     defer native.tm.dispose();
     var module_disposed = false;
     defer if (!module_disposed) native.module.dispose();
@@ -998,8 +1070,8 @@ pub fn generateThinShard(
     defer builder.dispose();
 
     // Declare external runtime functions
-    const register_fn = declareNativeDispatchRegister(native.module);
-    var rt_decls = ThinRuntimeDecls.declare(native.module);
+    const register_fn = declareNativeDispatchRegisterByIndex(native.module);
+    var rt_decls = ThinRuntimeDecls.declareWithTarget(native.module, target);
 
     // Generate each function
     var generated_count: u32 = 0;
@@ -1034,7 +1106,7 @@ pub fn generateThinShard(
                 skipped_close_fc += 1; // Track count but don't skip
             }
         }
-        if (generateThinFunction(allocator, native.module, builder, sf, &rt_decls)) |has_unsafe_fallback| {
+        if (generateThinFunction(allocator, native.module, builder, sf, &rt_decls, target)) |has_unsafe_fallback| {
             if (has_unsafe_fallback) {
                 // Function uses opcodes that js_frozen_exec_opcode can't handle —
                 // don't register it, let the interpreter handle this function.
@@ -1086,7 +1158,8 @@ pub fn generateThinShard(
                             .get_super, .define_array_el, .set_name_computed, .copy_data_properties,
                             .put_var_ref_check,
                             .rest, .regexp, .push_bigint_i32,
-                            .check_ctor, .init_ctor, .special_object,
+                            // check_ctor, init_ctor, special_object need func_obj/new_target
+                            // which frozen functions don't receive — skip these
                             .define_method, .define_method_computed,
                             .put_ref_value,
                             .check_define_var, .define_var, .define_func,
@@ -1119,6 +1192,7 @@ pub fn generateThinShard(
             generated_infos.append(allocator, .{
                 .name = sf.name,
                 .func_index = sf.func_index,
+                .parser_index = sf.parser_index,
                 .line_num = sf.line_num,
                 .llvm_func_name = sf.llvm_func_name,
                 .has_tail_call = func_has_tail_call,
@@ -1325,6 +1399,7 @@ const ThinRuntimeDecls = struct {
     op_to_propkey2: llvm.Value,
 
     // Array ops
+    op_array_from: llvm.Value,
     op_append: llvm.Value,
     op_put_array_el: llvm.Value,
 
@@ -1355,11 +1430,16 @@ const ThinRuntimeDecls = struct {
     exec_opcode: llvm.Value,
 
     fn declare(module: llvm.Module) ThinRuntimeDecls {
+        return declareWithTarget(module, native_target);
+    }
+
+    fn declareWithTarget(module: llvm.Module, target: TargetInfo) ThinRuntimeDecls {
         const ptr = llvm.ptrType();
         const i32t = llvm.i32Type();
         const i64t = llvm.i64Type();
         const voidt = llvm.voidType();
-        const jsv_ty = jsvalueType(); // {i64, i64} — native JSValue ABI
+        const jsv_ty = target.jsvalueType(); // {i64, i64} native, i64 wasm32
+        const usize_t = target.usizeType(); // i64 native, i32 wasm32
 
         // Common signatures
         // void(stack, sp, i32)
@@ -1381,9 +1461,9 @@ const ThinRuntimeDecls = struct {
         // i32(ctx, stack, sp, ptr) - simpler field/var op
         const field_op = llvm.functionType(i32t, &.{ ptr, ptr, ptr, ptr }, false);
         // JSValue(ctx, stack, sp, locals, usize, ptr, ptr, ptr, usize) - return helper
-        const return_helper = llvm.functionType(jsv_ty, &.{ ptr, ptr, ptr, ptr, i64t, ptr, ptr, ptr, i64t }, false);
+        const return_helper = llvm.functionType(jsv_ty, &.{ ptr, ptr, ptr, ptr, usize_t, ptr, ptr, ptr, usize_t }, false);
         // JSValue(ctx, locals, usize, ptr, ptr, ptr, usize) - returnUndef/exceptionCleanup
-        const cleanup_helper = llvm.functionType(jsv_ty, &.{ ptr, ptr, i64t, ptr, ptr, ptr, i64t }, false);
+        const cleanup_helper = llvm.functionType(jsv_ty, &.{ ptr, ptr, usize_t, ptr, ptr, ptr, usize_t }, false);
 
         return .{
             .push_i32 = declareExtern(module, "llvm_rt_push_i32", stack_sp_i32),
@@ -1528,6 +1608,7 @@ const ThinRuntimeDecls = struct {
             .op_to_propkey = declareExtern(module, "llvm_rt_op_to_propkey", llvm.functionType(i32t, &.{ ptr, ptr, ptr }, false)),
             .op_to_propkey2 = declareExtern(module, "llvm_rt_op_to_propkey2", llvm.functionType(i32t, &.{ ptr, ptr, ptr }, false)),
 
+            .op_array_from = declareExtern(module, "llvm_rt_array_from", llvm.functionType(i32t, &.{ ptr, ptr, ptr, i32t }, false)),
             .op_append = declareExtern(module, "llvm_rt_op_append", ctx_stack_sp),
             .op_put_array_el = declareExtern(module, "llvm_rt_op_put_array_el", ctx_stack_sp),
 
@@ -1549,12 +1630,12 @@ const ThinRuntimeDecls = struct {
             .call_method_array_push = declareExtern(module, "llvm_rt_call_method_array_push", llvm.functionType(i32t, &.{ ptr, ptr, ptr }, false)),
             .call_method_math_unary = declareExtern(module, "llvm_rt_call_method_math_unary", llvm.functionType(i32t, &.{ ptr, ptr, ptr, i32t }, false)),
 
-            // exec_opcode: i32(ctx, op, operand, stack, sp, locals, var_count, var_refs, closure_var_count, argv, argc, arg_buf, func_obj{i64,i64}, new_target{i64,i64}, cpool, operand2, atom_name)
+            // exec_opcode: i32(ctx, op, operand, stack, sp, locals, var_count, var_refs, closure_var_count, argv, argc, arg_buf, func_obj, new_target, cpool, operand2, atom_name)
             .exec_opcode = declareExtern(module, "llvm_rt_exec_opcode", llvm.functionType(i32t, &.{ ptr, llvm.i8Type(), i32t, ptr, ptr, ptr, i32t, ptr, i32t, ptr, i32t, ptr, jsv_ty, jsv_ty, ptr, i32t, ptr }, false)),
 
             // Combined tail_call+return: (ctx, stack, sp, argc, locals, local_count, arg_shadow, arg_count) -> JSValue
-            .tail_call_return = declareExtern(module, "llvm_rt_tail_call_return", llvm.functionType(jsv_ty, &.{ ptr, ptr, ptr, i32t, ptr, i64t, ptr, i64t }, false)),
-            .tail_call_method_return = declareExtern(module, "llvm_rt_tail_call_method_return", llvm.functionType(jsv_ty, &.{ ptr, ptr, ptr, i32t, ptr, i64t, ptr, i64t }, false)),
+            .tail_call_return = declareExtern(module, "llvm_rt_tail_call_return", llvm.functionType(jsv_ty, &.{ ptr, ptr, ptr, i32t, ptr, usize_t, ptr, usize_t }, false)),
+            .tail_call_method_return = declareExtern(module, "llvm_rt_tail_call_method_return", llvm.functionType(jsv_ty, &.{ ptr, ptr, ptr, i32t, ptr, usize_t, ptr, usize_t }, false)),
 
         };
     }
@@ -1583,6 +1664,7 @@ const ThinCodegenCtx = struct {
     module: llvm.Module,
     rt: *ThinRuntimeDecls,
     allocator: Allocator,
+    target: TargetInfo = .{},
 
     // Function parameters
     ctx_param: llvm.Value, // JSContext*
@@ -1606,6 +1688,10 @@ const ThinCodegenCtx = struct {
     has_put_arg: bool = false,
     has_fclosure: bool = false,
     has_for_of: bool = false,
+
+    // for_of iter tracking (allocated when has_for_of)
+    for_of_iter_stack_ptr: ?llvm.Value = null,
+    for_of_depth_ptr: ?llvm.Value = null,
 
     // Arg shadow
     arg_shadow_ptr: ?llvm.Value = null,
@@ -1646,6 +1732,31 @@ const ThinCodegenCtx = struct {
         const idx = self.ic_count;
         self.ic_count += 1;
         return idx;
+    }
+
+    /// Load SP value with correct type for target (i64 native, i32 WASM32)
+    fn loadSp(self: *ThinCodegenCtx) llvm.Value {
+        return self.builder.buildLoad(self.target.usizeType(), self.sp_ptr, "sp");
+    }
+
+    /// Store SP value
+    fn storeSp(self: *ThinCodegenCtx, val: llvm.Value) void {
+        _ = self.builder.buildStore(val, self.sp_ptr);
+    }
+
+    /// Create a constant matching SP type (i64 native, i32 WASM32)
+    fn spConst(self: *ThinCodegenCtx, val: u64) llvm.Value {
+        return self.target.constUsize(val);
+    }
+
+    /// SP add: sp + N with correct type
+    fn spAdd(self: *ThinCodegenCtx, sp: llvm.Value, n: u64, name: [*:0]const u8) llvm.Value {
+        return self.builder.buildAdd(sp, self.spConst(n), name);
+    }
+
+    /// SP sub: sp - N with correct type
+    fn spSub(self: *ThinCodegenCtx, sp: llvm.Value, n: u64, name: [*:0]const u8) llvm.Value {
+        return self.builder.buildSub(sp, self.spConst(n), name);
     }
 };
 
@@ -1760,12 +1871,11 @@ fn vstackPop(tctx: *ThinCodegenCtx) VStackEntry {
         return tctx.vstack.pop().?;
     }
     // Underflow: load from physical stack (sp-1), decrement sp
-    const b = tctx.builder;
-    const sp_val = inlineLoadSp(b, tctx.sp_ptr);
-    const new_sp = b.buildSub(sp_val, llvm.constInt64(1), "usp");
-    const slot = inlineStackSlot(b, tctx.stack_ptr, new_sp);
-    const val = b.buildLoad(llvm.i64Type(), slot, "upop");
-    inlineStoreSp(b, tctx.sp_ptr, new_sp);
+    const sp_val = tctx.loadSp();
+    const new_sp = tctx.spSub(sp_val, 1, "usp");
+    const slot = inlineStackSlot(tctx.builder, tctx.stack_ptr, new_sp);
+    const val = tctx.builder.buildLoad(llvm.i64Type(), slot, "upop");
+    tctx.storeSp(new_sp);
     return .{ .value = val, .owned = true };
 }
 
@@ -1775,12 +1885,11 @@ fn vstackPeek(tctx: *ThinCodegenCtx) VStackEntry {
         return tctx.vstack.items[tctx.vstack.items.len - 1];
     }
     // Underflow: pop from physical stack into vstack, then peek
-    const b = tctx.builder;
-    const sp_val = inlineLoadSp(b, tctx.sp_ptr);
-    const new_sp = b.buildSub(sp_val, llvm.constInt64(1), "usp");
-    const slot = inlineStackSlot(b, tctx.stack_ptr, new_sp);
-    const val = b.buildLoad(llvm.i64Type(), slot, "upeek");
-    inlineStoreSp(b, tctx.sp_ptr, new_sp);
+    const sp_val = tctx.loadSp();
+    const new_sp = tctx.spSub(sp_val, 1, "usp");
+    const slot = inlineStackSlot(tctx.builder, tctx.stack_ptr, new_sp);
+    const val = tctx.builder.buildLoad(llvm.i64Type(), slot, "upeek");
+    tctx.storeSp(new_sp);
     const entry = VStackEntry{ .value = val, .owned = true };
     tctx.vstack.append(tctx.allocator, entry) catch unreachable;
     return entry;
@@ -1792,10 +1901,10 @@ fn vstackFlush(tctx: *ThinCodegenCtx) void {
     const count = tctx.vstack.items.len;
     if (count == 0) return;
 
-    const sp_val = inlineLoadSp(b, tctx.sp_ptr);
+    const sp_val = tctx.loadSp();
 
     for (tctx.vstack.items, 0..) |entry, i| {
-        const idx = b.buildAdd(sp_val, llvm.constInt64(@intCast(i)), "fidx");
+        const idx = b.buildAdd(sp_val, tctx.spConst(@intCast(i)), "fidx");
         const slot = inlineStackSlot(b, tctx.stack_ptr, idx);
         if (entry.owned) {
             _ = b.buildStore(entry.value, slot);
@@ -1806,8 +1915,8 @@ fn vstackFlush(tctx: *ThinCodegenCtx) void {
         }
     }
 
-    const new_sp = b.buildAdd(sp_val, llvm.constInt64(@intCast(count)), "fsp");
-    inlineStoreSp(b, tctx.sp_ptr, new_sp);
+    const new_sp = b.buildAdd(sp_val, tctx.spConst(@intCast(count)), "fsp");
+    tctx.storeSp(new_sp);
 
     tctx.vstack.clearRetainingCapacity();
 }
@@ -1856,6 +1965,7 @@ fn generateThinFunction(
     builder: llvm.Builder,
     sf: ThinShardFunction,
     rt: *ThinRuntimeDecls,
+    target: TargetInfo,
 ) CodegenError!bool {
     const func = sf.func;
     const cfg = sf.cfg;
@@ -1883,16 +1993,16 @@ fn generateThinFunction(
     }
 
     // Create the wrapper function:
-    // {i64,i64} @__frozen_N_name(ptr %ctx, {i64,i64} %this, i32 %argc, ptr %argv, ptr %var_refs, i32 %closure_cnt, ptr %cpool)
-    // JSValue on native is 16-byte struct {JSValueUnion, tag} — must match C ABI
+    // JSValue @__frozen_N_name(ptr %ctx, JSValue %this, i32 %argc, ptr %argv, ptr %var_refs, i32 %closure_cnt, ptr %cpool)
+    // Native: JSValue = {i64, i64} (16 bytes), WASM32: JSValue = i64 (8 bytes, NaN-boxed)
     var wrapper_name_buf: [512]u8 = undefined;
     const wrapper_name = std.fmt.bufPrintZ(&wrapper_name_buf, "{s}", .{sf.llvm_func_name}) catch
         return CodegenError.FormatError;
 
-    const jsv_ty = jsvalueType();
+    const jsv_ty = target.jsvalueType();
     const wrapper_params = [_]llvm.Type{
         llvm.ptrType(), // ctx
-        jsv_ty, // this_val: JSValue = {i64, i64}
+        jsv_ty, // this_val: JSValue
         llvm.i32Type(), // argc
         llvm.ptrType(), // argv
         llvm.ptrType(), // var_refs
@@ -1943,14 +2053,8 @@ fn generateThinFunction(
         _ = builder.buildCondBr(overflow, overflow_bb, no_overflow_bb);
 
         // Overflow: return EXCEPTION value
-        // Native JSValue: { .u = { .int32 = 0 }, .tag = JS_TAG_EXCEPTION }
-        // JS_TAG_EXCEPTION on native = 6
         builder.positionAtEnd(overflow_bb);
-        const exc_jsv_ty = jsvalueType();
-        var exc_val = c.LLVMGetUndef(exc_jsv_ty);
-        exc_val = c.LLVMBuildInsertValue(builder.ref, exc_val, llvm.constInt64(0), 0, "exc0");
-        exc_val = c.LLVMBuildInsertValue(builder.ref, exc_val, llvm.constInt64(6), 1, "exc1");
-        _ = builder.buildRet(exc_val);
+        _ = builder.buildRet(target.makeException(builder));
 
         builder.positionAtEnd(no_overflow_bb);
     }
@@ -1972,9 +2076,9 @@ fn generateThinFunction(
     const stack_ty = llvm.arrayType(llvm.i64Type(), stack_array_size);
     const stack_alloc = builder.buildAlloca(stack_ty, "stack");
 
-    // Stack pointer (usize = i64 on x86-64)
-    const sp_ptr = builder.buildAlloca(llvm.i64Type(), "sp");
-    _ = builder.buildStore(llvm.constInt64(0), sp_ptr);
+    // Stack pointer (usize: i64 on native, i32 on WASM32)
+    const sp_ptr = builder.buildAlloca(target.usizeType(), "sp");
+    _ = builder.buildStore(target.constUsize(0), sp_ptr);
 
     // Arg shadow (if has_put_arg)
     var arg_shadow_ptr: ?llvm.Value = null;
@@ -1998,7 +2102,7 @@ fn generateThinFunction(
 
             // In-bounds path: load argv[i], convert to CV, dupRef
             builder.positionAtEnd(arg_load_bb);
-            const jsv_el_ty = jsvalueType();
+            const jsv_el_ty = target.jsvalueType();
             var argv_idx = [_]llvm.Value{llvm.constInt(llvm.i64Type(), i, false)};
             const argv_elem_ptr = builder.buildInBoundsGEP(jsv_el_ty, argv_param, &argv_idx, "avp");
             const argv_val = builder.buildLoad(jsv_el_ty, argv_elem_ptr, "av");
@@ -2050,8 +2154,9 @@ fn generateThinFunction(
     var locals_jsv_ptr_val: ?llvm.Value = null;
     var var_ref_list_ptr_val: ?llvm.Value = null;
     if (has_fclosure and local_count > 0) {
-        // locals_jsv: array of JSValue (16 bytes each = 2 x i64), but stored as [local_count * 2 x i64]
-        const jsv_array_ty = llvm.arrayType(llvm.i64Type(), local_count * 2);
+        // locals_jsv: array of JSValue. Native: 16 bytes = 2 x i64. WASM32: 8 bytes = 1 x i64.
+        const jsv_slots = if (target.is_wasm32) local_count else local_count * 2;
+        const jsv_array_ty = llvm.arrayType(llvm.i64Type(), jsv_slots);
         const jsv_alloca = builder.buildAlloca(jsv_array_ty, "locals_jsv");
         var jsv_gep_idx = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(0) };
         locals_jsv_ptr_val = builder.buildInBoundsGEP(jsv_array_ty, jsv_alloca, &jsv_gep_idx, "ljv");
@@ -2070,6 +2175,20 @@ fn generateThinFunction(
         _ = builder.buildStore(list_flat, next_ptr);
     }
 
+    // for_of iter tracking: allocate stack for nested for...of depth tracking
+    var for_of_iter_stack_ptr: ?llvm.Value = null;
+    var for_of_depth_ptr: ?llvm.Value = null;
+    if (has_for_of) {
+        // Max nesting depth of 8 for...of loops (matches Zig runtime)
+        const iter_stack_ty = llvm.arrayType(target.usizeType(), 8);
+        const iter_stack_alloca = builder.buildAlloca(iter_stack_ty, "fo_iters");
+        var iter_gep = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(0) };
+        for_of_iter_stack_ptr = builder.buildInBoundsGEP(iter_stack_ty, iter_stack_alloca, &iter_gep, "fo_is");
+
+        for_of_depth_ptr = builder.buildAlloca(target.usizeType(), "fo_depth");
+        _ = builder.buildStore(target.constUsize(0), for_of_depth_ptr.?);
+    }
+
     // Save the no_overflow insertion point
     const no_overflow_bb = c.LLVMGetInsertBlock(builder.ref);
 
@@ -2078,21 +2197,22 @@ fn generateThinFunction(
     {
         // Call exit_stack, then exceptionCleanup
         _ = builder.buildCall(llvm.functionType(llvm.voidType(), &.{}, false), rt.exit_stack, &.{}, "");
-        const cleanup_fn_ty = llvm.functionType(jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.i64Type(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i64Type() }, false);
+        const usize_t = target.usizeType();
+        const cleanup_fn_ty = llvm.functionType(target.jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), usize_t, llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), usize_t }, false);
         const cleanup_result = builder.buildCall(
             cleanup_fn_ty,
             rt.exceptionCleanup,
             &.{
                 ctx_param,
                 locals_flat,
-                llvm.constInt64(local_count),
+                target.constUsize(local_count),
                 locals_jsv_ptr_val orelse llvm.constNull(llvm.ptrType()),
                 var_ref_list_ptr_val orelse llvm.constNull(llvm.ptrType()),
                 if (arg_shadow_ptr) |sp2| blk: {
                     var si = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(0) };
                     break :blk builder.buildInBoundsGEP(llvm.arrayType(llvm.i64Type(), func.arg_count), sp2, &si, "asp");
                 } else llvm.constNull(llvm.ptrType()),
-                llvm.constInt64(if (has_put_arg) func.arg_count else 0),
+                target.constUsize(if (has_put_arg) func.arg_count else 0),
             },
             "exc_ret",
         );
@@ -2108,6 +2228,7 @@ fn generateThinFunction(
         .module = module,
         .rt = rt,
         .allocator = allocator,
+        .target = target,
         .ctx_param = ctx_param,
         .this_param = this_param,
         .argc_param = argc_param,
@@ -2122,6 +2243,8 @@ fn generateThinFunction(
         .has_put_arg = has_put_arg,
         .has_fclosure = has_fclosure,
         .has_for_of = has_for_of,
+        .for_of_iter_stack_ptr = for_of_iter_stack_ptr,
+        .for_of_depth_ptr = for_of_depth_ptr,
         .arg_shadow_ptr = arg_shadow_ptr,
         .locals_jsv_ptr = locals_jsv_ptr_val,
         .var_ref_list_ptr = var_ref_list_ptr_val,
@@ -2178,12 +2301,12 @@ fn generateThinFunction(
         if (!isBlockTerminated(blocks[0])) {
             _ = builder.buildCall(llvm.functionType(llvm.voidType(), &.{}, false), rt.exit_stack, &.{}, "");
             const ret = builder.buildCall(
-                llvm.functionType(jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.i64Type(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i64Type() }, false),
+                llvm.functionType(tctx.target.jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), tctx.target.usizeType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), tctx.target.usizeType() }, false),
                 rt.returnUndef,
                 &.{
-                    ctx_param, locals_flat, llvm.constInt64(local_count),
+                    ctx_param, locals_flat, tctx.target.constUsize(local_count),
                     llvm.constNull(llvm.ptrType()), llvm.constNull(llvm.ptrType()),
-                    llvm.constNull(llvm.ptrType()), llvm.constInt64(0),
+                    llvm.constNull(llvm.ptrType()), tctx.target.constUsize(0),
                 },
                 "ret",
             );
@@ -2246,12 +2369,14 @@ fn generateThinFunction(
                     else => {},
                 }
 
-                emitThinInstruction(&tctx, instr) catch |err| {
-                    switch (err) {
-                        CodegenError.UnsupportedOpcode => emitFallbackOpcode(&tctx, instr),
-                        else => return err,
-                    }
-                };
+                {
+                    emitThinInstruction(&tctx, instr) catch |err| {
+                        switch (err) {
+                            CodegenError.UnsupportedOpcode => emitFallbackOpcode(&tctx, instr),
+                            else => return err,
+                        }
+                    };
+                }
             }
 
             // Block terminator (vstackFlush handled inside for if_true/if_false optimization)
@@ -2270,6 +2395,387 @@ fn isBlockTerminated(block: CFGBasicBlock) bool {
 }
 
 /// Emit a single thin-codegen instruction as LLVM IR calls to llvm_rt_* functions.
+/// Debug: emit ALL opcodes through runtime wrapper calls (no inline LLVM IR).
+/// This is the "all-runtime" path used to diagnose codegen bugs in specific functions.
+/// If an opcode doesn't have a runtime wrapper, returns UnsupportedOpcode to fall through.
+fn emitAllRuntimeInstruction(
+    tctx: *ThinCodegenCtx,
+    instr: Instruction,
+) CodegenError!void {
+    // Flush vstack before every runtime call
+    vstackFlush(tctx);
+    const b = tctx.builder;
+    const rt = tctx.rt;
+    const ctx_p = tctx.ctx_param;
+    const stk = tctx.stack_ptr;
+    const sp = tctx.sp_ptr;
+    const locs = tctx.locals_ptr;
+    const i32t = llvm.i32Type();
+
+    switch (instr.opcode) {
+        // Local variables — all through runtime
+        .get_loc0, .get_loc1, .get_loc2, .get_loc3, .get_loc, .get_loc8,
+        .get_loc_check,
+        => {
+            const idx: u32 = switch (instr.opcode) {
+                .get_loc0 => 0, .get_loc1 => 1, .get_loc2 => 2, .get_loc3 => 3,
+                else => instr.operand.loc,
+            };
+            // For get_loc_check: inline TDZ check then runtime get_loc
+            if (instr.opcode == .get_loc_check) {
+                const loc_ptr = inlineLocalSlot(b, locs, idx);
+                const val = b.buildLoad(llvm.i64Type(), loc_ptr, "locv");
+                const is_uninit = b.buildICmp(c.LLVMIntEQ, val, llvm.constInt(llvm.i64Type(), CV_UNINITIALIZED, false), "isuninit");
+                const current_fn = c.LLVMGetBasicBlockParent(c.LLVMGetInsertBlock(b.ref));
+                const tdz_bb = llvm.appendBasicBlock(current_fn, "dtdz_err");
+                const ok_bb = llvm.appendBasicBlock(current_fn, "dtdz_ok");
+                _ = b.buildCondBr(is_uninit, tdz_bb, ok_bb);
+                b.positionAtEnd(tdz_bb);
+                _ = b.buildCall(llvm.functionType(i32t, &.{llvm.ptrType()}, false), rt.throw_tdz, &.{ctx_p}, "");
+                _ = b.buildBr(tctx.cleanup_bb);
+                b.positionAtEnd(ok_bb);
+            }
+            _ = b.buildCall(
+                llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), i32t }, false),
+                rt.get_loc, &.{ ctx_p, stk, sp, locs, llvm.constInt32(@intCast(idx)) }, "",
+            );
+        },
+        .put_loc0, .put_loc1, .put_loc2, .put_loc3, .put_loc, .put_loc8 => {
+            const idx: u32 = switch (instr.opcode) {
+                .put_loc0 => 0, .put_loc1 => 1, .put_loc2 => 2, .put_loc3 => 3,
+                else => instr.operand.loc,
+            };
+            _ = b.buildCall(
+                llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), i32t }, false),
+                rt.put_loc, &.{ ctx_p, stk, sp, locs, llvm.constInt32(@intCast(idx)) }, "",
+            );
+        },
+        .put_loc_check, .put_loc_check_init => {
+            const idx: u32 = instr.operand.loc;
+            // Inline TDZ check for put_loc_check (not put_loc_check_init)
+            if (instr.opcode == .put_loc_check) {
+                const loc_ptr = inlineLocalSlot(b, locs, idx);
+                const old_val = b.buildLoad(llvm.i64Type(), loc_ptr, "oldv");
+                const is_uninit = b.buildICmp(c.LLVMIntEQ, old_val, llvm.constInt(llvm.i64Type(), CV_UNINITIALIZED, false), "isuninit");
+                const current_fn = c.LLVMGetBasicBlockParent(c.LLVMGetInsertBlock(b.ref));
+                const tdz_bb = llvm.appendBasicBlock(current_fn, "dtdz_err2");
+                const ok_bb = llvm.appendBasicBlock(current_fn, "dtdz_ok2");
+                _ = b.buildCondBr(is_uninit, tdz_bb, ok_bb);
+                b.positionAtEnd(tdz_bb);
+                _ = b.buildCall(llvm.functionType(i32t, &.{llvm.ptrType()}, false), rt.throw_tdz, &.{ctx_p}, "");
+                _ = b.buildBr(tctx.cleanup_bb);
+                b.positionAtEnd(ok_bb);
+            }
+            _ = b.buildCall(
+                llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), i32t }, false),
+                rt.put_loc, &.{ ctx_p, stk, sp, locs, llvm.constInt32(@intCast(idx)) }, "",
+            );
+        },
+        .set_loc0, .set_loc1, .set_loc2, .set_loc3, .set_loc, .set_loc8 => {
+            const idx: u32 = switch (instr.opcode) {
+                .set_loc0 => 0, .set_loc1 => 1, .set_loc2 => 2, .set_loc3 => 3,
+                else => instr.operand.loc,
+            };
+            _ = b.buildCall(
+                llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), i32t }, false),
+                rt.set_loc, &.{ ctx_p, stk, sp, locs, llvm.constInt32(@intCast(idx)) }, "",
+            );
+        },
+        .set_loc_uninitialized => {
+            // Inline: free old value, store UNINITIALIZED (no runtime wrapper exists)
+            const idx = instr.operand.loc;
+            const loc_ptr = inlineLocalSlot(b, locs, idx);
+            const old_val = b.buildLoad(llvm.i64Type(), loc_ptr, "oldv");
+            inlineFreeRef(tctx, old_val);
+            _ = b.buildStore(llvm.constInt(llvm.i64Type(), CV_UNINITIALIZED, false), loc_ptr);
+        },
+
+        // Stack operations — all through runtime
+        .dup => { callVoid3(b, rt.dup_top, ctx_p, stk, sp); },
+        .dup1 => { callVoid3(b, rt.dup1, ctx_p, stk, sp); },
+        .dup2 => { callVoid3(b, rt.dup2, ctx_p, stk, sp); },
+        .dup3 => { callVoid3(b, rt.dup3, ctx_p, stk, sp); },
+        .drop => { callVoid3(b, rt.drop, ctx_p, stk, sp); },
+        .nip => { callVoid3(b, rt.nip, ctx_p, stk, sp); },
+        .nip1 => { callVoid3(b, rt.nip1, ctx_p, stk, sp); },
+        .swap => { callVoid3(b, rt.swap, ctx_p, stk, sp); },
+        .insert2 => { callVoid3(b, rt.insert2, ctx_p, stk, sp); },
+        .insert3 => { callVoid3(b, rt.insert3, ctx_p, stk, sp); },
+        .insert4 => { callVoid3(b, rt.insert4, ctx_p, stk, sp); },
+
+        // Constants — through runtime
+        .push_i8 => {
+            const val: i32 = @intCast(instr.operand.i8);
+            _ = b.buildCall(
+                llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), i32t }, false),
+                rt.push_i32, &.{ stk, sp, llvm.constInt32(@bitCast(val)) }, "",
+            );
+        },
+        .push_i16 => {
+            const val: i32 = @intCast(instr.operand.i16);
+            _ = b.buildCall(
+                llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), i32t }, false),
+                rt.push_i32, &.{ stk, sp, llvm.constInt32(@bitCast(val)) }, "",
+            );
+        },
+        .push_i32 => {
+            _ = b.buildCall(
+                llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), i32t }, false),
+                rt.push_i32, &.{ stk, sp, llvm.constInt32(@bitCast(instr.operand.i32)) }, "",
+            );
+        },
+        .push_0 => { _ = b.buildCall(llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), i32t }, false), rt.push_i32, &.{ stk, sp, llvm.constInt32(0) }, ""); },
+        .push_1 => { _ = b.buildCall(llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), i32t }, false), rt.push_i32, &.{ stk, sp, llvm.constInt32(1) }, ""); },
+        .push_2 => { _ = b.buildCall(llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), i32t }, false), rt.push_i32, &.{ stk, sp, llvm.constInt32(2) }, ""); },
+        .push_3 => { _ = b.buildCall(llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), i32t }, false), rt.push_i32, &.{ stk, sp, llvm.constInt32(3) }, ""); },
+        .push_4 => { _ = b.buildCall(llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), i32t }, false), rt.push_i32, &.{ stk, sp, llvm.constInt32(4) }, ""); },
+        .push_5 => { _ = b.buildCall(llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), i32t }, false), rt.push_i32, &.{ stk, sp, llvm.constInt32(5) }, ""); },
+        .push_6 => { _ = b.buildCall(llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), i32t }, false), rt.push_i32, &.{ stk, sp, llvm.constInt32(6) }, ""); },
+        .push_7 => { _ = b.buildCall(llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), i32t }, false), rt.push_i32, &.{ stk, sp, llvm.constInt32(7) }, ""); },
+        .push_minus1 => { _ = b.buildCall(llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), i32t }, false), rt.push_i32, &.{ stk, sp, llvm.constInt32(@bitCast(@as(i32, -1))) }, ""); },
+        .push_true => { callVoid2(b, rt.push_true, stk, sp); },
+        .push_false => { callVoid2(b, rt.push_false, stk, sp); },
+        .null => { callVoid2(b, rt.push_null, stk, sp); },
+        .undefined => { callVoid2(b, rt.push_undefined, stk, sp); },
+        .push_this => {
+            _ = b.buildCall(
+                llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), tctx.target.jsvalueType() }, false),
+                rt.push_this, &.{ ctx_p, stk, sp, tctx.this_param }, "",
+            );
+        },
+        .push_empty_string => { callVoid3(b, rt.push_empty_string, ctx_p, stk, sp); },
+        .push_const8, .push_const => {
+            // Constant pool access through exec_opcode fallback
+            return CodegenError.UnsupportedOpcode;
+        },
+
+        // Arithmetic — through runtime
+        .add => { callVoid3(b, rt.op_add, ctx_p, stk, sp); },
+        .sub => { callVoid3(b, rt.op_sub, ctx_p, stk, sp); },
+        .mul => { callVoid3(b, rt.op_mul, ctx_p, stk, sp); },
+        .div => { callVoid3(b, rt.op_div, ctx_p, stk, sp); },
+        .mod => { callVoid3(b, rt.op_mod, ctx_p, stk, sp); },
+        .neg => { callVoid3(b, rt.op_neg, ctx_p, stk, sp); },
+        .plus => { callVoid3(b, rt.op_plus, ctx_p, stk, sp); },
+
+        // Bitwise — through runtime
+        .@"and" => { callVoid3(b, rt.op_band, ctx_p, stk, sp); },
+        .@"or" => { callVoid3(b, rt.op_bor, ctx_p, stk, sp); },
+        .xor => { callVoid3(b, rt.op_bxor, ctx_p, stk, sp); },
+        .not => { callVoid3(b, rt.op_bnot, ctx_p, stk, sp); },
+        .shl => { callVoid3(b, rt.op_shl, ctx_p, stk, sp); },
+        .sar => { callVoid3(b, rt.op_sar, ctx_p, stk, sp); },
+        .shr => { callVoid3(b, rt.op_shr, ctx_p, stk, sp); },
+
+        // Comparison — through runtime
+        .lt => { callVoid3(b, rt.op_lt, ctx_p, stk, sp); },
+        .lte => { callVoid3(b, rt.op_lte, ctx_p, stk, sp); },
+        .gt => { callVoid3(b, rt.op_gt, ctx_p, stk, sp); },
+        .gte => { callVoid3(b, rt.op_gte, ctx_p, stk, sp); },
+        .eq => { callVoid3(b, rt.op_eq, ctx_p, stk, sp); },
+        .neq => { callVoid3(b, rt.op_neq, ctx_p, stk, sp); },
+        .strict_eq => { callVoid3(b, rt.op_strict_eq, ctx_p, stk, sp); },
+        .strict_neq => { callVoid3(b, rt.op_strict_neq, ctx_p, stk, sp); },
+
+        // Logical/type
+        .lnot => { callVoid3(b, rt.op_lnot, ctx_p, stk, sp); },
+        .typeof => { callVoid3(b, rt.op_typeof, ctx_p, stk, sp); },
+        .is_undefined => { callVoid3(b, rt.is_undefined, ctx_p, stk, sp); },
+        .is_null => { callVoid3(b, rt.is_null, ctx_p, stk, sp); },
+        .is_undefined_or_null => { callVoid3(b, rt.is_undefined_or_null, ctx_p, stk, sp); },
+
+        // Increment/decrement
+        .inc => { callVoid3(b, rt.inc, ctx_p, stk, sp); },
+        .dec => { callVoid3(b, rt.dec, ctx_p, stk, sp); },
+        .post_inc => { callVoid3(b, rt.post_inc, ctx_p, stk, sp); },
+        .post_dec => { callVoid3(b, rt.post_dec, ctx_p, stk, sp); },
+        .inc_loc => { callVoid4u(b, rt.inc_loc, ctx_p, stk, sp, locs, instr.operand.loc); },
+        .dec_loc => { callVoid4u(b, rt.dec_loc, ctx_p, stk, sp, locs, instr.operand.loc); },
+
+        // Arguments — through runtime
+        .get_arg0, .get_arg1, .get_arg2, .get_arg3, .get_arg => {
+            const idx: u32 = switch (instr.opcode) {
+                .get_arg0 => 0, .get_arg1 => 1, .get_arg2 => 2, .get_arg3 => 3,
+                else => instr.operand.arg,
+            };
+            if (tctx.has_put_arg) {
+                if (tctx.arg_shadow_ptr) |asp| {
+                    var si = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(0) };
+                    const asp_flat = b.buildInBoundsGEP(
+                        llvm.arrayType(llvm.i64Type(), tctx.func.arg_count),
+                        asp, &si, "asp",
+                    );
+                    // get_arg_shadow(stack, sp, arg_shadow, idx) — no ctx param
+                    _ = b.buildCall(
+                        llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), i32t }, false),
+                        rt.get_arg_shadow, &.{ stk, sp, asp_flat, llvm.constInt32(@intCast(idx)) }, "",
+                    );
+                }
+            } else {
+                // get_arg(ctx, stack, sp, argc, argv, idx)
+                _ = b.buildCall(
+                    llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), i32t, llvm.ptrType(), i32t }, false),
+                    rt.get_arg, &.{ ctx_p, stk, sp, tctx.argc_param, tctx.argv_param, llvm.constInt32(@intCast(idx)) }, "",
+                );
+            }
+        },
+
+        // ===== Return (must emit exit_stack + returnFromStack/returnUndef + buildRet) =====
+        .@"return" => {
+            _ = b.buildCall(llvm.functionType(llvm.voidType(), &.{}, false), rt.exit_stack, &.{}, "");
+            const ret = b.buildCall(
+                llvm.functionType(tctx.target.jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), tctx.target.usizeType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), tctx.target.usizeType() }, false),
+                rt.returnFromStack,
+                &.{
+                    ctx_p, stk, sp, locs, tctx.target.constUsize(tctx.local_count),
+                    tctx.locals_jsv_ptr orelse llvm.constNull(llvm.ptrType()),
+                    tctx.var_ref_list_ptr orelse llvm.constNull(llvm.ptrType()),
+                    if (tctx.arg_shadow_ptr) |asp| blk: {
+                        var si = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(0) };
+                        break :blk b.buildInBoundsGEP(llvm.arrayType(llvm.i64Type(), tctx.func.arg_count), asp, &si, "asp");
+                    } else llvm.constNull(llvm.ptrType()),
+                    tctx.target.constUsize(if (tctx.has_put_arg) tctx.func.arg_count else 0),
+                },
+                "ret",
+            );
+            _ = b.buildRet(ret);
+        },
+        .return_undef => {
+            _ = b.buildCall(llvm.functionType(llvm.voidType(), &.{}, false), rt.exit_stack, &.{}, "");
+            const ret = b.buildCall(
+                llvm.functionType(tctx.target.jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), tctx.target.usizeType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), tctx.target.usizeType() }, false),
+                rt.returnUndef,
+                &.{
+                    ctx_p, locs, tctx.target.constUsize(tctx.local_count),
+                    tctx.locals_jsv_ptr orelse llvm.constNull(llvm.ptrType()),
+                    tctx.var_ref_list_ptr orelse llvm.constNull(llvm.ptrType()),
+                    if (tctx.arg_shadow_ptr) |asp| blk: {
+                        var si = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(0) };
+                        break :blk b.buildInBoundsGEP(llvm.arrayType(llvm.i64Type(), tctx.func.arg_count), asp, &si, "asp");
+                    } else llvm.constNull(llvm.ptrType()),
+                    tctx.target.constUsize(if (tctx.has_put_arg) tctx.func.arg_count else 0),
+                },
+                "ret",
+            );
+            _ = b.buildRet(ret);
+        },
+
+        // ===== Calls (through runtime, no inline optimizations) =====
+        .call0, .call1, .call2, .call3, .call => {
+            const argc: u32 = switch (instr.opcode) {
+                .call0 => 0, .call1 => 1, .call2 => 2, .call3 => 3,
+                else => instr.operand.u16,
+            };
+            const err_code = b.buildCall(
+                llvm.functionType(i32t, &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), i32t }, false),
+                rt.op_call, &.{ ctx_p, stk, sp, llvm.constInt32(@intCast(argc)) }, "err",
+            );
+            emitErrorCheck(tctx, err_code);
+        },
+        .call_method => {
+            const argc: u32 = instr.operand.u16;
+            const err_code = b.buildCall(
+                llvm.functionType(i32t, &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), i32t }, false),
+                rt.op_call_method, &.{ ctx_p, stk, sp, llvm.constInt32(@intCast(argc)) }, "err",
+            );
+            emitErrorCheck(tctx, err_code);
+            tctx.pending_method = .none;
+        },
+        .call_constructor => {
+            const argc: u32 = instr.operand.u16;
+            const err_code = b.buildCall(
+                llvm.functionType(i32t, &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), i32t }, false),
+                rt.op_call_constructor, &.{ ctx_p, stk, sp, llvm.constInt32(@intCast(argc)) }, "err",
+            );
+            emitErrorCheck(tctx, err_code);
+        },
+
+        // ===== Field ops (through runtime, no inline IC) =====
+        .get_field => {
+            emitThinFieldOp(tctx, rt.op_get_field_ic, instr);
+        },
+        .get_field2 => {
+            emitThinFieldOp(tctx, rt.op_get_field2_ic, instr);
+            tctx.pending_math_obj = false;
+        },
+        .put_field => {
+            emitThinPutFieldOp(tctx, instr);
+        },
+
+        // ===== Closure vars (through runtime, no inline) =====
+        .get_var_ref, .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3 => {
+            const idx: u32 = switch (instr.opcode) {
+                .get_var_ref0 => 0, .get_var_ref1 => 1, .get_var_ref2 => 2, .get_var_ref3 => 3,
+                else => instr.operand.var_ref,
+            };
+            _ = b.buildCall(
+                llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), i32t, i32t }, false),
+                rt.get_var_ref, &.{ ctx_p, stk, sp, tctx.var_refs_param, llvm.constInt32(@intCast(idx)), tctx.closure_var_count_param }, "",
+            );
+        },
+
+        // ===== put_arg (through runtime, needs arg_shadow) =====
+        .put_arg0, .put_arg1, .put_arg2, .put_arg3, .put_arg => {
+            const idx: u32 = switch (instr.opcode) {
+                .put_arg0 => 0, .put_arg1 => 1, .put_arg2 => 2, .put_arg3 => 3,
+                else => instr.operand.arg,
+            };
+            if (tctx.arg_shadow_ptr) |asp| {
+                var si = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(0) };
+                const asp_flat = b.buildInBoundsGEP(
+                    llvm.arrayType(llvm.i64Type(), tctx.func.arg_count),
+                    asp, &si, "asp",
+                );
+                callVoid4u(b, rt.put_arg, ctx_p, stk, sp, asp_flat, idx);
+            }
+        },
+
+        // ===== array_from (dedicated handler, bypasses exec_opcode) =====
+        .array_from => {
+            const count: u32 = instr.operand.u16;
+            const err_code = b.buildCall(
+                llvm.functionType(i32t, &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), i32t }, false),
+                rt.op_array_from, &.{ ctx_p, stk, sp, llvm.constInt32(@intCast(count)) }, "err",
+            );
+            emitErrorCheck(tctx, err_code);
+        },
+
+        // ===== for...of iterator ops (use dedicated runtime, not exec_opcode) =====
+        .for_of_start => {
+            if (tctx.for_of_iter_stack_ptr) |isp| {
+                const err_code = b.buildCall(
+                    llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType() }, false),
+                    rt.op_for_of_start, &.{ ctx_p, stk, sp, isp, tctx.for_of_depth_ptr.? }, "err",
+                );
+                emitErrorCheck(tctx, err_code);
+            } else return CodegenError.UnsupportedOpcode;
+        },
+        .for_of_next => {
+            if (tctx.for_of_iter_stack_ptr) |isp| {
+                const err_code = b.buildCall(
+                    llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType() }, false),
+                    rt.op_for_of_next, &.{ ctx_p, stk, sp, isp, tctx.for_of_depth_ptr.? }, "err",
+                );
+                emitErrorCheck(tctx, err_code);
+            } else return CodegenError.UnsupportedOpcode;
+        },
+        .iterator_close => {
+            if (tctx.for_of_iter_stack_ptr) |isp| {
+                _ = b.buildCall(
+                    llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType() }, false),
+                    rt.op_iterator_close, &.{ ctx_p, stk, sp, isp, tctx.for_of_depth_ptr.? }, "",
+                );
+            } else return CodegenError.UnsupportedOpcode;
+        },
+
+        // ===== No-op / handled by terminator =====
+        .nop, .set_name, .set_home_object => {},
+
+        // Everything else — fall through to emitFallbackOpcode (exec_opcode)
+        else => return CodegenError.UnsupportedOpcode,
+    }
+}
+
 fn emitThinInstruction(
     tctx: *ThinCodegenCtx,
     instr: Instruction,
@@ -2303,7 +2809,7 @@ fn emitThinInstruction(
         .push_this => {
             vstackFlush(tctx);
             _ = b.buildCall(
-                llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), jsvalueType() }, false),
+                llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), tctx.target.jsvalueType() }, false),
                 rt.push_this,
                 &.{ ctx_p, stk, sp, tctx.this_param },
                 "",
@@ -2417,11 +2923,24 @@ fn emitThinInstruction(
             emitErrorCheck(tctx, err_code);
         },
         // get_var_ref: vstack-optimized inline with int fast path
-        .get_var_ref0 => emitVstackGetVarRef(tctx, 0),
-        .get_var_ref1 => emitVstackGetVarRef(tctx, 1),
-        .get_var_ref2 => emitVstackGetVarRef(tctx, 2),
-        .get_var_ref3 => emitVstackGetVarRef(tctx, 3),
-        .get_var_ref => emitVstackGetVarRef(tctx, instr.operand.var_ref),
+        .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3, .get_var_ref => {
+            const idx: u32 = switch (instr.opcode) {
+                .get_var_ref0 => 0,
+                .get_var_ref1 => 1,
+                .get_var_ref2 => 2,
+                .get_var_ref3 => 3,
+                else => instr.operand.var_ref,
+            };
+            if (tctx.target.is_wasm32) {
+                vstackFlush(tctx);
+                _ = b.buildCall(
+                    llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.i32Type() }, false),
+                    rt.get_var_ref, &.{ ctx_p, stk, sp, tctx.var_refs_param, llvm.constInt32(@intCast(idx)), tctx.closure_var_count_param }, "",
+                );
+            } else {
+                emitVstackGetVarRef(tctx, idx);
+            }
+        },
         // put_var_ref / set_var_ref: flush + runtime (write ops need old-value free)
         .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3, .put_var_ref,
         .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3, .set_var_ref,
@@ -2641,18 +3160,18 @@ fn emitThinInstruction(
                 _ = b.buildCall(detach_fn_ty, rt.var_ref_list_detach, &.{ ctx_p, tctx.var_ref_list_ptr.? }, "");
             }
             // Combined: call + cleanup + return in one runtime function
-            const tc_fn_ty = llvm.functionType(jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.i64Type(), llvm.ptrType(), llvm.i64Type() }, false);
+            const tc_fn_ty = llvm.functionType(tctx.target.jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), tctx.target.usizeType(), llvm.ptrType(), tctx.target.usizeType() }, false);
             const ret = b.buildCall(
                 tc_fn_ty,
                 rt.tail_call_return,
                 &.{
                     ctx_p, stk, sp, llvm.constInt32(@intCast(instr.operand.u16)),
-                    locs, llvm.constInt64(tctx.local_count),
+                    locs, tctx.target.constUsize(tctx.local_count),
                     if (tctx.arg_shadow_ptr) |asp| blk: {
                         var si = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(0) };
                         break :blk b.buildInBoundsGEP(llvm.arrayType(llvm.i64Type(), tctx.func.arg_count), asp, &si, "asp");
                     } else llvm.constNull(llvm.ptrType()),
-                    llvm.constInt64(if (tctx.has_put_arg) tctx.func.arg_count else 0),
+                    tctx.target.constUsize(if (tctx.has_put_arg) tctx.func.arg_count else 0),
                 },
                 "ret",
             );
@@ -2668,18 +3187,18 @@ fn emitThinInstruction(
                 _ = b.buildCall(detach_fn_ty, rt.var_ref_list_detach, &.{ ctx_p, tctx.var_ref_list_ptr.? }, "");
             }
             // Combined: call_method + cleanup + return in one runtime function
-            const tc_fn_ty = llvm.functionType(jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.i64Type(), llvm.ptrType(), llvm.i64Type() }, false);
+            const tc_fn_ty = llvm.functionType(tctx.target.jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), tctx.target.usizeType(), llvm.ptrType(), tctx.target.usizeType() }, false);
             const ret = b.buildCall(
                 tc_fn_ty,
                 rt.tail_call_method_return,
                 &.{
                     ctx_p, stk, sp, llvm.constInt32(@intCast(instr.operand.u16)),
-                    locs, llvm.constInt64(tctx.local_count),
+                    locs, tctx.target.constUsize(tctx.local_count),
                     if (tctx.arg_shadow_ptr) |asp| blk: {
                         var si = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(0) };
                         break :blk b.buildInBoundsGEP(llvm.arrayType(llvm.i64Type(), tctx.func.arg_count), asp, &si, "asp");
                     } else llvm.constNull(llvm.ptrType()),
-                    llvm.constInt64(if (tctx.has_put_arg) tctx.func.arg_count else 0),
+                    tctx.target.constUsize(if (tctx.has_put_arg) tctx.func.arg_count else 0),
                 },
                 "ret",
             );
@@ -2689,10 +3208,18 @@ fn emitThinInstruction(
 
         // ========== Property Access (with error check, flush vstack) ==========
         .get_field => {
-            emitVstackGetField(tctx, instr);
+            if (tctx.target.is_wasm32) {
+                emitThinFieldOp(tctx, rt.op_get_field_ic, instr);
+            } else {
+                emitVstackGetField(tctx, instr);
+            }
         },
         .get_field2 => {
-            emitVstackGetField2(tctx, instr);
+            if (tctx.target.is_wasm32) {
+                emitThinFieldOp(tctx, rt.op_get_field2_ic, instr);
+            } else {
+                emitVstackGetField2(tctx, instr);
+            }
             // Detect method patterns: get_field2("name") → ... → call_method(argc)
             const atom_idx = instr.operand.atom;
             const name = getAtomStringStatic(tctx.func, atom_idx);
@@ -2739,17 +3266,17 @@ fn emitThinInstruction(
             vstackFlush(tctx);
             _ = b.buildCall(llvm.functionType(llvm.voidType(), &.{}, false), rt.exit_stack, &.{}, "");
             const ret = b.buildCall(
-                llvm.functionType(jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i64Type(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i64Type() }, false),
+                llvm.functionType(tctx.target.jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), tctx.target.usizeType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), tctx.target.usizeType() }, false),
                 rt.returnFromStack,
                 &.{
-                    ctx_p, stk, sp, locs, llvm.constInt64(tctx.local_count),
+                    ctx_p, stk, sp, locs, tctx.target.constUsize(tctx.local_count),
                     tctx.locals_jsv_ptr orelse llvm.constNull(llvm.ptrType()),
                     tctx.var_ref_list_ptr orelse llvm.constNull(llvm.ptrType()),
                     if (tctx.arg_shadow_ptr) |asp| blk: {
                         var si = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(0) };
                         break :blk b.buildInBoundsGEP(llvm.arrayType(llvm.i64Type(), tctx.func.arg_count), asp, &si, "asp");
                     } else llvm.constNull(llvm.ptrType()),
-                    llvm.constInt64(if (tctx.has_put_arg) tctx.func.arg_count else 0),
+                    tctx.target.constUsize(if (tctx.has_put_arg) tctx.func.arg_count else 0),
                 },
                 "ret",
             );
@@ -2760,17 +3287,17 @@ fn emitThinInstruction(
             vstackDiscardAll(tctx);
             _ = b.buildCall(llvm.functionType(llvm.voidType(), &.{}, false), rt.exit_stack, &.{}, "");
             const ret = b.buildCall(
-                llvm.functionType(jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.i64Type(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i64Type() }, false),
+                llvm.functionType(tctx.target.jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), tctx.target.usizeType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), tctx.target.usizeType() }, false),
                 rt.returnUndef,
                 &.{
-                    ctx_p, locs, llvm.constInt64(tctx.local_count),
+                    ctx_p, locs, tctx.target.constUsize(tctx.local_count),
                     tctx.locals_jsv_ptr orelse llvm.constNull(llvm.ptrType()),
                     tctx.var_ref_list_ptr orelse llvm.constNull(llvm.ptrType()),
                     if (tctx.arg_shadow_ptr) |asp| blk: {
                         var si = [_]llvm.Value{ llvm.constInt32(0), llvm.constInt32(0) };
                         break :blk b.buildInBoundsGEP(llvm.arrayType(llvm.i64Type(), tctx.func.arg_count), asp, &si, "asp");
                     } else llvm.constNull(llvm.ptrType()),
-                    llvm.constInt64(if (tctx.has_put_arg) tctx.func.arg_count else 0),
+                    tctx.target.constUsize(if (tctx.has_put_arg) tctx.func.arg_count else 0),
                 },
                 "ret",
             );
@@ -2860,11 +3387,28 @@ fn emitThinInstruction(
         },
 
         // ========== Array operations ==========
+        .array_from => {
+            vstackFlush(tctx);
+            const count: u32 = instr.operand.u16;
+            emitErrorCheck(tctx, b.buildCall(
+                llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false),
+                rt.op_array_from, &.{ ctx_p, stk, sp, llvm.constInt32(@intCast(count)) }, "e",
+            ));
+        },
         .append => { vstackFlush(tctx); callVoid3(b, rt.op_append, ctx_p, stk, sp); arrayCacheInvalidateAll(tctx); },
         .put_array_el => { vstackFlush(tctx); callVoid3(b, rt.op_put_array_el, ctx_p, stk, sp); arrayCacheInvalidateAll(tctx); },
-        .get_array_el => emitVstackGetArrayEl(tctx, false),
-        .get_array_el2 => emitVstackGetArrayEl(tctx, true),
-        .get_length => emitVstackGetLength(tctx),
+        .get_array_el => if (tctx.target.is_wasm32) {
+            vstackFlush(tctx);
+            emitErrorCheck(tctx, b.buildCall(llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false), rt.get_array_el, &.{ ctx_p, stk, sp, locs, llvm.constInt32(0) }, "e"));
+        } else emitVstackGetArrayEl(tctx, false),
+        .get_array_el2 => if (tctx.target.is_wasm32) {
+            vstackFlush(tctx);
+            emitErrorCheck(tctx, b.buildCall(llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false), rt.get_array_el2, &.{ ctx_p, stk, sp, locs, llvm.constInt32(0) }, "e"));
+        } else emitVstackGetArrayEl(tctx, true),
+        .get_length => if (tctx.target.is_wasm32) {
+            vstackFlush(tctx);
+            emitErrorCheck(tctx, b.buildCall(llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false), rt.get_length, &.{ ctx_p, stk, sp, locs, llvm.constInt32(0) }, "e"));
+        } else emitVstackGetLength(tctx),
 
         // ========== add_loc (vstack: int fast path) ==========
         .add_loc => emitVstackAddLoc(tctx, instr.operand.loc),
@@ -2977,6 +3521,37 @@ fn emitThinInstruction(
                 );
                 emitErrorCheck(tctx, err_code);
             }
+        },
+
+        // ========== for...of iterator ops (dedicated runtime, avoids CV↔JSValue round-trip) ==========
+        .for_of_start => {
+            vstackFlush(tctx);
+            if (tctx.for_of_iter_stack_ptr) |isp| {
+                const err_code = b.buildCall(
+                    llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType() }, false),
+                    rt.op_for_of_start, &.{ ctx_p, stk, sp, isp, tctx.for_of_depth_ptr.? }, "err",
+                );
+                emitErrorCheck(tctx, err_code);
+            } else return CodegenError.UnsupportedOpcode;
+        },
+        .for_of_next => {
+            vstackFlush(tctx);
+            if (tctx.for_of_iter_stack_ptr) |isp| {
+                const err_code = b.buildCall(
+                    llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType() }, false),
+                    rt.op_for_of_next, &.{ ctx_p, stk, sp, isp, tctx.for_of_depth_ptr.? }, "err",
+                );
+                emitErrorCheck(tctx, err_code);
+            } else return CodegenError.UnsupportedOpcode;
+        },
+        .iterator_close => {
+            vstackFlush(tctx);
+            if (tctx.for_of_iter_stack_ptr) |isp| {
+                _ = b.buildCall(
+                    llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType() }, false),
+                    rt.op_iterator_close, &.{ ctx_p, stk, sp, isp, tctx.for_of_depth_ptr.? }, "",
+                );
+            } else return CodegenError.UnsupportedOpcode;
         },
 
         // ========== Unsupported — use fallback ==========
@@ -3113,7 +3688,7 @@ fn emitFallbackOpcode(tctx: *ThinCodegenCtx, instr: Instruction) void {
         .get_super, .define_array_el, .set_name_computed, .copy_data_properties,
         .put_var_ref_check,
         .rest, .regexp, .push_bigint_i32,
-        .check_ctor, .init_ctor, .special_object,
+        // check_ctor, init_ctor, special_object need func_obj/new_target — not safe
         .define_method, .define_method_computed,
         .put_ref_value,
         .check_define_var, .define_var, .define_func,
@@ -3152,11 +3727,17 @@ fn emitFallbackOpcode(tctx: *ThinCodegenCtx, instr: Instruction) void {
         else => 0,
     });
 
-    // Build JS_UNDEFINED as {0, JS_TAG_UNDEFINED(3)} for func_obj and new_target
-    const jsv_ty = jsvalueType();
-    var undef_jsv = c.LLVMGetUndef(jsv_ty);
-    undef_jsv = c.LLVMBuildInsertValue(b.ref, undef_jsv, llvm.constInt64(0), 0, "undef0");
-    undef_jsv = c.LLVMBuildInsertValue(b.ref, undef_jsv, llvm.constInt64(3), 1, "undef1"); // JS_TAG_UNDEFINED = 3
+    // Build JS_UNDEFINED for func_obj and new_target
+    const jsv_ty = tctx.target.jsvalueType();
+    const undef_jsv = if (tctx.target.is_wasm32)
+        // NaN-boxed: JS_MKVAL(JS_TAG_UNDEFINED, 0) = (3 << 32)
+        llvm.constInt64(@as(u64, 3) << 32)
+    else blk: {
+        var undef_val = c.LLVMGetUndef(jsv_ty);
+        undef_val = c.LLVMBuildInsertValue(b.ref, undef_val, llvm.constInt64(0), 0, "undef0");
+        undef_val = c.LLVMBuildInsertValue(b.ref, undef_val, llvm.constInt64(3), 1, "undef1");
+        break :blk undef_val;
+    };
 
     // arg_buf: use arg_shadow if available, otherwise null
     const null_ptr = llvm.constNull(llvm.ptrType());
@@ -3289,8 +3870,8 @@ fn emitThinBlockTerminator(
                 // Bool path: check if CV_TRUE (0x7FFA_0000_0001) or CV_FALSE (0x7FFA_0000_0000)
                 b.positionAtEnd(bool_check_bb);
                 const CV_QNAN_BOOL: u64 = 0x7FFA_0000_0000_0000;
-                const tag = b.buildAnd(cond.value, llvm.constInt(llvm.i64Type(), CV_TAG_MASK, false), "btag");
-                const is_bool = b.buildICmp(c.LLVMIntEQ, tag, llvm.constInt(llvm.i64Type(), CV_QNAN_BOOL, false), "isbool");
+                const btag = b.buildAnd(cond.value, llvm.constInt(llvm.i64Type(), CV_TAG_MASK, false), "btag");
+                const is_bool = b.buildICmp(c.LLVMIntEQ, btag, llvm.constInt(llvm.i64Type(), CV_QNAN_BOOL, false), "isbool");
                 const bool_cond_bb = llvm.appendBasicBlock(current_fn, "tb_bcond");
                 _ = b.buildCondBr(is_bool, bool_cond_bb, slow_check_bb);
 
@@ -3346,12 +3927,12 @@ fn emitThinBlockTerminator(
         vstackDiscardAll(tctx);
         _ = b.buildCall(llvm.functionType(llvm.voidType(), &.{}, false), tctx.rt.exit_stack, &.{}, "");
         const ret = b.buildCall(
-            llvm.functionType(jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.i64Type(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i64Type() }, false),
+            llvm.functionType(tctx.target.jsvalueType(), &.{ llvm.ptrType(), llvm.ptrType(), tctx.target.usizeType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), tctx.target.usizeType() }, false),
             tctx.rt.returnUndef,
             &.{
-                tctx.ctx_param, tctx.locals_ptr, llvm.constInt64(tctx.local_count),
+                tctx.ctx_param, tctx.locals_ptr, tctx.target.constUsize(tctx.local_count),
                 llvm.constNull(llvm.ptrType()), llvm.constNull(llvm.ptrType()),
-                llvm.constNull(llvm.ptrType()), llvm.constInt64(0),
+                llvm.constNull(llvm.ptrType()), tctx.target.constUsize(0),
             },
             "ret",
         );
@@ -3510,7 +4091,20 @@ fn emitVstackPushConst(tctx: *ThinCodegenCtx, idx: u32) void {
     vstackPush(tctx, phi, true);
 }
 
+// DEBUG: force specific opcode categories through runtime to isolate inline handler bugs
+const FORCE_RUNTIME_LOCALS = false;
+const FORCE_RUNTIME_STACK_OPS = false;
+
 fn emitVstackGetLoc(tctx: *ThinCodegenCtx, idx: u32) void {
+    if (FORCE_RUNTIME_LOCALS) {
+        vstackFlush(tctx);
+        const b = tctx.builder;
+        _ = b.buildCall(
+            llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false),
+            tctx.rt.get_loc, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, tctx.locals_ptr, llvm.constInt32(@intCast(idx)) }, "",
+        );
+        return;
+    }
     const b = tctx.builder;
     const loc_ptr = inlineLocalSlot(b, tctx.locals_ptr, idx);
     const val = b.buildLoad(llvm.i64Type(), loc_ptr, "locv");
@@ -3520,6 +4114,16 @@ fn emitVstackGetLoc(tctx: *ThinCodegenCtx, idx: u32) void {
 /// put_loc: pop from vstack, store to local, freeRef(old).
 /// If owned, stores directly (ownership transfers). If borrowed, dupRef first.
 fn emitVstackPutLoc(tctx: *ThinCodegenCtx, idx: u32) void {
+    if (FORCE_RUNTIME_LOCALS) {
+        vstackFlush(tctx);
+        const b = tctx.builder;
+        _ = b.buildCall(
+            llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false),
+            tctx.rt.put_loc, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, tctx.locals_ptr, llvm.constInt32(@intCast(idx)) }, "",
+        );
+        vstackInvalidateLocal(tctx, idx);
+        return;
+    }
     const b = tctx.builder;
     const entry = vstackPop(tctx);
 
@@ -3541,6 +4145,16 @@ fn emitVstackPutLoc(tctx: *ThinCodegenCtx, idx: u32) void {
 
 /// set_loc: peek vstack top (don't pop), always dupRef (value stays on vstack AND goes to local).
 fn emitVstackSetLoc(tctx: *ThinCodegenCtx, idx: u32) void {
+    if (FORCE_RUNTIME_LOCALS) {
+        vstackFlush(tctx);
+        const b = tctx.builder;
+        _ = b.buildCall(
+            llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false),
+            tctx.rt.set_loc, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, tctx.locals_ptr, llvm.constInt32(@intCast(idx)) }, "",
+        );
+        vstackInvalidateLocal(tctx, idx);
+        return;
+    }
     const b = tctx.builder;
     const entry = vstackPeek(tctx);
     const duped = inlineDupRef(tctx, entry.value);
@@ -3561,6 +4175,27 @@ fn emitVstackSetLoc(tctx: *ThinCodegenCtx, idx: u32) void {
 /// get_loc_check: load locals[idx], check for UNINITIALIZED, throw TDZ error if so.
 /// Otherwise push to vstack as borrowed (same as get_loc).
 fn emitVstackGetLocCheck(tctx: *ThinCodegenCtx, idx: u32) void {
+    if (FORCE_RUNTIME_LOCALS) {
+        vstackFlush(tctx);
+        const b = tctx.builder;
+        // Inline TDZ check then runtime get_loc (same as emitAllRuntimeInstruction)
+        const loc_ptr = inlineLocalSlot(b, tctx.locals_ptr, idx);
+        const val = b.buildLoad(llvm.i64Type(), loc_ptr, "locv");
+        const is_uninit = b.buildICmp(c.LLVMIntEQ, val, llvm.constInt(llvm.i64Type(), CV_UNINITIALIZED, false), "isuninit");
+        const current_fn = c.LLVMGetBasicBlockParent(c.LLVMGetInsertBlock(b.ref));
+        const tdz_bb = llvm.appendBasicBlock(current_fn, "dtdz_err");
+        const ok_bb = llvm.appendBasicBlock(current_fn, "dtdz_ok");
+        _ = b.buildCondBr(is_uninit, tdz_bb, ok_bb);
+        b.positionAtEnd(tdz_bb);
+        _ = b.buildCall(llvm.functionType(llvm.i32Type(), &.{llvm.ptrType()}, false), tctx.rt.throw_tdz, &.{tctx.ctx_param}, "");
+        _ = b.buildBr(tctx.cleanup_bb);
+        b.positionAtEnd(ok_bb);
+        _ = b.buildCall(
+            llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false),
+            tctx.rt.get_loc, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, tctx.locals_ptr, llvm.constInt32(@intCast(idx)) }, "",
+        );
+        return;
+    }
     const b = tctx.builder;
     const loc_ptr = inlineLocalSlot(b, tctx.locals_ptr, idx);
     const val = b.buildLoad(llvm.i64Type(), loc_ptr, "locv");
@@ -3683,14 +4318,14 @@ fn emitVstackArith(tctx: *ThinCodegenCtx, comptime op: enum { add, sub, mul }, r
         // Write entries to physical stack with proper ref handling
         const lhs_val = if (!lhs.owned) inlineDupRef(tctx, lhs.value) else lhs.value;
         const rhs_val = if (!rhs.owned) inlineDupRef(tctx, rhs.value) else rhs.value;
-        const sp_val = inlineLoadSp(b, tctx.sp_ptr);
+        const sp_val = tctx.loadSp();
         const a_slot = inlineStackSlot(b, tctx.stack_ptr, sp_val);
         _ = b.buildStore(lhs_val, a_slot);
-        const b_slot_idx = b.buildAdd(sp_val, llvm.constInt64(1), "bsi");
+        const b_slot_idx = tctx.spAdd(sp_val, 1, "bsi");
         const b_slot = inlineStackSlot(b, tctx.stack_ptr, b_slot_idx);
         _ = b.buildStore(rhs_val, b_slot);
-        const sp_plus2 = b.buildAdd(sp_val, llvm.constInt64(2), "sp2");
-        inlineStoreSp(b, tctx.sp_ptr, sp_plus2);
+        const sp_plus2 = tctx.spAdd(sp_val, 2, "sp2");
+        tctx.storeSp(sp_plus2);
     }
     // Call runtime (consumes the two stack values, pushes result)
     if (needs_ctx) {
@@ -3699,11 +4334,11 @@ fn emitVstackArith(tctx: *ThinCodegenCtx, comptime op: enum { add, sub, mul }, r
         callVoid2(b, rt_slow, tctx.stack_ptr, tctx.sp_ptr);
     }
     // Pop result from physical stack back to SSA
-    const slow_sp = inlineLoadSp(b, tctx.sp_ptr);
-    const slow_nsp = b.buildSub(slow_sp, llvm.constInt64(1), "snsp");
+    const slow_sp = tctx.loadSp();
+    const slow_nsp = tctx.spSub(slow_sp, 1, "snsp");
     const slow_slot = inlineStackSlot(b, tctx.stack_ptr, slow_nsp);
     const slow_result = b.buildLoad(llvm.i64Type(), slow_slot, "sres");
-    inlineStoreSp(b, tctx.sp_ptr, slow_nsp);
+    tctx.storeSp(slow_nsp);
     const slow_final_bb = c.LLVMGetInsertBlock(b.ref);
     _ = b.buildBr(merge_bb);
 
@@ -3753,22 +4388,22 @@ fn emitVstackCmp(tctx: *ThinCodegenCtx, pred: c.LLVMIntPredicate, rt_slow: llvm.
     {
         const lhs_val = if (!lhs.owned) inlineDupRef(tctx, lhs.value) else lhs.value;
         const rhs_val = if (!rhs.owned) inlineDupRef(tctx, rhs.value) else rhs.value;
-        const sp_val = inlineLoadSp(b, tctx.sp_ptr);
+        const sp_val = tctx.loadSp();
         const a_slot = inlineStackSlot(b, tctx.stack_ptr, sp_val);
         _ = b.buildStore(lhs_val, a_slot);
-        const b_slot_idx = b.buildAdd(sp_val, llvm.constInt64(1), "bsi");
+        const b_slot_idx = tctx.spAdd(sp_val, 1, "bsi");
         const b_slot = inlineStackSlot(b, tctx.stack_ptr, b_slot_idx);
         _ = b.buildStore(rhs_val, b_slot);
-        const sp_plus2 = b.buildAdd(sp_val, llvm.constInt64(2), "sp2");
-        inlineStoreSp(b, tctx.sp_ptr, sp_plus2);
+        const sp_plus2 = tctx.spAdd(sp_val, 2, "sp2");
+        tctx.storeSp(sp_plus2);
     }
     callVoid3(b, rt_slow, tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr);
     // Pop result from physical stack
-    const slow_sp = inlineLoadSp(b, tctx.sp_ptr);
-    const slow_nsp = b.buildSub(slow_sp, llvm.constInt64(1), "snsp");
+    const slow_sp = tctx.loadSp();
+    const slow_nsp = tctx.spSub(slow_sp, 1, "snsp");
     const slow_slot = inlineStackSlot(b, tctx.stack_ptr, slow_nsp);
     const slow_result = b.buildLoad(llvm.i64Type(), slow_slot, "sres");
-    inlineStoreSp(b, tctx.sp_ptr, slow_nsp);
+    tctx.storeSp(slow_nsp);
     const slow_final_bb = c.LLVMGetInsertBlock(b.ref);
     _ = b.buildBr(merge_bb);
 
@@ -3820,22 +4455,22 @@ fn emitVstackEq(tctx: *ThinCodegenCtx, comptime is_eq: bool, rt_slow: llvm.Value
     {
         const lhs_val = if (!lhs.owned) inlineDupRef(tctx, lhs.value) else lhs.value;
         const rhs_val = if (!rhs.owned) inlineDupRef(tctx, rhs.value) else rhs.value;
-        const sp_val = inlineLoadSp(b, tctx.sp_ptr);
+        const sp_val = tctx.loadSp();
         const a_slot = inlineStackSlot(b, tctx.stack_ptr, sp_val);
         _ = b.buildStore(lhs_val, a_slot);
-        const b_slot_idx = b.buildAdd(sp_val, llvm.constInt64(1), "bsi");
+        const b_slot_idx = tctx.spAdd(sp_val, 1, "bsi");
         const b_slot = inlineStackSlot(b, tctx.stack_ptr, b_slot_idx);
         _ = b.buildStore(rhs_val, b_slot);
-        const sp_plus2 = b.buildAdd(sp_val, llvm.constInt64(2), "sp2");
-        inlineStoreSp(b, tctx.sp_ptr, sp_plus2);
+        const sp_plus2 = tctx.spAdd(sp_val, 2, "sp2");
+        tctx.storeSp(sp_plus2);
     }
     callVoid3(b, rt_slow, tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr);
     // Pop result from physical stack
-    const slow_sp = inlineLoadSp(b, tctx.sp_ptr);
-    const slow_nsp = b.buildSub(slow_sp, llvm.constInt64(1), "snsp");
+    const slow_sp = tctx.loadSp();
+    const slow_nsp = tctx.spSub(slow_sp, 1, "snsp");
     const slow_slot = inlineStackSlot(b, tctx.stack_ptr, slow_nsp);
     const slow_result = b.buildLoad(llvm.i64Type(), slow_slot, "sres");
-    inlineStoreSp(b, tctx.sp_ptr, slow_nsp);
+    tctx.storeSp(slow_nsp);
     const slow_final_bb = c.LLVMGetInsertBlock(b.ref);
     _ = b.buildBr(merge_bb);
 
@@ -3909,21 +4544,21 @@ fn emitVstackBitwise(tctx: *ThinCodegenCtx, comptime op: enum { @"and", @"or", x
     {
         const lhs_val = if (!lhs.owned) inlineDupRef(tctx, lhs.value) else lhs.value;
         const rhs_val = if (!rhs.owned) inlineDupRef(tctx, rhs.value) else rhs.value;
-        const sp_val = inlineLoadSp(b, tctx.sp_ptr);
+        const sp_val = tctx.loadSp();
         const a_slot = inlineStackSlot(b, tctx.stack_ptr, sp_val);
         _ = b.buildStore(lhs_val, a_slot);
-        const b_slot_idx = b.buildAdd(sp_val, llvm.constInt64(1), "bsi");
+        const b_slot_idx = tctx.spAdd(sp_val, 1, "bsi");
         const b_slot = inlineStackSlot(b, tctx.stack_ptr, b_slot_idx);
         _ = b.buildStore(rhs_val, b_slot);
-        const sp_plus2 = b.buildAdd(sp_val, llvm.constInt64(2), "sp2");
-        inlineStoreSp(b, tctx.sp_ptr, sp_plus2);
+        const sp_plus2 = tctx.spAdd(sp_val, 2, "sp2");
+        tctx.storeSp(sp_plus2);
     }
     callVoid3(b, rt_slow, tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr);
-    const slow_sp = inlineLoadSp(b, tctx.sp_ptr);
-    const slow_nsp = b.buildSub(slow_sp, llvm.constInt64(1), "snsp");
+    const slow_sp = tctx.loadSp();
+    const slow_nsp = tctx.spSub(slow_sp, 1, "snsp");
     const slow_slot = inlineStackSlot(b, tctx.stack_ptr, slow_nsp);
     const slow_result = b.buildLoad(llvm.i64Type(), slow_slot, "sres");
-    inlineStoreSp(b, tctx.sp_ptr, slow_nsp);
+    tctx.storeSp(slow_nsp);
     const slow_final_bb = c.LLVMGetInsertBlock(b.ref);
     _ = b.buildBr(merge_bb);
 
@@ -3996,21 +4631,21 @@ fn emitVstackDivMod(tctx: *ThinCodegenCtx, comptime is_div: bool, rt_slow: llvm.
         {
             const lhs_val = if (!lhs.owned) inlineDupRef(tctx, lhs.value) else lhs.value;
             const rhs_val = if (!rhs.owned) inlineDupRef(tctx, rhs.value) else rhs.value;
-            const sp_val = inlineLoadSp(b, tctx.sp_ptr);
+            const sp_val = tctx.loadSp();
             const a_slot = inlineStackSlot(b, tctx.stack_ptr, sp_val);
             _ = b.buildStore(lhs_val, a_slot);
-            const b_slot_idx = b.buildAdd(sp_val, llvm.constInt64(1), "bsi");
+            const b_slot_idx = tctx.spAdd(sp_val, 1, "bsi");
             const b_slot = inlineStackSlot(b, tctx.stack_ptr, b_slot_idx);
             _ = b.buildStore(rhs_val, b_slot);
-            const sp_plus2 = b.buildAdd(sp_val, llvm.constInt64(2), "sp2");
-            inlineStoreSp(b, tctx.sp_ptr, sp_plus2);
+            const sp_plus2 = tctx.spAdd(sp_val, 2, "sp2");
+            tctx.storeSp(sp_plus2);
         }
         callVoid3(b, rt_slow, tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr);
-        const slow_sp = inlineLoadSp(b, tctx.sp_ptr);
-        const slow_nsp = b.buildSub(slow_sp, llvm.constInt64(1), "snsp");
+        const slow_sp = tctx.loadSp();
+        const slow_nsp = tctx.spSub(slow_sp, 1, "snsp");
         const slow_slot = inlineStackSlot(b, tctx.stack_ptr, slow_nsp);
         const slow_result = b.buildLoad(llvm.i64Type(), slow_slot, "sres");
-        inlineStoreSp(b, tctx.sp_ptr, slow_nsp);
+        tctx.storeSp(slow_nsp);
         const slow_final_bb = c.LLVMGetInsertBlock(b.ref);
         _ = b.buildBr(merge_bb);
 
@@ -4032,21 +4667,21 @@ fn emitVstackDivMod(tctx: *ThinCodegenCtx, comptime is_div: bool, rt_slow: llvm.
         {
             const lhs_val = if (!lhs.owned) inlineDupRef(tctx, lhs.value) else lhs.value;
             const rhs_val = if (!rhs.owned) inlineDupRef(tctx, rhs.value) else rhs.value;
-            const sp_val = inlineLoadSp(b, tctx.sp_ptr);
+            const sp_val = tctx.loadSp();
             const a_slot = inlineStackSlot(b, tctx.stack_ptr, sp_val);
             _ = b.buildStore(lhs_val, a_slot);
-            const b_slot_idx = b.buildAdd(sp_val, llvm.constInt64(1), "bsi");
+            const b_slot_idx = tctx.spAdd(sp_val, 1, "bsi");
             const b_slot = inlineStackSlot(b, tctx.stack_ptr, b_slot_idx);
             _ = b.buildStore(rhs_val, b_slot);
-            const sp_plus2 = b.buildAdd(sp_val, llvm.constInt64(2), "sp2");
-            inlineStoreSp(b, tctx.sp_ptr, sp_plus2);
+            const sp_plus2 = tctx.spAdd(sp_val, 2, "sp2");
+            tctx.storeSp(sp_plus2);
         }
         callVoid3(b, rt_slow, tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr);
-        const slow_sp = inlineLoadSp(b, tctx.sp_ptr);
-        const slow_nsp = b.buildSub(slow_sp, llvm.constInt64(1), "snsp");
+        const slow_sp = tctx.loadSp();
+        const slow_nsp = tctx.spSub(slow_sp, 1, "snsp");
         const slow_slot = inlineStackSlot(b, tctx.stack_ptr, slow_nsp);
         const slow_result = b.buildLoad(llvm.i64Type(), slow_slot, "sres");
-        inlineStoreSp(b, tctx.sp_ptr, slow_nsp);
+        tctx.storeSp(slow_nsp);
         const slow_final_bb = c.LLVMGetInsertBlock(b.ref);
         _ = b.buildBr(merge_bb);
 
@@ -4129,6 +4764,7 @@ fn emitVstackGetVarRef(tctx: *ThinCodegenCtx, idx: u32) void {
     var phi_vals = [_]llvm.Value{ int_cv, nonint_cv, undef_cv };
     var phi_bbs = [_]llvm.BasicBlock{ int_bb, nonint_final_bb, undef_bb };
     llvm.addIncoming(phi, &phi_vals, &phi_bbs);
+
     vstackPush(tctx, phi, true);
 }
 
@@ -4137,7 +4773,7 @@ fn emitVstackGetVarRef(tctx: *ThinCodegenCtx, idx: u32) void {
 /// On IC miss: fall back to runtime op_get_field_ic (which populates the cache).
 ///
 /// CV object encoding (native x86_64):
-///   QNAN|TAG_PTR|addr = 0x7FFD_xxxx_xxxx_xxxx, ptr in lower 44 bits
+///   QNAN|TAG_PTR|addr = 0x7FFD_xxxx_xxxx_xxxx, ptr in lower 48 bits
 /// JSObject layout: shape at offset 24, prop base at offset 32
 /// IC slot layout: {shape_ptr, offset_u32, atom_u32} (16 bytes)
 /// JSProperty layout: 16 bytes each, JSValue at offset 0
@@ -4179,16 +4815,16 @@ fn emitVstackGetField(tctx: *ThinCodegenCtx, instr: Instruction) void {
     const miss_bb = llvm.appendBasicBlock(current_fn, "gf_miss");
     const merge_bb = llvm.appendBasicBlock(current_fn, "gf_merge");
 
-    // Check if obj is a CV object: (cv & 0xFFFFF00000000000) == 0x7FFD000000000000
-    const CV_OBJ_MASK: u64 = 0xFFFFF00000000000;
+    // Check if obj is a CV object: (cv & TAG_MASK) == CV_QNAN_PTR
+    const CV_OBJ_MASK: u64 = 0xFFFF000000000000;
     const CV_OBJ_TAG: u64 = 0x7FFD000000000000;
     const masked = b.buildAnd(obj_cv, llvm.constInt(i64t, CV_OBJ_MASK, false), "gfmask");
     const is_obj = b.buildICmp(c.LLVMIntEQ, masked, llvm.constInt(i64t, CV_OBJ_TAG, false), "gfobj");
     _ = b.buildCondBr(is_obj, shape_bb, miss_bb);
 
-    // Extract object pointer and load shape (shared by all IC checks)
+    // Extract object pointer (48-bit) and load shape
     b.positionAtEnd(shape_bb);
-    const CV_PTR_ADDR_MASK: u64 = 0x00000FFFFFFFFFFF;
+    const CV_PTR_ADDR_MASK: u64 = 0x0000FFFFFFFFFFFF;
     const obj_addr = b.buildAnd(obj_cv, llvm.constInt(i64t, CV_PTR_ADDR_MASK, false), "oaddr");
     const obj_ptr = b.buildIntToPtr(obj_addr, ptr, "optr");
     const shape_addr = b.buildGEP(llvm.i8Type(), obj_ptr, &.{llvm.constInt64(24)}, "saddr");
@@ -4222,6 +4858,30 @@ fn emitVstackGetField(tctx: *ThinCodegenCtx, instr: Instruction) void {
     const offset_phi = b.buildPhi(i32t, "offphi");
     llvm.addIncoming(offset_phi, &hit_offsets, &hit_from_bbs);
 
+    // ABA validation: check offset < shape->prop_count (at shape+40) to prevent
+    // stale IC offsets from reading beyond valid properties when shape pointers are reused.
+    const prop_count_addr = b.buildGEP(llvm.i8Type(), shape, &.{llvm.constInt64(40)}, "pcaddr");
+    const prop_count_val = b.buildLoad(i32t, prop_count_addr, "pcount");
+    const in_bounds = b.buildICmp(c.LLVMIntULT, offset_phi, prop_count_val, "inbnd");
+    const bounds_ok_bb = llvm.appendBasicBlock(current_fn, "gf_bok");
+    _ = b.buildCondBr(in_bounds, bounds_ok_bb, miss_bb);
+
+    // Also verify shape->prop[offset].atom matches IC's cached atom (double safety).
+    b.positionAtEnd(bounds_ok_bb);
+    const ic_atom_addr = b.buildGEP(llvm.i8Type(), ic_global, &.{llvm.constInt64(48)}, "icaaddr");
+    const ic_atom = b.buildLoad(i32t, ic_atom_addr, "icatom");
+    const off_ext_v = b.buildZExt(offset_phi, i64t, "offextv");
+    const shape_prop_byte = b.buildMul(off_ext_v, llvm.constInt64(8), "spbyte");
+    const shape_prop_base = b.buildGEP(llvm.i8Type(), shape, &.{llvm.constInt64(64)}, "spbase");
+    const shape_prop_ptr = b.buildGEP(llvm.i8Type(), shape_prop_base, &.{shape_prop_byte}, "spptr");
+    const shape_atom_addr = b.buildGEP(llvm.i8Type(), shape_prop_ptr, &.{llvm.constInt64(4)}, "saaddr");
+    const shape_atom = b.buildLoad(i32t, shape_atom_addr, "satom");
+    const atom_ok = b.buildICmp(c.LLVMIntEQ, ic_atom, shape_atom, "atok");
+    const hit_ok_bb = llvm.appendBasicBlock(current_fn, "gf_hitok");
+    _ = b.buildCondBr(atom_ok, hit_ok_bb, miss_bb);
+
+    // Hit path (atom validated): load property value
+    b.positionAtEnd(hit_ok_bb);
     // Load prop_base at offset 32
     const pbase_addr = b.buildGEP(llvm.i8Type(), obj_ptr, &.{llvm.constInt64(32)}, "pbaddr");
     const prop_base = b.buildLoad(ptr, pbase_addr, "pbase");
@@ -4235,15 +4895,16 @@ fn emitVstackGetField(tctx: *ThinCodegenCtx, instr: Instruction) void {
     const is_int = b.buildICmp(c.LLVMIntEQ, tag, llvm.constInt64(0), "pint");
     _ = b.buildCondBr(is_int, hit_int_bb, hit_ni_bb);
 
-    // Hit + int: load i32 payload, make CV int, free old obj
+    // Hit + int: load i32 payload, make CV int, free obj
     b.positionAtEnd(hit_int_bb);
     const payload = b.buildLoad(i32t, prop_addr, "ppay");
     const int_cv = inlineNewInt(b, payload);
+
     if (obj_entry.owned) inlineFreeRef(tctx, obj_cv);
     const int_final_bb = c.LLVMGetInsertBlock(b.ref);
     _ = b.buildBr(merge_bb);
 
-    // Hit + non-int: call jsvalue_to_cv for dup + conversion, free old obj
+    // Hit + non-int: call jsvalue_to_cv for dup + conversion, free obj
     b.positionAtEnd(hit_ni_bb);
     const ni_cv = b.buildCall(
         llvm.functionType(i64t, &.{ ptr, ptr, i32t }, false),
@@ -4257,11 +4918,11 @@ fn emitVstackGetField(tctx: *ThinCodegenCtx, instr: Instruction) void {
     b.positionAtEnd(miss_bb);
     {
         const obj_to_store = if (!obj_entry.owned) inlineDupRef(tctx, obj_cv) else obj_cv;
-        const sp_val = inlineLoadSp(b, tctx.sp_ptr);
+        const sp_val = tctx.loadSp();
         const slot = inlineStackSlot(b, tctx.stack_ptr, sp_val);
         _ = b.buildStore(obj_to_store, slot);
-        const sp_plus1 = b.buildAdd(sp_val, llvm.constInt64(1), "sp1");
-        inlineStoreSp(b, tctx.sp_ptr, sp_plus1);
+        const sp_plus1 = tctx.spAdd(sp_val, 1, "sp1");
+        tctx.storeSp(sp_plus1);
     }
     const err_code = b.buildCall(
         llvm.functionType(i32t, &.{ ptr, ptr, ptr, ptr, ptr }, false),
@@ -4272,11 +4933,11 @@ fn emitVstackGetField(tctx: *ThinCodegenCtx, instr: Instruction) void {
     _ = b.buildCondBr(is_err, tctx.cleanup_bb, miss_ok_bb);
 
     b.positionAtEnd(miss_ok_bb);
-    const miss_sp = inlineLoadSp(b, tctx.sp_ptr);
-    const miss_nsp = b.buildSub(miss_sp, llvm.constInt64(1), "mnsp");
+    const miss_sp = tctx.loadSp();
+    const miss_nsp = tctx.spSub(miss_sp, 1, "mnsp");
     const miss_slot = inlineStackSlot(b, tctx.stack_ptr, miss_nsp);
     const miss_result = b.buildLoad(i64t, miss_slot, "mres");
-    inlineStoreSp(b, tctx.sp_ptr, miss_nsp);
+    tctx.storeSp(miss_nsp);
     const miss_final_bb = c.LLVMGetInsertBlock(b.ref);
     _ = b.buildBr(merge_bb);
 
@@ -4286,6 +4947,7 @@ fn emitVstackGetField(tctx: *ThinCodegenCtx, instr: Instruction) void {
     var phi_vals = [_]llvm.Value{ int_cv, ni_cv, miss_result };
     var phi_bbs = [_]llvm.BasicBlock{ int_final_bb, ni_final_bb, miss_final_bb };
     llvm.addIncoming(phi, &phi_vals, &phi_bbs);
+
     vstackPush(tctx, phi, true);
 }
 
@@ -4316,8 +4978,8 @@ fn emitVstackGetField2(tctx: *ThinCodegenCtx, instr: Instruction) void {
     vstackFlush(tctx);
 
     // Load obj from physical stack[sp-1] (peek, don't pop)
-    const sp_val = inlineLoadSp(b, tctx.sp_ptr);
-    const obj_sp = b.buildSub(sp_val, llvm.constInt64(1), "objsp");
+    const sp_val = tctx.loadSp();
+    const obj_sp = tctx.spSub(sp_val, 1, "objsp");
     const obj_slot = inlineStackSlot(b, tctx.stack_ptr, obj_sp);
     const obj_cv = b.buildLoad(i64t, obj_slot, "objcv");
 
@@ -4335,16 +4997,16 @@ fn emitVstackGetField2(tctx: *ThinCodegenCtx, instr: Instruction) void {
     const miss_bb = llvm.appendBasicBlock(current_fn, "gf2_miss");
     const merge_bb = llvm.appendBasicBlock(current_fn, "gf2_merge");
 
-    // Check if obj is a CV object: (cv & 0xFFFFF00000000000) == 0x7FFD000000000000
-    const CV_OBJ_MASK: u64 = 0xFFFFF00000000000;
+    // Check if obj is a CV object: (cv & TAG_MASK) == CV_QNAN_PTR
+    const CV_OBJ_MASK: u64 = 0xFFFF000000000000;
     const CV_OBJ_TAG: u64 = 0x7FFD000000000000;
     const masked = b.buildAnd(obj_cv, llvm.constInt(i64t, CV_OBJ_MASK, false), "gf2mask");
     const is_obj = b.buildICmp(c.LLVMIntEQ, masked, llvm.constInt(i64t, CV_OBJ_TAG, false), "gf2obj");
     _ = b.buildCondBr(is_obj, shape_bb, miss_bb);
 
-    // Extract object pointer and load shape
+    // Extract object pointer (48-bit) and load shape
     b.positionAtEnd(shape_bb);
-    const CV_PTR_ADDR_MASK: u64 = 0x00000FFFFFFFFFFF;
+    const CV_PTR_ADDR_MASK: u64 = 0x0000FFFFFFFFFFFF;
     const obj_addr = b.buildAnd(obj_cv, llvm.constInt(i64t, CV_PTR_ADDR_MASK, false), "o2addr");
     const obj_ptr = b.buildIntToPtr(obj_addr, ptr, "o2ptr");
     const shape_addr = b.buildGEP(llvm.i8Type(), obj_ptr, &.{llvm.constInt64(24)}, "s2addr");
@@ -4374,6 +5036,29 @@ fn emitVstackGetField2(tctx: *ThinCodegenCtx, instr: Instruction) void {
     const offset_phi = b.buildPhi(i32t, "off2phi");
     llvm.addIncoming(offset_phi, &hit_offsets, &hit_from_bbs);
 
+    // ABA validation: bounds check offset < shape->prop_count (at shape+40)
+    const prop_count_addr2 = b.buildGEP(llvm.i8Type(), shape, &.{llvm.constInt64(40)}, "pc2addr");
+    const prop_count_val2 = b.buildLoad(i32t, prop_count_addr2, "pc2ount");
+    const in_bounds2 = b.buildICmp(c.LLVMIntULT, offset_phi, prop_count_val2, "inb2nd");
+    const bounds_ok_bb2 = llvm.appendBasicBlock(current_fn, "gf2_bok");
+    _ = b.buildCondBr(in_bounds2, bounds_ok_bb2, miss_bb);
+
+    // Also verify shape->prop[offset].atom matches IC's cached atom (double safety).
+    b.positionAtEnd(bounds_ok_bb2);
+    const ic_atom_addr2 = b.buildGEP(llvm.i8Type(), ic_global, &.{llvm.constInt64(48)}, "ica2addr");
+    const ic_atom2 = b.buildLoad(i32t, ic_atom_addr2, "ica2tom");
+    const off_ext_v2 = b.buildZExt(offset_phi, i64t, "oev2");
+    const sp_byte2 = b.buildMul(off_ext_v2, llvm.constInt64(8), "spb2");
+    const sp_base2 = b.buildGEP(llvm.i8Type(), shape, &.{llvm.constInt64(64)}, "spb2ase");
+    const sp_ptr2 = b.buildGEP(llvm.i8Type(), sp_base2, &.{sp_byte2}, "spp2tr");
+    const sa_addr2 = b.buildGEP(llvm.i8Type(), sp_ptr2, &.{llvm.constInt64(4)}, "saa2dr");
+    const sa2 = b.buildLoad(i32t, sa_addr2, "sa2");
+    const atom_ok2 = b.buildICmp(c.LLVMIntEQ, ic_atom2, sa2, "atok2");
+    const hit_ok_bb2 = llvm.appendBasicBlock(current_fn, "gf2_hitok");
+    _ = b.buildCondBr(atom_ok2, hit_ok_bb2, miss_bb);
+
+    // Hit path (atom validated): load property value
+    b.positionAtEnd(hit_ok_bb2);
     // Load prop_base at offset 32 and GEP to property
     const pbase_addr = b.buildGEP(llvm.i8Type(), obj_ptr, &.{llvm.constInt64(32)}, "pb2addr");
     const prop_base = b.buildLoad(ptr, pbase_addr, "pbase2");
@@ -4414,11 +5099,11 @@ fn emitVstackGetField2(tctx: *ThinCodegenCtx, instr: Instruction) void {
 
     // Miss OK: read result from stack[sp-1] (op_get_field2_ic pushed it), pop back to vstack
     b.positionAtEnd(miss_ok_bb);
-    const miss_sp = inlineLoadSp(b, tctx.sp_ptr);
-    const miss_nsp = b.buildSub(miss_sp, llvm.constInt64(1), "m2nsp");
+    const miss_sp = tctx.loadSp();
+    const miss_nsp = tctx.spSub(miss_sp, 1, "m2nsp");
     const miss_slot = inlineStackSlot(b, tctx.stack_ptr, miss_nsp);
     const miss_result = b.buildLoad(i64t, miss_slot, "m2res");
-    inlineStoreSp(b, tctx.sp_ptr, miss_nsp);
+    tctx.storeSp(miss_nsp);
     const miss_final_bb = c.LLVMGetInsertBlock(b.ref);
     _ = b.buildBr(merge_bb);
 
@@ -4713,14 +5398,14 @@ fn emitVstackGetArrayEl(tctx: *ThinCodegenCtx, keep_array: bool) void {
     {
         const arr_val = if (!arr_entry.owned) inlineDupRef(tctx, arr_entry.value) else arr_entry.value;
         const idx_val = if (!idx_entry.owned) inlineDupRef(tctx, idx_entry.value) else idx_entry.value;
-        const sp_val = inlineLoadSp(b, tctx.sp_ptr);
+        const sp_val = tctx.loadSp();
         const arr_slot = inlineStackSlot(b, tctx.stack_ptr, sp_val);
         _ = b.buildStore(arr_val, arr_slot);
-        const idx_slot_pos = b.buildAdd(sp_val, llvm.constInt64(1), "isi");
+        const idx_slot_pos = tctx.spAdd(sp_val, 1, "isi");
         const idx_slot = inlineStackSlot(b, tctx.stack_ptr, idx_slot_pos);
         _ = b.buildStore(idx_val, idx_slot);
-        const sp_plus2 = b.buildAdd(sp_val, llvm.constInt64(2), "sp2");
-        inlineStoreSp(b, tctx.sp_ptr, sp_plus2);
+        const sp_plus2 = tctx.spAdd(sp_val, 2, "sp2");
+        tctx.storeSp(sp_plus2);
     }
     const err_code = b.buildCall(
         llvm.functionType(i32t, &.{ ptr_t, ptr_t, ptr_t, ptr_t, i32t }, false),
@@ -4728,11 +5413,11 @@ fn emitVstackGetArrayEl(tctx: *ThinCodegenCtx, keep_array: bool) void {
     );
     emitErrorCheck(tctx, err_code);
     // Pop result from physical stack
-    const slow_sp = inlineLoadSp(b, tctx.sp_ptr);
-    const slow_nsp = b.buildSub(slow_sp, llvm.constInt64(1), "snsp");
+    const slow_sp = tctx.loadSp();
+    const slow_nsp = tctx.spSub(slow_sp, 1, "snsp");
     const slow_slot = inlineStackSlot(b, tctx.stack_ptr, slow_nsp);
     const slow_result = b.buildLoad(i64t, slow_slot, "sres");
-    inlineStoreSp(b, tctx.sp_ptr, slow_nsp);
+    tctx.storeSp(slow_nsp);
     const slow_final_bb = c.LLVMGetInsertBlock(b.ref);
     _ = b.buildBr(merge_bb);
 
@@ -4861,22 +5546,22 @@ fn emitVstackGetLength(tctx: *ThinCodegenCtx) void {
     b.positionAtEnd(slow_bb);
     {
         const arr_val = if (!arr_entry.owned) inlineDupRef(tctx, arr_entry.value) else arr_entry.value;
-        const sp_val = inlineLoadSp(b, tctx.sp_ptr);
+        const sp_val = tctx.loadSp();
         const arr_slot = inlineStackSlot(b, tctx.stack_ptr, sp_val);
         _ = b.buildStore(arr_val, arr_slot);
-        const sp_plus1 = b.buildAdd(sp_val, llvm.constInt64(1), "sp1");
-        inlineStoreSp(b, tctx.sp_ptr, sp_plus1);
+        const sp_plus1 = tctx.spAdd(sp_val, 1, "sp1");
+        tctx.storeSp(sp_plus1);
     }
     const err_code = b.buildCall(
         llvm.functionType(i32t, &.{ ptr_t, ptr_t, ptr_t, ptr_t, i32t }, false),
         rt.get_length, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, tctx.locals_ptr, llvm.constInt32(@intCast(tctx.func.var_count)) }, "err",
     );
     emitErrorCheck(tctx, err_code);
-    const slow_sp = inlineLoadSp(b, tctx.sp_ptr);
-    const slow_nsp = b.buildSub(slow_sp, llvm.constInt64(1), "snsp");
+    const slow_sp = tctx.loadSp();
+    const slow_nsp = tctx.spSub(slow_sp, 1, "snsp");
     const slow_slot = inlineStackSlot(b, tctx.stack_ptr, slow_nsp);
     const slow_result = b.buildLoad(i64t, slow_slot, "sres");
-    inlineStoreSp(b, tctx.sp_ptr, slow_nsp);
+    tctx.storeSp(slow_nsp);
     const slow_final_bb = c.LLVMGetInsertBlock(b.ref);
     _ = b.buildBr(merge_bb);
 
@@ -4957,11 +5642,11 @@ fn emitVstackAddLoc(tctx: *ThinCodegenCtx, idx: u32) void {
     b.positionAtEnd(slow_bb);
     {
         const v = if (!val_entry.owned) inlineDupRef(tctx, val_entry.value) else val_entry.value;
-        const sp_val = inlineLoadSp(b, tctx.sp_ptr);
+        const sp_val = tctx.loadSp();
         const slot = inlineStackSlot(b, tctx.stack_ptr, sp_val);
         _ = b.buildStore(v, slot);
-        const sp_plus1 = b.buildAdd(sp_val, llvm.constInt64(1), "sp1");
-        inlineStoreSp(b, tctx.sp_ptr, sp_plus1);
+        const sp_plus1 = tctx.spAdd(sp_val, 1, "sp1");
+        tctx.storeSp(sp_plus1);
     }
     const err_code = b.buildCall(
         llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false),

@@ -107,6 +107,8 @@ pub fn build(b: *std.Build) void {
         "-fno-vectorize", // Disable auto-vectorization
         "-fno-slp-vectorize", // Disable SLP vectorization
         "-fno-unroll-loops", // Disable loop unrolling
+        "-DQJS_DISABLE_PARSER", // No parser needed — bytecode is pre-compiled
+        // CONFIG_ATOMICS already disabled for __wasi__ targets (quickjs.c:75)
         // BigInt enabled - required for TypeScript and modern JS
     };
 
@@ -387,7 +389,7 @@ pub fn build(b: *std.Build) void {
     wasm_static_exe.max_memory = 4 * 1024 * 1024 * 1024; // 4GB max
     wasm_static_exe.stack_size = 128 * 1024 * 1024; // 128MB stack (very deep promise chains in reactive SDK)
 
-    wasm_static_exe.rdynamic = true;
+    wasm_static_exe.rdynamic = false; // Don't export all symbols — saves ~100KB in WASM
     wasm_static_exe.root_module.addIncludePath(b.path(quickjs_dir));
 
     // Embed bytecode via @embedFile (requires -Dbytecode=path/to/bundle.bin)
@@ -505,6 +507,34 @@ pub fn build(b: *std.Build) void {
 
         if (wasm_shard_count > 0) {
             std.debug.print("[build] Compiling {d} WASM frozen shards as separate object files\n", .{wasm_shard_count});
+        }
+
+        // Discover and link LLVM-generated WASM .o shard files
+        var wasm_llvm_shard_count: usize = 0;
+        while (true) : (wasm_llvm_shard_count += 1) {
+            const llvm_wasm_obj_path = b.fmt("{s}/frozen_llvm_shard_wasm_{d}.o", .{ wasm_shard_dir, wasm_llvm_shard_count });
+            if (std.fs.cwd().access(llvm_wasm_obj_path, .{})) |_| {
+                wasm_static_exe.addObjectFile(.{ .cwd_relative = llvm_wasm_obj_path });
+            } else |_| {
+                break;
+            }
+        }
+        if (wasm_llvm_shard_count > 0) {
+            std.debug.print("[build] Linking {d} LLVM WASM frozen shard .o files\n", .{wasm_llvm_shard_count});
+
+            // Compile llvm_runtime_exports.zig for WASM target
+            const wasm_llvm_rt_exports_mod = b.createModule(.{
+                .root_source_file = b.path("src/freeze/llvm_runtime_exports.zig"),
+                .target = wasm_target,
+                .optimize = frozen_optimize,
+            });
+            wasm_llvm_rt_exports_mod.addImport("zig_runtime", zig_runtime_mod);
+            wasm_llvm_rt_exports_mod.addIncludePath(b.path(quickjs_dir));
+            const wasm_llvm_rt_exports_obj = b.addObject(.{
+                .name = "wasm_llvm_runtime_exports",
+                .root_module = wasm_llvm_rt_exports_mod,
+            });
+            wasm_static_exe.addObject(wasm_llvm_rt_exports_obj);
         }
     }
 

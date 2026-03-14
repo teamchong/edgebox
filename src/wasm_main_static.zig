@@ -29,14 +29,14 @@ const crypto_polyfill = @import("polyfills/crypto.zig");
 const require_polyfill = @import("polyfills/require.zig");
 // const compression_polyfill = @import("polyfills/compression.zig"); // TODO: Zig std.compress incomplete for wasm32
 
-// Native dispatch - provides frozen_dispatch_lookup and frozen_dispatch_lookup_bytecode
+// Native dispatch - provides index-based frozen function dispatch
 // These are called by QuickJS for frozen function dispatch
 const native_dispatch = @import("native_dispatch");
 
 // Force export of native_dispatch symbols for C linkage
 comptime {
-    _ = &native_dispatch.frozen_dispatch_lookup;
-    _ = &native_dispatch.frozen_dispatch_lookup_bytecode;
+    _ = &native_dispatch.frozen_dispatch_get_by_index;
+    _ = &native_dispatch.frozen_dispatch_is_enabled;
 }
 
 // WASM stubs for native registry functions (used by frozen_module)

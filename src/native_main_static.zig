@@ -84,10 +84,9 @@ comptime {
 const native_dispatch = @import("native_dispatch");
 comptime {
     // Force linker to include these symbols - called by QuickJS C code
-    _ = &native_dispatch.frozen_dispatch_lookup;
-    _ = &native_dispatch.frozen_dispatch_lookup_bytecode;
+    _ = &native_dispatch.frozen_dispatch_get_by_index;
+    _ = &native_dispatch.frozen_dispatch_is_enabled;
     _ = &native_dispatch.frozen_dispatch_count;
-    _ = &native_dispatch.frozen_dispatch_check_and_reset;
 }
 
 // Call profiling for PGO (Profile-Guided Optimization)

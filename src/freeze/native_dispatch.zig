@@ -1,16 +1,16 @@
 //! Native Frozen Function Dispatch
 //!
-//! Provides a fast hash table lookup for frozen functions, called directly
+//! Provides O(1) index-based lookup for frozen functions, called directly
 //! from the QuickJS bytecode interpreter (JS_CallInternal) via C FFI.
 //!
-//! This eliminates the overhead of JS property lookups (globalThis.__frozen_NAME)
-//! by doing the dispatch in native code before bytecode execution.
-//!
-//! Uses arena allocator + wyhash for efficient dynamic allocation and fast lookups.
+//! Each frozen function is assigned a stable index at compile time (its position
+//! in the module parser's function list). During bytecode deserialization,
+//! JS_ReadFunctionTag stores the same counter as frozen_func_index in each
+//! JSFunctionBytecode. At call time, a flat array lookup replaces the old
+//! string hash table, eliminating hashing overhead and duplicate-key issues.
 
 const std = @import("std");
 const zig_runtime = @import("zig_runtime");
-const hashmap_helper = @import("hashmap_helper");
 
 const JSContext = zig_runtime.JSContext;
 const JSValue = zig_runtime.JSValue;
@@ -20,186 +20,76 @@ const qjs = zig_runtime.quickjs;
 // WASM32 detection - same as in js_value.zig
 const is_wasm32 = @sizeOf(*anyopaque) == 4;
 
-// Debug flag for fclosure registration logging
-const FCLOSURE_DEBUG = false;
-
-// Note: Cpool traversal FFI functions removed (js_frozen_get_cpool_info, js_frozen_get_cpool_func_bytecode,
-// js_frozen_get_bytecode_name_line) - they caused bytecode collisions when multiple functions had the
-// same name@line key. Now we only register functions directly via name dispatch, not cpool traversal.
-
 /// C function pointer type for frozen functions (includes var_refs and cpool for closure/fclosure support)
 pub const FrozenFnPtr = *const fn (*JSContext, JSValue, c_int, [*]JSValue, ?[*]*JSVarRef, c_int, ?[*]JSValue) callconv(.c) JSValue;
 
 // ============================================================================
-// Arena-backed registries using wyhash for fast lookup
+// Index-based registry: flat array indexed by parser function ordinal
 // ============================================================================
 
-/// Arena allocator for all registry allocations - freed all at once on clear()
+/// Arena allocator for registry allocations - freed all at once on clear()
 var arena: ?std.heap.ArenaAllocator = null;
 
-/// Name-based registry: name@line -> FrozenFnPtr (uses wyhash for fast lookups)
-var name_registry: ?hashmap_helper.StringHashMap(FrozenFnPtr) = null;
+/// Flat array: index → FrozenFnPtr (null = not frozen)
+var index_array: ?[]?FrozenFnPtr = null;
 
-/// Bytecode pointer registry: *anyopaque -> FrozenFnPtr (uses wyhash for fast lookups)
-var bytecode_registry: ?hashmap_helper.PointerHashMap(*anyopaque, FrozenFnPtr) = null;
+/// Current capacity of index_array
+var index_capacity: usize = 0;
 
-/// Initialize the registries with arena allocator
+/// Initialize the registry
 fn ensureInit() void {
     if (arena == null) {
         arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        const alloc = arena.?.allocator();
-        name_registry = hashmap_helper.StringHashMap(FrozenFnPtr).init(alloc);
-        bytecode_registry = hashmap_helper.PointerHashMap(*anyopaque, FrozenFnPtr).init(alloc);
     }
 }
 
-/// Register a function by bytecode pointer (only the function itself, no cpool traversal)
-/// Note: We removed cpool traversal because it caused bytecode collisions when multiple
-/// functions have the same name@line key but different closure requirements.
-/// Functions are now only dispatchable:
-/// 1. Via name dispatch (first call) - registers bytecode -> frozen func
-/// 2. Via bytecode dispatch (subsequent calls after name dispatch)
-fn registerFunctionOnly(bytecode_ptr: *anyopaque, func: FrozenFnPtr) void {
-    // Only register if not already registered
-    if (lookupByBytecode(bytecode_ptr) == null) {
-        registerByBytecode(bytecode_ptr, func);
-    }
-}
-
-// Flag to indicate frozen dispatch just happened - allows callers to fix return value
-var g_frozen_dispatch_occurred: bool = false;
-
-/// Check if frozen dispatch just occurred (and reset the flag)
-pub export fn frozen_dispatch_check_and_reset() callconv(.c) c_int {
-    const result = g_frozen_dispatch_occurred;
-    g_frozen_dispatch_occurred = false;
-    return if (result) 1 else 0;
-}
-
-/// Register a frozen function by its bytecode pointer
-/// Called after bytecode is loaded when we know the actual bytecode address
-pub fn registerByBytecode(bytecode_ptr: *anyopaque, func: FrozenFnPtr) void {
+/// Ensure index_array can hold at least `idx + 1` entries
+fn ensureCapacity(idx: u32) void {
     ensureInit();
-    // Only debug print for problematic patterns (functions expecting closures registered for bytecode with 0 closures)
-    bytecode_registry.?.put(bytecode_ptr, func) catch {
-        std.debug.print("[native_dispatch] Failed to register bytecode function\n", .{});
-    };
-}
+    const needed = @as(usize, idx) + 1;
+    if (index_array != null and needed <= index_capacity) return;
 
-/// Register a bytecode function from cpool with its corresponding frozen function
-/// Called from frozen functions when creating closures (fclosure opcode)
-/// @param bfunc - The bytecode JSValue from cpool
-/// @param func - The frozen function pointer to register
-pub fn registerCpoolBytecode(bfunc: JSValue, func: FrozenFnPtr) void {
-    // Extract bytecode pointer from JSValue
-    const bytecode_ptr = qjs.js_get_function_bytecode_ptr(bfunc);
-    if (bytecode_ptr) |ptr| {
-        // Only register if not already registered
-        if (lookupByBytecode(ptr) == null) {
-            registerByBytecode(ptr, func);
-        }
-    }
-}
-
-/// Register a bytecode function from cpool by looking up the frozen function by name
-/// Called from frozen functions when creating closures (fclosure opcode)
-/// This allows cross-shard registration without direct function pointer references
-/// @param bfunc - The bytecode JSValue from cpool
-/// @param name - The name@line_num key to look up the frozen function
-pub export fn registerCpoolBytecodeByName(bfunc: JSValue, name: [*:0]const u8) callconv(.c) void {
-    // Skip if dispatch is not enabled yet
-    if (!dispatch_enabled) return;
-
-    // Convert to slice
-    var len: usize = 0;
-    while (name[len] != 0) : (len += 1) {}
-    const name_slice = name[0..len];
-
-    // Look up the frozen function by name, handling naming convention mismatch:
-    // Old shards use "anonymous@lineNum" but registration uses "@lineNum" (empty name).
-    // Try the exact name first, then strip "anonymous" prefix if needed.
-    const func = lookup(name) orelse blk: {
-        // If name starts with "anonymous@", try looking up with just "@lineNum"
-        if (std.mem.startsWith(u8, name_slice, "anonymous@")) {
-            const stripped = name_slice["anonymous".len..]; // "@lineNum"
-            if (name_registry) |*reg| {
-                break :blk reg.get(stripped);
-            }
-        }
-        break :blk null;
-    };
-
-    if (func == null) {
-        // Debug: name not found
-        if (FCLOSURE_DEBUG) {
-            std.debug.print("[fclosure] Name not found: {s}\n", .{name_slice});
-        }
-        return;
-    }
-
-    // Extract bytecode pointer from JSValue and register
-    const bytecode_ptr = qjs.js_get_function_bytecode_ptr(bfunc);
-    if (bytecode_ptr) |ptr| {
-        // Only register if not already registered
-        if (lookupByBytecode(ptr) == null) {
-            registerByBytecode(ptr, func.?);
-            if (FCLOSURE_DEBUG) {
-                std.debug.print("[fclosure] Registered bytecode {*} -> {s}\n", .{ ptr, name_slice });
-            }
-        }
-    } else {
-        if (FCLOSURE_DEBUG) {
-            std.debug.print("[fclosure] Could not get bytecode ptr for {s}\n", .{name_slice});
-        }
-    }
-}
-
-/// Lookup a frozen function by bytecode pointer
-fn lookupByBytecode(bytecode_ptr: *anyopaque) ?FrozenFnPtr {
-    if (bytecode_registry) |*reg| {
-        return reg.get(bytecode_ptr);
-    }
-    return null;
-}
-
-/// Register a frozen function in the native registry
-/// Called from frozen_init during startup
-/// Exported as native_dispatch_register for shards to call via extern linkage
-pub fn register(name: [*:0]const u8, func: FrozenFnPtr) callconv(.c) void {
-    ensureInit();
     const alloc = arena.?.allocator();
+    const new_cap = @max(needed, index_capacity * 2, 256);
 
-    // Convert null-terminated string to slice and dupe for arena ownership
-    var len: usize = 0;
-    while (name[len] != 0) : (len += 1) {}
-    const name_slice = name[0..len];
-
-    const owned_name = alloc.dupe(u8, name_slice) catch {
-        std.debug.print("[native_dispatch] Failed to allocate name: {s}\n", .{name_slice});
-        return;
-    };
-
-    name_registry.?.put(owned_name, func) catch {
-        std.debug.print("[native_dispatch] Failed to register: {s}\n", .{name_slice});
-    };
+    if (index_array) |old| {
+        const new_arr = alloc.alloc(?FrozenFnPtr, new_cap) catch return;
+        @memcpy(new_arr[0..old.len], old);
+        @memset(new_arr[old.len..], null);
+        index_array = new_arr;
+    } else {
+        const new_arr = alloc.alloc(?FrozenFnPtr, new_cap) catch return;
+        @memset(new_arr, null);
+        index_array = new_arr;
+    }
+    index_capacity = new_cap;
 }
 
-// Export functions for shards to call via extern linkage
-// This avoids compiling all of native_dispatch into each shard
-comptime {
-    @export(&register, .{ .name = "native_dispatch_register" });
-    @export(&registerCpoolBytecodeByName, .{ .name = "native_dispatch_registerCpoolBytecodeByName" });
+/// Register a frozen function by its parser index
+/// Called from LLVM shard init functions during startup
+pub fn registerByIndex(idx: u32, func: FrozenFnPtr) callconv(.c) void {
+    ensureCapacity(idx);
+    if (index_array) |arr| {
+        if (idx < arr.len) {
+            arr[idx] = func;
+        }
+    }
 }
 
-/// Lookup a frozen function by name
-/// Returns null if not found
-fn lookup(name: [*:0]const u8) ?FrozenFnPtr {
-    if (name_registry) |*reg| {
-        var len: usize = 0;
-        while (name[len] != 0) : (len += 1) {}
-        return reg.get(name[0..len]);
+/// Lookup a frozen function by parser index
+/// Returns the function pointer or null if not frozen
+fn lookupByIndex(idx: u32) ?FrozenFnPtr {
+    if (index_array) |arr| {
+        if (idx < arr.len) {
+            return arr[idx];
+        }
     }
     return null;
+}
+
+// Export for LLVM shards to call via extern linkage
+comptime {
+    @export(&registerByIndex, .{ .name = "native_dispatch_register_by_index" });
 }
 
 /// Flag to enable/disable frozen dispatch (set after init complete)
@@ -208,6 +98,25 @@ var dispatch_enabled: bool = false;
 /// Enable frozen dispatch (called after frozen_init completes)
 pub fn enableDispatch() void {
     dispatch_enabled = true;
+    // Debug: print registration stats
+    if (index_array) |arr| {
+        var count: usize = 0;
+        var max_idx: usize = 0;
+        for (arr, 0..) |entry, i| {
+            if (entry != null) {
+                count += 1;
+                max_idx = i;
+            }
+        }
+        std.debug.print("[dispatch] Enabled: {d} functions registered, max_index={d}, capacity={d}\n", .{ count, max_idx, index_capacity });
+    } else {
+        std.debug.print("[dispatch] Enabled: no functions registered\n", .{});
+    }
+}
+
+/// Check if frozen dispatch is enabled (exported for C to avoid caching misses during init)
+pub export fn frozen_dispatch_is_enabled() callconv(.c) c_int {
+    return if (dispatch_enabled) 1 else 0;
 }
 
 /// Disable frozen dispatch (for fallback mode)
@@ -219,121 +128,23 @@ pub fn disableDispatch() void {
 // C FFI - Called from QuickJS JS_CallInternal
 // ============================================================================
 
-/// Lookup and call a frozen function if one exists for the given name
-/// Called from JS_CallInternal before executing bytecode
-/// Returns: 1 if frozen function was called (result in *result_out), 0 if not found
-///
-/// This is the hot path - must be as fast as possible
-/// Uses name@line_num format to disambiguate functions with the same name in different scopes
-pub export fn frozen_dispatch_lookup(
-    ctx: *JSContext,
-    func_name: [*:0]const u8,
-    this_val: JSValue,
-    argc: c_int,
-    argv: [*]JSValue,
-    var_refs: ?[*]*JSVarRef,
-    closure_var_count: c_int,
-    cpool: ?[*]JSValue,
-    bytecode_ptr: ?*anyopaque,
-    result_out: *JSValue,
-) callconv(.c) c_int {
-    // Skip if dispatch is not enabled yet (during initialization)
-    if (!dispatch_enabled) return 0;
-
-    // Lookup frozen function by name@line_num key
-    const func = lookup(func_name) orelse {
-        return 0;
-    };
-
-    // Register this function by bytecode pointer for future bytecode-based dispatch
-    // Only registers this specific function, NOT cpool entries (to avoid bytecode collisions)
-    if (bytecode_ptr) |bptr| {
-        registerFunctionOnly(bptr, func);
-    }
-
-    // Call the frozen function with var_refs and cpool for closure/fclosure support
-    if (is_wasm32) {
-        // On WASM32, LLVM FastISel corrupts u64 returns. The frozen function writes
-        // its result to split globals before returning. We read the two u32s separately
-        // and reconstruct the JSValue to avoid any u64 operations.
-        _ = func(ctx, this_val, argc, argv, var_refs, closure_var_count, cpool);
-        // Read split globals and reconstruct JSValue
-        const lo = zig_runtime.g_return_slot_lo.*;
-        const hi = zig_runtime.g_return_slot_hi.*;
-        const result_words: *[2]u32 = @ptrCast(@alignCast(result_out));
-        result_words[0] = lo;
-        result_words[1] = hi;
-        // Set flag so callers can fix the return value
-        g_frozen_dispatch_occurred = true;
-    } else {
-        result_out.* = func(ctx, this_val, argc, argv, var_refs, closure_var_count, cpool);
-    }
-    return 1;
-}
-
-/// Lookup and call a frozen function by bytecode pointer
-/// Called from JS_CallInternal when executing a bytecode function
-/// This is the closure-aware dispatch path - var_refs is extracted from the function object
-/// Returns: 1 if frozen function was called (result in *result_out), 0 if not found
-pub export fn frozen_dispatch_lookup_bytecode(
-    ctx: *JSContext,
-    bytecode_ptr: *anyopaque,
-    this_val: JSValue,
-    argc: c_int,
-    argv: [*]JSValue,
-    var_refs: ?[*]*JSVarRef, // Extracted from JSFunctionBytecode in QuickJS
-    closure_var_count: c_int, // Number of closure vars for bounds checking
-    cpool: ?[*]JSValue, // Constant pool for fclosure support
-    result_out: *JSValue,
-) callconv(.c) c_int {
-    // Skip if dispatch is not enabled yet (during initialization)
-    if (!dispatch_enabled) return 0;
-
-    // Lookup frozen function by bytecode pointer
-    const func = lookupByBytecode(bytecode_ptr) orelse {
-        return 0;
-    };
-
-    // Call the frozen function with var_refs, closure_var_count, and cpool for closure/fclosure support
-    if (is_wasm32) {
-        // On WASM32, LLVM FastISel corrupts u64 returns. The frozen function writes
-        // its result to split globals before returning. We read the two u32s separately
-        // and reconstruct the JSValue to avoid any u64 operations.
-        _ = func(ctx, this_val, argc, argv, var_refs, closure_var_count, cpool);
-        // Read split globals and reconstruct JSValue
-        const lo = zig_runtime.g_return_slot_lo.*;
-        const hi = zig_runtime.g_return_slot_hi.*;
-        const result_words: *[2]u32 = @ptrCast(@alignCast(result_out));
-        result_words[0] = lo;
-        result_words[1] = hi;
-        // Set flag so callers can fix the return value
-        g_frozen_dispatch_occurred = true;
-    } else {
-        result_out.* = func(ctx, this_val, argc, argv, var_refs, closure_var_count, cpool);
-    }
-    return 1;
-}
-
-/// Get frozen function pointer for a bytecode (for caching in JSFunctionBytecode.frozen_impl)
-/// Called by C after successful dispatch to cache the pointer for fast path
-pub export fn frozen_dispatch_get_impl(bytecode_ptr: *anyopaque) callconv(.c) ?*anyopaque {
-    const func = lookupByBytecode(bytecode_ptr) orelse return null;
+/// Get frozen function pointer by parser index
+/// Called from JS_CallInternal on first call to a function
+/// Returns: function pointer if frozen, NULL if not
+pub export fn frozen_dispatch_get_by_index(idx: c_int) callconv(.c) ?*anyopaque {
+    if (idx < 0) return null;
+    const func = lookupByIndex(@intCast(idx)) orelse return null;
     return @ptrCast(@constCast(func));
 }
 
 /// Get the number of registered frozen functions
 pub export fn frozen_dispatch_count() callconv(.c) c_int {
-    if (name_registry) |reg| {
-        return @intCast(reg.count());
-    }
-    return 0;
-}
-
-
-/// Get the number of bytecode-registered frozen functions
-export fn frozen_dispatch_bytecode_count() callconv(.c) c_int {
-    if (bytecode_registry) |reg| {
-        return @intCast(reg.count());
+    if (index_array) |arr| {
+        var count: c_int = 0;
+        for (arr) |entry| {
+            if (entry != null) count += 1;
+        }
+        return count;
     }
     return 0;
 }
@@ -344,8 +155,8 @@ pub fn clear() void {
         a.deinit();
     }
     arena = null;
-    name_registry = null;
-    bytecode_registry = null;
+    index_array = null;
+    index_capacity = 0;
     dispatch_enabled = false;
 }
 
@@ -353,7 +164,7 @@ pub fn clear() void {
 // Tests
 // ============================================================================
 
-test "register and lookup" {
+test "register and lookup by index" {
     clear();
 
     // Test function
@@ -363,19 +174,22 @@ test "register and lookup" {
         }
     }.call;
 
-    register("testFunc", @ptrCast(&testFn));
+    registerByIndex(5, @ptrCast(&testFn));
     enableDispatch();
 
-    const found = lookup("testFunc");
+    const found = lookupByIndex(5);
     try std.testing.expect(found != null);
 
-    const not_found = lookup("nonexistent");
+    const not_found = lookupByIndex(3);
     try std.testing.expect(not_found == null);
+
+    const out_of_range = lookupByIndex(999);
+    try std.testing.expect(out_of_range == null);
 
     clear();
 }
 
-test "hash collision handling" {
+test "sparse index registration" {
     clear();
 
     const fn1 = struct {
@@ -390,19 +204,18 @@ test "hash collision handling" {
         }
     }.call;
 
-    // Register many functions to test probing
-    register("func1", @ptrCast(&fn1));
-    register("func2", @ptrCast(&fn2));
-    register("func3", @ptrCast(&fn1));
-    register("func4", @ptrCast(&fn2));
+    // Register sparse indices
+    registerByIndex(0, @ptrCast(&fn1));
+    registerByIndex(100, @ptrCast(&fn2));
+    registerByIndex(5000, @ptrCast(&fn1));
 
     enableDispatch();
 
-    try std.testing.expect(lookup("func1") != null);
-    try std.testing.expect(lookup("func2") != null);
-    try std.testing.expect(lookup("func3") != null);
-    try std.testing.expect(lookup("func4") != null);
-    try std.testing.expect(lookup("func5") == null);
+    try std.testing.expect(lookupByIndex(0) != null);
+    try std.testing.expect(lookupByIndex(1) == null);
+    try std.testing.expect(lookupByIndex(100) != null);
+    try std.testing.expect(lookupByIndex(5000) != null);
+    try std.testing.expect(lookupByIndex(5001) == null);
 
     clear();
 }

@@ -176,6 +176,7 @@ pub const ModuleParser = struct {
     functions: std.ArrayListUnmanaged(FunctionInfo),
     allocator: std.mem.Allocator,
     version: u8, // Bytecode version, needed for first_atom calculation
+    phase1_count: usize = 0, // Number of functions found by structured parsing (matches JS_ReadFunctionTag counter)
 
     pub fn init(allocator: std.mem.Allocator, data: []const u8) ModuleParser {
         return .{
@@ -797,6 +798,9 @@ pub const ModuleParser = struct {
                 break;
             };
         }
+
+        // Record Phase 1 count — this matches JS_ReadFunctionTag's per-JS_ReadObject counter
+        self.phase1_count = self.functions.items.len;
 
         // Phase 2: Scan remaining data for function_bytecode tags
         // This catches functions in embedded source code sections

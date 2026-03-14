@@ -510,3 +510,53 @@ pub fn createNativeModuleWithOpt(name: [*:0]const u8, opt_level: c.LLVMCodeGenOp
 
     return .{ .ctx = ctx, .module = module, .tm = tm };
 }
+
+/// Create a module targeting wasm32-wasi for frozen WASM builds.
+pub fn createWasmModule(name: [*:0]const u8, opt_level: c.LLVMCodeGenOptLevel) Error!NativeModule {
+    const ctx = Context{ .ref = c.LLVMGetGlobalContext() };
+    const module = Module.create(name, ctx);
+    const tm = try createWasmTargetMachine(opt_level);
+
+    const triple = tm.getTriple();
+    defer c.LLVMDisposeMessage(triple);
+    module.setTarget(triple);
+
+    const layout = tm.getDataLayout();
+    defer c.LLVMDisposeMessage(layout);
+    module.setDataLayout(layout);
+
+    return .{ .ctx = ctx, .module = module, .tm = tm };
+}
+
+fn createWasmTargetMachine(opt_level: c.LLVMCodeGenOptLevel) Error!TargetMachine {
+    // Initialize WebAssembly backend
+    c.LLVMInitializeWebAssemblyTargetInfo();
+    c.LLVMInitializeWebAssemblyTarget();
+    c.LLVMInitializeWebAssemblyTargetMC();
+    c.LLVMInitializeWebAssemblyAsmPrinter();
+
+    const triple: [*:0]const u8 = "wasm32-wasi";
+    var target: c.LLVMTargetRef = null;
+    var err_msg: [*c]u8 = null;
+    if (c.LLVMGetTargetFromTriple(triple, &target, &err_msg) != 0) {
+        if (err_msg) |msg| {
+            std.debug.print("[llvm] WASM target lookup failed: {s}\n", .{msg});
+            c.LLVMDisposeMessage(msg);
+        }
+        return Error.TargetLookupFailed;
+    }
+
+    // Match features from build.zig wasm_target
+    const tm = c.LLVMCreateTargetMachine(
+        target,
+        triple,
+        "generic",
+        "+bulk-memory,+sign-ext,+simd128",
+        opt_level,
+        c.LLVMRelocPIC,
+        c.LLVMCodeModelDefault,
+    );
+    if (tm == null) return Error.TargetMachineCreateFailed;
+
+    return .{ .ref = tm };
+}

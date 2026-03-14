@@ -262,6 +262,9 @@ pub const AnalyzedFunction = struct {
     func_kind: u2 = 0,
     /// Local indices captured by child closures (for targeted reverse sync in relooper)
     captured_local_indices: []const u16 = &.{},
+    /// Parser index for index-based dispatch (position in parser.functions)
+    /// Matches the JS_ReadFunctionTag counter during bytecode deserialization
+    parser_index: u32 = 0,
 };
 
 /// Result of analyzing a module for freezable functions
@@ -337,8 +340,9 @@ pub fn analyzeModule(
     }
     result.atom_strings = atom_strings_copy;
 
-    // Analyze each function
-    for (parser.functions.items) |func_info| {
+    // Analyze each function — only Phase 1 functions get valid parser_index values
+    // Phase 2 (byte-scanned) functions use sentinel 0xFFFFFFFF (never matched at runtime)
+    for (parser.functions.items, 0..) |func_info, parser_idx| {
         // Parse instructions - skip functions that fail to parse
         var bc_parser = bytecode_parser.BytecodeParser.init(func_info.bytecode);
         const instructions = bc_parser.parseAll(allocator) catch |err| {
@@ -454,12 +458,17 @@ pub fn analyzeModule(
             .has_use_strict = func_info.has_use_strict, // For proper 'this' handling
             .func_kind = func_info.func_kind, // 0=normal, 1=generator, 2=async, 3=async_generator
             .captured_local_indices = captured_local_indices_slice,
+            .parser_index = if (parser_idx < parser.phase1_count) @intCast(parser_idx) else 0xFFFFFFFF,
         });
 
         if (can_freeze_final) {
             result.freezable_count += 1;
         }
     }
+
+    std.debug.print("[freeze] Module parser found {d} total functions (phase1: {d}, phase2: {d}), {d} analyzable\n", .{
+        result.functions.items.len, parser.phase1_count, parser.functions.items.len - parser.phase1_count, result.freezable_count,
+    });
 
     return result;
 }
@@ -783,6 +792,8 @@ pub fn generateModuleZigShardedWithBackend(
     // Filter: skip functions with unsupported opcodes or unbuildable CFGs
     for (analysis.functions.items, 0..) |func, idx| {
         if (hasKillerOpcodes(func.instructions, func.is_self_recursive)) continue;
+        // DEBUG: skip specific parser indices for diagnosis
+        // DEBUG: no skip — re-enabled for diagnosis
         var cfg = cfg_builder.buildCFG(allocator, func.instructions) catch continue;
         cfg.deinit();
         try generated_all.append(allocator, .{ .func = func, .idx = idx });
@@ -898,6 +909,52 @@ pub fn generateModuleZigShardedWithBackend(
 
     if (effective_max > 0 and generated_all.items.len > effective_max) {
         const total_before = generated_all.items.len;
+        // Print boundary function for debugging
+        if (effective_max < total_before) {
+            const boundary = generated_all.items[effective_max - 1];
+            std.debug.print("[freeze] Boundary func #{d}: {s}@{d} ({d} instrs)\n", .{
+                effective_max, boundary.func.name, boundary.func.line_num, boundary.func.instructions.len,
+            });
+        }
+        // DEBUG: Count functions with specific opcodes
+        {
+            var insert2_count: usize = 0;
+            var put_arg_count: usize = 0;
+            var call_ctor_count: usize = 0;
+            var nested_for_of_count: usize = 0;
+            var array_from_count: usize = 0;
+            var put_loc_check_count: usize = 0;
+            for (generated_all.items[0..effective_max]) |gf| {
+                var has_insert2 = false;
+                var has_put_arg = false;
+                var has_call_ctor = false;
+                var for_of_depth: usize = 0;
+                var max_for_of_depth: usize = 0;
+                var has_array_from = false;
+                var has_put_loc_check = false;
+                for (gf.func.instructions) |instr| {
+                    switch (instr.opcode) {
+                        .insert2 => has_insert2 = true,
+                        .put_arg0, .put_arg1, .put_arg2, .put_arg3, .put_arg => has_put_arg = true,
+                        .call_constructor => has_call_ctor = true,
+                        .for_of_start => { for_of_depth += 1; if (for_of_depth > max_for_of_depth) max_for_of_depth = for_of_depth; },
+                        .iterator_close => { if (for_of_depth > 0) for_of_depth -= 1; },
+                        .array_from => has_array_from = true,
+                        .put_loc_check => has_put_loc_check = true,
+                        else => {},
+                    }
+                }
+                if (has_insert2) insert2_count += 1;
+                if (has_put_arg) put_arg_count += 1;
+                if (has_call_ctor) call_ctor_count += 1;
+                if (max_for_of_depth >= 2) nested_for_of_count += 1;
+                if (has_array_from) array_from_count += 1;
+                if (has_put_loc_check) put_loc_check_count += 1;
+            }
+            std.debug.print("[freeze-stats] In first {d} funcs: insert2={d} put_arg={d} call_ctor={d} nested_for_of={d} array_from={d} put_loc_check={d}\n", .{
+                effective_max, insert2_count, put_arg_count, call_ctor_count, nested_for_of_count, array_from_count, put_loc_check_count,
+            });
+        }
         generated_all.items.len = effective_max;
         std.debug.print("[freeze] Limited to {d} of {d} freezable functions\n", .{ effective_max, total_before });
     }
@@ -963,6 +1020,7 @@ pub fn generateModuleZigShardedWithBackend(
             try llvm_funcs.append(allocator, .{
                 .name = gf.func.name,
                 .func_index = gf.idx,
+                .parser_index = gf.func.parser_index,
                 .line_num = gf.func.line_num,
                 .llvm_func_name = llvm_func_names.items[info.func_name_idx],
                 .func = gf.func,
@@ -1040,16 +1098,12 @@ pub fn generateModuleZigShardedWithBackend(
 
         var thin_skipped_int32: usize = 0;
         for (generated_all.items, 0..) |gf, gi| {
-            if (gf.func.line_num == 41871) {
-                std.debug.print("[TRACE-41871] gen_idx={d} name='{s}' line={d} is_int32={} instrs={d}\n", .{
-                    gi, gf.func.name, gf.func.line_num, isPureInt32Function(gf.func), gf.func.instructions.len,
-                });
-            }
             // Skip int32 functions (already handled above)
             if (isPureInt32Function(gf.func)) {
                 thin_skipped_int32 += 1;
                 continue;
             }
+
 
             const cfg = cfg_builder.buildCFG(allocator, gf.func.instructions) catch |err| {
                 std.debug.print("[freeze-debug] CFG build failed for '{s}'@{d} (gen_idx={d}): {}\n", .{ gf.func.name, gf.func.line_num, gi, err });
@@ -1081,6 +1135,7 @@ pub fn generateModuleZigShardedWithBackend(
             try thin_llvm_funcs.append(allocator, .{
                 .name = gf.func.name,
                 .func_index = gf.idx,
+                .parser_index = gf.func.parser_index,
                 .line_num = gf.func.line_num,
                 .llvm_func_name = thin_func_names.items[info.func_name_idx],
                 .func = gf.func,
@@ -1119,6 +1174,38 @@ pub fn generateModuleZigShardedWithBackend(
 
             if (llvm_shard_count > 0) {
                 std.debug.print("[freeze] LLVM IR total: {d} shard .o files (int32 + thin)\n", .{llvm_shard_count});
+            }
+
+            // Also generate WASM .o files (thin-only, int32 tier is native-only)
+            var wasm_shard_count: usize = 0;
+            {
+                var wasm_func_offset: usize = 0;
+                while (wasm_func_offset < thin_llvm_funcs.items.len) {
+                    const wasm_end = @min(wasm_func_offset + THIN_FUNCS_PER_SHARD, thin_llvm_funcs.items.len);
+                    const wasm_shard_funcs = thin_llvm_funcs.items[wasm_func_offset..wasm_end];
+
+                    var wasm_obj_path_buf: [4096]u8 = undefined;
+                    const wasm_obj_path = std.fmt.bufPrintZ(&wasm_obj_path_buf, "{s}/frozen_llvm_shard_wasm_{d}.o", .{ cache_dir, wasm_shard_count }) catch {
+                        wasm_func_offset = wasm_end;
+                        continue;
+                    };
+
+                    const wasm_result = llvm_codegen.generateThinShardWasm(allocator, wasm_shard_funcs, wasm_shard_count, wasm_obj_path) catch |err| {
+                        std.debug.print("[freeze] LLVM WASM shard {d} failed: {}\n", .{ wasm_shard_count, err });
+                        wasm_func_offset = wasm_end;
+                        continue;
+                    };
+
+                    if (wasm_result.has_functions) {
+                        std.debug.print("[freeze] LLVM WASM shard {d}: {d} functions → {s}\n", .{ wasm_shard_count, wasm_result.func_count, wasm_obj_path });
+                        wasm_shard_count += 1;
+                    }
+
+                    wasm_func_offset = wasm_end;
+                }
+                if (wasm_shard_count > 0) {
+                    std.debug.print("[freeze] LLVM WASM: {d} shard .o files\n", .{wasm_shard_count});
+                }
             }
         }
     }
@@ -1313,23 +1400,6 @@ pub fn generateModuleZig(
     // Print report of any unsupported opcodes encountered
     zig_codegen_full.printUnsupportedOpcodeReport();
 
-    // Count ALL function dispatch keys (name@line_num) to prevent collision
-    // If there are 2 functions with the same dispatch key, we'd intercept
-    // calls to both with our frozen version - must skip both
-    // Note: functions with the same name but different line numbers have unique dispatch keys
-    var dispatch_key_counts2 = hashmap_helper.StringHashMap(u32).init(allocator);
-    defer dispatch_key_counts2.deinit();
-    for (analysis.functions.items) |func| {
-        const dk = try std.fmt.allocPrint(allocator, "{s}@{d}", .{ func.name, func.line_num });
-        const entry = try dispatch_key_counts2.getOrPut(dk);
-        if (entry.found_existing) {
-            allocator.free(dk);
-            entry.value_ptr.* += 1;
-        } else {
-            entry.value_ptr.* = 1;
-        }
-    }
-
     // Generate init function that registers all frozen functions
     try output.appendSlice(allocator,
         \\
@@ -1384,34 +1454,25 @@ pub fn generateModuleZig(
         \\
     );
 
-    // Register each generated function with native dispatch using name@line_num key
-    // QuickJS dispatches using "name@line_num" format (see quickjs.c:16598)
+    // Register each generated function with native dispatch using parser index
     for (analysis.functions.items, 0..) |func, idx| {
         // Only register functions that were actually generated (skip partial freeze, etc.)
         if (!generated_indices.contains(idx)) continue;
         if (!func.can_freeze) continue;
-
-        // Skip if dispatch key collides with another function
-        {
-            var dk_buf: [512]u8 = undefined;
-            const dk = std.fmt.bufPrint(&dk_buf, "{s}@{d}", .{ func.name, func.line_num }) catch continue;
-            if ((dispatch_key_counts2.get(dk) orelse 0) > 1) {
-                if (FREEZE_DEBUG) std.debug.print("[freeze] Skipping duplicate dispatch key: '{s}'\n", .{dk});
-                continue;
-            }
-        }
+        // Skip Phase 2 (byte-scanned) functions — no valid runtime index
+        if (func.parser_index == 0xFFFFFFFF) continue;
 
         var reg_buf: [512]u8 = undefined;
         // Sanitize name for Zig identifier (replace colons, etc.)
         var sanitized_buf: [256]u8 = undefined;
         const sanitized_name = sanitizeName(func.name, &sanitized_buf);
-        // Use name@line_num format to match QuickJS dispatch key
+        // Use parser_index for O(1) index-based dispatch
         const reg_line = std.fmt.bufPrint(&reg_buf,
-            \\    // Register {s}@{d} with native dispatch
-            \\    native_dispatch_register("{s}@{d}", &__frozen_{d}_{s});
+            \\    // Register parser_index={d} ({s}) with native dispatch
+            \\    native_dispatch.registerByIndex({d}, &__frozen_{d}_{s});
             \\    count += 1;
             \\
-        , .{ func.name, func.line_num, func.name, func.line_num, idx, sanitized_name }) catch continue;
+        , .{ func.parser_index, func.name, func.parser_index, idx, sanitized_name }) catch continue;
         try output.appendSlice(allocator, reg_line);
     }
 

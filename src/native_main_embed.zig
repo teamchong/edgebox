@@ -56,11 +56,12 @@ comptime {
 }
 
 // Native dispatch for frozen functions - must be linked even with --no-freeze
-// because QuickJS C code unconditionally calls frozen_dispatch_lookup
+// because QuickJS C code calls frozen_dispatch_get_by_index and frozen_dispatch_is_enabled
 // Use module name (not path) to match how frozen_module.zig imports it
 const native_dispatch = @import("native_dispatch");
 comptime {
-    _ = &native_dispatch.frozen_dispatch_lookup;
+    _ = &native_dispatch.frozen_dispatch_get_by_index;
+    _ = &native_dispatch.frozen_dispatch_is_enabled;
 }
 
 // Frozen module (generated Zig frozen functions)
@@ -138,9 +139,13 @@ pub fn main() !void {
             std.debug.print("Failed to create QuickJS runtime with arena\n", .{});
             return error.RuntimeCreationFailed;
         };
-    } else qjs.JS_NewRuntime() orelse {
-        std.debug.print("Failed to create QuickJS runtime\n", .{});
-        return error.RuntimeCreationFailed;
+    } else blk: {
+        // Non-arena path: 48-bit NaN-boxing works with any address range
+        zig_runtime.initCompressedHeap(0);
+        break :blk qjs.JS_NewRuntime() orelse {
+            std.debug.print("Failed to create QuickJS runtime\n", .{});
+            return error.RuntimeCreationFailed;
+        };
     };
     defer {
         // Note: js_std_free_handlers is called in context cleanup defer
