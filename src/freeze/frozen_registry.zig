@@ -1184,7 +1184,10 @@ pub fn generateModuleZigShardedWithBackend(
             }
 
             // Also generate WASM .o files (thin-only, int32 tier is native-only)
-            var wasm_shard_count: usize = 0;
+            // WASM shard numbering starts at int32_llvm_shard_count so shard init function
+            // names match native thin shard numbers (e.g., frozen_init_llvm_shard_1 for
+            // both native and WASM when there is 1 int32 shard).
+            var wasm_shard_count: usize = int32_llvm_shard_count;
             {
                 var wasm_func_offset: usize = 0;
                 while (wasm_func_offset < thin_llvm_funcs.items.len) {
@@ -1210,8 +1213,8 @@ pub fn generateModuleZigShardedWithBackend(
 
                     wasm_func_offset = wasm_end;
                 }
-                if (wasm_shard_count > 0) {
-                    std.debug.print("[freeze] LLVM WASM: {d} shard .o files\n", .{wasm_shard_count});
+                if (wasm_shard_count > int32_llvm_shard_count) {
+                    std.debug.print("[freeze] LLVM WASM: {d} shard .o files\n", .{wasm_shard_count - int32_llvm_shard_count});
                 }
             }
         }

@@ -308,6 +308,21 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         return @ptrFromInt(self.lo);
     }
 
+    /// Alias for decompressPtr (compatibility with native CV API)
+    pub inline fn getPtr(self: CompressedValue) ?*anyopaque {
+        return self.decompressPtr();
+    }
+
+    /// Check if value is a boolean
+    pub inline fn isBool(self: CompressedValue) bool {
+        return (self.hi & TAG_MASK_HI) == (QNAN_HI | TAG_BOOL_HI);
+    }
+
+    /// Get boolean value (assumes isBool() is true)
+    pub inline fn getBool(self: CompressedValue) bool {
+        return self.lo != 0;
+    }
+
     /// Get the PTR subtype bits (for Symbol/BigInt/Object discrimination)
     /// On WASM32, the subtype is stored in hi word bits
     pub inline fn getPtrSubtype(self: CompressedValue) u64 {

@@ -14,12 +14,26 @@ const CV = zig_runtime.CompressedValue;
 const ICSlot = zig_runtime.ICSlot;
 const JSVarRef = zig_runtime.JSVarRef;
 const thin = zig_runtime.thin;
+const is_wasm32 = zig_runtime.is_wasm32;
+
+// ABI type for CV at the LLVM FFI boundary.
+// WASM32: LLVM uses i64 for CV, but Zig's extern struct {lo:u32, hi:u32} splits into 2×i32.
+// Native: LLVM uses {i64,i64} for CV, matching Zig's extern struct {u:i64, tag:i64}.
+const CvAbi = if (is_wasm32) u64 else CV;
+
+inline fn cvIn(abi: CvAbi) CV {
+    return if (comptime is_wasm32) @bitCast(abi) else abi;
+}
+inline fn cvOut(cv: CV) CvAbi {
+    return if (comptime is_wasm32) @bitCast(cv) else cv;
+}
 
 // ============================================================================
 // Debug trace for diagnosing codegen bugs
 // ============================================================================
 
-export fn llvm_rt_debug_trace_cv(label: [*:0]const u8, cv: CV) callconv(.c) void {
+export fn llvm_rt_debug_trace_cv(label: [*:0]const u8, cv_abi: CvAbi) callconv(.c) void {
+    const cv = cvIn(cv_abi);
     if (cv.isInt()) {
         std.debug.print("[TRACE] {s}: int({d})\n", .{ std.mem.span(label), cv.getInt() });
     } else if (cv.isUndefined()) {
@@ -61,8 +75,8 @@ export fn llvm_rt_push_undefined(stack: [*]CV, sp: *usize) callconv(.c) void {
     thin.push_undefined(stack, sp);
 }
 
-export fn llvm_rt_push_cv(stack: [*]CV, sp: *usize, val: CV) callconv(.c) void {
-    thin.push_cv(stack, sp, val);
+export fn llvm_rt_push_cv(stack: [*]CV, sp: *usize, val: CvAbi) callconv(.c) void {
+    thin.push_cv(stack, sp, cvIn(val));
 }
 
 export fn llvm_rt_push_const(ctx: *JSContext, stack: [*]CV, sp: *usize, cpool: ?[*]JSValue, idx: u32) callconv(.c) void {
@@ -746,7 +760,8 @@ export fn llvm_rt_op_put_array_el(ctx: *JSContext, stack: [*]CV, sp: *usize) cal
 /// The returned pointer is valid as long as the array is not modified.
 /// This is designed to be called ONCE before a loop, then use the pointer
 /// for direct element access inside the loop (avoiding per-element getFastArrayDirect).
-export fn llvm_rt_fast_array_probe(cv: CV, out_values_ptr: *?[*]u8, out_count: *u32) callconv(.c) c_int {
+export fn llvm_rt_fast_array_probe(cv_abi: CvAbi, out_values_ptr: *?[*]u8, out_count: *u32) callconv(.c) c_int {
+    const cv = cvIn(cv_abi);
     if (!cv.isObject()) {
         out_values_ptr.* = null;
         out_count.* = 0;
@@ -771,7 +786,8 @@ export fn llvm_rt_fast_array_probe(cv: CV, out_values_ptr: *?[*]u8, out_count: *
 
 /// Check if a CV value is a fast array (contiguous JSValue[] backing store).
 /// Returns 1 if fast array, 0 otherwise.
-export fn llvm_rt_fast_array_is_fast(cv: CV) callconv(.c) c_int {
+export fn llvm_rt_fast_array_is_fast(cv_abi: CvAbi) callconv(.c) c_int {
+    const cv = cvIn(cv_abi);
     if (!cv.isObject()) return 0;
     const jsv = cv.toJSValue();
     const result = zig_runtime.getFastArrayDirect(jsv);
@@ -780,7 +796,8 @@ export fn llvm_rt_fast_array_is_fast(cv: CV) callconv(.c) c_int {
 
 /// Get the raw JSValue[] pointer from a fast array CV.
 /// Caller must check is_fast first. Returns null if not a fast array.
-export fn llvm_rt_fast_array_get_values(cv: CV) callconv(.c) ?[*]u8 {
+export fn llvm_rt_fast_array_get_values(cv_abi: CvAbi) callconv(.c) ?[*]u8 {
+    const cv = cvIn(cv_abi);
     const jsv = cv.toJSValue();
     const result = zig_runtime.getFastArrayDirect(jsv);
     if (!result.success) return null;
@@ -792,7 +809,8 @@ export fn llvm_rt_fast_array_get_values(cv: CV) callconv(.c) ?[*]u8 {
 
 /// Get the element count from a fast array CV.
 /// Caller must check is_fast first. Returns 0 if not a fast array.
-export fn llvm_rt_fast_array_get_count(cv: CV) callconv(.c) c_int {
+export fn llvm_rt_fast_array_get_count(cv_abi: CvAbi) callconv(.c) c_int {
+    const cv = cvIn(cv_abi);
     const jsv = cv.toJSValue();
     const result = zig_runtime.getFastArrayDirect(jsv);
     if (!result.success) return 0;
@@ -802,12 +820,11 @@ export fn llvm_rt_fast_array_get_count(cv: CV) callconv(.c) c_int {
 /// Load a JSValue at index from a raw values pointer, convert to CV (with refcount dup).
 /// The pointer must come from llvm_rt_fast_array_get_values.
 /// Each JSValue is 16 bytes on x86_64 (JSValueUnion + tag).
-export fn llvm_rt_jsvalue_to_cv(ctx: *JSContext, values_ptr: [*]const u8, index: c_int) callconv(.c) CV {
+export fn llvm_rt_jsvalue_to_cv(ctx: *JSContext, values_ptr: [*]const u8, index: c_int) callconv(.c) CvAbi {
     const jsv_ptr: [*]const JSValue = @ptrCast(@alignCast(values_ptr));
     const jsv = jsv_ptr[@intCast(index)];
-    // Dup the JSValue (increment refcount) since we're creating a new owned CV reference
     const duped = JSValue.dup(ctx, jsv);
-    return CV.fromJSValue(duped);
+    return cvOut(CV.fromJSValue(duped));
 }
 
 /// Combined fast array element access: check if fast array, load element, return as CV.
@@ -815,39 +832,42 @@ export fn llvm_rt_jsvalue_to_cv(ctx: *JSContext, values_ptr: [*]const u8, index:
 /// index out of bounds, or index not an integer).
 /// This avoids 3 separate runtime calls per element access in the hot loop.
 const CV_SENTINEL: CV = CV.newInt(0); // Sentinel value for failed fast array access
-export fn llvm_rt_fast_array_get_el(ctx: *JSContext, arr: CV, idx: CV) callconv(.c) CV {
+export fn llvm_rt_fast_array_get_el(ctx: *JSContext, arr_abi: CvAbi, idx_abi: CvAbi) callconv(.c) CvAbi {
+    const arr = cvIn(arr_abi);
+    const idx = cvIn(idx_abi);
     // Index must be an integer
-    if (!idx.isInt()) return CV_SENTINEL;
+    if (!idx.isInt()) return cvOut(CV_SENTINEL);
 
     // Array must be an object
-    if (!arr.isObject()) return CV_SENTINEL;
+    if (!arr.isObject()) return cvOut(CV_SENTINEL);
 
     // Get JSValue and check fast array
     const jsv = arr.toJSValue();
     const result = zig_runtime.getFastArrayDirect(jsv);
-    if (!result.success) return CV_SENTINEL;
+    if (!result.success) return cvOut(CV_SENTINEL);
 
     const i_signed = idx.getInt();
-    if (i_signed < 0) return CV_SENTINEL;
+    if (i_signed < 0) return cvOut(CV_SENTINEL);
     const i: u32 = @intCast(i_signed);
-    if (i >= result.count) return CV_SENTINEL;
+    if (i >= result.count) return cvOut(CV_SENTINEL);
 
     if (result.values) |vals| {
         const elem = vals[i];
         const duped = JSValue.dup(ctx, elem);
-        return CV.fromJSValue(duped);
+        return cvOut(CV.fromJSValue(duped));
     }
-    return CV_SENTINEL;
+    return cvOut(CV_SENTINEL);
 }
 
 /// Combined fast array length access: check if fast array, return count as CV int.
 /// Returns CV int on success, or CV_SENTINEL on failure.
-export fn llvm_rt_fast_array_get_len(arr: CV) callconv(.c) CV {
-    if (!arr.isObject()) return CV_SENTINEL;
+export fn llvm_rt_fast_array_get_len(arr_abi: CvAbi) callconv(.c) CvAbi {
+    const arr = cvIn(arr_abi);
+    if (!arr.isObject()) return cvOut(CV_SENTINEL);
     const jsv = arr.toJSValue();
     const result = zig_runtime.getFastArrayDirect(jsv);
-    if (!result.success) return CV_SENTINEL;
-    return CV.newInt(@intCast(result.count));
+    if (!result.success) return cvOut(CV_SENTINEL);
+    return cvOut(CV.newInt(@intCast(result.count)));
 }
 
 /// Stack-based get_array_el: pop index and array, push result.
@@ -981,20 +1001,20 @@ export fn llvm_rt_add_loc(ctx: *JSContext, stack: [*]CV, sp: *usize, locals: [*]
 // CompressedValue operations (for JSValue ↔ CV conversion)
 // ============================================================================
 
-export fn llvm_rt_cv_from_jsvalue(val: JSValue) callconv(.c) CV {
-    return CV.fromJSValue(val);
+export fn llvm_rt_cv_from_jsvalue(val: JSValue) callconv(.c) CvAbi {
+    return cvOut(CV.fromJSValue(val));
 }
 
 export fn llvm_rt_cv_to_jsvalue_with_ctx(ctx: *JSContext, cv: *CV) callconv(.c) JSValue {
     return cv.toJSValueWithCtx(ctx);
 }
 
-export fn llvm_rt_cv_dup_ref(cv: CV) callconv(.c) CV {
-    return CV.dupRef(cv);
+export fn llvm_rt_cv_dup_ref(cv_abi: CvAbi) callconv(.c) CvAbi {
+    return cvOut(CV.dupRef(cvIn(cv_abi)));
 }
 
-export fn llvm_rt_cv_free_ref(ctx: *JSContext, cv: CV) callconv(.c) void {
-    CV.freeRef(ctx, cv);
+export fn llvm_rt_cv_free_ref(ctx: *JSContext, cv_abi: CvAbi) callconv(.c) void {
+    CV.freeRef(ctx, cvIn(cv_abi));
 }
 
 /// Pop CV from stack, evaluate JS truthiness (handles empty string, NaN, 0.0, etc.)
@@ -1367,7 +1387,8 @@ export fn llvm_rt_js_dup_value(ctx: *JSContext, val: JSValue) callconv(.c) JSVal
 
 /// Debug: print a CV value with a label (for tracing codegen bugs)
 var debug_trace_invocation: u32 = 0;
-export fn llvm_rt_debug_trace(label: c_int, v: CV) callconv(.c) void {
+export fn llvm_rt_debug_trace(label: c_int, v_abi: CvAbi) callconv(.c) void {
+    const v = cvIn(v_abi);
     // Increment invocation counter when we see label 0 (start of locals dump)
     if (label == 0) debug_trace_invocation += 1;
     const inv = debug_trace_invocation;

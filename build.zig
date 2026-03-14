@@ -510,13 +510,16 @@ pub fn build(b: *std.Build) void {
         }
 
         // Discover and link LLVM-generated WASM .o shard files
+        // WASM shards may start at a non-zero index (int32 shards are native-only),
+        // so scan up to a reasonable maximum rather than stopping at the first gap.
         var wasm_llvm_shard_count: usize = 0;
-        while (true) : (wasm_llvm_shard_count += 1) {
-            const llvm_wasm_obj_path = b.fmt("{s}/frozen_llvm_shard_wasm_{d}.o", .{ wasm_shard_dir, wasm_llvm_shard_count });
+        for (0..256) |shard_idx| {
+            const llvm_wasm_obj_path = b.fmt("{s}/frozen_llvm_shard_wasm_{d}.o", .{ wasm_shard_dir, shard_idx });
             if (std.fs.cwd().access(llvm_wasm_obj_path, .{})) |_| {
                 wasm_static_exe.addObjectFile(.{ .cwd_relative = llvm_wasm_obj_path });
+                wasm_llvm_shard_count += 1;
             } else |_| {
-                break;
+                // Continue scanning — there may be gaps from int32-only shard indices
             }
         }
         if (wasm_llvm_shard_count > 0) {
