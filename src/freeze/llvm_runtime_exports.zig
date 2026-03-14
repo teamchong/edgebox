@@ -496,14 +496,26 @@ export fn llvm_rt_op_call_constructor(
 /// Property access with inline cache
 /// Returns 0 on success, non-zero on exception.
 export fn llvm_rt_op_get_field_ic(ctx: *JSContext, stack: [*]CV, sp: *usize, ic: *ICSlot, name: [*:0]const u8) callconv(.c) c_int {
-    thin.op_get_field_ic(ctx, stack, sp, ic, name) catch return 1;
+    // LLVM inline IC already checked all 4 slots and missed.
+    // Skip Zig-side icLoad (would redundantly check the same 4 slots).
+    // Go directly to C js_frozen_ic_load which resolves the atom and populates the IC.
+    const obj = stack[sp.* - 1].toJSValue();
+    const result = zig_runtime.quickjs.js_frozen_ic_load(ctx, obj, @ptrCast(ic), name);
+    if (result.isException()) return 1;
+    CV.freeRef(ctx, stack[sp.* - 1]);
+    stack[sp.* - 1] = CV.fromJSValue(result);
     return 0;
 }
 
 /// Property access with inline cache (keeps object on stack)
 /// Returns 0 on success, non-zero on exception.
 export fn llvm_rt_op_get_field2_ic(ctx: *JSContext, stack: [*]CV, sp: *usize, ic: *ICSlot, name: [*:0]const u8) callconv(.c) c_int {
-    thin.op_get_field2_ic(ctx, stack, sp, ic, name) catch return 1;
+    // LLVM inline IC already checked all 4 slots — go directly to C slow path.
+    const obj = stack[sp.* - 1].toJSValue();
+    const result = zig_runtime.quickjs.js_frozen_ic_load(ctx, obj, @ptrCast(ic), name);
+    if (result.isException()) return 1;
+    stack[sp.*] = CV.fromJSValue(result);
+    sp.* += 1;
     return 0;
 }
 
