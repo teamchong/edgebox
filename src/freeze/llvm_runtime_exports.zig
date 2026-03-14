@@ -585,40 +585,32 @@ export fn llvm_rt_tail_call_return(
     arg_count: usize,
 ) callconv(.c) JSValue {
     const n: usize = @intCast(argc);
+    const func_idx = sp.* - n - 1;
+    const fn_val = stack[func_idx].toJSValue();
 
-    // Extract function from stack
-    const fn_val = CV.toJSValuePtr(&stack[sp.* - n - 1]);
+    // On native, CV=JSValue — pass stack args directly (zero copy).
+    const result = if (comptime !is_wasm32) blk: {
+        const argv_ptr: [*]JSValue = @ptrCast(&stack[sp.* - n]);
+        break :blk JSValue.call(ctx, fn_val, JSValue.UNDEFINED, @intCast(argc), argv_ptr);
+    } else blk: {
+        var args: [256]JSValue = undefined;
+        for (0..n) |i| {
+            args[i] = CV.toJSValuePtr(&stack[sp.* - n + i]);
+        }
+        break :blk JSValue.call(ctx, fn_val, JSValue.UNDEFINED, @intCast(argc), @ptrCast(&args));
+    };
 
-    // Build args array from stack
-    var args: [256]JSValue = undefined;
-    for (0..n) |i| {
-        args[i] = CV.toJSValuePtr(&stack[sp.* - n + i]);
+    // Free consumed CVs directly from stack
+    for (func_idx..sp.*) |i| {
+        CV.freeRef(ctx, stack[i]);
     }
 
-    // Call the function
-    const result = JSValue.call(ctx, fn_val, JSValue.UNDEFINED, @intCast(argc), @ptrCast(&args));
-
-    // Free consumed CVs: args then func (matching Zig full codegen order)
-    for (0..n) |i| {
-        CV.freeRef(ctx, stack[sp.* - n + i]);
-    }
-    CV.freeRef(ctx, stack[sp.* - n - 1]); // func
-
-    // Exit frozen call depth
     zig_runtime.exitStack();
-
-    // Cleanup locals
     zig_runtime.cleanupLocals(ctx, locals, local_count);
-
-    // Free arg shadow
     if (arg_shadow) |shadow| {
         for (0..arg_count) |i| {
             CV.freeRef(ctx, shadow[i]);
         }
-    }
-
-    if (result.isException()) {
-        return result;
     }
 
     return result;
@@ -636,40 +628,33 @@ export fn llvm_rt_tail_call_method_return(
     arg_count: usize,
 ) callconv(.c) JSValue {
     const n: usize = @intCast(argc);
+    const obj_idx = sp.* - n - 2;
+    const obj = stack[obj_idx].toJSValue();
+    const method = stack[obj_idx + 1].toJSValue();
 
-    // Extract obj and method from stack
-    const obj = CV.toJSValuePtr(&stack[sp.* - n - 2]);
-    const method = CV.toJSValuePtr(&stack[sp.* - n - 1]);
+    // On native, CV=JSValue — pass stack args directly (zero copy).
+    const result = if (comptime !is_wasm32) blk: {
+        const argv_ptr: [*]JSValue = @ptrCast(&stack[sp.* - n]);
+        break :blk JSValue.call(ctx, method, obj, @intCast(argc), argv_ptr);
+    } else blk: {
+        var args: [256]JSValue = undefined;
+        for (0..n) |i| {
+            args[i] = CV.toJSValuePtr(&stack[sp.* - n + i]);
+        }
+        break :blk JSValue.call(ctx, method, obj, @intCast(argc), @ptrCast(&args));
+    };
 
-    // Build args
-    var args: [256]JSValue = undefined;
-    for (0..n) |i| {
-        args[i] = CV.toJSValuePtr(&stack[sp.* - n + i]);
+    // Free consumed CVs directly from stack
+    for (obj_idx..sp.*) |i| {
+        CV.freeRef(ctx, stack[i]);
     }
 
-    // Call
-    const result = JSValue.call(ctx, method, obj, @intCast(argc), @ptrCast(&args));
-
-    // Free consumed CVs: args, method, obj
-    for (0..n) |i| {
-        CV.freeRef(ctx, stack[sp.* - n + i]);
-    }
-    CV.freeRef(ctx, stack[sp.* - n - 1]); // method
-    CV.freeRef(ctx, stack[sp.* - n - 2]); // obj
-
-    // Exit frozen call depth
     zig_runtime.exitStack();
-
-    // Cleanup
     zig_runtime.cleanupLocals(ctx, locals, local_count);
     if (arg_shadow) |shadow| {
         for (0..arg_count) |i| {
             CV.freeRef(ctx, shadow[i]);
         }
-    }
-
-    if (result.isException()) {
-        return result;
     }
 
     return result;
@@ -1293,17 +1278,47 @@ export fn llvm_rt_exec_opcode(
         break :blk @bitCast(atom);
     } else operand;
 
-    // CVs are 8 bytes (NaN-boxed i64), JSValues are 16 bytes ({i64, i64}).
-    // We must convert between them — @ptrCast is wrong since element sizes differ.
     const old_sp = sp.*;
-    // Convert stack CVs to JSValues. toJSValuePtr does NOT dup — transfers
-    // ownership temporarily. The C function operates on JSValues and manages
-    // refs internally (frees popped values, creates refs for pushed values).
+
+    if (comptime !is_wasm32) {
+        // Native: CV=JSValue — pass stack and locals directly (zero copy).
+        var sp_i: c_int = @intCast(old_sp);
+        const result = quickjs.js_frozen_exec_opcode(
+            ctx,
+            op,
+            @bitCast(resolved_operand),
+            @ptrCast(stack),
+            &sp_i,
+            @ptrCast(locals),
+            @intCast(var_count),
+            var_refs,
+            closure_var_count,
+            argv,
+            argc,
+            arg_buf,
+            func_obj,
+            new_target,
+            cpool,
+            operand2,
+        );
+        sp.* = @intCast(sp_i);
+
+        if (atom_name != null) {
+            quickjs.JS_FreeAtom(ctx, @bitCast(resolved_operand));
+        }
+
+        if (result.isException()) {
+            std.debug.print("[exec_opcode FAIL] op={d} sp={d}\n", .{ op, old_sp });
+            return -1;
+        }
+        return 0;
+    }
+
+    // WASM32: CV != JSValue — must convert between 8-byte CVs and 16-byte JSValues.
     var jsv_stack: [512]JSValue = undefined;
     for (0..old_sp) |i| {
         jsv_stack[i] = CV.toJSValuePtr(&stack[i]);
     }
-    // Convert locals CVs to JSValues (some opcodes may read locals)
     const lc: usize = @intCast(var_count);
     var jsv_locals: [256]JSValue = undefined;
     const local_max = if (lc < 256) lc else 256;
@@ -1332,7 +1347,6 @@ export fn llvm_rt_exec_opcode(
     );
     const new_sp: usize = @intCast(sp_i);
 
-    // Write back JSValue stack to CV stack.
     for (0..new_sp) |i| {
         stack[i] = CV.fromJSValue(jsv_stack[i]);
     }
@@ -1414,14 +1428,18 @@ export fn llvm_rt_array_from(ctx: *JSContext, stack: [*]CV, sp: *usize, count: c
     const n: usize = @intCast(count);
     const old_sp = sp.*;
 
-    // Convert top n CVs to JSValues
-    var jsv_buf: [64]JSValue = undefined;
-    for (0..n) |i| {
-        jsv_buf[i] = stack[old_sp - n + i].toJSValue();
-    }
-
-    // JS_NewArrayFrom takes ownership via memcpy — no dup needed
-    const result = quickjs.JS_NewArrayFrom(ctx, @intCast(n), @ptrCast(&jsv_buf));
+    // On native, CV=JSValue — pass stack directly (zero copy).
+    // JS_NewArrayFrom does memcpy internally so stack entries are safe to reuse.
+    const result = if (comptime !is_wasm32) blk: {
+        const argv_ptr: [*]JSValue = @ptrCast(&stack[old_sp - n]);
+        break :blk quickjs.JS_NewArrayFrom(ctx, @intCast(n), argv_ptr);
+    } else blk: {
+        var jsv_buf: [64]JSValue = undefined;
+        for (0..n) |i| {
+            jsv_buf[i] = stack[old_sp - n + i].toJSValue();
+        }
+        break :blk quickjs.JS_NewArrayFrom(ctx, @intCast(n), @ptrCast(&jsv_buf));
+    };
     if (result.isException()) return -1;
 
     // Pop n elements, push result (refs for old CVs transferred to array via memcpy)
