@@ -1215,12 +1215,20 @@ pub const thin = struct {
         arg_shadow: ?[*]CV,
         arg_count: usize,
     ) JSValue {
+        // Transfer ownership: stack CV → returned JSValue.
+        // On native (CV=JSValue), dup+freeRef cancel out — just bitcast.
+        // On WASM32, must dup before free (different representations).
         const ret_cv = stack[sp - 1];
-        const ret_val = if (ret_cv.isRefType())
-            JSValue.dup(ctx, ret_cv.toJSValueWithCtx(ctx))
-        else
-            ret_cv.toJSValueWithCtx(ctx);
-        CV.freeRef(ctx, ret_cv);
+        const ret_val = if (comptime !is_wasm32)
+            ret_cv.toJSValue()
+        else blk: {
+            const v = if (ret_cv.isRefType())
+                JSValue.dup(ctx, ret_cv.toJSValueWithCtx(ctx))
+            else
+                ret_cv.toJSValueWithCtx(ctx);
+            CV.freeRef(ctx, ret_cv);
+            break :blk v;
+        };
         // Sync locals → _locals_jsv and detach var_refs
         if (locals_jsv) |jsv| {
             for (0..local_count) |i| {
