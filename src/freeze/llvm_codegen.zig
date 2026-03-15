@@ -329,6 +329,67 @@ fn finalizeAndEmitShard(
     return true; // module consumed
 }
 
+/// Generate standalone WASM module with pure int32 functions — no QuickJS runtime.
+/// These functions are exported directly as WASM exports, callable from JS Workers.
+/// Only works for functions identified by isPureInt32Function.
+pub fn generateStandaloneWasm(
+    allocator: Allocator,
+    functions: []const ShardFunction,
+    obj_path: [*:0]const u8,
+) CodegenError!LLVMShardResult {
+    const native = llvm.createWasmModule("standalone", c.LLVMCodeGenLevelAggressive) catch
+        return CodegenError.LLVMError;
+    defer native.tm.dispose();
+    var module_disposed = false;
+    defer if (!module_disposed) native.module.dispose();
+
+    const builder = llvm.Builder.create(native.ctx);
+    defer builder.dispose();
+
+    var generated_count: u32 = 0;
+    for (functions) |sf| {
+        const func = sf.func;
+
+        // Create the function with simple i32 signature: i32 @name(i32 %n0, ...)
+        // Use a clean export name (just the JS function name)
+        var export_name_buf: [256]u8 = undefined;
+        const export_name = std.fmt.bufPrintZ(&export_name_buf, "{s}", .{sf.name}) catch continue;
+
+        var param_types_buf: [8]llvm.Type = undefined;
+        for (0..func.arg_count) |i| {
+            param_types_buf[i] = llvm.i32Type();
+        }
+        const fn_ty = llvm.functionType(llvm.i32Type(), param_types_buf[0..func.arg_count], false);
+        const standalone_fn = native.module.addFunction(export_name, fn_ty);
+        // External linkage = exported from WASM module
+        llvm.setLinkage(standalone_fn, c.LLVMExternalLinkage);
+
+        // Generate the body using the same int32 body generator
+        generateInt32Body(allocator, builder, standalone_fn, func, sf.cfg) catch {
+            // Clean up failed function
+            while (c.LLVMGetFirstBasicBlock(standalone_fn)) |bb| {
+                while (c.LLVMGetFirstInstruction(bb)) |inst| {
+                    c.LLVMInstructionEraseFromParent(inst);
+                }
+                c.LLVMDeleteBasicBlock(bb);
+            }
+            const fb = llvm.appendBasicBlock(standalone_fn, "entry");
+            builder.positionAtEnd(fb);
+            _ = builder.buildRet(llvm.constInt32(0));
+            continue;
+        };
+
+        generated_count += 1;
+    }
+
+    if (generated_count == 0) {
+        return .{ .func_count = 0, .has_functions = false };
+    }
+
+    module_disposed = try finalizeAndEmitShard(native, obj_path, "standalone-wasm");
+    return .{ .func_count = generated_count, .has_functions = true };
+}
+
 /// Generate a complete shard as an LLVM IR module and emit to object file.
 /// Returns the number of functions generated.
 pub fn generateShard(

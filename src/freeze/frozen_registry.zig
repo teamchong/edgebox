@@ -1071,6 +1071,22 @@ pub fn generateModuleZigShardedWithBackend(
             // Track int32 shard count (thin shards follow after these)
             int32_llvm_shard_count = llvm_shard_count;
 
+            // Generate standalone WASM for int32 functions (no QuickJS runtime)
+            // These can run directly in V8/workerd at near-native speed
+            {
+                var standalone_path_buf: [4096]u8 = undefined;
+                const standalone_path = std.fmt.bufPrintZ(&standalone_path_buf, "{s}/standalone.o", .{cache_dir}) catch null;
+                if (standalone_path) |sp| {
+                    if (llvm_codegen.generateStandaloneWasm(allocator, llvm_funcs.items, sp)) |standalone_result| {
+                        if (standalone_result.has_functions) {
+                            std.debug.print("[freeze] Standalone WASM: {d} pure functions → {s}\n", .{ standalone_result.func_count, sp });
+                        }
+                    } else |err| {
+                        std.debug.print("[freeze] Standalone WASM generation failed: {}\n", .{err});
+                    }
+                }
+            }
+
             // NOTE: Int32 functions are NOT removed from generated_all.
             // They remain in Zig shards for cross-platform compatibility (embed, standalone/WASM).
             // The LLVM .o files re-register the same dispatch keys with LLVM-compiled versions.
@@ -1105,7 +1121,7 @@ pub fn generateModuleZigShardedWithBackend(
 
         var thin_skipped_int32: usize = 0;
         for (generated_all.items, 0..) |gf, gi| {
-            // Skip int32 functions (already handled above)
+            // Skip int32 functions (already handled above in int32 shard for native)
             if (isPureInt32Function(gf.func)) {
                 thin_skipped_int32 += 1;
                 continue;
@@ -1248,12 +1264,34 @@ pub fn generateModuleZigShardedWithBackend(
         \\
     );
 
+    // Add WASM32 detection for conditional shard init
+    try main_output.appendSlice(allocator,
+        \\const is_wasm32 = @import("builtin").cpu.arch == .wasm32;
+        \\
+    );
+
     // Declare extern functions for LLVM shard inits (from LLVM-compiled .o files)
+    // Int32 shards (0..int32_llvm_shard_count-1) are native-only — skip on WASM
     if (llvm_shard_count > 0) {
         for (0..llvm_shard_count) |i| {
-            var extern_buf: [128]u8 = undefined;
-            const extern_line = std.fmt.bufPrint(&extern_buf, "extern fn frozen_init_llvm_shard_{d}() callconv(.c) c_int;\n", .{i}) catch continue;
-            try main_output.appendSlice(allocator, extern_line);
+            var extern_buf: [512]u8 = undefined;
+            if (i < int32_llvm_shard_count) {
+                // Int32 shard: native-only, return 0 on WASM
+                // Use @extern to reference original symbol name without naming conflict
+                const extern_line = std.fmt.bufPrint(&extern_buf,
+                    \\fn call_shard_init_{d}() c_int {{
+                    \\    if (comptime is_wasm32) return 0;
+                    \\    const f = @extern(*const fn () callconv(.c) c_int, .{{ .name = "frozen_init_llvm_shard_{d}" }});
+                    \\    return f();
+                    \\}}
+                    \\
+                , .{ i, i }) catch continue;
+                try main_output.appendSlice(allocator, extern_line);
+            } else {
+                // Thin shard: available on both native and WASM
+                const extern_line = std.fmt.bufPrint(&extern_buf, "extern fn frozen_init_llvm_shard_{d}() callconv(.c) c_int;\n", .{i}) catch continue;
+                try main_output.appendSlice(allocator, extern_line);
+            }
         }
     }
 
@@ -1306,8 +1344,15 @@ pub fn generateModuleZigShardedWithBackend(
 
     for (0..llvm_shard_count) |i| {
         var call_buf: [128]u8 = undefined;
-        const call_line = std.fmt.bufPrint(&call_buf, "    count += frozen_init_llvm_shard_{d}();\n", .{i}) catch continue;
-        try main_output.appendSlice(allocator, call_line);
+        if (i < int32_llvm_shard_count) {
+            // Int32 shard: use wrapper that returns 0 on WASM
+            const call_line = std.fmt.bufPrint(&call_buf, "    count += call_shard_init_{d}();\n", .{i}) catch continue;
+            try main_output.appendSlice(allocator, call_line);
+        } else {
+            // Thin shard: available on both native and WASM
+            const call_line = std.fmt.bufPrint(&call_buf, "    count += frozen_init_llvm_shard_{d}();\n", .{i}) catch continue;
+            try main_output.appendSlice(allocator, call_line);
+        }
     }
 
     try main_output.appendSlice(allocator,

@@ -523,6 +523,7 @@ pub fn main() !void {
     var no_freeze = false;
     var no_bundle = false;
     var binary_only = false;
+    var wasm_only = false;
     var debug_build = false;
     var allocator_type: AllocatorType = .gpa; // Default: GPA for debugging (use --allocator=c for production)
     var allocator_explicitly_set = false;
@@ -553,6 +554,8 @@ pub fn main() !void {
             no_bundle = true;
         } else if (std.mem.eql(u8, arg, "--binary-only")) {
             binary_only = true;
+        } else if (std.mem.eql(u8, arg, "--wasm-only")) {
+            wasm_only = true;
         } else if (std.mem.eql(u8, arg, "--debug")) {
             debug_build = true;
         } else if (std.mem.startsWith(u8, arg, "--allocator=")) {
@@ -633,6 +636,7 @@ pub fn main() !void {
             .no_freeze = no_freeze,
             .no_bundle = no_bundle,
             .binary_only = binary_only,
+            .wasm_only = wasm_only,
             .debug_build = debug_build,
             .allocator_type = allocator_type,
             .output_prefix = output_prefix,
@@ -661,6 +665,7 @@ fn printUsage() void {
         \\  --no-freeze      Skip freeze analysis (faster builds, no optimization)
         \\  --no-bundle      Skip Bun bundler (for simple JS without imports)
         \\  --binary-only    Only build native binary (skip WASM/AOT)
+        \\  --wasm-only      Only build WASM + AOT (skip native binary)
         \\  --debug          Use Debug optimization (faster compile, slower runtime)
         \\  --allocator=X    Allocator for native binary: gpa (default), c, arena
         \\  --output-dir=X   Custom output directory (default: zig-out)
@@ -927,6 +932,7 @@ const BuildOptions = struct {
     no_freeze: bool = false, // Skip freeze analysis
     no_bundle: bool = false, // Skip Bun bundler
     binary_only: bool = false, // Only build native binary (skip WASM/AOT)
+    wasm_only: bool = false, // Only build WASM + AOT (skip native binary)
     debug_build: bool = false, // Use Debug optimization (faster compile, slower runtime)
     allocator_type: AllocatorType = .gpa, // Allocator for native binary (gpa=debug, c=fastest, arena=batch)
     output_prefix: ?[]const u8 = null, // Custom output prefix (default: zig-out)
@@ -1601,6 +1607,43 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
     const frozen_optimize_arg = "-Dfrozen-optimize=ReleaseFast";
     const frozen_thin_optimize_arg = "-Dfrozen-thin-optimize=ReleaseSmall";
 
+    // Step 6e: Link standalone WASM (pure int32 functions, no QuickJS runtime)
+    // Produces a tiny .wasm file for use in V8/workerd Workers
+    var standalone_wasm_path_buf: [4096]u8 = undefined;
+    var has_standalone_wasm = false;
+    {
+        var standalone_o_buf: [4096]u8 = undefined;
+        const standalone_o = std.fmt.bufPrint(&standalone_o_buf, "{s}/standalone.o", .{cache_dir}) catch null;
+        if (standalone_o) |so| {
+            if (std.fs.cwd().access(so, .{})) |_| {
+                const standalone_wasm = std.fmt.bufPrint(&standalone_wasm_path_buf, "{s}/{s}-standalone.wasm", .{ output_dir, output_base }) catch null;
+                if (standalone_wasm) |sw| {
+                    const link_result = runCommand(allocator, &.{
+                        "wasm-ld-19", "--no-entry", "--export-all", "-o", sw, so,
+                    }) catch null;
+                    if (link_result) |lr| {
+                        defer {
+                            if (lr.stdout) |s| allocator.free(s);
+                            if (lr.stderr) |s| allocator.free(s);
+                        }
+                        const link_ok = switch (lr.term) {
+                            .Exited => |code| code == 0,
+                            else => false,
+                        };
+                        if (link_ok) {
+                            has_standalone_wasm = true;
+                            if (std.fs.cwd().statFile(sw)) |stat| {
+                                std.debug.print("[build] Standalone WASM: {s} ({d} bytes)\n", .{ sw, stat.size });
+                            } else |_| {}
+                        } else {
+                            std.debug.print("[warn] Standalone WASM linking failed\n", .{});
+                        }
+                    }
+                }
+            } else |_| {} // No standalone.o — no pure int32 functions
+        }
+    }
+
     // Step 7: Build WASM static (with host imports for edgebox daemon AOT)
     if (!options.binary_only) {
         std.debug.print("[build] Building WASM static with embedded bytecode...\n", .{});
@@ -1641,52 +1684,54 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         }
     }
 
-    // Step 7b: Build native binary using native (raw bytecode via @embedFile)
-    // This avoids OOM from parsing 321MB C hex arrays by embedding bytecode directly
-    // Uses the SAME frozen_module.zig as WASM, but embeds bytecode via linker
-    std.debug.print("[build] Building native binary with embedded bytecode (native)...\n", .{});
-    const native_result = if (source_dir_arg.len > 0)
-        try runCommand(allocator, &.{
-            "zig", "build", "-j4", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native", optimize_arg, frozen_optimize_arg, frozen_thin_optimize_arg, source_dir_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
-        })
-    else
-        try runCommand(allocator, &.{
-            "zig", "build", "-j4", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native", optimize_arg, frozen_optimize_arg, frozen_thin_optimize_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
-        });
-    defer {
-        if (native_result.stdout) |s| allocator.free(s);
-        if (native_result.stderr) |s| allocator.free(s);
-    }
-
-    // Generate binary path (no extension)
+    // Generate binary path (no extension) — needed for summary even if skipped
     var binary_path_buf: [4096]u8 = undefined;
     const binary_path = std.fmt.bufPrint(&binary_path_buf, "{s}/{s}", .{ output_dir, output_base }) catch {
         std.debug.print("[error] Output path too long: {s}/{s}\n", .{ output_dir, output_base });
         std.process.exit(1);
     };
 
-    const native_failed = switch (native_result.term) {
-        .Exited => |code| code != 0,
-        .Signal => true,
-        .Stopped, .Unknown => true,
-    };
-    if (native_failed) {
-        std.debug.print("[warn] Native-embed build failed (WASM/AOT still usable)\n", .{});
-        if (native_result.stderr) |err| {
-            std.debug.print("{s}\n", .{err});
+    // Step 7b: Build native binary using native (raw bytecode via @embedFile)
+    // This avoids OOM from parsing 321MB C hex arrays by embedding bytecode directly
+    // Uses the SAME frozen_module.zig as WASM, but embeds bytecode via linker
+    if (!options.wasm_only) {
+        std.debug.print("[build] Building native binary with embedded bytecode (native)...\n", .{});
+        const native_result = if (source_dir_arg.len > 0)
+            try runCommand(allocator, &.{
+                "zig", "build", "-j4", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native", optimize_arg, frozen_optimize_arg, frozen_thin_optimize_arg, source_dir_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
+            })
+        else
+            try runCommand(allocator, &.{
+                "zig", "build", "-j4", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native", optimize_arg, frozen_optimize_arg, frozen_thin_optimize_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
+            });
+        defer {
+            if (native_result.stdout) |s| allocator.free(s);
+            if (native_result.stderr) |s| allocator.free(s);
         }
-    } else {
-        // Copy from build output with output name based on input
-        // build.zig derives output name from source_dir basename (e.g., _tsc.js -> _tsc)
-        var native_path_buf: [4096]u8 = undefined;
-        const native_path = std.fmt.bufPrint(&native_path_buf, "{s}/bin/{s}", .{ out_prefix, output_base }) catch "zig-out/bin/edgebox-native";
-        std.fs.cwd().copyFile(native_path, std.fs.cwd(), binary_path, .{}) catch |err| {
-            std.debug.print("[warn] Failed to copy binary: {}\n", .{err});
+
+        const native_failed = switch (native_result.term) {
+            .Exited => |code| code != 0,
+            .Signal => true,
+            .Stopped, .Unknown => true,
         };
-        if (std.fs.cwd().statFile(binary_path)) |stat| {
-            const size_mb = @as(f64, @floatFromInt(stat.size)) / 1024.0 / 1024.0;
-            std.debug.print("[build] Binary: {s} ({d:.1}MB)\n", .{ binary_path, size_mb });
-        } else |_| {}
+        if (native_failed) {
+            std.debug.print("[warn] Native-embed build failed (WASM/AOT still usable)\n", .{});
+            if (native_result.stderr) |err| {
+                std.debug.print("{s}\n", .{err});
+            }
+        } else {
+            // Copy from build output with output name based on input
+            // build.zig derives output name from source_dir basename (e.g., _tsc.js -> _tsc)
+            var native_path_buf: [4096]u8 = undefined;
+            const native_path = std.fmt.bufPrint(&native_path_buf, "{s}/bin/{s}", .{ out_prefix, output_base }) catch "zig-out/bin/edgebox-native";
+            std.fs.cwd().copyFile(native_path, std.fs.cwd(), binary_path, .{}) catch |err| {
+                std.debug.print("[warn] Failed to copy binary: {}\n", .{err});
+            };
+            if (std.fs.cwd().statFile(binary_path)) |stat| {
+                const size_mb = @as(f64, @floatFromInt(stat.size)) / 1024.0 / 1024.0;
+                std.debug.print("[build] Binary: {s} ({d:.1}MB)\n", .{ binary_path, size_mb });
+            } else |_| {}
+        }
     }
 
     // Steps 8-10: Strip, wasm-opt, AOT (skip if binary_only)
@@ -1728,21 +1773,47 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             }
         }
 
-        // Summary for full build
-        std.debug.print("\n[build] === Static Build Complete ===\n\n", .{});
-        std.debug.print("Files created:\n", .{});
-        std.debug.print("  {s}     - Native binary (QuickJS + frozen)\n", .{binary_path});
-        std.debug.print("  {s}   - WASM with embedded bytecode\n", .{wasm_path});
-        std.debug.print("  {s}  - AOT native module\n\n", .{aot_path});
-        std.debug.print("To run:\n", .{});
-        std.debug.print("  ./{s}            # Binary (fastest startup)\n", .{binary_path});
-        std.debug.print("  edgebox {s}   # WASM (sandboxed)\n", .{wasm_path});
-        std.debug.print("  edgebox {s}  # AOT (sandboxed, fast)\n\n", .{aot_path});
+        if (options.wasm_only) {
+            // Summary for wasm-only build
+            std.debug.print("\n[build] === WASM Build Complete ===\n\n", .{});
+            std.debug.print("Files created:\n", .{});
+            std.debug.print("  {s}   - WASM with embedded bytecode\n", .{wasm_path});
+            std.debug.print("  {s}  - AOT native module\n", .{aot_path});
+            if (has_standalone_wasm) {
+                const sw_path = std.fmt.bufPrint(&standalone_wasm_path_buf, "{s}/{s}-standalone.wasm", .{ output_dir, output_base }) catch "";
+                std.debug.print("  {s}  - Standalone WASM (pure functions, for workerd/V8)\n", .{sw_path});
+            }
+            std.debug.print("\n", .{});
+            std.debug.print("To run:\n", .{});
+            std.debug.print("  edgebox {s}   # WASM (sandboxed)\n", .{wasm_path});
+            std.debug.print("  edgebox {s}  # AOT (sandboxed, fast)\n\n", .{aot_path});
+        } else {
+            // Summary for full build
+            std.debug.print("\n[build] === Static Build Complete ===\n\n", .{});
+            std.debug.print("Files created:\n", .{});
+            std.debug.print("  {s}     - Native binary (QuickJS + frozen)\n", .{binary_path});
+            std.debug.print("  {s}   - WASM with embedded bytecode\n", .{wasm_path});
+            std.debug.print("  {s}  - AOT native module\n", .{aot_path});
+            if (has_standalone_wasm) {
+                const sw_path = std.fmt.bufPrint(&standalone_wasm_path_buf, "{s}/{s}-standalone.wasm", .{ output_dir, output_base }) catch "";
+                std.debug.print("  {s}  - Standalone WASM (pure functions, for workerd/V8)\n", .{sw_path});
+            }
+            std.debug.print("\n", .{});
+            std.debug.print("To run:\n", .{});
+            std.debug.print("  ./{s}            # Binary (fastest startup)\n", .{binary_path});
+            std.debug.print("  edgebox {s}   # WASM (sandboxed)\n", .{wasm_path});
+            std.debug.print("  edgebox {s}  # AOT (sandboxed, fast)\n\n", .{aot_path});
+        }
     } else {
         // Summary for binary-only build
         std.debug.print("\n[build] === Binary Build Complete ===\n\n", .{});
-        std.debug.print("File created:\n", .{});
-        std.debug.print("  {s}  - Native binary (QuickJS + frozen)\n\n", .{binary_path});
+        std.debug.print("Files created:\n", .{});
+        std.debug.print("  {s}  - Native binary (QuickJS + frozen)\n", .{binary_path});
+        if (has_standalone_wasm) {
+            const sw_path = std.fmt.bufPrint(&standalone_wasm_path_buf, "{s}/{s}-standalone.wasm", .{ output_dir, output_base }) catch "";
+            std.debug.print("  {s}  - Standalone WASM (pure functions, for workerd/V8)\n", .{sw_path});
+        }
+        std.debug.print("\n", .{});
         std.debug.print("To run:\n", .{});
         std.debug.print("  ./{s}\n\n", .{binary_path});
     }
