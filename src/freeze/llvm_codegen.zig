@@ -899,6 +899,53 @@ fn emitInt32Instruction(
             vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
         },
 
+        .get_loc_check_i32 => {
+            // Same as get_loc — in int32 context, locals are always initialized
+            const idx: u32 = switch (instr.operand) {
+                .u8 => |a| a,
+                .u16 => |a| a,
+                else => 0,
+            };
+            if (idx >= @min(local_count, 16)) return CodegenError.UnsupportedOpcode;
+            const loc_ptr = locals.*[idx];
+            const val = builder.buildLoad(llvm.i32Type(), loc_ptr, "loc");
+            vstack.append(allocator, val) catch return CodegenError.OutOfMemory;
+        },
+
+        .put_loc_check_i32 => {
+            // Same as put_loc — const check irrelevant in int32 context
+            const idx: u32 = switch (instr.operand) {
+                .u8 => |a| a,
+                .u16 => |a| a,
+                else => 0,
+            };
+            if (vstack.items.len < 1) return CodegenError.StackUnderflow;
+            if (idx >= @min(local_count, 16)) return CodegenError.UnsupportedOpcode;
+            const val = i32VstackPop(vstack);
+            _ = builder.buildStore(val, locals.*[idx]);
+        },
+
+        .set_loc_uninitialized_i32 => {
+            // In int32 context, "uninitialized" = 0
+            const idx: u32 = switch (instr.operand) {
+                .u8 => |a| a,
+                .u16 => |a| a,
+                else => 0,
+            };
+            if (idx >= @min(local_count, 16)) return CodegenError.UnsupportedOpcode;
+            _ = builder.buildStore(llvm.constInt32(0), locals.*[idx]);
+        },
+
+        .swap_i32 => {
+            if (vstack.items.len < 2) return CodegenError.StackUnderflow;
+            const a = vstack.items[vstack.items.len - 1];
+            const b = vstack.items[vstack.items.len - 2];
+            vstack.items[vstack.items.len - 1] = b;
+            vstack.items[vstack.items.len - 2] = a;
+        },
+
+        .nop_i32 => {},
+
         .inc_dec_i32 => {
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
             const val = i32VstackPop(vstack);

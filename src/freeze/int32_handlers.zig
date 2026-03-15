@@ -51,6 +51,16 @@ pub const Int32Pattern = enum {
     push_bool_i32,
     /// Logical NOT: pop 1, push !val as i32 (0→1, nonzero→0)
     lnot_i32,
+    /// Get local with TDZ check (same as get_loc in int32 context)
+    get_loc_check_i32,
+    /// Put local with const check (same as put_loc in int32 context)
+    put_loc_check_i32,
+    /// Set local uninitialized (set to 0 in int32 context)
+    set_loc_uninitialized_i32,
+    /// Swap top two stack values
+    swap_i32,
+    /// No-op
+    nop_i32,
     /// Unsupported in int32 mode
     unsupported,
 };
@@ -170,6 +180,16 @@ pub fn getInt32Handler(opcode: Opcode) Int32Handler {
         // Return
         .@"return" => .{ .pattern = .return_i32 },
         .return_undef => .{ .pattern = .return_i32, .value = 0 },
+
+        // Get/put local with TDZ/const checks (same as regular get/put in int32 context)
+        .get_loc_check => .{ .pattern = .get_loc_check_i32 },
+        .put_loc_check => .{ .pattern = .put_loc_check_i32 },
+        .put_loc_check_init => .{ .pattern = .put_loc_check_i32 },
+        .set_loc_uninitialized => .{ .pattern = .set_loc_uninitialized_i32 },
+
+        // Stack ops
+        .swap => .{ .pattern = .swap_i32 },
+        .nop => .{ .pattern = .nop_i32 },
 
         // Control flow
         .if_false, .if_false8 => .{ .pattern = .if_false_i32 },
