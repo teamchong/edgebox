@@ -1080,6 +1080,24 @@ pub fn generateModuleZigShardedWithBackend(
                     if (llvm_codegen.generateStandaloneWasm(allocator, llvm_funcs.items, sp)) |standalone_result| {
                         if (standalone_result.has_functions) {
                             std.debug.print("[freeze] Standalone WASM: {d} pure functions → {s}\n", .{ standalone_result.func_count, sp });
+                            // Write manifest of standalone WASM function names for worker generation
+                            var manifest_path_buf: [4096]u8 = undefined;
+                            const manifest_path = std.fmt.bufPrint(&manifest_path_buf, "{s}/standalone_manifest.json", .{cache_dir}) catch null;
+                            if (manifest_path) |mp| {
+                                if (std.fs.cwd().createFile(mp, .{})) |mf| {
+                                    defer mf.close();
+                                    mf.writeAll("[") catch {};
+                                    var first = true;
+                                    for (llvm_funcs.items) |sf| {
+                                        if (!first) mf.writeAll(",") catch {};
+                                        first = false;
+                                        var entry_buf: [512]u8 = undefined;
+                                        const entry = std.fmt.bufPrint(&entry_buf, "{{\"name\":\"{s}\",\"args\":{d}}}", .{ sf.name, sf.func.arg_count }) catch continue;
+                                        mf.writeAll(entry) catch {};
+                                    }
+                                    mf.writeAll("]") catch {};
+                                } else |_| {}
+                            }
                         }
                     } else |err| {
                         std.debug.print("[freeze] Standalone WASM generation failed: {}\n", .{err});

@@ -1126,6 +1126,13 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         }
     }
 
+    // Save clean bundle for workerd worker generation (before polyfills/hooks)
+    var clean_bundle_path_buf: [4096]u8 = undefined;
+    const clean_bundle_path = std.fmt.bufPrint(&clean_bundle_path_buf, "{s}/bundle_clean.js", .{cache_dir}) catch null;
+    if (clean_bundle_path) |cbp| {
+        std.fs.cwd().copyFile(bundle_js_path, std.fs.cwd(), cbp, .{}) catch {};
+    }
+
     // Step 4: Prepend polyfills (skip if --no-polyfill flag)
     if (!options.no_polyfill) {
         // All polyfill modules (in dependency order)
@@ -1644,6 +1651,161 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         }
     }
 
+    // Step 6f: Generate workerd worker files (worker.mjs + config.capnp)
+    // Uses the clean bundle (pre-polyfill) + standalone WASM
+    var has_worker_files = false;
+    if (has_standalone_wasm) {
+        var worker_path_buf: [4096]u8 = undefined;
+        var config_path_buf: [4096]u8 = undefined;
+        const worker_path = std.fmt.bufPrint(&worker_path_buf, "{s}/{s}-worker.mjs", .{ output_dir, output_base }) catch null;
+        const config_path = std.fmt.bufPrint(&config_path_buf, "{s}/{s}-config.capnp", .{ output_dir, output_base }) catch null;
+
+        if (worker_path != null and config_path != null) {
+            // Read standalone manifest to know which functions are in WASM
+            var manifest_buf: [4096]u8 = undefined;
+            const manifest_path = std.fmt.bufPrint(&manifest_buf, "{s}/standalone_manifest.json", .{cache_dir}) catch null;
+            var wasm_manifest: ?[]const u8 = null;
+            if (manifest_path) |mp| {
+                wasm_manifest = std.fs.cwd().readFileAlloc(allocator, mp, 1024 * 1024) catch null;
+            }
+            defer if (wasm_manifest) |wm| allocator.free(wm);
+
+            // Read clean bundle
+            var clean_content: ?[]const u8 = null;
+            if (clean_bundle_path) |cbp| {
+                clean_content = std.fs.cwd().readFileAlloc(allocator, cbp, 50 * 1024 * 1024) catch null;
+            }
+            defer if (clean_content) |cc| allocator.free(cc);
+
+            var wasm_fn_buf: [256]u8 = undefined;
+            const wasm_filename = std.fmt.bufPrint(&wasm_fn_buf, "{s}-standalone.wasm", .{output_base}) catch "standalone.wasm";
+
+            // Generate worker.mjs — exposes WASM functions as a Worker
+            if (worker_path) |wp| {
+                if (std.fs.cwd().createFile(wp, .{})) |wf| {
+                    defer wf.close();
+                    wf.writeAll("// EdgeBox Worker for workerd (auto-generated)\n") catch {};
+                    wf.writeAll("// Pure int32 functions compiled: JS → LLVM IR → WASM → V8 TurboFan\n\n") catch {};
+                    wf.writeAll("import wasm from \"") catch {};
+                    wf.writeAll(wasm_filename) catch {};
+                    wf.writeAll("\";\nconst __wasm = new WebAssembly.Instance(wasm);\n") catch {};
+
+                    // Destructure WASM exports
+                    if (wasm_manifest) |mc| {
+                        wf.writeAll("const { ") catch {};
+                        var pos: usize = 0;
+                        var first = true;
+                        while (std.mem.indexOfPos(u8, mc, pos, "\"name\":\"")) |name_start| {
+                            const ns = name_start + 8;
+                            if (std.mem.indexOfPos(u8, mc, ns, "\"")) |name_end| {
+                                if (!first) wf.writeAll(", ") catch {};
+                                first = false;
+                                wf.writeAll(mc[ns..name_end]) catch {};
+                                pos = name_end + 1;
+                            } else break;
+                        }
+                        wf.writeAll(" } = __wasm.exports;\n\n") catch {};
+                    }
+
+                    // Generate a fetch handler that benchmarks the WASM functions
+                    wf.writeAll("export default {\n") catch {};
+                    wf.writeAll("  async fetch(request) {\n") catch {};
+                    wf.writeAll("    const url = new URL(request.url);\n") catch {};
+                    wf.writeAll("    const results = {};\n\n") catch {};
+
+                    // Call each WASM function with a benchmark
+                    if (wasm_manifest) |mc| {
+                        var pos: usize = 0;
+                        while (std.mem.indexOfPos(u8, mc, pos, "\"name\":\"")) |name_start| {
+                            const ns = name_start + 8;
+                            if (std.mem.indexOfPos(u8, mc, ns, "\"")) |name_end| {
+                                const func_name = mc[ns..name_end];
+                                // Extract args count
+                                var args_count: u32 = 0;
+                                if (std.mem.indexOfPos(u8, mc, name_end, "\"args\":")) |args_start| {
+                                    const as = args_start + 7;
+                                    if (as < mc.len and mc[as] >= '0' and mc[as] <= '9') {
+                                        args_count = mc[as] - '0';
+                                    }
+                                }
+
+                                wf.writeAll("    // ") catch {};
+                                wf.writeAll(func_name) catch {};
+                                wf.writeAll(" — WASM (LLVM O3 + V8 TurboFan)\n") catch {};
+                                wf.writeAll("    {\n") catch {};
+
+                                // Parse args from query string or use defaults
+                                wf.writeAll("      const arg = parseInt(url.searchParams.get(\"n\") || \"45\");\n") catch {};
+                                wf.writeAll("      const start = performance.now();\n") catch {};
+                                wf.writeAll("      const result = ") catch {};
+                                wf.writeAll(func_name) catch {};
+                                wf.writeAll("(arg") catch {};
+                                // Add extra 0 args if function takes more than 1
+                                var extra: u32 = 1;
+                                while (extra < args_count) : (extra += 1) {
+                                    wf.writeAll(", 0") catch {};
+                                }
+                                wf.writeAll(");\n") catch {};
+                                wf.writeAll("      const elapsed = performance.now() - start;\n") catch {};
+                                wf.writeAll("      results.") catch {};
+                                wf.writeAll(func_name) catch {};
+                                wf.writeAll(" = { result, elapsed_ms: elapsed.toFixed(1) };\n") catch {};
+                                wf.writeAll("    }\n\n") catch {};
+                                pos = name_end + 1;
+                            } else break;
+                        }
+                    }
+
+                    wf.writeAll("    return new Response(JSON.stringify({\n") catch {};
+                    wf.writeAll("      engine: \"V8 JIT (EdgeBox WASM)\",\n") catch {};
+                    wf.writeAll("      source: \"JS → QuickJS parser → LLVM IR → WASM (automated)\",\n") catch {};
+                    wf.writeAll("      ...results,\n") catch {};
+                    wf.writeAll("    }, null, 2), {\n") catch {};
+                    wf.writeAll("      headers: { \"content-type\": \"application/json\" }\n") catch {};
+                    wf.writeAll("    });\n") catch {};
+                    wf.writeAll("  }\n") catch {};
+                    wf.writeAll("};\n") catch {};
+
+                    has_worker_files = true;
+                    std.debug.print("[build] Worker: {s}\n", .{wp});
+                } else |_| {}
+            }
+
+            // Generate config.capnp
+            if (config_path) |cp| {
+                if (std.fs.cwd().createFile(cp, .{})) |cf| {
+                    defer cf.close();
+                    var wn_buf: [256]u8 = undefined;
+                    const wn = std.fmt.bufPrint(&wn_buf, "{s}-worker.mjs", .{output_base}) catch "worker.mjs";
+                    cf.writeAll("using Workerd = import \"/workerd/workerd.capnp\";\n\n") catch {};
+                    cf.writeAll("const config :Workerd.Config = (\n") catch {};
+                    cf.writeAll("  services = [\n") catch {};
+                    cf.writeAll("    (name = \"main\", worker = .worker),\n") catch {};
+                    cf.writeAll("  ],\n") catch {};
+                    cf.writeAll("  sockets = [\n") catch {};
+                    cf.writeAll("    (name = \"http\", address = \"*:8787\", http = (), service = \"main\"),\n") catch {};
+                    cf.writeAll("  ],\n") catch {};
+                    cf.writeAll(");\n\n") catch {};
+                    cf.writeAll("const worker :Workerd.Worker = (\n") catch {};
+                    cf.writeAll("  modules = [\n") catch {};
+                    cf.writeAll("    (name = \"entrypoint\", esModule = embed \"") catch {};
+                    cf.writeAll(wn) catch {};
+                    cf.writeAll("\"),\n") catch {};
+                    cf.writeAll("    (name = \"") catch {};
+                    cf.writeAll(wasm_filename) catch {};
+                    cf.writeAll("\", wasm = embed \"") catch {};
+                    cf.writeAll(wasm_filename) catch {};
+                    cf.writeAll("\"),\n") catch {};
+                    cf.writeAll("  ],\n") catch {};
+                    cf.writeAll("  compatibilityDate = \"2024-09-23\",\n") catch {};
+                    cf.writeAll(");\n") catch {};
+
+                    std.debug.print("[build] Config: {s}\n", .{cp});
+                } else |_| {}
+            }
+        }
+    }
+
     // Step 7: Build WASM static (with host imports for edgebox daemon AOT)
     if (!options.binary_only) {
         std.debug.print("[build] Building WASM static with embedded bytecode...\n", .{});
@@ -1783,10 +1945,24 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                 const sw_path = std.fmt.bufPrint(&standalone_wasm_path_buf, "{s}/{s}-standalone.wasm", .{ output_dir, output_base }) catch "";
                 std.debug.print("  {s}  - Standalone WASM (pure functions, for workerd/V8)\n", .{sw_path});
             }
+            if (has_worker_files) {
+                var wp_buf: [4096]u8 = undefined;
+                var cp_buf2: [4096]u8 = undefined;
+                const wp = std.fmt.bufPrint(&wp_buf, "{s}/{s}-worker.mjs", .{ output_dir, output_base }) catch "";
+                const cp = std.fmt.bufPrint(&cp_buf2, "{s}/{s}-config.capnp", .{ output_dir, output_base }) catch "";
+                std.debug.print("  {s}  - workerd Worker module\n", .{wp});
+                std.debug.print("  {s}  - workerd config\n", .{cp});
+            }
             std.debug.print("\n", .{});
             std.debug.print("To run:\n", .{});
             std.debug.print("  edgebox {s}   # WASM (sandboxed)\n", .{wasm_path});
-            std.debug.print("  edgebox {s}  # AOT (sandboxed, fast)\n\n", .{aot_path});
+            std.debug.print("  edgebox {s}  # AOT (sandboxed, fast)\n", .{aot_path});
+            if (has_worker_files) {
+                var cp_buf3: [4096]u8 = undefined;
+                const cp2 = std.fmt.bufPrint(&cp_buf3, "{s}/{s}-config.capnp", .{ output_dir, output_base }) catch "";
+                std.debug.print("  npx workerd serve {s}  # workerd (V8 JIT)\n", .{cp2});
+            }
+            std.debug.print("\n", .{});
         } else {
             // Summary for full build
             std.debug.print("\n[build] === Static Build Complete ===\n\n", .{});
