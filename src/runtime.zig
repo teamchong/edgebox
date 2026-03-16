@@ -1695,7 +1695,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     defer wf.close();
 
                     // Collect WASM function metadata from manifest
-                    const WasmFunc = struct { name: []const u8, arg_count: u32, instr_count: u32, is_recursive: bool, array_args: u8, mutated_args: u8, length_args: u8, has_loop: bool, line_num: u32, is_anon: bool, is_f64: bool };
+                    const WasmFunc = struct { name: []const u8, arg_count: u32, instr_count: u32, is_recursive: bool, array_args: u8, mutated_args: u8, length_args: u8, has_loop: bool, has_bitwise: bool, line_num: u32, is_anon: bool, is_f64: bool };
                     var wasm_funcs: [64]WasmFunc = undefined;
                     var wasm_func_count: usize = 0;
                     if (wasm_manifest) |mc| {
@@ -1762,6 +1762,12 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     const next_name = std.mem.indexOfPos(u8, mc, name_end + 1, "\"name\":\"") orelse mc.len;
                                     if (hls < next_name) has_loop = true;
                                 }
+                                // Parse has_bitwise: "has_bitwise":1
+                                var has_bitwise = false;
+                                if (std.mem.indexOfPos(u8, mc, name_end, "\"has_bitwise\":1")) |hbs| {
+                                    const next_name = std.mem.indexOfPos(u8, mc, name_end + 1, "\"name\":\"") orelse mc.len;
+                                    if (hbs < next_name) has_bitwise = true;
+                                }
                                 // Parse line number: "line":N
                                 var ln: u32 = 0;
                                 if (std.mem.indexOfPos(u8, mc, name_end, "\"line\":")) |ls| {
@@ -1781,7 +1787,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 // Detect anonymous functions (synthetic name starts with __anon_)
                                 const is_anon = std.mem.startsWith(u8, mc[ns..name_end], "__anon_");
                                 if (wasm_func_count < 64) {
-                                    wasm_funcs[wasm_func_count] = .{ .name = mc[ns..name_end], .arg_count = ac, .instr_count = ic, .is_recursive = is_rec, .array_args = aa, .mutated_args = ma, .length_args = la, .has_loop = has_loop, .line_num = ln, .is_anon = is_anon, .is_f64 = is_f64 };
+                                    wasm_funcs[wasm_func_count] = .{ .name = mc[ns..name_end], .arg_count = ac, .instr_count = ic, .is_recursive = is_rec, .array_args = aa, .mutated_args = ma, .length_args = la, .has_loop = has_loop, .has_bitwise = has_bitwise, .line_num = ln, .is_anon = is_anon, .is_f64 = is_f64 };
                                     wasm_func_count += 1;
                                 }
                                 pos = name_end + 1;
@@ -1961,11 +1967,22 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             if (matched_func) |mf| {
                                 // Smart trampoline heuristic:
                                 // - Recursive functions: ALWAYS trampoline (deep stacks stay in WASM)
+                                //   EXCEPT: f64 tier + bitwise = integer code forced into float
+                                //   (V8 JIT specializes to i32; WASM f64 has fptosi/sitofp overhead)
+                                //   fastPow: 430ms WASM vs 165ms V8 due to |0 roundtrips
                                 // - Cross-callers: ALWAYS trampoline (calls stay in WASM)
                                 // - Array functions with heavy computation (>200 instrs): trampoline
                                 //   (WASM compute amortizes copy cost)
                                 // - Small array/scalar functions (<200 instrs): keep as JS
                                 //   (V8 JIT inlines these perfectly; copy overhead dominates)
+                                if (mf.is_recursive and mf.is_f64 and mf.has_bitwise) {
+                                    // f64+bitwise recursive: integer code forced into f64 tier by division.
+                                    // WASM pays fptosi/sitofp roundtrip per |0, fmod polyfill per %.
+                                    // V8 JIT specializes to native i32 ops — always faster.
+                                    wf.writeAll(cc[src_pos .. src_pos + 1]) catch {};
+                                    src_pos += 1;
+                                    continue;
+                                }
                                 if (!mf.is_recursive) {
                                     // Check if body calls another WASM function (cross-call)
                                     var calls_wasm = false;

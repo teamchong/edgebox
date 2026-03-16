@@ -714,6 +714,17 @@ pub fn detectHasLoop(instructions: anytype) bool {
     return false;
 }
 
+/// Detect whether a function contains bitwise operations (and, or, xor, shl, sar, shr).
+/// Functions with bitwise ops in f64 tier pay heavy fptosi/sitofp conversion overhead.
+/// V8 JIT handles these natively as i32 via runtime type specialization.
+pub fn detectHasBitwise(instructions: anytype) bool {
+    for (instructions) |instr| {
+        const handler = getHandler(instr.opcode);
+        if (handler.requires_i32) return true;
+    }
+    return false;
+}
+
 // ============================================================================
 // Comptime LLVM instruction selection
 // ============================================================================
