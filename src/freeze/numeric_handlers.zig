@@ -702,6 +702,18 @@ pub fn detectLengthArgs(instructions: anytype, arg_count: u32) u8 {
     return result;
 }
 
+/// Detect whether a function contains a loop (backward jump in bytecode).
+/// Functions with loops iterate over data — their computation scales with
+/// input size, making WASM trampolines worthwhile even for small instruction counts.
+pub fn detectHasLoop(instructions: anytype) bool {
+    for (instructions) |instr| {
+        if (instr.getJumpTarget()) |target| {
+            if (target <= instr.pc) return true; // backward jump = loop
+        }
+    }
+    return false;
+}
+
 // ============================================================================
 // Comptime LLVM instruction selection
 // ============================================================================

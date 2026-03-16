@@ -1301,6 +1301,7 @@ pub fn generateModuleZigShardedWithBackend(
                                         }
 
                                         const length_args_mask = numeric_handlers.detectLengthArgs(sf.func.instructions, sf.func.arg_count);
+                                        const has_loop: u8 = if (numeric_handlers.detectHasLoop(sf.func.instructions)) 1 else 0;
                                         // Use synthetic name for anonymous functions
                                         var synth_buf: [32]u8 = undefined;
                                         const manifest_name = if (sf.name.len == 0)
@@ -1308,7 +1309,7 @@ pub fn generateModuleZigShardedWithBackend(
                                         else
                                             sf.name;
                                         var entry_buf: [512]u8 = undefined;
-                                        const entry = std.fmt.bufPrint(&entry_buf, "{{\"name\":\"{s}\",\"args\":{d},\"type\":\"{s}\",\"instrs\":{d},\"recursive\":{d},\"array_args\":{d},\"mutated_args\":{d},\"length_args\":{d},\"line\":{d}}}", .{ manifest_name, sf.func.arg_count, type_str, sf.func.instructions.len, recursive, array_args_mask, mutated_args_mask, length_args_mask, sf.func.line_num }) catch continue;
+                                        const entry = std.fmt.bufPrint(&entry_buf, "{{\"name\":\"{s}\",\"args\":{d},\"type\":\"{s}\",\"instrs\":{d},\"recursive\":{d},\"array_args\":{d},\"mutated_args\":{d},\"length_args\":{d},\"has_loop\":{d},\"line\":{d}}}", .{ manifest_name, sf.func.arg_count, type_str, sf.func.instructions.len, recursive, array_args_mask, mutated_args_mask, length_args_mask, has_loop, sf.func.line_num }) catch continue;
                                         mf.writeAll(entry) catch {};
                                     }
                                     mf.writeAll("]") catch {};
