@@ -150,8 +150,36 @@ pub const Builder = struct {
         return c.LLVMBuildSRem(self.ref, lhs, rhs, name);
     }
 
+    pub fn buildFAdd(self: Builder, lhs: Value, rhs: Value, name: [*:0]const u8) Value {
+        return c.LLVMBuildFAdd(self.ref, lhs, rhs, name);
+    }
+
+    pub fn buildFSub(self: Builder, lhs: Value, rhs: Value, name: [*:0]const u8) Value {
+        return c.LLVMBuildFSub(self.ref, lhs, rhs, name);
+    }
+
+    pub fn buildFMul(self: Builder, lhs: Value, rhs: Value, name: [*:0]const u8) Value {
+        return c.LLVMBuildFMul(self.ref, lhs, rhs, name);
+    }
+
     pub fn buildFDiv(self: Builder, lhs: Value, rhs: Value, name: [*:0]const u8) Value {
         return c.LLVMBuildFDiv(self.ref, lhs, rhs, name);
+    }
+
+    pub fn buildFRem(self: Builder, lhs: Value, rhs: Value, name: [*:0]const u8) Value {
+        return c.LLVMBuildFRem(self.ref, lhs, rhs, name);
+    }
+
+    pub fn buildFNeg(self: Builder, val: Value, name: [*:0]const u8) Value {
+        return c.LLVMBuildFNeg(self.ref, val, name);
+    }
+
+    pub fn buildFCmp(self: Builder, op: c.LLVMRealPredicate, lhs: Value, rhs: Value, name: [*:0]const u8) Value {
+        return c.LLVMBuildFCmp(self.ref, op, lhs, rhs, name);
+    }
+
+    pub fn buildFPToSI(self: Builder, val: Value, dest_ty: Type, name: [*:0]const u8) Value {
+        return c.LLVMBuildFPToSI(self.ref, val, dest_ty, name);
     }
 
     pub fn buildNeg(self: Builder, val: Value, name: [*:0]const u8) Value {
@@ -346,6 +374,10 @@ pub fn constInt32(val: i32) Value {
 
 pub fn constInt64(val: i64) Value {
     return c.LLVMConstInt(i64Type(), @bitCast(val), 1);
+}
+
+pub fn constF64(val: f64) Value {
+    return c.LLVMConstReal(doubleType(), val);
 }
 
 pub fn constNull(ty: Type) Value {

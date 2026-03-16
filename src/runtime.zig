@@ -423,6 +423,12 @@ pub const EdgeBoxConfig = struct {
     }
 };
 
+/// Check if a byte is a valid JS identifier character (a-z, A-Z, 0-9, _, $)
+fn isIdentChar(ch: u8) bool {
+    return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+        (ch >= '0' and ch <= '9') or ch == '_' or ch == '$';
+}
+
 /// Expand ${VAR} references in a string with host environment variables
 /// Example: "${GH_TOKEN}" -> actual value from host env
 fn expandEnvVar(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
@@ -1680,91 +1686,148 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             var wasm_fn_buf: [256]u8 = undefined;
             const wasm_filename = std.fmt.bufPrint(&wasm_fn_buf, "{s}-standalone.wasm", .{output_base}) catch "standalone.wasm";
 
-            // Generate worker.mjs — exposes WASM functions as a Worker
+            // Generate worker.mjs — source transform: replace WASM-compiled function
+            // bodies with WASM call trampolines. This is a proper source-to-source
+            // transform, not a runtime override hack.
             if (worker_path) |wp| {
                 if (std.fs.cwd().createFile(wp, .{})) |wf| {
                     defer wf.close();
-                    wf.writeAll("// EdgeBox Worker for workerd (auto-generated)\n") catch {};
-                    wf.writeAll("// Pure int32 functions compiled: JS → LLVM IR → WASM → V8 TurboFan\n\n") catch {};
+
+                    // Collect WASM function names and arg counts from manifest
+                    const WasmFunc = struct { name: []const u8, arg_count: u32 };
+                    var wasm_funcs: [64]WasmFunc = undefined;
+                    var wasm_func_count: usize = 0;
+                    if (wasm_manifest) |mc| {
+                        var pos: usize = 0;
+                        while (std.mem.indexOfPos(u8, mc, pos, "\"name\":\"")) |name_start| {
+                            const ns = name_start + 8;
+                            if (std.mem.indexOfPos(u8, mc, ns, "\"")) |name_end| {
+                                var ac: u32 = 1;
+                                if (std.mem.indexOfPos(u8, mc, name_end, "\"args\":")) |as| {
+                                    const ad = as + 7;
+                                    if (ad < mc.len and mc[ad] >= '0' and mc[ad] <= '9') ac = mc[ad] - '0';
+                                }
+                                if (wasm_func_count < 64) {
+                                    wasm_funcs[wasm_func_count] = .{ .name = mc[ns..name_end], .arg_count = ac };
+                                    wasm_func_count += 1;
+                                }
+                                pos = name_end + 1;
+                            } else break;
+                        }
+                    }
+
+                    // Preamble: import WASM module
+                    wf.writeAll("// EdgeBox AOT+JIT (auto-generated)\n") catch {};
+                    wf.writeAll("// Source transform: function bodies replaced with WASM calls\n") catch {};
+                    wf.writeAll("// V8 inlines these WASM calls into JS (zero overhead)\n\n") catch {};
                     wf.writeAll("import wasm from \"") catch {};
                     wf.writeAll(wasm_filename) catch {};
-                    wf.writeAll("\";\nconst __wasm = new WebAssembly.Instance(wasm);\n") catch {};
+                    wf.writeAll("\";\nconst __wasm = new WebAssembly.Instance(wasm);\n\n") catch {};
 
-                    // Destructure WASM exports
-                    if (wasm_manifest) |mc| {
-                        wf.writeAll("const { ") catch {};
-                        var pos: usize = 0;
-                        var first = true;
-                        while (std.mem.indexOfPos(u8, mc, pos, "\"name\":\"")) |name_start| {
-                            const ns = name_start + 8;
-                            if (std.mem.indexOfPos(u8, mc, ns, "\"")) |name_end| {
-                                if (!first) wf.writeAll(", ") catch {};
-                                first = false;
-                                wf.writeAll(mc[ns..name_end]) catch {};
-                                pos = name_end + 1;
-                            } else break;
-                        }
-                        wf.writeAll(" } = __wasm.exports;\n\n") catch {};
-                    }
+                    // Source transform: copy original source, but replace function bodies
+                    // for WASM-compiled functions with WASM call trampolines.
+                    // e.g. `function fib(n) { ... }` → `function fib(n) { return __wasm.exports.fib(n); }`
+                    if (clean_content) |cc| {
+                        var src_pos: usize = 0;
+                        while (src_pos < cc.len) {
+                            // Try to match `function NAME(` for each WASM function
+                            var matched_func: ?WasmFunc = null;
+                            var match_end: usize = 0;
+                            for (wasm_funcs[0..wasm_func_count]) |wf_entry| {
+                                // Build search pattern: "function NAME("
+                                if (src_pos + 9 + wf_entry.name.len + 1 > cc.len) continue;
+                                if (!std.mem.startsWith(u8, cc[src_pos..], "function ")) continue;
+                                const after_kw = src_pos + 9; // len("function ")
+                                if (!std.mem.startsWith(u8, cc[after_kw..], wf_entry.name)) continue;
+                                const after_name = after_kw + wf_entry.name.len;
+                                if (after_name >= cc.len or cc[after_name] != '(') continue;
+                                // Verify it's a declaration (not part of a longer identifier)
+                                if (src_pos > 0 and isIdentChar(cc[src_pos - 1])) continue;
+                                matched_func = wf_entry;
+                                match_end = after_name;
+                                break;
+                            }
 
-                    // Generate a fetch handler that benchmarks the WASM functions
-                    wf.writeAll("export default {\n") catch {};
-                    wf.writeAll("  async fetch(request) {\n") catch {};
-                    wf.writeAll("    const url = new URL(request.url);\n") catch {};
-                    wf.writeAll("    const results = {};\n\n") catch {};
+                            if (matched_func) |mf| {
+                                // Found a WASM function declaration. Find opening brace.
+                                const brace_pos = std.mem.indexOfPos(u8, cc, match_end, "{") orelse {
+                                    // No brace found — write char and advance
+                                    wf.writeAll(cc[src_pos .. src_pos + 1]) catch {};
+                                    src_pos += 1;
+                                    continue;
+                                };
 
-                    // Call each WASM function with a benchmark
-                    if (wasm_manifest) |mc| {
-                        var pos: usize = 0;
-                        while (std.mem.indexOfPos(u8, mc, pos, "\"name\":\"")) |name_start| {
-                            const ns = name_start + 8;
-                            if (std.mem.indexOfPos(u8, mc, ns, "\"")) |name_end| {
-                                const func_name = mc[ns..name_end];
-                                // Extract args count
-                                var args_count: u32 = 0;
-                                if (std.mem.indexOfPos(u8, mc, name_end, "\"args\":")) |args_start| {
-                                    const as = args_start + 7;
-                                    if (as < mc.len and mc[as] >= '0' and mc[as] <= '9') {
-                                        args_count = mc[as] - '0';
+                                // Write everything up to and including the opening brace
+                                wf.writeAll(cc[src_pos .. brace_pos + 1]) catch {};
+
+                                // Skip the original function body by brace-matching
+                                var depth: i32 = 1;
+                                var scan = brace_pos + 1;
+                                while (scan < cc.len and depth > 0) {
+                                    const ch = cc[scan];
+                                    if (ch == '\'' or ch == '"' or ch == '`') {
+                                        // Skip string literals
+                                        scan += 1;
+                                        while (scan < cc.len) {
+                                            if (cc[scan] == '\\') {
+                                                scan += 2; // skip escape
+                                                continue;
+                                            }
+                                            if (cc[scan] == ch) {
+                                                scan += 1;
+                                                break;
+                                            }
+                                            scan += 1;
+                                        }
+                                        continue;
                                     }
+                                    if (ch == '/' and scan + 1 < cc.len) {
+                                        if (cc[scan + 1] == '/') {
+                                            // Skip line comment
+                                            while (scan < cc.len and cc[scan] != '\n') scan += 1;
+                                            continue;
+                                        }
+                                        if (cc[scan + 1] == '*') {
+                                            // Skip block comment
+                                            scan += 2;
+                                            while (scan + 1 < cc.len) {
+                                                if (cc[scan] == '*' and cc[scan + 1] == '/') {
+                                                    scan += 2;
+                                                    break;
+                                                }
+                                                scan += 1;
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                    if (ch == '{') depth += 1;
+                                    if (ch == '}') depth -= 1;
+                                    scan += 1;
                                 }
 
-                                wf.writeAll("    // ") catch {};
-                                wf.writeAll(func_name) catch {};
-                                wf.writeAll(" — WASM (LLVM O3 + V8 TurboFan)\n") catch {};
-                                wf.writeAll("    {\n") catch {};
+                                // Emit trampoline body: return __wasm.exports.NAME(a0, a1, ...);
+                                wf.writeAll(" return __wasm.exports.") catch {};
+                                wf.writeAll(mf.name) catch {};
+                                wf.writeAll("(") catch {};
+                                // Generate arg list matching original params
+                                // Read param names from original source between ( and )
+                                const params_start = match_end + 1; // after '('
+                                const params_end = std.mem.indexOfPos(u8, cc, params_start, ")") orelse params_start;
+                                const params_str = cc[params_start..params_end];
+                                wf.writeAll(params_str) catch {};
+                                wf.writeAll("); }") catch {};
 
-                                // Parse args from query string or use defaults
-                                wf.writeAll("      const arg = parseInt(url.searchParams.get(\"n\") || \"45\");\n") catch {};
-                                wf.writeAll("      const start = performance.now();\n") catch {};
-                                wf.writeAll("      const result = ") catch {};
-                                wf.writeAll(func_name) catch {};
-                                wf.writeAll("(arg") catch {};
-                                // Add extra 0 args if function takes more than 1
-                                var extra: u32 = 1;
-                                while (extra < args_count) : (extra += 1) {
-                                    wf.writeAll(", 0") catch {};
-                                }
-                                wf.writeAll(");\n") catch {};
-                                wf.writeAll("      const elapsed = performance.now() - start;\n") catch {};
-                                wf.writeAll("      results.") catch {};
-                                wf.writeAll(func_name) catch {};
-                                wf.writeAll(" = { result, elapsed_ms: elapsed.toFixed(1) };\n") catch {};
-                                wf.writeAll("    }\n\n") catch {};
-                                pos = name_end + 1;
-                            } else break;
+                                // src_pos = scan (past the closing brace we already consumed)
+                                src_pos = scan;
+                            } else {
+                                // No match — copy one character
+                                wf.writeAll(cc[src_pos .. src_pos + 1]) catch {};
+                                src_pos += 1;
+                            }
                         }
+                    } else {
+                        wf.writeAll("// ERROR: Original source not available\n") catch {};
                     }
-
-                    wf.writeAll("    return new Response(JSON.stringify({\n") catch {};
-                    wf.writeAll("      engine: \"V8 JIT (EdgeBox WASM)\",\n") catch {};
-                    wf.writeAll("      source: \"JS → QuickJS parser → LLVM IR → WASM (automated)\",\n") catch {};
-                    wf.writeAll("      ...results,\n") catch {};
-                    wf.writeAll("    }, null, 2), {\n") catch {};
-                    wf.writeAll("      headers: { \"content-type\": \"application/json\" }\n") catch {};
-                    wf.writeAll("    });\n") catch {};
-                    wf.writeAll("  }\n") catch {};
-                    wf.writeAll("};\n") catch {};
 
                     has_worker_files = true;
                     std.debug.print("[build] Worker: {s}\n", .{wp});

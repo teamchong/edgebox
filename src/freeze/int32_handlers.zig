@@ -61,6 +61,12 @@ pub const Int32Pattern = enum {
     swap_i32,
     /// No-op
     nop_i32,
+    /// Set argument (store to arg, keeps value on stack)
+    set_arg_i32,
+    /// Add to local: local[N] += pop()
+    add_loc_i32,
+    /// Increment local: local[N]++
+    inc_loc_i32,
     /// Unsupported in int32 mode
     unsupported,
 };
@@ -116,7 +122,8 @@ pub fn getInt32Handler(opcode: Opcode) Int32Handler {
 
         // Bitwise
         .shl => .{ .pattern = .bitwise_binary_i32, .op = "<<" },
-        .shr => .{ .pattern = .bitwise_binary_i32, .op = ">>" },
+        .sar => .{ .pattern = .bitwise_binary_i32, .op = ">>" },   // JS >> (arithmetic/signed shift right)
+        .shr => .{ .pattern = .bitwise_binary_i32, .op = ">>>" },  // JS >>> (logical/unsigned shift right)
         .@"and" => .{ .pattern = .bitwise_binary_i32, .op = "&" },
         .@"or" => .{ .pattern = .bitwise_binary_i32, .op = "|" },
         .@"xor" => .{ .pattern = .bitwise_binary_i32, .op = "^" },
@@ -186,6 +193,17 @@ pub fn getInt32Handler(opcode: Opcode) Int32Handler {
         .put_loc_check => .{ .pattern = .put_loc_check_i32 },
         .put_loc_check_init => .{ .pattern = .put_loc_check_i32 },
         .set_loc_uninitialized => .{ .pattern = .set_loc_uninitialized_i32 },
+
+        // Set argument (store to arg slot, keeps value on stack)
+        .set_arg0 => .{ .pattern = .set_arg_i32, .index = 0 },
+        .set_arg1 => .{ .pattern = .set_arg_i32, .index = 1 },
+        .set_arg2 => .{ .pattern = .set_arg_i32, .index = 2 },
+        .set_arg3 => .{ .pattern = .set_arg_i32, .index = 3 },
+        .set_arg => .{ .pattern = .set_arg_i32 },
+
+        // Add to local / increment local
+        .add_loc => .{ .pattern = .add_loc_i32 },
+        .inc_loc => .{ .pattern = .inc_loc_i32 },
 
         // Stack ops
         .swap => .{ .pattern = .swap_i32 },

@@ -23,6 +23,7 @@ const zig_hotpath_codegen = @import("zig_hotpath_codegen.zig");
 const zig_codegen_full = @import("zig_codegen_full.zig");
 const zig_codegen_relooper = @import("zig_codegen_relooper.zig");
 const llvm_codegen = @import("llvm_codegen.zig");
+const numeric_handlers = @import("numeric_handlers.zig");
 const call_profile = @import("call_profile.zig");
 
 const JSValue = jsvalue.JSValue;
@@ -1071,16 +1072,92 @@ pub fn generateModuleZigShardedWithBackend(
             // Track int32 shard count (thin shards follow after these)
             int32_llvm_shard_count = llvm_shard_count;
 
-            // Generate standalone WASM for int32 functions (no QuickJS runtime)
+            // Generate standalone WASM for numeric functions (i32 + f64, no QuickJS runtime)
             // These can run directly in V8/workerd at near-native speed
             {
+                // Collect ALL numeric-tier functions (i32 already in llvm_funcs, plus f64)
+                var wasm_funcs = std.ArrayListUnmanaged(llvm_codegen.ShardFunction){};
+                defer wasm_funcs.deinit(allocator);
+
+                // Include existing i32 functions
+                for (llvm_funcs.items) |sf| {
+                    try wasm_funcs.append(allocator, sf);
+                }
+
+                // Scan for f64-tier functions (have div or other float-introducing ops)
+                var f64_cfgs = std.ArrayListUnmanaged(cfg_builder.CFG){};
+                defer {
+                    for (f64_cfgs.items) |*cfg_item| cfg_item.deinit();
+                    f64_cfgs.deinit(allocator);
+                }
+                var f64_func_names = std.ArrayListUnmanaged([]u8){};
+                defer {
+                    for (f64_func_names.items) |name| allocator.free(name);
+                    f64_func_names.deinit(allocator);
+                }
+
+                const F64Info = struct { gf_idx: usize, cfg_idx: usize, name_idx: usize };
+                var f64_infos = std.ArrayListUnmanaged(F64Info){};
+                defer f64_infos.deinit(allocator);
+
+                // Scan for additional numeric-tier functions not in int32 shard:
+                // - f64-tier functions (use div/float ops)
+                // - i32-tier functions rejected by isPureInt32Function (e.g., backward jumps)
+                // LLVM handles backward jumps fine (proper basic blocks), so we can
+                // include while-loop functions like mandelbrot that the old Zig hotpath rejects.
+                var extra_i32_count: usize = 0;
+                for (generated_all.items, 0..) |gf, gi| {
+                    // Skip functions already in int32 shard
+                    if (isPureInt32Function(gf.func)) continue;
+
+                    // Check if it qualifies for any numeric tier
+                    const tier = analyzeNumericTier(gf.func) orelse continue;
+
+                    const cfg_val = cfg_builder.buildCFG(allocator, gf.func.instructions) catch continue;
+                    const cfg_idx = f64_cfgs.items.len;
+                    try f64_cfgs.append(allocator, cfg_val);
+
+                    var sanitized_buf: [256]u8 = undefined;
+                    const sanitized = sanitizeName(gf.func.name, &sanitized_buf);
+                    const llvm_func_name = try std.fmt.allocPrint(allocator, "__frozen_{d}_{s}", .{ gf.idx, sanitized });
+                    const name_idx = f64_func_names.items.len;
+                    try f64_func_names.append(allocator, llvm_func_name);
+
+                    try f64_infos.append(allocator, .{ .gf_idx = gi, .cfg_idx = cfg_idx, .name_idx = name_idx });
+
+                    if (tier == .i32) extra_i32_count += 1;
+                }
+
+                // Build ShardFunctions (safe — f64_cfgs won't grow)
+                for (f64_infos.items) |info| {
+                    const gf = generated_all.items[info.gf_idx];
+                    const tier = analyzeNumericTier(gf.func) orelse continue;
+                    try wasm_funcs.append(allocator, .{
+                        .name = gf.func.name,
+                        .func_index = gf.idx,
+                        .parser_index = gf.func.parser_index,
+                        .line_num = gf.func.line_num,
+                        .llvm_func_name = f64_func_names.items[info.name_idx],
+                        .func = gf.func,
+                        .cfg = &f64_cfgs.items[info.cfg_idx],
+                        .value_kind = tier,
+                    });
+                }
+
+                if (f64_infos.items.len > 0) {
+                    const f64_count = f64_infos.items.len - extra_i32_count;
+                    std.debug.print("[freeze] Numeric extra: {d} functions for WASM ({d} f64, {d} i32 with loops)\n", .{ f64_infos.items.len, f64_count, extra_i32_count });
+                }
+
                 var standalone_path_buf: [4096]u8 = undefined;
                 const standalone_path = std.fmt.bufPrintZ(&standalone_path_buf, "{s}/standalone.o", .{cache_dir}) catch null;
                 if (standalone_path) |sp| {
-                    if (llvm_codegen.generateStandaloneWasm(allocator, llvm_funcs.items, sp)) |standalone_result| {
+                    if (llvm_codegen.generateStandaloneWasm(allocator, wasm_funcs.items, sp)) |standalone_result| {
                         if (standalone_result.has_functions) {
-                            std.debug.print("[freeze] Standalone WASM: {d} pure functions → {s}\n", .{ standalone_result.func_count, sp });
-                            // Write manifest of standalone WASM function names for worker generation
+                            std.debug.print("[freeze] Standalone WASM: {d} numeric functions → {s}\n", .{
+                                standalone_result.func_count, sp,
+                            });
+                            // Write manifest with type info for worker generation
                             var manifest_path_buf: [4096]u8 = undefined;
                             const manifest_path = std.fmt.bufPrint(&manifest_path_buf, "{s}/standalone_manifest.json", .{cache_dir}) catch null;
                             if (manifest_path) |mp| {
@@ -1088,11 +1165,15 @@ pub fn generateModuleZigShardedWithBackend(
                                     defer mf.close();
                                     mf.writeAll("[") catch {};
                                     var first = true;
-                                    for (llvm_funcs.items) |sf| {
+                                    for (wasm_funcs.items) |sf| {
                                         if (!first) mf.writeAll(",") catch {};
                                         first = false;
                                         var entry_buf: [512]u8 = undefined;
-                                        const entry = std.fmt.bufPrint(&entry_buf, "{{\"name\":\"{s}\",\"args\":{d}}}", .{ sf.name, sf.func.arg_count }) catch continue;
+                                        const type_str: []const u8 = switch (sf.value_kind) {
+                                            .i32 => "i32",
+                                            .f64 => "f64",
+                                        };
+                                        const entry = std.fmt.bufPrint(&entry_buf, "{{\"name\":\"{s}\",\"args\":{d},\"type\":\"{s}\"}}", .{ sf.name, sf.func.arg_count, type_str }) catch continue;
                                         mf.writeAll(entry) catch {};
                                     }
                                     mf.writeAll("]") catch {};
@@ -1728,12 +1809,18 @@ pub fn isPureInt32Function(func: AnalyzedFunction) bool {
     var has_int32_op = false;
     for (func.instructions) |instr| {
         const handler = int32_handlers.getInt32Handler(instr.opcode);
-        if (handler.pattern == .unsupported) return false;
+        if (handler.pattern == .unsupported) {
+            if (std.posix.getenv("EDGEBOX_INT32_DEBUG")) |_| {
+                std.debug.print("[int32-reject] {s}: unsupported opcode '{s}'\n", .{ func.name, @tagName(instr.opcode) });
+            }
+            return false;
+        }
         // These patterns prove the function actually computes with integers
         switch (handler.pattern) {
             .binary_arith_i32, .binary_cmp_i32, .bitwise_binary_i32,
             .unary_i32, .inc_dec_i32, .lnot_i32, .push_const_i32,
             .push_bool_i32, .call_self_i32, .tail_call_self_i32,
+            .add_loc_i32, .inc_loc_i32,
             => has_int32_op = true,
             else => {},
         }
@@ -1763,6 +1850,33 @@ pub fn isPureInt32Function(func: AnalyzedFunction) bool {
     }
 
     return true;
+}
+
+/// Analyze if a function qualifies for standalone numeric WASM compilation.
+/// Returns the ValueKind (.i32 or .f64) or null if unsupported.
+/// This extends isPureInt32Function to also detect float-only functions
+/// (e.g., functions using div, which produces floats in JS).
+///
+/// Unlike isPureInt32Function, this allows backward jumps (while loops)
+/// because LLVM generates proper basic blocks — no Zig hotpath dispatch issues.
+pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
+    // Same preconditions as isPureInt32Function
+    if (func.arg_count < 1 or func.arg_count > 8) return null;
+    if (func.var_count > 16) return null;
+
+    // Use comptime numeric analysis
+    const kind = numeric_handlers.analyzeFunction(func.instructions) orelse return null;
+
+    // For non-recursive functions, reject recursive-only patterns
+    // (self_ref + call_self without the function being self-recursive)
+    if (!func.is_self_recursive) {
+        for (func.instructions) |instr| {
+            const handler = numeric_handlers.getHandler(instr.opcode);
+            if (handler.pattern == .self_ref or handler.pattern == .call_self or handler.pattern == .tail_call_self) return null;
+        }
+    }
+
+    return kind;
 }
 
 // ============================================================================
