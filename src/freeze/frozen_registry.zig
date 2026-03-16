@@ -2005,12 +2005,24 @@ pub fn isPureInt32Function(func: AnalyzedFunction) bool {
 /// Supported Math.* intrinsics for standalone WASM compilation.
 /// These map directly to WASM f64 intrinsics (f64.abs, f64.sqrt, etc.).
 pub const MathIntrinsic = enum {
+    // Unary (1 arg)
     abs, // Math.abs(x) → f64.abs
     sqrt, // Math.sqrt(x) → f64.sqrt
     floor, // Math.floor(x) → f64.floor
     ceil, // Math.ceil(x) → f64.ceil
     round, // Math.round(x) → floor(x + 0.5)
     trunc, // Math.trunc(x) → f64.trunc
+    // Binary (2 args)
+    min, // Math.min(a, b) → f64.min
+    max, // Math.max(a, b) → f64.max
+    pow, // Math.pow(a, b) → llvm.pow.f64
+
+    pub fn arity(self: MathIntrinsic) u16 {
+        return switch (self) {
+            .abs, .sqrt, .floor, .ceil, .round, .trunc => 1,
+            .min, .max, .pow => 2,
+        };
+    }
 };
 
 /// Detect a Math.* method setup starting at instruction index `i`.
@@ -2045,11 +2057,14 @@ pub fn detectMathSetup(func: AnalyzedFunction, instructions: []const bytecode_pa
     if (std.mem.eql(u8, method_name, "ceil")) return .ceil;
     if (std.mem.eql(u8, method_name, "round")) return .round;
     if (std.mem.eql(u8, method_name, "trunc")) return .trunc;
+    if (std.mem.eql(u8, method_name, "min")) return .min;
+    if (std.mem.eql(u8, method_name, "max")) return .max;
+    // pow needs exp/log polyfill — not yet supported in standalone WASM
     return null;
 }
 
-/// Check if instruction at index `i` is call_method(1) or tail_call_method(1)
-/// — the call part of a Math intrinsic.
+/// Check if instruction at index `i` is call_method(N) or tail_call_method(N)
+/// where N=1 (unary) or N=2 (binary) — the call part of a Math intrinsic.
 /// QuickJS optimizes `return Math.sqrt(x)` → tail_call_method instead of call_method.
 pub fn isMathCallMethod1(instructions: []const bytecode_parser.Instruction, i: usize) bool {
     if (i >= instructions.len) return false;
@@ -2059,7 +2074,7 @@ pub fn isMathCallMethod1(instructions: []const bytecode_parser.Instruction, i: u
         .u16 => |v| v,
         else => return false,
     };
-    return argc == 1;
+    return argc == 1 or argc == 2;
 }
 
 /// Returns the ValueKind (.i32 or .f64) or null if unsupported.

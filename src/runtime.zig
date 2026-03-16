@@ -1784,7 +1784,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     }
 
                     // Preamble: load WASM module (compatible with Node.js + workerd)
-                    // Uses static ESM imports + createRequire for CJS compat
+                    // Node.js: readFileSync + sync instantiation
+                    // workerd: WASM binding from capnp config — import resolves to WebAssembly.Module
                     wf.writeAll("// EdgeBox AOT+JIT (auto-generated)\n") catch {};
                     wf.writeAll("// Source transform: function bodies replaced with WASM calls\n") catch {};
                     wf.writeAll("// V8 inlines these WASM calls into JS (zero overhead)\n\n") catch {};
@@ -1802,7 +1803,12 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     wf.writeAll("  __wasm = new WebAssembly.Instance(new WebAssembly.Module(buf));\n") catch {};
                     wf.writeAll("  __wasm.exports.memory.grow(254);\n") catch {}; // 256 pages = 16MB
                     wf.writeAll("} else {\n") catch {};
-                    wf.writeAll("  __wasm = null; // workerd loads WASM differently\n") catch {};
+                    // workerd: WASM module bound via capnp config as ESM module
+                    wf.writeAll("  const { default: __wasmModule } = await import('") catch {};
+                    wf.writeAll(wasm_filename) catch {};
+                    wf.writeAll("');\n") catch {};
+                    wf.writeAll("  __wasm = new WebAssembly.Instance(__wasmModule);\n") catch {};
+                    wf.writeAll("  __wasm.exports.memory.grow(254);\n") catch {};
                     wf.writeAll("}\n") catch {};
                     // Hoist Int32Array view creation to module level (avoids per-call allocation).
                     // Array elements are always i32 in WASM linear memory regardless of function tier.
@@ -1973,11 +1979,16 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             }
                                         }
                                     }
-                                    // Keep as JS if: not a cross-caller AND no arrays AND not very heavy
-                                    // Very heavy scalar functions (>150 instrs) get WASM trampolines
-                                    // for consistent performance. Smaller functions are faster as JS
-                                    // when called millions of times (less per-call overhead).
-                                    if (!calls_wasm and mf.array_args == 0 and mf.instr_count < 150) {
+                                    // Keep as JS when trampoline overhead exceeds WASM benefit:
+                                    // 1. Unrolled fixed-size array ops (no .length, >= 100 instrs):
+                                    //    .set() copy cost dominates. Many instructions = unrolled
+                                    //    (vec_add16: 338, salsa20_qr: 803, core_salsa20: 2386).
+                                    // 2. Small scalar functions (<150 instrs): V8 JIT already optimal.
+                                    // Functions with .length OR compact array loops (<100 instrs) are
+                                    // trampolined: computation scales with array size.
+                                    // adler32 (68 instrs, no .length) has a loop bounded by scalar len.
+                                    const is_unrolled_array = mf.array_args != 0 and mf.length_args == 0 and mf.instr_count >= 100;
+                                    if (!calls_wasm and (is_unrolled_array or (mf.array_args == 0 and mf.instr_count < 150))) {
                                         wf.writeAll(cc[src_pos .. src_pos + 1]) catch {};
                                         src_pos += 1;
                                         continue;
@@ -2099,21 +2110,29 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             wf.writeAll(" = __off;\n") catch {};
 
                                             if (read_only_args & (@as(u8, 1) << @intCast(i)) != 0) {
-                                                // Read-only: cache by reference identity
+                                                // Read-only: cache by reference identity, but ONLY for
+                                                // large arrays (>1024 elements). Small arrays always copy
+                                                // because .set() is cheap (<30ns for 32 elem) and caching
+                                                // small arrays risks stale data when JS mutates elements
+                                                // between calls (same ref, different data — e.g. tweetnacl vn).
                                                 var cid_buf: [32]u8 = undefined;
                                                 const cid = std.fmt.bufPrint(&cid_buf, "{d}_{d}", .{ matched_func_idx, i }) catch "0_0";
+                                                const pn = param_names[i];
+                                                // if (arr.length > 1024 && arr === __cN) skip; else copy
                                                 wf.writeAll("  if (") catch {};
-                                                wf.writeAll(param_names[i]) catch {};
+                                                wf.writeAll(pn) catch {};
+                                                wf.writeAll(".length <= 1024 || ") catch {};
+                                                wf.writeAll(pn) catch {};
                                                 wf.writeAll(" !== __c") catch {};
                                                 wf.writeAll(cid) catch {};
                                                 wf.writeAll(") { ") catch {};
                                                 wf.writeAll(mem_view) catch {};
                                                 wf.writeAll(".set(") catch {};
-                                                wf.writeAll(param_names[i]) catch {};
+                                                wf.writeAll(pn) catch {};
                                                 wf.writeAll(", __off); __c") catch {};
                                                 wf.writeAll(cid) catch {};
                                                 wf.writeAll(" = ") catch {};
-                                                wf.writeAll(param_names[i]) catch {};
+                                                wf.writeAll(pn) catch {};
                                                 wf.writeAll("; }\n") catch {};
                                             } else {
                                                 // Mutated: always copy
@@ -2235,6 +2254,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     cf.writeAll("\"),\n") catch {};
                     cf.writeAll("  ],\n") catch {};
                     cf.writeAll("  compatibilityDate = \"2024-09-23\",\n") catch {};
+                    cf.writeAll("  compatibilityFlags = [\"nodejs_compat\"],\n") catch {};
                     cf.writeAll(");\n") catch {};
 
                     std.debug.print("[build] Config: {s}\n", .{cp});

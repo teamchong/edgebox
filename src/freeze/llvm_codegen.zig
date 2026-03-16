@@ -1528,40 +1528,66 @@ fn generateNumericBody(
                     continue;
                 }
             }
-            // Phase 2: At call_method(1) or tail_call_method(1), emit the most recent intrinsic
+            // Phase 2: At call_method(N) or tail_call_method(N), emit the most recent intrinsic
             if (math_intrinsic_depth > 0 and (instr.opcode == .call_method or instr.opcode == .tail_call_method)) {
                 const argc: u16 = switch (instr.operand) {
                     .u16 => |v| v,
                     else => 0,
                 };
-                if (argc == 1) {
+                if (argc == 1 or argc == 2) {
                     math_intrinsic_depth -= 1;
                     const intrinsic = math_intrinsic_stack[math_intrinsic_depth];
-                    // Pop argument from vstack
-                    if (vstack.items.len < 1) return CodegenError.StackUnderflow;
-                    const arg = vstack.items[vstack.items.len - 1];
-                    vstack.items.len -= 1;
-                    // Convert to f64 if needed
-                    const f64_arg = switch (kind) {
-                        .f64 => arg,
-                        .i32 => builder.buildSIToFP(arg, llvm.doubleType(), "math_f64"),
-                    };
-                    // Emit LLVM intrinsic
-                    const result_f64 = emitMathIntrinsic(builder, module, intrinsic, f64_arg);
-                    // Convert back to elem_type if needed
-                    const result = switch (kind) {
-                        .f64 => result_f64,
-                        .i32 => builder.buildFPToSI(result_f64, llvm.i32Type(), "math_i32"),
-                    };
-
-                    // tail_call_method is a terminator — emit ret immediately
-                    if (instr.opcode == .tail_call_method) {
-                        _ = builder.buildRet(result);
-                        block_terminated = true;
-                    } else {
-                        vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
+                    const expected_arity = intrinsic.arity();
+                    if (argc == expected_arity) {
+                        if (argc == 1) {
+                            // Unary: pop 1 arg
+                            if (vstack.items.len < 1) return CodegenError.StackUnderflow;
+                            const arg = vstack.items[vstack.items.len - 1];
+                            vstack.items.len -= 1;
+                            const f64_arg = switch (kind) {
+                                .f64 => arg,
+                                .i32 => builder.buildSIToFP(arg, llvm.doubleType(), "math_f64"),
+                            };
+                            const result_f64 = emitMathIntrinsic(builder, module, intrinsic, f64_arg);
+                            const result = switch (kind) {
+                                .f64 => result_f64,
+                                .i32 => builder.buildFPToSI(result_f64, llvm.i32Type(), "math_i32"),
+                            };
+                            if (instr.opcode == .tail_call_method) {
+                                _ = builder.buildRet(result);
+                                block_terminated = true;
+                            } else {
+                                vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
+                            }
+                            continue;
+                        } else {
+                            // Binary: pop 2 args (stack order: arg0 pushed first, arg1 on top)
+                            if (vstack.items.len < 2) return CodegenError.StackUnderflow;
+                            const arg1 = vstack.items[vstack.items.len - 1];
+                            const arg0 = vstack.items[vstack.items.len - 2];
+                            vstack.items.len -= 2;
+                            const f64_arg0 = switch (kind) {
+                                .f64 => arg0,
+                                .i32 => builder.buildSIToFP(arg0, llvm.doubleType(), "math_a_f64"),
+                            };
+                            const f64_arg1 = switch (kind) {
+                                .f64 => arg1,
+                                .i32 => builder.buildSIToFP(arg1, llvm.doubleType(), "math_b_f64"),
+                            };
+                            const result_f64 = emitMathBinaryIntrinsic(builder, module, intrinsic, f64_arg0, f64_arg1);
+                            const result = switch (kind) {
+                                .f64 => result_f64,
+                                .i32 => builder.buildFPToSI(result_f64, llvm.i32Type(), "math_i32"),
+                            };
+                            if (instr.opcode == .tail_call_method) {
+                                _ = builder.buildRet(result);
+                                block_terminated = true;
+                            } else {
+                                vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
+                            }
+                            continue;
+                        }
                     }
-                    continue;
                 }
             }
 
@@ -1725,6 +1751,37 @@ fn emitMathIntrinsic(builder: llvm.Builder, module: llvm.Module, intrinsic: froz
             const f = getOrDeclareIntrinsic(module, "llvm.floor.f64", unary_fn_ty);
             return builder.buildCall(unary_fn_ty, f, &.{added}, "round");
         },
+        // Binary intrinsics should not reach here
+        .min, .max, .pow => unreachable,
+    }
+}
+
+/// Emit inline LLVM IR for a binary Math.* function.
+/// Uses fcmp+select for min/max (avoids external fmin/fmax calls in standalone WASM).
+/// pow uses an integer exponent fast path with loop.
+fn emitMathBinaryIntrinsic(builder: llvm.Builder, module: llvm.Module, intrinsic: frozen_registry.MathIntrinsic, arg0: llvm.Value, arg1: llvm.Value) llvm.Value {
+    _ = module;
+    switch (intrinsic) {
+        .min => {
+            // Math.min(a, b): a < b ? a : b, with NaN propagation (JS spec)
+            const cmp = builder.buildFCmp(c.LLVMRealOLT, arg0, arg1, "min_cmp");
+            const min_val = builder.buildSelect(cmp, arg0, arg1, "min_val");
+            // If either arg is NaN, fcmp UNO returns true → return NaN
+            const is_nan = builder.buildFCmp(c.LLVMRealUNO, arg0, arg1, "is_nan");
+            const nan_const = llvm.constF64(std.math.nan(f64));
+            return builder.buildSelect(is_nan, nan_const, min_val, "min");
+        },
+        .max => {
+            // Math.max(a, b): a > b ? a : b, with NaN propagation (JS spec)
+            const cmp = builder.buildFCmp(c.LLVMRealOGT, arg0, arg1, "max_cmp");
+            const max_val = builder.buildSelect(cmp, arg0, arg1, "max_val");
+            const is_nan = builder.buildFCmp(c.LLVMRealUNO, arg0, arg1, "is_nan");
+            const nan_const = llvm.constF64(std.math.nan(f64));
+            return builder.buildSelect(is_nan, nan_const, max_val, "max");
+        },
+        .pow => unreachable, // pow not yet supported (needs exp/log polyfill)
+        // Unary intrinsics should not reach here
+        .abs, .sqrt, .floor, .ceil, .round, .trunc => unreachable,
     }
 }
 
