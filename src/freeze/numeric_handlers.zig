@@ -273,9 +273,10 @@ pub fn analyzeFunction(instructions: anytype) ?ValueKind {
 
     if (!has_computing_op) return null;
 
-    // If function uses div (introduces float) AND bitwise ops (requires i32),
-    // we can't cleanly compile it in either tier → reject
-    if (needs_float and has_i32_only) return null;
+    // If function uses div AND bitwise ops, compile as i32 with truncating
+    // division (sdiv). This matches the JS `(x / y) | 0` idiom for integer
+    // division. The bitwise ops prove the programmer expects integer results.
+    if (needs_float and has_i32_only) return .i32;
 
     if (needs_float) return .f64;
     return .i32;
@@ -306,7 +307,7 @@ pub fn selectArithOp(comptime kind: ValueKind, comptime op: []const u8) ArithOp 
             '-' => .{ .i32_op = .sub },
             '*' => .{ .i32_op = .mul },
             '%' => .{ .i32_op = .srem },
-            '/' => .{ .i32_op = .sdiv }, // unreachable for i32 tier (div rejected)
+            '/' => .{ .i32_op = .sdiv }, // truncating division (matches JS `(x/y)|0`)
             else => @compileError("unknown arith op: " ++ op),
         },
         .f64 => switch (op[0]) {
