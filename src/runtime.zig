@@ -1695,7 +1695,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     defer wf.close();
 
                     // Collect WASM function metadata from manifest
-                    const WasmFunc = struct { name: []const u8, arg_count: u32, instr_count: u32, is_recursive: bool, array_args: u8, mutated_args: u8, length_args: u8, has_loop: bool, has_bitwise: bool, line_num: u32, is_anon: bool, is_f64: bool };
+                    const WasmFunc = struct { name: []const u8, arg_count: u32, instr_count: u32, is_recursive: bool, array_args: u8, mutated_args: u8, read_array_args: u8, length_args: u8, has_loop: bool, has_bitwise: bool, line_num: u32, is_anon: bool, is_f64: bool };
                     var wasm_funcs: [64]WasmFunc = undefined;
                     var wasm_func_count: usize = 0;
                     if (wasm_manifest) |mc| {
@@ -1745,6 +1745,17 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     }
                                     ma = @truncate(ma_val);
                                 }
+                                // Parse read_array_args bitmask: "read_array_args":N
+                                var ra: u8 = aa; // Default: assume all array args are read
+                                if (std.mem.indexOfPos(u8, mc, name_end, "\"read_array_args\":")) |ras| {
+                                    var rad = ras + 18;
+                                    var ra_val: u32 = 0;
+                                    while (rad < mc.len and mc[rad] >= '0' and mc[rad] <= '9') {
+                                        ra_val = ra_val * 10 + (mc[rad] - '0');
+                                        rad += 1;
+                                    }
+                                    ra = @truncate(ra_val);
+                                }
                                 // Parse length_args bitmask: "length_args":N
                                 var la: u8 = 0;
                                 if (std.mem.indexOfPos(u8, mc, name_end, "\"length_args\":")) |las| {
@@ -1787,7 +1798,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 // Detect anonymous functions (synthetic name starts with __anon_)
                                 const is_anon = std.mem.startsWith(u8, mc[ns..name_end], "__anon_");
                                 if (wasm_func_count < 64) {
-                                    wasm_funcs[wasm_func_count] = .{ .name = mc[ns..name_end], .arg_count = ac, .instr_count = ic, .is_recursive = is_rec, .array_args = aa, .mutated_args = ma, .length_args = la, .has_loop = has_loop, .has_bitwise = has_bitwise, .line_num = ln, .is_anon = is_anon, .is_f64 = is_f64 };
+                                    wasm_funcs[wasm_func_count] = .{ .name = mc[ns..name_end], .arg_count = ac, .instr_count = ic, .is_recursive = is_rec, .array_args = aa, .mutated_args = ma, .read_array_args = ra, .length_args = la, .has_loop = has_loop, .has_bitwise = has_bitwise, .line_num = ln, .is_anon = is_anon, .is_f64 = is_f64 };
                                     wasm_func_count += 1;
                                 }
                                 pos = name_end + 1;
@@ -2003,6 +2014,12 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         }
                                     }
                                     // Keep as JS when trampoline overhead exceeds WASM benefit:
+                                    // 0. Write-only array functions: all array args are written,
+                                    //    never read via get_array_el. Copy-in is wasted (data overwritten).
+                                    //    V8 JIT handles write loops perfectly (direct memory writes).
+                                    //    zero(buf): 162ms WASM vs 43ms V8 (3.8x slower due to copies).
+                                    //    fillData(arr,seed): 1803ms WASM vs 1043ms V8 (1.7x slower).
+                                    const is_write_only_array = mf.mutated_args != 0 and mf.read_array_args == 0;
                                     // 1. No-loop array ops (no .length, no loop): wrapper/delegation
                                     //    functions — .set() copy cost always dominates.
                                     //    crypto_verify_16 (7 instrs), dot16 (128 instrs).
@@ -2015,7 +2032,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     // adler32 (68 instrs, has_loop): 29ms WASM vs 109ms V8.
                                     const is_fixed_array = mf.array_args != 0 and mf.length_args == 0 and
                                         (!mf.has_loop or mf.instr_count >= 200);
-                                    if (!calls_wasm and (is_fixed_array or (mf.array_args == 0 and mf.instr_count < 150))) {
+                                    if (!calls_wasm and (is_write_only_array or is_fixed_array or (mf.array_args == 0 and mf.instr_count < 150))) {
                                         wf.writeAll(cc[src_pos .. src_pos + 1]) catch {};
                                         src_pos += 1;
                                         continue;
@@ -2161,13 +2178,15 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                                 wf.writeAll(" = ") catch {};
                                                 wf.writeAll(pn) catch {};
                                                 wf.writeAll("; }\n") catch {};
-                                            } else {
-                                                // Mutated: always copy
+                                            } else if (mf.read_array_args & (@as(u8, 1) << @intCast(i)) != 0) {
+                                                // Mutated + read: must copy in (function reads then writes)
                                                 wf.writeAll("  ") catch {};
                                                 wf.writeAll(mem_view) catch {};
                                                 wf.writeAll(".set(") catch {};
                                                 wf.writeAll(param_names[i]) catch {};
                                                 wf.writeAll(", __off);\n") catch {};
+                                            } else {
+                                                // Write-only: skip copy-in (data will be overwritten)
                                             }
 
                                             // Advance offset past this array

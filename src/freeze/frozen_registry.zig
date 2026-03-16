@@ -1300,9 +1300,36 @@ pub fn generateModuleZigShardedWithBackend(
                                             }
                                         }
 
+                                        var read_array_args_mask = numeric_handlers.detectReadArrayArgs(sf.func.instructions, sf.func.arg_count);
                                         const length_args_mask = numeric_handlers.detectLengthArgs(sf.func.instructions, sf.func.arg_count);
                                         const has_loop: u8 = if (numeric_handlers.detectHasLoop(sf.func.instructions)) 1 else 0;
                                         const has_bitwise: u8 = if (numeric_handlers.detectHasBitwise(sf.func.instructions)) 1 else 0;
+
+                                        // Propagate read_array_args from callees (same as array_args propagation)
+                                        if (read_array_args_mask == 0 and array_args_mask != 0) {
+                                            // If array_args were propagated from callee, also propagate read_array_args
+                                            if (array_info_map.get(sf.name)) |_| {} else {
+                                                // Cross-caller: check callee's read_array_args
+                                                for (sf.func.instructions) |instr| {
+                                                    const handler = numeric_handlers.getHandler(instr.opcode);
+                                                    if (handler.pattern == .self_ref) {
+                                                        const callee_name: ?[]const u8 = if (instr.opcode == .get_var or instr.opcode == .get_var_undef) blk: {
+                                                            const atom_val: u32 = switch (instr.operand) { .atom => |a| a, else => break :blk null };
+                                                            break :blk resolveAtomToName(sf.func, atom_val);
+                                                        } else if (instr.opcode == .get_var_ref0) blk: {
+                                                            if (sf.func.closure_vars.len > 0) break :blk sf.func.closure_vars[0].name;
+                                                            break :blk null;
+                                                        } else null;
+                                                        if (callee_name) |cn| {
+                                                            if (array_info_map.get(cn)) |info| {
+                                                                read_array_args_mask = info.array_args; // callee's array_args = read pattern
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
                                         // Use synthetic name for anonymous functions
                                         var synth_buf: [32]u8 = undefined;
                                         const manifest_name = if (sf.name.len == 0)
@@ -1310,7 +1337,7 @@ pub fn generateModuleZigShardedWithBackend(
                                         else
                                             sf.name;
                                         var entry_buf: [512]u8 = undefined;
-                                        const entry = std.fmt.bufPrint(&entry_buf, "{{\"name\":\"{s}\",\"args\":{d},\"type\":\"{s}\",\"instrs\":{d},\"recursive\":{d},\"array_args\":{d},\"mutated_args\":{d},\"length_args\":{d},\"has_loop\":{d},\"has_bitwise\":{d},\"line\":{d}}}", .{ manifest_name, sf.func.arg_count, type_str, sf.func.instructions.len, recursive, array_args_mask, mutated_args_mask, length_args_mask, has_loop, has_bitwise, sf.func.line_num }) catch continue;
+                                        const entry = std.fmt.bufPrint(&entry_buf, "{{\"name\":\"{s}\",\"args\":{d},\"type\":\"{s}\",\"instrs\":{d},\"recursive\":{d},\"array_args\":{d},\"mutated_args\":{d},\"read_array_args\":{d},\"length_args\":{d},\"has_loop\":{d},\"has_bitwise\":{d},\"line\":{d}}}", .{ manifest_name, sf.func.arg_count, type_str, sf.func.instructions.len, recursive, array_args_mask, mutated_args_mask, read_array_args_mask, length_args_mask, has_loop, has_bitwise, sf.func.line_num }) catch continue;
                                         mf.writeAll(entry) catch {};
                                     }
                                     mf.writeAll("]") catch {};

@@ -601,6 +601,122 @@ pub fn detectMutatedArgs(instructions: anytype, arg_count: u32) u8 {
     return result;
 }
 
+/// Detect which function args are READ via get_array_el (element access).
+/// Returns a bitmask: bit N set = arg N has its elements read.
+/// Unlike detectArrayArgs, this does NOT count put_array_el or get_length —
+/// only actual element reads. Used to identify write-only array params where
+/// the copy-in can be skipped (the data is overwritten, not read).
+pub fn detectReadArrayArgs(instructions: anytype, arg_count: u32) u8 {
+    var stack: [128]i8 = undefined;
+    var sp: usize = 0;
+    var result: u8 = 0;
+
+    for (instructions) |instr| {
+        const handler = getHandler(instr.opcode);
+        switch (handler.pattern) {
+            .get_arg => {
+                const idx: u8 = handler.index orelse switch (instr.operand) {
+                    .arg => |a| @intCast(a),
+                    .u8 => |a| a,
+                    else => 255,
+                };
+                if (sp < stack.len) {
+                    stack[sp] = if (idx < arg_count) @intCast(idx) else -1;
+                    sp += 1;
+                }
+            },
+            .array_get => {
+                // Only reads set the result bit
+                if (sp >= 2) {
+                    sp -= 1; // pop index
+                    sp -= 1; // pop base
+                    const base_arg = stack[sp];
+                    if (base_arg >= 0 and base_arg < 8) result |= @as(u8, 1) << @intCast(base_arg);
+                    stack[sp] = -1;
+                    sp += 1;
+                }
+            },
+            .array_get2 => {
+                if (sp >= 2) {
+                    sp -= 1; // pop index
+                    if (sp >= 1) {
+                        const base_arg = stack[sp - 1];
+                        if (base_arg >= 0 and base_arg < 8) result |= @as(u8, 1) << @intCast(base_arg);
+                    }
+                    if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+                }
+            },
+            .array_put => {
+                // Writes do NOT set the result bit — just update stack
+                if (sp >= 3) { sp -= 3; }
+            },
+            .push_const, .push_cpool, .push_bool => {
+                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+            },
+            .binary_arith, .binary_cmp, .bitwise_binary => {
+                if (sp >= 2) { sp -= 1; stack[sp - 1] = -1; }
+            },
+            .unary, .lnot, .inc_dec => {
+                if (sp >= 1) { stack[sp - 1] = -1; }
+            },
+            .post_inc_dec => {
+                if (sp >= 1) { stack[sp - 1] = -1; if (sp < stack.len) { stack[sp] = -1; sp += 1; } }
+            },
+            .get_loc, .get_loc_check => {
+                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+            },
+            .get_loc_pair => {
+                if (sp + 1 < stack.len) { stack[sp] = -1; stack[sp + 1] = -1; sp += 2; }
+            },
+            .put_loc, .put_loc_check, .put_arg => {
+                if (sp >= 1) sp -= 1;
+            },
+            .set_loc, .set_arg => {},
+            .stack_dup => {
+                if (sp >= 1 and sp < stack.len) { stack[sp] = stack[sp - 1]; sp += 1; }
+            },
+            .stack_drop => {
+                if (sp >= 1) sp -= 1;
+            },
+            .stack_swap => {
+                if (sp >= 2) {
+                    const tmp = stack[sp - 1];
+                    stack[sp - 1] = stack[sp - 2];
+                    stack[sp - 2] = tmp;
+                }
+            },
+            .self_ref => {
+                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+            },
+            .call_self => {
+                const argc: u32 = switch (instr.opcode) {
+                    .call1 => 1, .call2 => 2, .call3 => 3, .call => instr.operand.u16, else => 1,
+                };
+                if (sp >= argc) sp -= argc;
+                if (sp >= 1) sp -= 1;
+                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+            },
+            .ret, .if_false, .if_true => {
+                if (sp >= 1) sp -= 1;
+            },
+            .add_loc => {
+                if (sp >= 1) sp -= 1;
+            },
+            .inc_loc, .dec_loc => {},
+            .array_length => {
+                // Length access does NOT count as element read — just update stack
+                if (sp >= 1) { stack[sp - 1] = -1; }
+            },
+            .always_false => {
+                if (sp >= 1) { stack[sp - 1] = -1; }
+            },
+            .nop, .goto_br, .set_loc_uninitialized, .tail_call_self => {},
+            .unsupported => {},
+        }
+    }
+    return result;
+}
+
 /// Detect which array args have `.length` accessed via `get_length`.
 /// Returns a bitmask: bit N set = arg N's length is read.
 /// Used to add extra length parameters to the WASM function signature.
