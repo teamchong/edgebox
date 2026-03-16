@@ -84,6 +84,8 @@ pub const NumericPattern = enum {
     if_true,
     /// Unconditional branch
     goto_br,
+    /// Push constant from constant pool (resolved at compile time)
+    push_cpool,
     /// Unsupported in numeric mode
     unsupported,
 };
@@ -121,6 +123,7 @@ pub fn getHandler(opcode: Opcode) NumericHandler {
         .push_7 => .{ .pattern = .push_const, .value = 7 },
         .push_minus1 => .{ .pattern = .push_const, .value = -1 },
         .push_i8, .push_i16, .push_i32 => .{ .pattern = .push_const }, // value from operand
+        .push_const8, .push_const => .{ .pattern = .push_cpool }, // value from constant pool
 
         // ── Push booleans ───────────────────────────────────────
         .push_true => .{ .pattern = .push_bool, .value = 1 },
@@ -260,7 +263,7 @@ pub fn analyzeFunction(instructions: anytype) ?ValueKind {
 
         switch (handler.pattern) {
             .binary_arith, .binary_cmp, .bitwise_binary,
-            .unary, .inc_dec, .lnot, .push_const,
+            .unary, .inc_dec, .lnot, .push_const, .push_cpool,
             .push_bool, .call_self, .tail_call_self,
             .add_loc, .inc_loc,
             => has_computing_op = true,
@@ -282,7 +285,7 @@ pub fn analyzeFunction(instructions: anytype) ?ValueKind {
 pub fn isComputingPattern(pattern: NumericPattern) bool {
     return switch (pattern) {
         .binary_arith, .binary_cmp, .bitwise_binary,
-        .unary, .inc_dec, .lnot, .push_const,
+        .unary, .inc_dec, .lnot, .push_const, .push_cpool,
         .push_bool, .call_self, .tail_call_self,
         .add_loc, .inc_loc,
         => true,

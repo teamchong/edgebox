@@ -787,6 +787,28 @@ fn emitInt32Instruction(
             vstack.append(allocator, llvm.constInt32(val)) catch return CodegenError.OutOfMemory;
         },
 
+        .push_cpool_i32 => {
+            // Load constant from constant pool at compile time.
+            // Large hex constants (e.g., 0xEDB88320) are stored as float64 in
+            // QuickJS cpool because they exceed i32 range. We reinterpret the
+            // lower 32 bits as i32 (matching JavaScript's ToInt32 semantics).
+            const idx: u32 = switch (instr.operand) {
+                .const_idx => |a| a,
+                else => return CodegenError.UnsupportedOpcode,
+            };
+            if (idx >= analyzed.constants.len) return CodegenError.UnsupportedOpcode;
+            const val: i32 = switch (analyzed.constants[idx]) {
+                .int32 => |v| v,
+                .float64 => |v| blk: {
+                    // Match JS ToInt32: truncate f64 to i32 via u32 (wrapping)
+                    const as_i64: i64 = @intFromFloat(v);
+                    break :blk @as(i32, @truncate(as_i64));
+                },
+                else => return CodegenError.UnsupportedOpcode,
+            };
+            vstack.append(allocator, llvm.constInt32(val)) catch return CodegenError.OutOfMemory;
+        },
+
         .push_bool_i32 => {
             const val: i32 = handler.value orelse 0;
             vstack.append(allocator, llvm.constInt32(val)) catch return CodegenError.OutOfMemory;
@@ -1415,6 +1437,27 @@ fn emitNumericInstruction(
                 .push_i32 => switch (kind) {
                     .i32 => llvm.constInt32(instr.operand.i32),
                     .f64 => llvm.constF64(@as(f64, @floatFromInt(instr.operand.i32))),
+                },
+                else => return CodegenError.UnsupportedOpcode,
+            };
+            vstack.append(allocator, val) catch return CodegenError.OutOfMemory;
+        },
+
+        .push_cpool => {
+            // Load constant from constant pool at compile time
+            const idx: u32 = switch (instr.operand) {
+                .const_idx => |a| a,
+                else => return CodegenError.UnsupportedOpcode,
+            };
+            if (idx >= analyzed.constants.len) return CodegenError.UnsupportedOpcode;
+            const val: llvm.Value = switch (analyzed.constants[idx]) {
+                .int32 => |v| switch (kind) {
+                    .i32 => llvm.constInt32(v),
+                    .f64 => llvm.constF64(@as(f64, @floatFromInt(v))),
+                },
+                .float64 => |v| switch (kind) {
+                    .i32 => llvm.constInt32(@as(i32, @intFromFloat(v))),
+                    .f64 => llvm.constF64(v),
                 },
                 else => return CodegenError.UnsupportedOpcode,
             };

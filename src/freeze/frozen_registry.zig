@@ -1889,7 +1889,7 @@ pub fn isPureInt32Function(func: AnalyzedFunction) bool {
         // These patterns prove the function actually computes with integers
         switch (handler.pattern) {
             .binary_arith_i32, .binary_cmp_i32, .bitwise_binary_i32,
-            .unary_i32, .inc_dec_i32, .lnot_i32, .push_const_i32,
+            .unary_i32, .inc_dec_i32, .lnot_i32, .push_const_i32, .push_cpool_i32,
             .push_bool_i32, .call_self_i32, .tail_call_self_i32,
             .add_loc_i32, .inc_loc_i32,
             => has_int32_op = true,
@@ -1900,6 +1900,27 @@ pub fn isPureInt32Function(func: AnalyzedFunction) bool {
     // Reject functions that are just pass-throughs (e.g., `function f(x) { return x; }`)
     // — they can be called with any type and int32 specialization would corrupt objects.
     if (!has_int32_op) return false;
+
+    // Validate all cpool references are numeric (int32 or integer-valued float64).
+    // Large hex constants like 0xEDB88320 are stored as float64 in QuickJS cpool
+    // because they exceed i32 range, but are semantically integers.
+    for (func.instructions) |instr| {
+        if (instr.opcode == .push_const8 or instr.opcode == .push_const) {
+            const idx: u32 = switch (instr.operand) {
+                .const_idx => |a| a,
+                else => return false,
+            };
+            if (idx >= func.constants.len) return false;
+            switch (func.constants[idx]) {
+                .int32 => {},
+                .float64 => |v| {
+                    // Accept float64 if it represents a whole number (e.g., 0xEDB88320)
+                    if (v != @trunc(v)) return false; // not integer-valued
+                },
+                else => return false, // string/complex — not pure i32
+            }
+        }
+    }
 
     // For non-recursive functions, reject recursive-only patterns (self_ref, call_self)
     // and verify forward-jump-only control flow.
@@ -1944,6 +1965,21 @@ pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
         for (func.instructions) |instr| {
             const handler = numeric_handlers.getHandler(instr.opcode);
             if (handler.pattern == .self_ref or handler.pattern == .call_self or handler.pattern == .tail_call_self) return null;
+        }
+    }
+
+    // Validate all cpool references are numeric (int32 or float64)
+    for (func.instructions) |instr| {
+        if (instr.opcode == .push_const8 or instr.opcode == .push_const) {
+            const idx: u32 = switch (instr.operand) {
+                .const_idx => |a| a,
+                else => return null,
+            };
+            if (idx >= func.constants.len) return null;
+            switch (func.constants[idx]) {
+                .int32, .float64 => {},
+                else => return null, // string/object/complex — can't compile to numeric WASM
+            }
         }
     }
 
