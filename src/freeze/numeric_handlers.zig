@@ -56,6 +56,8 @@ pub const NumericPattern = enum {
     add_loc,
     /// Increment local: local[N]++
     inc_loc,
+    /// Decrement local: local[N]--
+    dec_loc,
     /// Get two locals at once (fused: push loc0, push loc1)
     get_loc_pair,
     /// Get local with TDZ check
@@ -229,6 +231,7 @@ pub fn getHandler(opcode: Opcode) NumericHandler {
         // ── Local arithmetic shortcuts ──────────────────────────
         .add_loc => .{ .pattern = .add_loc },
         .inc_loc => .{ .pattern = .inc_loc },
+        .dec_loc => .{ .pattern = .dec_loc },
 
         // ── Inc/Dec ─────────────────────────────────────────────
         .inc => .{ .pattern = .inc_dec, .is_inc = true },
@@ -311,7 +314,7 @@ pub fn analyzeFunctionFull(instructions: anytype) ?AnalysisResult {
             .binary_arith, .binary_cmp, .bitwise_binary,
             .unary, .inc_dec, .post_inc_dec, .lnot, .push_const, .push_cpool,
             .push_bool, .call_self, .tail_call_self,
-            .add_loc, .inc_loc,
+            .add_loc, .inc_loc, .dec_loc,
             => has_computing_op = true,
             .array_get, .array_get2, .array_put, .array_length => {
                 has_computing_op = true;
@@ -337,7 +340,7 @@ pub fn isComputingPattern(pattern: NumericPattern) bool {
         .binary_arith, .binary_cmp, .bitwise_binary,
         .unary, .inc_dec, .post_inc_dec, .lnot, .push_const, .push_cpool,
         .push_bool, .call_self, .tail_call_self,
-        .add_loc, .inc_loc,
+        .add_loc, .inc_loc, .dec_loc,
         .array_get, .array_get2, .array_put, .array_length,
         => true,
         else => false,
@@ -466,9 +469,10 @@ pub fn detectArrayArgs(instructions: anytype, arg_count: u32) u8 {
             .ret, .if_false, .if_true => {
                 if (sp >= 1) sp -= 1;
             },
-            .add_loc, .inc_loc => {
+            .add_loc => {
                 if (sp >= 1) sp -= 1; // add_loc pops from stack
             },
+            .inc_loc, .dec_loc => {}, // in-place local modify, no stack effect
             .array_length => {
                 // Pop array base, push length (not an arg)
                 if (sp >= 1) {
@@ -575,9 +579,10 @@ pub fn detectMutatedArgs(instructions: anytype, arg_count: u32) u8 {
             .ret, .if_false, .if_true => {
                 if (sp >= 1) sp -= 1;
             },
-            .add_loc, .inc_loc => {
+            .add_loc => {
                 if (sp >= 1) sp -= 1;
             },
+            .inc_loc, .dec_loc => {},
             .array_length => {
                 // Pop array base, push length (not an arg). No mutation.
                 if (sp >= 1) { stack[sp - 1] = -1; }
@@ -682,9 +687,10 @@ pub fn detectLengthArgs(instructions: anytype, arg_count: u32) u8 {
             .ret, .if_false, .if_true => {
                 if (sp >= 1) sp -= 1;
             },
-            .add_loc, .inc_loc => {
+            .add_loc => {
                 if (sp >= 1) sp -= 1;
             },
+            .inc_loc, .dec_loc => {},
             .nop, .goto_br, .set_loc_uninitialized, .tail_call_self => {},
             .unsupported => {},
         }

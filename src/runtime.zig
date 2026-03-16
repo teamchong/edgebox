@@ -1695,7 +1695,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     defer wf.close();
 
                     // Collect WASM function metadata from manifest
-                    const WasmFunc = struct { name: []const u8, arg_count: u32, instr_count: u32, is_recursive: bool, array_args: u8, mutated_args: u8, length_args: u8, line_num: u32, is_anon: bool };
+                    const WasmFunc = struct { name: []const u8, arg_count: u32, instr_count: u32, is_recursive: bool, array_args: u8, mutated_args: u8, length_args: u8, line_num: u32, is_anon: bool, is_f64: bool };
                     var wasm_funcs: [64]WasmFunc = undefined;
                     var wasm_func_count: usize = 0;
                     if (wasm_manifest) |mc| {
@@ -1765,10 +1765,17 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         ld += 1;
                                     }
                                 }
+                                // Parse type: "type":"f64" or "type":"i32"
+                                var is_f64 = false;
+                                if (std.mem.indexOfPos(u8, mc, name_end, "\"type\":\"f64\"")) |ts| {
+                                    // Only match if within this entry (before next "name")
+                                    const next_name = std.mem.indexOfPos(u8, mc, name_end + 1, "\"name\":\"") orelse mc.len;
+                                    if (ts < next_name) is_f64 = true;
+                                }
                                 // Detect anonymous functions (synthetic name starts with __anon_)
                                 const is_anon = std.mem.startsWith(u8, mc[ns..name_end], "__anon_");
                                 if (wasm_func_count < 64) {
-                                    wasm_funcs[wasm_func_count] = .{ .name = mc[ns..name_end], .arg_count = ac, .instr_count = ic, .is_recursive = is_rec, .array_args = aa, .mutated_args = ma, .length_args = la, .line_num = ln, .is_anon = is_anon };
+                                    wasm_funcs[wasm_func_count] = .{ .name = mc[ns..name_end], .arg_count = ac, .instr_count = ic, .is_recursive = is_rec, .array_args = aa, .mutated_args = ma, .length_args = la, .line_num = ln, .is_anon = is_anon, .is_f64 = is_f64 };
                                     wasm_func_count += 1;
                                 }
                                 pos = name_end + 1;
@@ -1793,10 +1800,12 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     wf.writeAll(wasm_filename) catch {};
                     wf.writeAll("'));\n") catch {};
                     wf.writeAll("  __wasm = new WebAssembly.Instance(new WebAssembly.Module(buf));\n") catch {};
+                    wf.writeAll("  __wasm.exports.memory.grow(254);\n") catch {}; // 256 pages = 16MB
                     wf.writeAll("} else {\n") catch {};
                     wf.writeAll("  __wasm = null; // workerd loads WASM differently\n") catch {};
                     wf.writeAll("}\n") catch {};
-                    // Hoist Int32Array view creation to module level (avoids per-call allocation)
+                    // Hoist Int32Array view creation to module level (avoids per-call allocation).
+                    // Array elements are always i32 in WASM linear memory regardless of function tier.
                     {
                         var has_array_funcs = false;
                         for (wasm_funcs[0..wasm_func_count]) |wfe| {
@@ -1804,27 +1813,25 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         }
                         if (has_array_funcs) {
                             wf.writeAll("const __m = __wasm ? new Int32Array(__wasm.exports.memory.buffer) : null;\n") catch {};
-                            // Array copy cache: global generation counter + per-arg identity cache.
-                            // Read-only array args skip copy-in when same JS object is passed again
-                            // and no mutating WASM function has run since last copy.
-                            var has_any_mutating = false;
-                            var has_any_readonly = false;
-                            for (wasm_funcs[0..wasm_func_count]) |wfe| {
-                                if (wfe.mutated_args != 0) has_any_mutating = true;
-                                const read_only = wfe.array_args & ~wfe.mutated_args;
-                                if (read_only != 0) has_any_readonly = true;
-                            }
-                            if (has_any_readonly) {
-                                wf.writeAll("let __gen = 0;\n") catch {};
-                                for (wasm_funcs[0..wasm_func_count], 0..) |wfe, wfi| {
+                            // Per-arg identity cache: skip copy when same array reference is passed.
+                            // Cache variables: __cN = last array ref for arg N.
+                            {
+                                var any_cacheable = false;
+                                for (wasm_funcs[0..wasm_func_count]) |wfe| {
                                     const read_only = wfe.array_args & ~wfe.mutated_args;
-                                    if (read_only == 0) continue;
-                                    var ai: u32 = 0;
-                                    while (ai < 8) : (ai += 1) {
-                                        if (read_only & (@as(u8, 1) << @intCast(ai)) != 0) {
-                                            var decl_buf: [80]u8 = undefined;
-                                            const decl = std.fmt.bufPrint(&decl_buf, "let __c{d}_{d}=null,__g{d}_{d}=-1;\n", .{ wfi, ai, wfi, ai }) catch continue;
-                                            wf.writeAll(decl) catch {};
+                                    if (read_only != 0) { any_cacheable = true; break; }
+                                }
+                                if (any_cacheable) {
+                                    for (wasm_funcs[0..wasm_func_count], 0..) |wfe, wfi| {
+                                        const read_only = wfe.array_args & ~wfe.mutated_args;
+                                        if (read_only == 0) continue;
+                                        var ai: u32 = 0;
+                                        while (ai < 8) : (ai += 1) {
+                                            if (read_only & (@as(u8, 1) << @intCast(ai)) != 0) {
+                                                var decl_buf: [80]u8 = undefined;
+                                                const decl = std.fmt.bufPrint(&decl_buf, "let __c{d}_{d}=null;\n", .{ wfi, ai }) catch continue;
+                                                wf.writeAll(decl) catch {};
+                                            }
                                         }
                                     }
                                 }
@@ -2070,73 +2077,75 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 } else {
                                     // Array args — copy to/from WASM linear memory
                                     wf.writeAll("\n") catch {};
-                                    // __m is hoisted to module level (avoids per-call Int32Array creation)
+                                    // Array elements are always i32 in WASM linear memory
+                                    // (array_get/array_put use i32.load/i32.store regardless of tier).
+                                    // The f64 tier only affects scalar locals/args/return, not array elements.
+                                    const mem_view: []const u8 = "__m";
+                                    const byte_shift: []const u8 = " << 2";
 
-                                    // Determine which args are read-only (cached) vs mutated (always copy)
+                                    // Dynamic offsets: each array arg gets space = arr.length elements.
+                                    // Uses bulk .set() for fast TypedArray transfer (memcpy under the hood).
+                                    // Read-only args cached by reference identity (skip copy when same array).
                                     const read_only_args = mf.array_args & ~mf.mutated_args;
-
-                                    // Copy array args to WASM memory (1024 elements each region)
-                                    var byte_offset: u32 = 0;
+                                    wf.writeAll("  let __off = 0;\n") catch {};
                                     var i: u32 = 0;
                                     while (i < param_count) : (i += 1) {
                                         if (mf.array_args & (@as(u8, 1) << @intCast(i)) != 0) {
-                                            var off_buf: [32]u8 = undefined;
-                                            const off_str = std.fmt.bufPrint(&off_buf, "{d}", .{byte_offset / 4}) catch "0";
+                                            var idx_buf: [8]u8 = undefined;
+                                            const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{i}) catch "0";
+                                            // Emit: const __bN = __off;
+                                            wf.writeAll("  const __b") catch {};
+                                            wf.writeAll(idx_str) catch {};
+                                            wf.writeAll(" = __off;\n") catch {};
 
                                             if (read_only_args & (@as(u8, 1) << @intCast(i)) != 0) {
-                                                // Read-only arg: skip copy if same JS object + no mutations since last copy
-                                                var cache_id_buf: [32]u8 = undefined;
-                                                const cid = std.fmt.bufPrint(&cache_id_buf, "{d}_{d}", .{ matched_func_idx, i }) catch "0_0";
+                                                // Read-only: cache by reference identity
+                                                var cid_buf: [32]u8 = undefined;
+                                                const cid = std.fmt.bufPrint(&cid_buf, "{d}_{d}", .{ matched_func_idx, i }) catch "0_0";
                                                 wf.writeAll("  if (") catch {};
                                                 wf.writeAll(param_names[i]) catch {};
                                                 wf.writeAll(" !== __c") catch {};
                                                 wf.writeAll(cid) catch {};
-                                                wf.writeAll(" || __gen !== __g") catch {};
-                                                wf.writeAll(cid) catch {};
-                                                wf.writeAll(") {\n") catch {};
-                                                wf.writeAll("    for (let __i = 0; __i < ") catch {};
+                                                wf.writeAll(") { ") catch {};
+                                                wf.writeAll(mem_view) catch {};
+                                                wf.writeAll(".set(") catch {};
                                                 wf.writeAll(param_names[i]) catch {};
-                                                wf.writeAll(".length; __i++) __m[") catch {};
-                                                wf.writeAll(off_str) catch {};
-                                                wf.writeAll(" + __i] = ") catch {};
-                                                wf.writeAll(param_names[i]) catch {};
-                                                wf.writeAll("[__i];\n") catch {};
-                                                wf.writeAll("    __c") catch {};
+                                                wf.writeAll(", __off); __c") catch {};
                                                 wf.writeAll(cid) catch {};
                                                 wf.writeAll(" = ") catch {};
                                                 wf.writeAll(param_names[i]) catch {};
-                                                wf.writeAll("; __g") catch {};
-                                                wf.writeAll(cid) catch {};
-                                                wf.writeAll(" = __gen;\n  }\n") catch {};
+                                                wf.writeAll("; }\n") catch {};
                                             } else {
-                                                // Mutated arg: always copy in
-                                                wf.writeAll("  for (let __i = 0; __i < ") catch {};
+                                                // Mutated: always copy
+                                                wf.writeAll("  ") catch {};
+                                                wf.writeAll(mem_view) catch {};
+                                                wf.writeAll(".set(") catch {};
                                                 wf.writeAll(param_names[i]) catch {};
-                                                wf.writeAll(".length; __i++) __m[") catch {};
-                                                wf.writeAll(off_str) catch {};
-                                                wf.writeAll(" + __i] = ") catch {};
-                                                wf.writeAll(param_names[i]) catch {};
-                                                wf.writeAll("[__i];\n") catch {};
+                                                wf.writeAll(", __off);\n") catch {};
                                             }
+
+                                            // Advance offset past this array
+                                            wf.writeAll("  __off += ") catch {};
+                                            wf.writeAll(param_names[i]) catch {};
+                                            wf.writeAll(".length;\n") catch {};
                                         }
-                                        byte_offset += 4096; // 1024 elements * 4 bytes each
                                     }
-                                    // Call WASM with byte offsets for array args, scalars as-is
+                                    // Call WASM with byte offsets (__bN << 2) for array args, scalars as-is
                                     wf.writeAll("  const __r = __wasm.exports.") catch {};
                                     wf.writeAll(mf.name) catch {};
                                     wf.writeAll("(") catch {};
                                     i = 0;
-                                    var arg_offset: u32 = 0;
                                     while (i < param_count) : (i += 1) {
                                         if (i > 0) wf.writeAll(", ") catch {};
                                         if (mf.array_args & (@as(u8, 1) << @intCast(i)) != 0) {
-                                            var off_buf2: [32]u8 = undefined;
-                                            const off_str2 = std.fmt.bufPrint(&off_buf2, "{d}", .{arg_offset}) catch "0";
-                                            wf.writeAll(off_str2) catch {};
+                                            var idx_buf2: [8]u8 = undefined;
+                                            const idx_str2 = std.fmt.bufPrint(&idx_buf2, "{d}", .{i}) catch "0";
+                                            wf.writeAll("__b") catch {};
+                                            wf.writeAll(idx_str2) catch {};
+                                            wf.writeAll(byte_shift) catch {};
                                         } else {
                                             wf.writeAll(param_names[i]) catch {};
                                         }
-                                        arg_offset += 4096;
                                     }
                                     // Append .length for array args that use get_length
                                     i = 0;
@@ -2149,37 +2158,34 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     }
                                     wf.writeAll(");\n") catch {};
                                     // Copy modified arrays back from WASM memory (only mutated ones)
-                                    arg_offset = 0;
                                     i = 0;
                                     while (i < param_count) : (i += 1) {
                                         if (mf.mutated_args & (@as(u8, 1) << @intCast(i)) != 0) {
-                                            var off_buf3: [32]u8 = undefined;
-                                            const off_str3 = std.fmt.bufPrint(&off_buf3, "{d}", .{arg_offset / 4}) catch "0";
+                                            var idx_buf3: [8]u8 = undefined;
+                                            const idx_str3 = std.fmt.bufPrint(&idx_buf3, "{d}", .{i}) catch "0";
                                             wf.writeAll("  for (let __i = 0; __i < ") catch {};
                                             wf.writeAll(param_names[i]) catch {};
                                             wf.writeAll(".length; __i++) ") catch {};
                                             wf.writeAll(param_names[i]) catch {};
-                                            wf.writeAll("[__i] = __m[") catch {};
-                                            wf.writeAll(off_str3) catch {};
+                                            wf.writeAll("[__i] = ") catch {};
+                                            wf.writeAll(mem_view) catch {};
+                                            wf.writeAll("[__b") catch {};
+                                            wf.writeAll(idx_str3) catch {};
                                             wf.writeAll(" + __i];\n") catch {};
                                         }
-                                        arg_offset += 4096;
                                     }
-                                    // Invalidate caches if this function mutates arrays
+                                    // Invalidate all caches when mutation happens (cross-function safety)
                                     if (mf.mutated_args != 0 and read_only_args != 0) {
-                                        // Only need gen counter if there are also read-only args somewhere
-                                        wf.writeAll("  __gen++;\n") catch {};
-                                    } else if (mf.mutated_args != 0) {
-                                        // Check if ANY other function has read-only args
-                                        var any_other_ro = false;
-                                        for (wasm_funcs[0..wasm_func_count]) |other_wf| {
-                                            if ((other_wf.array_args & ~other_wf.mutated_args) != 0) {
-                                                any_other_ro = true;
-                                                break;
+                                        // This function has both mutated and cached args — invalidate caches
+                                        var ai: u32 = 0;
+                                        while (ai < param_count) : (ai += 1) {
+                                            if (read_only_args & (@as(u8, 1) << @intCast(ai)) != 0) {
+                                                var cid_buf2: [32]u8 = undefined;
+                                                const cid2 = std.fmt.bufPrint(&cid_buf2, "{d}_{d}", .{ matched_func_idx, ai }) catch "0_0";
+                                                wf.writeAll("  __c") catch {};
+                                                wf.writeAll(cid2) catch {};
+                                                wf.writeAll(" = null;\n") catch {};
                                             }
-                                        }
-                                        if (any_other_ro) {
-                                            wf.writeAll("  __gen++;\n") catch {};
                                         }
                                     }
                                     wf.writeAll("  return __r;\n}") catch {};

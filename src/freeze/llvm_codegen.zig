@@ -1111,6 +1111,21 @@ fn emitInt32Instruction(
             _ = builder.buildStore(new_val, loc_ptr);
         },
 
+        .dec_loc_i32 => {
+            // dec_loc: local[N]--
+            const idx: u32 = switch (instr.operand) {
+                .loc => |a| a,
+                .u8 => |a| a,
+                .u16 => |a| a,
+                else => 0,
+            };
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            const loc_ptr = locals.*[idx];
+            const old_val = builder.buildLoad(llvm.i32Type(), loc_ptr, "decloc_old");
+            const new_val = builder.buildNSWSub(old_val, llvm.constInt32(1), "decloc_new");
+            _ = builder.buildStore(new_val, loc_ptr);
+        },
+
         .inc_dec_i32 => {
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
             const val = i32VstackPop(vstack);
@@ -1346,7 +1361,11 @@ fn generateNumericBody(
         .f64 => llvm.constF64(0.0),
     };
 
-    // Create LLVM basic blocks
+    // Create LLVM basic blocks.
+    // Entry block holds only allocas + br to blk_0, so blk_0 can have loop backedges.
+    // (LLVM requires the entry block to have no predecessors.)
+    const entry_bb = llvm.appendBasicBlock(func, "entry");
+
     var llvm_blocks = allocator.alloc(llvm.BasicBlock, blocks.len) catch return CodegenError.OutOfMemory;
     defer allocator.free(llvm_blocks);
 
@@ -1360,8 +1379,8 @@ fn generateNumericBody(
     builder.positionAtEnd(unreachable_bb);
     _ = builder.buildUnreachable();
 
-    // Allocate locals with comptime-selected type
-    builder.positionAtEnd(llvm_blocks[0]);
+    // Allocate locals in entry block (LLVM mem2reg requires allocas in entry)
+    builder.positionAtEnd(entry_bb);
     var locals_buf: [48]llvm.Value = undefined;
     const local_count = analyzed.var_count;
     for (0..@min(local_count, 48)) |i| {
@@ -1407,6 +1426,9 @@ fn generateNumericBody(
         spill_slots[i] = builder.buildAlloca(elem_type, name);
         _ = builder.buildStore(zero_val, spill_slots[i]);
     }
+
+    // Branch from entry to first CFG block (entry stays predecessor-free)
+    _ = builder.buildBr(llvm_blocks[0]);
 
     // Compute entry stack depth for each block via static analysis
     var entry_depths = allocator.alloc(i32, blocks.len) catch return CodegenError.OutOfMemory;
@@ -1612,7 +1634,7 @@ fn numericStackEffect(instr: Instruction) i32 {
         .push_const, .push_cpool, .push_bool, .get_arg, .get_loc, .get_loc_check => 1,
         .get_loc_pair => 2, // push 2 locals
         .put_arg, .put_loc, .put_loc_check, .stack_drop, .add_loc => -1,
-        .set_arg, .set_loc, .nop, .set_loc_uninitialized, .inc_loc => 0,
+        .set_arg, .set_loc, .nop, .set_loc_uninitialized, .inc_loc, .dec_loc => 0,
         .binary_arith, .binary_cmp, .bitwise_binary, .array_get => -1, // pop 2, push 1
         .unary, .lnot, .inc_dec, .always_false, .array_length => 0, // pop 1, push 1
         .post_inc_dec => 1, // pop 1, push 2
@@ -1786,7 +1808,17 @@ fn emitNumericInstructionMem(
                     .f64 => llvm.constF64(@as(f64, @floatFromInt(v))),
                 },
                 .float64 => |v| switch (kind) {
-                    .i32 => llvm.constInt32(@as(i32, @intFromFloat(v))),
+                    .i32 => blk: {
+                        // JS bitwise ops use unsigned 32-bit, reinterpret as signed i32.
+                        // E.g., 0x85ebca6b (2246822219) → -2048145077 as i32.
+                        const u: u32 = if (v >= 0 and v <= @as(f64, @floatFromInt(std.math.maxInt(u32))))
+                            @intFromFloat(v)
+                        else if (v < 0 and v >= @as(f64, @floatFromInt(std.math.minInt(i32))))
+                            @bitCast(@as(i32, @intFromFloat(v)))
+                        else
+                            return CodegenError.UnsupportedOpcode;
+                        break :blk llvm.constInt32(@bitCast(u));
+                    },
                     .f64 => llvm.constF64(v),
                 },
                 else => return CodegenError.UnsupportedOpcode,
@@ -2008,6 +2040,19 @@ fn emitNumericInstructionMem(
             const new_val = switch (kind) {
                 .i32 => builder.buildNSWAdd(old, one_val, "incloc"),
                 .f64 => builder.buildFAdd(old, one_val, "fincloc"),
+            };
+            _ = builder.buildStore(new_val, locals.*[idx]);
+        },
+
+        .dec_loc => {
+            const idx: u32 = switch (instr.operand) {
+                .loc => |a| a, .u8 => |a| a, .u16 => |a| a, else => 0,
+            };
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            const old = builder.buildLoad(elem_type, locals.*[idx], "decloc_old");
+            const new_val = switch (kind) {
+                .i32 => builder.buildNSWSub(old, one_val, "decloc"),
+                .f64 => builder.buildFSub(old, one_val, "fdecloc"),
             };
             _ = builder.buildStore(new_val, locals.*[idx]);
         },
@@ -2293,7 +2338,15 @@ fn emitNumericInstruction(
                     .f64 => llvm.constF64(@as(f64, @floatFromInt(v))),
                 },
                 .float64 => |v| switch (kind) {
-                    .i32 => llvm.constInt32(@as(i32, @intFromFloat(v))),
+                    .i32 => blk: {
+                        const u: u32 = if (v >= 0 and v <= @as(f64, @floatFromInt(std.math.maxInt(u32))))
+                            @intFromFloat(v)
+                        else if (v < 0 and v >= @as(f64, @floatFromInt(std.math.minInt(i32))))
+                            @bitCast(@as(i32, @intFromFloat(v)))
+                        else
+                            return CodegenError.UnsupportedOpcode;
+                        break :blk llvm.constInt32(@bitCast(u));
+                    },
                     .f64 => llvm.constF64(v),
                 },
                 else => return CodegenError.UnsupportedOpcode,
@@ -2628,6 +2681,23 @@ fn emitNumericInstruction(
             const new_val = switch (kind) {
                 .i32 => builder.buildNSWAdd(old_val, one_val, "incloc"),
                 .f64 => builder.buildFAdd(old_val, one_val, "fincloc"),
+            };
+            _ = builder.buildStore(new_val, loc_ptr);
+        },
+
+        .dec_loc => {
+            const idx: u32 = switch (instr.operand) {
+                .loc => |a| a,
+                .u8 => |a| a,
+                .u16 => |a| a,
+                else => 0,
+            };
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            const loc_ptr = locals.*[idx];
+            const old_val = builder.buildLoad(elem_type, loc_ptr, "decloc_old");
+            const new_val = switch (kind) {
+                .i32 => builder.buildNSWSub(old_val, one_val, "decloc"),
+                .f64 => builder.buildFSub(old_val, one_val, "fdecloc"),
             };
             _ = builder.buildStore(new_val, loc_ptr);
         },

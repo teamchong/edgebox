@@ -67,6 +67,8 @@ pub const Int32Pattern = enum {
     add_loc_i32,
     /// Increment local: local[N]++
     inc_loc_i32,
+    /// Decrement local: local[N]--
+    dec_loc_i32,
     /// Push constant from cpool (resolved at compile time)
     push_cpool_i32,
     /// Unsupported in int32 mode
@@ -207,6 +209,7 @@ pub fn getInt32Handler(opcode: Opcode) Int32Handler {
         // Add to local / increment local
         .add_loc => .{ .pattern = .add_loc_i32 },
         .inc_loc => .{ .pattern = .inc_loc_i32 },
+        .dec_loc => .{ .pattern = .dec_loc_i32 },
 
         // Stack ops
         .swap => .{ .pattern = .swap_i32 },

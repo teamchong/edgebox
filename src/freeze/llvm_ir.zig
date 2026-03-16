@@ -138,6 +138,10 @@ pub const Builder = struct {
         return c.LLVMBuildSub(self.ref, lhs, rhs, name);
     }
 
+    pub fn buildNSWSub(self: Builder, lhs: Value, rhs: Value, name: [*:0]const u8) Value {
+        return c.LLVMBuildNSWSub(self.ref, lhs, rhs, name);
+    }
+
     pub fn buildMul(self: Builder, lhs: Value, rhs: Value, name: [*:0]const u8) Value {
         return c.LLVMBuildMul(self.ref, lhs, rhs, name);
     }

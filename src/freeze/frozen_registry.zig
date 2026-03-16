@@ -2190,7 +2190,7 @@ fn analyzeFunctionWithMath(func: AnalyzedFunction, debug: bool) ?numeric_handler
         if (handler.requires_i32) has_i32_only = true;
 
         switch (handler.pattern) {
-            .binary_arith, .binary_cmp, .bitwise_binary, .unary, .inc_dec, .post_inc_dec, .lnot, .push_const, .push_cpool, .push_bool, .call_self, .tail_call_self, .add_loc, .inc_loc => has_computing_op = true,
+            .binary_arith, .binary_cmp, .bitwise_binary, .unary, .inc_dec, .post_inc_dec, .lnot, .push_const, .push_cpool, .push_bool, .call_self, .tail_call_self, .add_loc, .inc_loc, .dec_loc => has_computing_op = true,
             .array_get, .array_get2, .array_put, .array_length => has_computing_op = true,
             else => {},
         }
