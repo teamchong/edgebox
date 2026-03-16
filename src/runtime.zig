@@ -2204,15 +2204,33 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     }
                                     wf.writeAll(");\n") catch {};
                                     // Copy modified arrays back from WASM memory (only mutated ones)
+                                    // TypedArrays: use bulk .set(subarray) for native memcpy speed
+                                    // Plain Arrays: fall back to per-element copy
                                     i = 0;
                                     while (i < param_count) : (i += 1) {
                                         if (mf.mutated_args & (@as(u8, 1) << @intCast(i)) != 0) {
                                             var idx_buf3: [8]u8 = undefined;
                                             const idx_str3 = std.fmt.bufPrint(&idx_buf3, "{d}", .{i}) catch "0";
-                                            wf.writeAll("  for (let __i = 0; __i < ") catch {};
-                                            wf.writeAll(param_names[i]) catch {};
+                                            const pn = param_names[i];
+                                            // TypedArray fast path: .set(subarray)
+                                            wf.writeAll("  if (") catch {};
+                                            wf.writeAll(pn) catch {};
+                                            wf.writeAll(".set) ") catch {};
+                                            wf.writeAll(pn) catch {};
+                                            wf.writeAll(".set(") catch {};
+                                            wf.writeAll(mem_view) catch {};
+                                            wf.writeAll(".subarray(__b") catch {};
+                                            wf.writeAll(idx_str3) catch {};
+                                            wf.writeAll(", __b") catch {};
+                                            wf.writeAll(idx_str3) catch {};
+                                            wf.writeAll(" + ") catch {};
+                                            wf.writeAll(pn) catch {};
+                                            wf.writeAll(".length));\n") catch {};
+                                            // Plain Array fallback
+                                            wf.writeAll("  else for (let __i = 0; __i < ") catch {};
+                                            wf.writeAll(pn) catch {};
                                             wf.writeAll(".length; __i++) ") catch {};
-                                            wf.writeAll(param_names[i]) catch {};
+                                            wf.writeAll(pn) catch {};
                                             wf.writeAll("[__i] = ") catch {};
                                             wf.writeAll(mem_view) catch {};
                                             wf.writeAll("[__b") catch {};
