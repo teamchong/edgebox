@@ -1693,8 +1693,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                 if (std.fs.cwd().createFile(wp, .{})) |wf| {
                     defer wf.close();
 
-                    // Collect WASM function names and arg counts from manifest
-                    const WasmFunc = struct { name: []const u8, arg_count: u32 };
+                    // Collect WASM function metadata from manifest
+                    const WasmFunc = struct { name: []const u8, arg_count: u32, instr_count: u32, is_recursive: bool };
                     var wasm_funcs: [64]WasmFunc = undefined;
                     var wasm_func_count: usize = 0;
                     if (wasm_manifest) |mc| {
@@ -1707,8 +1707,23 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     const ad = as + 7;
                                     if (ad < mc.len and mc[ad] >= '0' and mc[ad] <= '9') ac = mc[ad] - '0';
                                 }
+                                // Parse instruction count: "instrs":N
+                                var ic: u32 = 0;
+                                if (std.mem.indexOfPos(u8, mc, name_end, "\"instrs\":")) |is| {
+                                    var id = is + 9;
+                                    while (id < mc.len and mc[id] >= '0' and mc[id] <= '9') {
+                                        ic = ic * 10 + (mc[id] - '0');
+                                        id += 1;
+                                    }
+                                }
+                                // Parse recursive flag: "recursive":1
+                                var is_rec = false;
+                                if (std.mem.indexOfPos(u8, mc, name_end, "\"recursive\":")) |rs| {
+                                    const rd = rs + 12;
+                                    if (rd < mc.len and mc[rd] == '1') is_rec = true;
+                                }
                                 if (wasm_func_count < 64) {
-                                    wasm_funcs[wasm_func_count] = .{ .name = mc[ns..name_end], .arg_count = ac };
+                                    wasm_funcs[wasm_func_count] = .{ .name = mc[ns..name_end], .arg_count = ac, .instr_count = ic, .is_recursive = is_rec };
                                     wasm_func_count += 1;
                                 }
                                 pos = name_end + 1;
@@ -1716,13 +1731,26 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         }
                     }
 
-                    // Preamble: import WASM module
+                    // Preamble: load WASM module (compatible with Node.js + workerd)
                     wf.writeAll("// EdgeBox AOT+JIT (auto-generated)\n") catch {};
                     wf.writeAll("// Source transform: function bodies replaced with WASM calls\n") catch {};
                     wf.writeAll("// V8 inlines these WASM calls into JS (zero overhead)\n\n") catch {};
-                    wf.writeAll("import wasm from \"") catch {};
+                    wf.writeAll("let __wasm;\n") catch {};
+                    wf.writeAll("if (typeof process !== 'undefined' && process.versions?.node) {\n") catch {};
+                    wf.writeAll("  const { readFileSync } = await import('fs');\n") catch {};
+                    wf.writeAll("  const { fileURLToPath } = await import('url');\n") catch {};
+                    wf.writeAll("  const { dirname, join } = await import('path');\n") catch {};
+                    wf.writeAll("  const __dir = dirname(fileURLToPath(import.meta.url));\n") catch {};
+                    wf.writeAll("  const buf = readFileSync(join(__dir, '") catch {};
                     wf.writeAll(wasm_filename) catch {};
-                    wf.writeAll("\";\nconst __wasm = new WebAssembly.Instance(wasm);\n\n") catch {};
+                    wf.writeAll("'));\n") catch {};
+                    wf.writeAll("  __wasm = new WebAssembly.Instance(new WebAssembly.Module(buf));\n") catch {};
+                    wf.writeAll("} else {\n") catch {};
+                    wf.writeAll("  const wasm = await import('") catch {};
+                    wf.writeAll(wasm_filename) catch {};
+                    wf.writeAll("');\n") catch {};
+                    wf.writeAll("  __wasm = new WebAssembly.Instance(wasm.default || wasm);\n") catch {};
+                    wf.writeAll("}\n\n") catch {};
 
                     // Source transform: copy original source, but replace function bodies
                     // for WASM-compiled functions with WASM call trampolines.
@@ -1749,6 +1777,39 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             }
 
                             if (matched_func) |mf| {
+                                // Skip trampolining for trivially small leaf functions.
+                                // V8 JIT inlines small JS functions into the caller's loop body,
+                                // which is faster than crossing the JS→WASM boundary per call.
+                                // BUT: always trampoline recursive or cross-call functions.
+                                const min_instrs: u32 = 20;
+                                if (!mf.is_recursive and mf.instr_count > 0 and mf.instr_count < min_instrs) {
+                                    // Check if body calls another WASM function (cross-call)
+                                    // by scanning ahead to the closing brace for WASM func names
+                                    var calls_wasm = false;
+                                    if (std.mem.indexOfPos(u8, cc, match_end, "{")) |bp| {
+                                        // Quick scan of function body text
+                                        var depth_scan: i32 = 1;
+                                        var sp = bp + 1;
+                                        while (sp < cc.len and depth_scan > 0) : (sp += 1) {
+                                            if (cc[sp] == '{') depth_scan += 1;
+                                            if (cc[sp] == '}') depth_scan -= 1;
+                                        }
+                                        const body = cc[bp + 1 .. @min(sp, cc.len)];
+                                        for (wasm_funcs[0..wasm_func_count]) |other| {
+                                            if (std.mem.eql(u8, other.name, mf.name)) continue;
+                                            if (std.mem.indexOf(u8, body, other.name)) |_| {
+                                                calls_wasm = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (!calls_wasm) {
+                                        wf.writeAll(cc[src_pos .. src_pos + 1]) catch {};
+                                        src_pos += 1;
+                                        continue;
+                                    }
+                                }
+
                                 // Found a WASM function declaration. Find opening brace.
                                 const brace_pos = std.mem.indexOfPos(u8, cc, match_end, "{") orelse {
                                     // No brace found — write char and advance

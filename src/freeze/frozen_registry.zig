@@ -1243,7 +1243,8 @@ pub fn generateModuleZigShardedWithBackend(
                                             .i32 => "i32",
                                             .f64 => "f64",
                                         };
-                                        const entry = std.fmt.bufPrint(&entry_buf, "{{\"name\":\"{s}\",\"args\":{d},\"type\":\"{s}\"}}", .{ sf.name, sf.func.arg_count, type_str }) catch continue;
+                                        const recursive: u8 = if (sf.func.is_self_recursive) 1 else 0;
+                                        const entry = std.fmt.bufPrint(&entry_buf, "{{\"name\":\"{s}\",\"args\":{d},\"type\":\"{s}\",\"instrs\":{d},\"recursive\":{d}}}", .{ sf.name, sf.func.arg_count, type_str, sf.func.instructions.len, recursive }) catch continue;
                                         mf.writeAll(entry) catch {};
                                     }
                                     mf.writeAll("]") catch {};
