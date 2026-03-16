@@ -1149,6 +1149,76 @@ pub fn generateModuleZigShardedWithBackend(
                     std.debug.print("[freeze] Numeric extra: {d} functions for WASM ({d} f64, {d} i32 with loops)\n", .{ f64_infos.items.len, f64_count, extra_i32_count });
                 }
 
+                // === Cross-function call pass ===
+                // Functions that call other numeric WASM functions (e.g., countPrimes -> isPrime)
+                // These were rejected by analyzeNumericTier (non-recursive with get_var+call)
+                // but qualify when the callee is already in the WASM set.
+                // NOTE: cross_cfgs/cross_names must outlive wasm_funcs (pointers stored in ShardFunction)
+                var cross_cfgs = std.ArrayListUnmanaged(cfg_builder.CFG){};
+                defer {
+                    for (cross_cfgs.items) |*ci| ci.deinit();
+                    cross_cfgs.deinit(allocator);
+                }
+                var cross_names = std.ArrayListUnmanaged([]u8){};
+                defer {
+                    for (cross_names.items) |cn| allocator.free(cn);
+                    cross_names.deinit(allocator);
+                }
+                {
+                    // Build set of existing WASM function names
+                    var wasm_name_set = std.ArrayListUnmanaged([]const u8){};
+                    defer wasm_name_set.deinit(allocator);
+                    for (wasm_funcs.items) |sf| {
+                        try wasm_name_set.append(allocator, sf.name);
+                    }
+
+                    const CrossInfo = struct { gf_idx: usize, cfg_idx: usize, name_idx: usize };
+                    var cross_infos = std.ArrayListUnmanaged(CrossInfo){};
+                    defer cross_infos.deinit(allocator);
+
+                    for (generated_all.items, 0..) |gf, gi| {
+                        // Skip functions already in WASM set
+                        if (isPureInt32Function(gf.func)) continue;
+                        if (analyzeNumericTier(gf.func) != null) continue;
+
+                        // Check if it qualifies with cross-call context
+                        const tier = analyzeNumericTierWithCrossCall(gf.func, wasm_name_set.items) orelse continue;
+                        _ = tier;
+
+                        const cfg_val = cfg_builder.buildCFG(allocator, gf.func.instructions) catch continue;
+                        const cfg_idx = cross_cfgs.items.len;
+                        try cross_cfgs.append(allocator, cfg_val);
+
+                        var sanitized_buf: [256]u8 = undefined;
+                        const sanitized = sanitizeName(gf.func.name, &sanitized_buf);
+                        const llvm_func_name = try std.fmt.allocPrint(allocator, "__frozen_{d}_{s}", .{ gf.idx, sanitized });
+                        const name_idx = cross_names.items.len;
+                        try cross_names.append(allocator, llvm_func_name);
+
+                        try cross_infos.append(allocator, .{ .gf_idx = gi, .cfg_idx = cfg_idx, .name_idx = name_idx });
+                    }
+
+                    // Build ShardFunctions for cross-call candidates (safe — cross_cfgs won't grow)
+                    for (cross_infos.items) |info| {
+                        const gf = generated_all.items[info.gf_idx];
+                        const tier = analyzeNumericTierWithCrossCall(gf.func, wasm_name_set.items) orelse continue;
+                        try wasm_funcs.append(allocator, .{
+                            .name = gf.func.name,
+                            .func_index = gf.idx,
+                            .parser_index = gf.func.parser_index,
+                            .line_num = gf.func.line_num,
+                            .llvm_func_name = cross_names.items[info.name_idx],
+                            .func = gf.func,
+                            .cfg = &cross_cfgs.items[info.cfg_idx],
+                            .value_kind = tier,
+                        });
+                    }
+
+                    if (cross_infos.items.len > 0) {
+                        std.debug.print("[freeze] Cross-call: {d} functions added to WASM (call other numeric functions)\n", .{cross_infos.items.len});
+                    }
+                }
+
                 var standalone_path_buf: [4096]u8 = undefined;
                 const standalone_path = std.fmt.bufPrintZ(&standalone_path_buf, "{s}/standalone.o", .{cache_dir}) catch null;
                 if (standalone_path) |sp| {
@@ -1873,6 +1943,74 @@ pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
         for (func.instructions) |instr| {
             const handler = numeric_handlers.getHandler(instr.opcode);
             if (handler.pattern == .self_ref or handler.pattern == .call_self or handler.pattern == .tail_call_self) return null;
+        }
+    }
+
+    return kind;
+}
+
+/// Resolve an atom index to a function name string slice.
+/// Used for cross-function call detection (atom → callee name).
+fn resolveAtomToName(func: AnalyzedFunction, atom_idx: u32) ?[]const u8 {
+    if (atom_idx < module_parser.JS_ATOM_END) {
+        if (atom_idx < module_parser.BUILTIN_ATOMS.len) {
+            const name = module_parser.BUILTIN_ATOMS[atom_idx];
+            if (name.len > 0 and name[0] != '<') return name;
+        }
+        return null;
+    }
+    const adjusted_idx = atom_idx - module_parser.JS_ATOM_END;
+    if (adjusted_idx < func.atom_strings.len) {
+        const str = func.atom_strings[adjusted_idx];
+        if (str.len > 0) return str;
+    }
+    return null;
+}
+
+/// Like analyzeNumericTier, but accepts non-recursive functions that call
+/// other known WASM functions (cross-function calls within the WASM module).
+pub fn analyzeNumericTierWithCrossCall(
+    func: AnalyzedFunction,
+    wasm_func_names: []const []const u8,
+) ?numeric_handlers.ValueKind {
+    if (func.arg_count < 1 or func.arg_count > 8) return null;
+    if (func.var_count > 16) return null;
+
+    const kind = numeric_handlers.analyzeFunction(func.instructions) orelse return null;
+
+    if (!func.is_self_recursive) {
+        for (func.instructions) |instr| {
+            const handler = numeric_handlers.getHandler(instr.opcode);
+            if (handler.pattern == .self_ref) {
+                // Resolve the callee name from the opcode:
+                // - get_var/get_var_undef: atom operand → global variable name
+                // - get_var_ref0: closure_vars[0].name → captured function name
+                const callee_name: ?[]const u8 = if (instr.opcode == .get_var or instr.opcode == .get_var_undef) blk: {
+                    const atom_val: u32 = switch (instr.operand) {
+                        .atom => |a| a,
+                        else => break :blk null,
+                    };
+                    break :blk resolveAtomToName(func, atom_val);
+                } else if (instr.opcode == .get_var_ref0) blk: {
+                    // Closure variable reference — look up name from closure metadata
+                    if (func.closure_vars.len > 0) break :blk func.closure_vars[0].name;
+                    break :blk null;
+                } else null;
+
+                if (callee_name) |cn| {
+                    var found = false;
+                    for (wasm_func_names) |wn| {
+                        if (std.mem.eql(u8, cn, wn)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) return null;
+                } else {
+                    return null;
+                }
+            }
+            // call_self/tail_call_self: resolved at codegen time (target determined by pending_callee)
         }
     }
 

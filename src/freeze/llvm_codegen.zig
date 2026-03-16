@@ -350,17 +350,14 @@ pub fn generateStandaloneWasm(
     const builder = llvm.Builder.create(native.ctx);
     defer builder.dispose();
 
-    var generated_count: u32 = 0;
+    // === Pass 1: Declare all functions (so cross-function calls can resolve) ===
     for (functions) |sf| {
         const func = sf.func;
-
-        // Select LLVM type based on numeric tier
         const elem_type: llvm.Type = switch (sf.value_kind) {
             .i32 => llvm.i32Type(),
             .f64 => llvm.doubleType(),
         };
 
-        // Create function: T @name(T %n0, T %n1, ...)
         var export_name_buf: [256]u8 = undefined;
         const export_name = std.fmt.bufPrintZ(&export_name_buf, "{s}", .{sf.name}) catch continue;
 
@@ -369,17 +366,26 @@ pub fn generateStandaloneWasm(
             param_types_buf[i] = elem_type;
         }
         const fn_ty = llvm.functionType(elem_type, param_types_buf[0..func.arg_count], false);
-        const standalone_fn = native.module.addFunction(export_name, fn_ty);
-        llvm.setLinkage(standalone_fn, c.LLVMExternalLinkage);
+        llvm.setLinkage(native.module.addFunction(export_name, fn_ty), c.LLVMExternalLinkage);
+    }
+
+    // === Pass 2: Generate bodies (all callees already declared) ===
+    var generated_count: u32 = 0;
+    for (functions) |sf| {
+        const func = sf.func;
+
+        var export_name_buf: [256]u8 = undefined;
+        const export_name = std.fmt.bufPrintZ(&export_name_buf, "{s}", .{sf.name}) catch continue;
+        const standalone_fn = native.module.getNamedFunction(export_name) orelse continue;
 
         // Generate body using the appropriate numeric codegen
         const gen_ok = switch (sf.value_kind) {
             .i32 => blk: {
-                generateInt32Body(allocator, builder, standalone_fn, func, sf.cfg) catch break :blk false;
+                generateInt32Body(allocator, builder, standalone_fn, func, sf.cfg, native.module) catch break :blk false;
                 break :blk true;
             },
             .f64 => blk: {
-                generateNumericBody(.f64, allocator, builder, standalone_fn, func, sf.cfg) catch break :blk false;
+                generateNumericBody(.f64, allocator, builder, standalone_fn, func, sf.cfg, native.module) catch break :blk false;
                 break :blk true;
             },
         };
@@ -556,7 +562,7 @@ fn generateInt32Function(
     // Generate the hot function body
     // If this fails, clean up by replacing the function with a valid stub
     // to avoid corrupting the LLVM module state.
-    generateInt32Body(allocator, builder, hot_fn, func, cfg) catch |err| {
+    generateInt32Body(allocator, builder, hot_fn, func, cfg, module) catch |err| {
         // Replace all basic blocks with a minimal valid body
         while (c.LLVMGetFirstBasicBlock(hot_fn)) |bb| {
             // Remove all instructions from this block first
@@ -650,6 +656,7 @@ fn generateInt32Body(
     func: llvm.Value,
     analyzed: AnalyzedFunction,
     cfg: *const CFG,
+    module: llvm.Module,
 ) CodegenError!void {
     const blocks = cfg.blocks.items;
     if (blocks.len == 0) return;
@@ -700,6 +707,7 @@ fn generateInt32Body(
         defer vstack.deinit(allocator);
 
         var block_terminated = false;
+        var pending_callee: ?llvm.Value = null;
 
         for (block.instructions) |instr| {
             if (block_terminated) break;
@@ -718,6 +726,9 @@ fn generateInt32Body(
                 block.successors.items,
                 func,
                 &block_terminated,
+                &pending_callee,
+                module,
+                analyzed,
             );
         }
 
@@ -748,6 +759,9 @@ fn emitInt32Instruction(
     successors: []const u32,
     func: llvm.Value,
     block_terminated: *bool,
+    pending_callee: *?llvm.Value,
+    module: llvm.Module,
+    analyzed: AnalyzedFunction,
 ) CodegenError!void {
     const handler = int32_handlers.getInt32Handler(instr.opcode);
 
@@ -997,6 +1011,7 @@ fn emitInt32Instruction(
         .add_loc_i32 => {
             // add_loc: local[N] += pop()
             const idx: u32 = switch (instr.operand) {
+                .loc => |a| a,
                 .u8 => |a| a,
                 .u16 => |a| a,
                 else => 0,
@@ -1013,6 +1028,7 @@ fn emitInt32Instruction(
         .inc_loc_i32 => {
             // inc_loc: local[N]++
             const idx: u32 = switch (instr.operand) {
+                .loc => |a| a,
                 .u8 => |a| a,
                 .u16 => |a| a,
                 else => 0,
@@ -1049,12 +1065,46 @@ fn emitInt32Instruction(
         },
 
         .self_ref_i32 => {
-            // Self-reference marker — no LLVM IR needed, just skip
-            // The subsequent call_self will handle it
+            // Function reference marker. Resolve the callee for cross-function calls.
+            // - get_var/get_var_undef: atom operand → look up by name in module
+            // - get_var_ref0: closure var[0].name → look up by name in module
+            if (instr.opcode == .get_var or instr.opcode == .get_var_undef) {
+                switch (instr.operand) {
+                    .atom => |atom_idx| {
+                        if (getAtomStringStatic(analyzed, atom_idx)) |callee_name| {
+                            if (module.getNamedFunction(callee_name)) |callee_fn| {
+                                if (callee_fn != func) {
+                                    pending_callee.* = callee_fn;
+                                }
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            } else if (instr.opcode == .get_var_ref0) {
+                // Closure variable ref — look up captured function by name
+                if (analyzed.closure_vars.len > 0) {
+                    const cv_name = analyzed.closure_vars[0].name;
+                    if (cv_name.len > 0) {
+                        // closure_vars names are slices, need null-terminated for LLVM lookup
+                        var name_buf: [256]u8 = undefined;
+                        if (cv_name.len < name_buf.len) {
+                            @memcpy(name_buf[0..cv_name.len], cv_name);
+                            name_buf[cv_name.len] = 0;
+                            const name_z: [*:0]const u8 = @ptrCast(name_buf[0..cv_name.len]);
+                            if (module.getNamedFunction(name_z)) |callee_fn| {
+                                if (callee_fn != func) {
+                                    pending_callee.* = callee_fn;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         },
 
         .call_self_i32 => {
-            // Self-recursive call — generate LLVM call to self
+            // Function call — self-recursive or cross-function
             const call_argc: u32 = switch (instr.opcode) {
                 .call1 => 1,
                 .call2 => 2,
@@ -1065,6 +1115,14 @@ fn emitInt32Instruction(
 
             if (vstack.items.len < call_argc) return CodegenError.StackUnderflow;
 
+            // Determine call target: cross-function callee or self
+            const call_target = if (pending_callee.*) |callee| blk: {
+                pending_callee.* = null;
+                // Verify arg count matches callee's param count
+                if (c.LLVMCountParams(callee) == call_argc) break :blk callee;
+                break :blk func; // Mismatch — fall back to self
+            } else func;
+
             // Pop args in reverse order
             var call_args: [8]llvm.Value = undefined;
             var i: u32 = call_argc;
@@ -1073,22 +1131,28 @@ fn emitInt32Instruction(
                 call_args[i] = i32VstackPop(vstack);
             }
 
-            // Build the self-recursive call
+            // Build the call
             var param_types_buf: [8]llvm.Type = undefined;
             for (0..call_argc) |j| {
                 param_types_buf[j] = llvm.i32Type();
             }
-            const self_fn_ty = llvm.functionType(llvm.i32Type(), param_types_buf[0..call_argc], false);
+            const call_fn_ty = llvm.functionType(llvm.i32Type(), param_types_buf[0..call_argc], false);
             const args_slice = call_args[0..call_argc];
-            const result = builder.buildCall(self_fn_ty, func, args_slice, "self");
+            const result = builder.buildCall(call_fn_ty, call_target, args_slice, "call");
             vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
         },
 
         .tail_call_self_i32 => {
-            // Tail recursive call — emit as regular call + return
+            // Tail call — self-recursive or cross-function
             const call_argc: u32 = instr.operand.u16;
 
             if (vstack.items.len < call_argc) return CodegenError.StackUnderflow;
+
+            const call_target = if (pending_callee.*) |callee| blk: {
+                pending_callee.* = null;
+                if (c.LLVMCountParams(callee) == call_argc) break :blk callee;
+                break :blk func;
+            } else func;
 
             var call_args: [8]llvm.Value = undefined;
             var i: u32 = call_argc;
@@ -1101,10 +1165,9 @@ fn emitInt32Instruction(
             for (0..call_argc) |j| {
                 param_types_buf[j] = llvm.i32Type();
             }
-            const self_fn_ty = llvm.functionType(llvm.i32Type(), param_types_buf[0..call_argc], false);
+            const call_fn_ty = llvm.functionType(llvm.i32Type(), param_types_buf[0..call_argc], false);
             const args_slice = call_args[0..call_argc];
-            const result = builder.buildCall(self_fn_ty, func, args_slice, "tail");
-            // TODO: mark as tail call via LLVM API
+            const result = builder.buildCall(call_fn_ty, call_target, args_slice, "tail");
             _ = builder.buildRet(result);
             block_terminated.* = true;
         },
@@ -1196,6 +1259,7 @@ fn generateNumericBody(
     func: llvm.Value,
     analyzed: AnalyzedFunction,
     cfg: *const CFG,
+    module: llvm.Module,
 ) CodegenError!void {
     const blocks = cfg.blocks.items;
     if (blocks.len == 0) return;
@@ -1252,6 +1316,7 @@ fn generateNumericBody(
         defer vstack.deinit(allocator);
 
         var block_terminated = false;
+        var pending_callee: ?llvm.Value = null;
 
         for (block.instructions) |instr| {
             if (block_terminated) break;
@@ -1271,6 +1336,9 @@ fn generateNumericBody(
                 block.successors.items,
                 func,
                 &block_terminated,
+                &pending_callee,
+                module,
+                analyzed,
             );
         }
 
@@ -1302,6 +1370,9 @@ fn emitNumericInstruction(
     successors: []const u32,
     func: llvm.Value,
     block_terminated: *bool,
+    pending_callee: *?llvm.Value,
+    module: llvm.Module,
+    analyzed: AnalyzedFunction,
 ) CodegenError!void {
     const handler = numeric_handlers.getHandler(instr.opcode);
 
@@ -1601,6 +1672,7 @@ fn emitNumericInstruction(
 
         .add_loc => {
             const idx: u32 = switch (instr.operand) {
+                .loc => |a| a,
                 .u8 => |a| a,
                 .u16 => |a| a,
                 else => 0,
@@ -1619,6 +1691,7 @@ fn emitNumericInstruction(
 
         .inc_loc => {
             const idx: u32 = switch (instr.operand) {
+                .loc => |a| a,
                 .u8 => |a| a,
                 .u16 => |a| a,
                 else => 0,
@@ -1654,7 +1727,40 @@ fn emitNumericInstruction(
 
         .nop => {},
 
-        .self_ref => {},
+        .self_ref => {
+            // Function reference marker. Resolve the callee for cross-function calls.
+            if (instr.opcode == .get_var or instr.opcode == .get_var_undef) {
+                switch (instr.operand) {
+                    .atom => |atom_idx| {
+                        if (getAtomStringStatic(analyzed, atom_idx)) |callee_name| {
+                            if (module.getNamedFunction(callee_name)) |callee_fn| {
+                                if (callee_fn != func) {
+                                    pending_callee.* = callee_fn;
+                                }
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            } else if (instr.opcode == .get_var_ref0) {
+                if (analyzed.closure_vars.len > 0) {
+                    const cv_name = analyzed.closure_vars[0].name;
+                    if (cv_name.len > 0) {
+                        var name_buf: [256]u8 = undefined;
+                        if (cv_name.len < name_buf.len) {
+                            @memcpy(name_buf[0..cv_name.len], cv_name);
+                            name_buf[cv_name.len] = 0;
+                            const name_z: [*:0]const u8 = @ptrCast(name_buf[0..cv_name.len]);
+                            if (module.getNamedFunction(name_z)) |callee_fn| {
+                                if (callee_fn != func) {
+                                    pending_callee.* = callee_fn;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
 
         .call_self => {
             const call_argc: u32 = switch (instr.opcode) {
@@ -1666,6 +1772,13 @@ fn emitNumericInstruction(
             };
             if (vstack.items.len < call_argc) return CodegenError.StackUnderflow;
 
+            // Determine call target: cross-function callee or self
+            const call_target = if (pending_callee.*) |callee| blk: {
+                pending_callee.* = null;
+                if (c.LLVMCountParams(callee) == call_argc) break :blk callee;
+                break :blk func; // Mismatch — fall back to self
+            } else func;
+
             var call_args: [8]llvm.Value = undefined;
             var i: u32 = call_argc;
             while (i > 0) {
@@ -1677,8 +1790,8 @@ fn emitNumericInstruction(
             for (0..call_argc) |j| {
                 param_types_buf[j] = elem_type;
             }
-            const self_fn_ty = llvm.functionType(elem_type, param_types_buf[0..call_argc], false);
-            const result = builder.buildCall(self_fn_ty, func, call_args[0..call_argc], "self");
+            const call_fn_ty = llvm.functionType(elem_type, param_types_buf[0..call_argc], false);
+            const result = builder.buildCall(call_fn_ty, call_target, call_args[0..call_argc], "call");
             vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
         },
 
@@ -1686,6 +1799,12 @@ fn emitNumericInstruction(
             const call_argc: u32 = instr.operand.u16;
             if (vstack.items.len < call_argc) return CodegenError.StackUnderflow;
 
+            const call_target = if (pending_callee.*) |callee| blk: {
+                pending_callee.* = null;
+                if (c.LLVMCountParams(callee) == call_argc) break :blk callee;
+                break :blk func;
+            } else func;
+
             var call_args: [8]llvm.Value = undefined;
             var i: u32 = call_argc;
             while (i > 0) {
@@ -1697,8 +1816,8 @@ fn emitNumericInstruction(
             for (0..call_argc) |j| {
                 param_types_buf[j] = elem_type;
             }
-            const self_fn_ty = llvm.functionType(elem_type, param_types_buf[0..call_argc], false);
-            const result = builder.buildCall(self_fn_ty, func, call_args[0..call_argc], "tail");
+            const call_fn_ty = llvm.functionType(elem_type, param_types_buf[0..call_argc], false);
+            const result = builder.buildCall(call_fn_ty, call_target, call_args[0..call_argc], "tail");
             _ = builder.buildRet(result);
             block_terminated.* = true;
         },
