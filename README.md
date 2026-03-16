@@ -1,123 +1,113 @@
 # EdgeBox
 
-QuickJS JavaScript runtime with **LLVM-compiled frozen functions** and **standalone WASM generation** for fast, sandboxed JavaScript execution at the edge.
+## The Problem
 
-## Two Execution Modes
+V8's JIT compiler is excellent at object-heavy JavaScript (property access, closures, string manipulation), but **leaves performance on the table for compute-intensive numeric code**. Functions like cryptographic hashes, compression kernels, and recursive algorithms run 2-5x slower than they need to because V8's speculative JIT can't fully eliminate dynamic type checks and boxing overhead for tight numeric loops.
 
-| Mode | Target | How It Works | Best For |
-|------|--------|--------------|----------|
-| **Native (Frozen LLVM)** | CLI binaries | QuickJS bytecode → LLVM IR → native `.o` files, linked into single binary | Standalone tools, CLI apps |
-| **AOT+JIT (V8/workerd)** | Cloudflare Workers | Numeric kernels → standalone `.wasm`, JS source-transformed with WASM call trampolines | Edge serverless, V8 environments |
+Meanwhile, WebAssembly runs numeric code at near-native speed, but the **JS↔WASM boundary** has historically been too expensive for fine-grained function calls. Array data must be copied between JS heap and WASM linear memory on every call.
 
-## Architecture
+## The Solution: AOT+JIT Compilation
 
-```
-┌───────────────────────────────────────────────────────────┐
-│                       EdgeBox                             │
-├───────────────────────────────────────────────────────────┤
-│  ┌─────────────┐  ┌─────────────┐  ┌───────────────────┐  │
-│  │  QuickJS-NG │  │   WASI      │  │   WAMR Runtime    │  │
-│  │  (ES2023)   │──│  (preview1) │──│   + AOT Compiler  │  │
-│  │  [vendored] │  │             │  │   (LLVM-based)    │  │
-│  └─────────────┘  └─────────────┘  └───────────────────┘  │
-├───────────────────────────────────────────────────────────┤
-│  ┌─────────────────────────────────────────────────────┐  │
-│  │              Node.js Polyfills                      │  │
-│  │  - Buffer, path, events, util, os, tty              │  │
-│  │  - process.stdin/stdout/stderr, env, argv           │  │
-│  │  - fetch (HTTP/HTTPS), child_process (spawnSync)    │  │
-│  │  - TLS 1.3 (X25519 + AES-GCM via std.crypto)        │  │
-│  └─────────────────────────────────────────────────────┘  │
-├───────────────────────────────────────────────────────────┤
-│  ┌─────────────────────────────────────────────────────┐  │
-│  │           WAMR AOT (Ahead-of-Time) Compilation      │  │
-│  │  - WASM → Native code at build time (via LLVM)      │  │
-│  │  - Still sandboxed: memory bounds checks preserved  │  │
-│  │  - WASI syscalls intercepted by runtime             │  │
-│  │  - 13ms cold start, 454KB binary size               │  │
-│  └─────────────────────────────────────────────────────┘  │
-└───────────────────────────────────────────────────────────┘
-```
-
-## Frozen LLVM Backend (Native Codegen)
-
-The frozen LLVM backend compiles **all** JavaScript functions directly to native machine code via LLVM IR, bypassing WAMR entirely:
-
-```
-JavaScript Source
-    ↓  Bun bundler
-Bundled JS
-    ↓  QuickJS parser
-Bytecodes (11,000+ functions for TypeScript compiler)
-    ↓  LLVM IR codegen (src/freeze/llvm_codegen.zig)
-Native .o files (sharded, parallel compilation)
-    ↓  Zig linker
-Single native binary (edgeboxc output)
-```
-
-### Two Codegen Tiers
-
-| Tier | Description | Opcodes | Example Functions |
-|------|-------------|---------|-------------------|
-| **Int32** | Pure i32 SSA — no JSValue boxing, register-allocated | All arithmetic, bitwise, comparisons, locals, args, control flow | `fib`, `gcd`, `isPrime`, `hashMix` |
-| **Thin** | Full opcode coverage — inline fast paths + runtime call fallbacks | 200+ opcodes including property access, closures, IC, exceptions | All remaining functions |
-
-### Inline Optimizations (Thin Tier)
-
-- **Polymorphic IC (4-way)**: Inline shape check cascade for property access — 4 cached {shape, offset} pairs per callsite
-- **Integer fast paths**: Arithmetic, comparison, bitwise ops check int tag first, skip JSValue conversion
-- **Counted loop specialization**: `for (i=0; i<arr.length; i++) acc += arr[i]` → tight native loop with GEP, zero function calls per element
-- **VStack (virtual stack)**: LLVM SSA values tracked on a virtual stack, eliminating intermediate memory traffic
-- **charCodeAt/Array.push/Math.\***: Pattern-detected method calls compiled to direct C helpers
-
-### Performance (Frozen Native)
-
-Benchmarks on Linux x86_64 (Ryzen 9):
-
-| Benchmark | EdgeBox (Frozen) | Node.js (V8 JIT) | Speedup |
-|-----------|:----------------:|:-----------------:|:-------:|
-| fib(45) | 2,234 ms | 8,987 ms | **4.0x faster** |
-| ackermann(3,10) | 821 ms | 2,968 ms | **3.6x faster** |
-| hashMix 10M | 90 ms | 127 ms | **1.4x faster** |
-| gcd 1M | 62 ms | 76 ms | **1.2x faster** |
-| TSC `--noEmit` | 7.5 s | 0.56 s | 13x slower* |
-
-*\*TSC is dominated by object-heavy code (property access, closures). Frozen compilation excels at compute-intensive functions.*
-
-## AOT+JIT Pipeline (V8/workerd)
-
-For Cloudflare Workers and V8 environments, EdgeBox generates **standalone WASM** + **source-transformed JS** that V8 fuses via WASM inlining:
+EdgeBox solves this with a build-time pipeline that compiles JavaScript's numeric functions to **standalone WebAssembly** and rewrites the source to call them via trampolines that V8 can inline:
 
 ```
 JavaScript Source
     ↓  QuickJS bytecode analysis
-Numeric tier detection (i32 / f64 / array)
+Automatic numeric tier detection (i32 / f64 / array)
     ↓  LLVM IR codegen → standalone .wasm
-Pure numeric kernels as WASM exports
+Pure numeric kernels compiled to WASM exports
     ↓  Source-to-source transform
 JS with function bodies replaced by WASM call trampolines
     ↓  V8 (Node.js / workerd)
 V8 inlines WASM calls into JS — zero boundary overhead
 ```
 
-### Smart Trampoline Heuristic
+**Key innovations:**
+- **Automatic detection**: Analyzes QuickJS bytecodes to identify pure numeric functions (no manual annotation)
+- **Smart trampolines**: Recursive/cross-calling functions → WASM (deep stacks stay native); pure scalar → keep as JS (V8 already optimal)
+- **Array copy caching**: Read-only array arguments are cached by identity + generation counter, eliminating 99.99% of redundant copies in tight loops
+- **Real npm packages work**: Tested with pako (zlib compression) and tweetnacl (cryptography) — correct results, significant speedups
 
-| Function Type | Strategy | Why |
-|---------------|----------|-----|
-| **Recursive** | Always trampoline to WASM | Deep call stacks stay inside WASM |
-| **Cross-callers** | Always trampoline | Calls to other WASM functions stay in WASM |
-| **Array functions** | Always trampoline + identity cache | Amortizes copy cost over iterations |
-| **Pure scalar** | Keep as JS | V8 JIT inlines perfectly, no benefit from WASM |
+## What It Achieves
 
-### Array Copy Caching
+### Benchmarks (AOT+JIT on Node.js v24)
 
-For read-only array arguments, the trampoline caches the last-used array identity to skip redundant copies:
+| Benchmark | WASM+V8 | Node.js (V8 only) | Speedup |
+|-----------|:-------:|:------------------:|:-------:|
+| fib(45) | 2,148 ms | 8,987 ms | **4.2x faster** |
+| hanoi(25) | 44 ms | 203 ms | **4.6x faster** |
+| ackermann(3,10) | 821 ms | 2,968 ms | **3.6x faster** |
+| adler32 10K (10KB arrays) | 27 ms | 103 ms | **3.8x faster** |
+| vn verify 10M (crypto) | 180 ms | 408 ms | **2.3x faster** |
+| hashMix 10M | 90 ms | 127 ms | **1.4x faster** |
+| gcd 1M | 62 ms | 76 ms | **1.2x faster** |
+
+### Real npm Packages
+
+| Package | WASM Functions | Correctness | Key Result |
+|---------|:--------------:|:-----------:|:----------:|
+| **pako** (zlib) | 7 | deflate→inflate roundtrip passes | adler32 **3.8x faster** |
+| **tweetnacl** (NaCl crypto) | 11 | SHA-512 hash + secretbox correct | verify **2.3x faster** |
+
+### Where It Excels vs Where It Doesn't
+
+| Code Pattern | Speedup | Why |
+|--------------|:-------:|-----|
+| Recursive functions (fib, ackermann) | **3.6-4.6x** | Entire call stack stays in WASM, zero JS overhead |
+| Numeric kernels (hash, CRC, crypto) | **1.4-3.8x** | WASM eliminates type checks, array caching skips copies |
+| Object-heavy code (TypeScript compiler) | No benefit | V8 JIT already optimal for property access and closures |
+
+## Quick Start
+
+```bash
+# Build EdgeBox
+zig build cli
+
+# Compile your JS → native binary + standalone WASM + V8 worker
+./zig-out/bin/edgeboxc --binary-only my-app.js
+
+# Run on V8 (Node.js / workerd)
+node my-app.js/my-app-worker.mjs
+
+# Or run native (QuickJS + frozen LLVM)
+./my-app.js/my-app
+```
+
+## How It Works
+
+### 1. Bytecode Analysis
+
+EdgeBox parses JavaScript with QuickJS-NG, then analyzes each function's bytecodes to determine if it's pure numeric:
+
+| Tier | Detection | WASM Signature | Examples |
+|------|-----------|----------------|----------|
+| **i32** | Only arithmetic, bitwise, comparisons, locals, control flow | `(i32, i32) → i32` | `fib`, `gcd`, `isPrime` |
+| **f64** | Uses division without bitwise (float semantics) | `(f64, f64) → f64` | `mandelbrot`, `lerp` |
+| **i32+array** | Pure numeric + array element access | `(i32, i32_ptr, i32) → i32` | `adler32`, `crc32` |
+
+Functions that use objects, strings, closures, or other non-numeric patterns are left as JavaScript for V8's JIT.
+
+### 2. LLVM Codegen → Standalone WASM
+
+Numeric functions are compiled through LLVM to a standalone `.wasm` binary:
+- **Cross-function calls resolved**: Two-pass compilation with forward declarations
+- **Constant pool**: QuickJS `push_const` values resolved at compile time
+- **O2 optimization**: LLVM auto-vectorization for float loops
+
+### 3. Source-to-Source Transform
+
+The original JavaScript is rewritten with function bodies replaced by WASM call trampolines:
 
 ```javascript
-// Generated trampoline with identity cache
-let __gen = 0;            // invalidated by mutating functions
-let __c0_1 = null;        // cached array reference
-let __g0_1 = -1;          // generation when cached
+// Original
+function adler32(adler, buf, len, pos) {
+  /* 30 lines of bit manipulation */
+}
+
+// Transformed (auto-generated)
+const __m = new Int32Array(__wasm.exports.memory.buffer);
+let __gen = 0;
+let __c0_1 = null, __g0_1 = -1;
 
 function adler32(adler, buf, len, pos) {
   if (buf !== __c0_1 || __gen !== __g0_1) {
@@ -128,46 +118,14 @@ function adler32(adler, buf, len, pos) {
 }
 ```
 
-This eliminates 99.99% of copies for tight loops like `for (i = 0; i < 10000; i++) adler32(1, data, ...)`.
+### 4. Smart Trampoline Decisions
 
-### Performance (AOT+JIT on V8)
-
-Benchmarks running on Node.js v24 (V8):
-
-| Benchmark | WASM+V8 | Node.js | Speedup |
-|-----------|:-------:|:-------:|:-------:|
-| fib(45) | 2,148 ms | 8,987 ms | **4.2x faster** |
-| ackermann(3,10) | 821 ms | 2,968 ms | **3.6x faster** |
-| hanoi(25) | 44 ms | 203 ms | **4.6x faster** |
-| adler32 10K (cached) | 27 ms | 103 ms | **3.8x faster** |
-| vn verify 10M (cached) | 180 ms | 408 ms | **2.3x faster** |
-| hashMix 10M | 90 ms | 127 ms | **1.4x faster** |
-| gcd 1M | 62 ms | 76 ms | **1.2x faster** |
-
-### Real npm Packages Tested
-
-| Package | Functions Compiled | Result |
-|---------|:------------------:|--------|
-| **pako** (zlib) | 7 WASM functions | deflate→inflate roundtrip correct, adler32 3.8x faster |
-| **tweetnacl** (crypto) | 11 WASM functions | SHA-512 hash + secretbox correct, verify 2.3x faster |
-
-### Usage
-
-```bash
-# Compile JS → native binary + standalone WASM + worker JS
-./zig-out/bin/edgeboxc --binary-only my-app.js
-
-# Files generated:
-#   my-app.js/my-app                    - Native binary (QuickJS + frozen)
-#   my-app.js/my-app-standalone.wasm    - Standalone WASM (numeric kernels)
-#   my-app.js/my-app-worker.mjs         - Source-transformed JS for V8/workerd
-
-# Run with V8 (Node.js)
-node my-app.js/my-app-worker.mjs
-
-# Run native
-./my-app.js/my-app
-```
+| Function Pattern | Decision | Rationale |
+|-----------------|----------|-----------|
+| Recursive (calls itself) | **WASM trampoline** | Entire call stack in WASM, no JS↔WASM boundary per recursion |
+| Cross-caller (calls other WASM functions) | **WASM trampoline** | Inter-function calls stay in WASM |
+| Array functions (reads/writes arrays) | **WASM trampoline + cache** | Identity cache amortizes copy cost |
+| Pure scalar, non-recursive | **Keep as JS** | V8 JIT inlines these perfectly, WASM adds no benefit |
 
 ## What is WAMR AOT?
 
