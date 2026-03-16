@@ -658,12 +658,13 @@ fn printUsage() void {
         \\EdgeBox Compiler
         \\
         \\Usage:
-        \\  edgeboxc <app.js>   Compile JS to Binary + WASM + AOT (all outputs in one build)
+        \\  edgeboxc <app.js>   AOT-compile numeric JS kernels to WASM for V8/workerd
         \\
         \\Output (all in zig-out/bin/<app.js>/):
-        \\  <app>        Native binary (QuickJS + frozen, includes host)
-        \\  <app>.wasm   WASM module (for use with edgebox daemon)
-        \\  <app>.aot    AOT compiled (WASM → WAMR, sandboxed)
+        \\  <app>-worker.mjs        Worker module (source-transformed JS + WASM calls)
+        \\  <app>-standalone.wasm   Standalone WASM (AOT-compiled numeric kernels)
+        \\  <app>-config.capnp      workerd configuration
+        \\  <app>                   Native binary (optional, QuickJS + frozen)
         \\
         \\Options:
         \\  -f, --force      Clean previous build outputs first
@@ -683,10 +684,9 @@ fn printUsage() void {
         \\  -v, --version    Show version
         \\
         \\Examples:
-        \\  edgeboxc app.js              Build Binary + WASM + AOT
-        \\  edgeboxc --minimal test.js   Fast build for simple JS
-        \\  ./zig-out/bin/app.js/app     Run binary directly
-        \\  edgebox zig-out/bin/app.js/app.aot   Run AOT in sandbox
+        \\  edgeboxc app.js                        Build Worker + WASM + native
+        \\  node zig-out/bin/app.js/app-worker.mjs  Run on Node.js (V8 + WASM)
+        \\  npx wrangler dev                        Deploy to Cloudflare Workers
         \\
     , .{});
 }
@@ -2411,15 +2411,24 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         }
     } else {
         // Summary for binary-only build
-        std.debug.print("\n[build] === Binary Build Complete ===\n\n", .{});
+        std.debug.print("\n[build] === Build Complete ===\n\n", .{});
         std.debug.print("Files created:\n", .{});
-        std.debug.print("  {s}  - Native binary (QuickJS + frozen)\n", .{binary_path});
+        if (has_worker_files) {
+            var wp_buf4: [4096]u8 = undefined;
+            const wp2 = std.fmt.bufPrint(&wp_buf4, "{s}/{s}-worker.mjs", .{ output_dir, output_base }) catch "";
+            std.debug.print("  {s}  - Worker module (V8 + WASM)\n", .{wp2});
+        }
         if (has_standalone_wasm) {
             const sw_path = std.fmt.bufPrint(&standalone_wasm_path_buf, "{s}/{s}-standalone.wasm", .{ output_dir, output_base }) catch "";
-            std.debug.print("  {s}  - Standalone WASM (pure functions, for workerd/V8)\n", .{sw_path});
+            std.debug.print("  {s}  - Standalone WASM (AOT numeric kernels)\n", .{sw_path});
         }
-        std.debug.print("\n", .{});
-        std.debug.print("To run:\n", .{});
+        std.debug.print("  {s}  - Native binary (QuickJS + frozen)\n", .{binary_path});
+        std.debug.print("\nTo run:\n", .{});
+        if (has_worker_files) {
+            var wp_buf5: [4096]u8 = undefined;
+            const wp3 = std.fmt.bufPrint(&wp_buf5, "{s}/{s}-worker.mjs", .{ output_dir, output_base }) catch "";
+            std.debug.print("  node {s}  # V8 + WASM (fastest)\n", .{wp3});
+        }
         std.debug.print("  ./{s}\n\n", .{binary_path});
     }
 }
