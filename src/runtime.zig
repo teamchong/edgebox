@@ -1835,33 +1835,32 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     wf.writeAll("}\n") catch {};
                     // Hoist Int32Array view creation to module level (avoids per-call allocation).
                     // Array elements are always i32 in WASM linear memory regardless of function tier.
-                    {
-                        var has_array_funcs = false;
-                        for (wasm_funcs[0..wasm_func_count]) |wfe| {
-                            if (wfe.array_args != 0) { has_array_funcs = true; break; }
+                    // Flags lifted to outer scope so trampoline body can reference them.
+                    var has_array_funcs = false;
+                    var any_cacheable_args = false;
+                    for (wasm_funcs[0..wasm_func_count]) |wfe| {
+                        if (wfe.array_args != 0) {
+                            has_array_funcs = true;
+                            const ro = wfe.array_args & ~wfe.mutated_args;
+                            if (ro != 0) any_cacheable_args = true;
                         }
-                        if (has_array_funcs) {
-                            wf.writeAll("const __m = __wasm ? new Int32Array(__wasm.exports.memory.buffer) : null;\n") catch {};
-                            // Per-arg identity cache: skip copy when same array reference is passed.
-                            // Cache variables: __cN = last array ref for arg N.
-                            {
-                                var any_cacheable = false;
-                                for (wasm_funcs[0..wasm_func_count]) |wfe| {
-                                    const read_only = wfe.array_args & ~wfe.mutated_args;
-                                    if (read_only != 0) { any_cacheable = true; break; }
-                                }
-                                if (any_cacheable) {
-                                    for (wasm_funcs[0..wasm_func_count], 0..) |wfe, wfi| {
-                                        const read_only = wfe.array_args & ~wfe.mutated_args;
-                                        if (read_only == 0) continue;
-                                        var ai: u32 = 0;
-                                        while (ai < 8) : (ai += 1) {
-                                            if (read_only & (@as(u8, 1) << @intCast(ai)) != 0) {
-                                                var decl_buf: [80]u8 = undefined;
-                                                const decl = std.fmt.bufPrint(&decl_buf, "let __c{d}_{d}=null;\n", .{ wfi, ai }) catch continue;
-                                                wf.writeAll(decl) catch {};
-                                            }
-                                        }
+                    }
+                    if (has_array_funcs) {
+                        wf.writeAll("const __m = __wasm ? new Int32Array(__wasm.exports.memory.buffer) : null;\n") catch {};
+                        // Per-arg identity cache: skip copy when same array reference is passed.
+                        // __last_fn tracks which function last wrote to WASM memory, so cached
+                        // functions detect when a different function has overwritten their region.
+                        if (any_cacheable_args) {
+                            wf.writeAll("let __last_fn = -1;\n") catch {};
+                            for (wasm_funcs[0..wasm_func_count], 0..) |wfe, wfi| {
+                                const read_only = wfe.array_args & ~wfe.mutated_args;
+                                if (read_only == 0) continue;
+                                var ai: u32 = 0;
+                                while (ai < 8) : (ai += 1) {
+                                    if (read_only & (@as(u8, 1) << @intCast(ai)) != 0) {
+                                        var decl_buf: [80]u8 = undefined;
+                                        const decl = std.fmt.bufPrint(&decl_buf, "let __c{d}_{d}=null;\n", .{ wfi, ai }) catch continue;
+                                        wf.writeAll(decl) catch {};
                                     }
                                 }
                             }
@@ -2148,6 +2147,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     // Uses bulk .set() for fast TypedArray transfer (memcpy under the hood).
                                     // Read-only args cached by reference identity (skip copy when same array).
                                     const read_only_args = mf.array_args & ~mf.mutated_args;
+                                    // Format function index for __last_fn tracking
+                                    var mfi_buf: [16]u8 = undefined;
+                                    const mfi_str = std.fmt.bufPrint(&mfi_buf, "{d}", .{matched_func_idx}) catch "0";
                                     wf.writeAll("  let __off = 0;\n") catch {};
                                     var i: u32 = 0;
                                     while (i < param_count) : (i += 1) {
@@ -2169,8 +2171,15 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                                 var cid_buf: [32]u8 = undefined;
                                                 const cid = std.fmt.bufPrint(&cid_buf, "{d}_{d}", .{ matched_func_idx, i }) catch "0_0";
                                                 const pn = param_names[i];
-                                                // if (arr !== __cN) { copy; cache = arr; }
-                                                wf.writeAll("  if (") catch {};
+                                                // if (__last_fn !== N || arr.length < 128 || arr !== __cN_M) { copy; cache; }
+                                                // Small arrays (< 128 = 512 bytes) always re-copy — too cheap to
+                                                // risk stale data from same-ref mutation (e.g. crypto_verify_32).
+                                                // Large arrays use identity cache for performance.
+                                                wf.writeAll("  if (__last_fn !== ") catch {};
+                                                wf.writeAll(mfi_str) catch {};
+                                                wf.writeAll(" || ") catch {};
+                                                wf.writeAll(pn) catch {};
+                                                wf.writeAll(".length < 128 || ") catch {};
                                                 wf.writeAll(pn) catch {};
                                                 wf.writeAll(" !== __c") catch {};
                                                 wf.writeAll(cid) catch {};
@@ -2199,6 +2208,12 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             wf.writeAll(param_names[i]) catch {};
                                             wf.writeAll(".length;\n") catch {};
                                         }
+                                    }
+                                    // Track which function last wrote to WASM memory (cross-function cache safety)
+                                    if (any_cacheable_args) {
+                                        wf.writeAll("  __last_fn = ") catch {};
+                                        wf.writeAll(mfi_str) catch {};
+                                        wf.writeAll(";\n") catch {};
                                     }
                                     // Call WASM with byte offsets (__bN << 2) for array args, scalars as-is
                                     wf.writeAll("  const __r = __wasm.exports.") catch {};
@@ -2262,20 +2277,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             wf.writeAll(" + __i];\n") catch {};
                                         }
                                     }
-                                    // Invalidate all caches when mutation happens (cross-function safety)
-                                    if (mf.mutated_args != 0 and read_only_args != 0) {
-                                        // This function has both mutated and cached args — invalidate caches
-                                        var ai: u32 = 0;
-                                        while (ai < param_count) : (ai += 1) {
-                                            if (read_only_args & (@as(u8, 1) << @intCast(ai)) != 0) {
-                                                var cid_buf2: [32]u8 = undefined;
-                                                const cid2 = std.fmt.bufPrint(&cid_buf2, "{d}_{d}", .{ matched_func_idx, ai }) catch "0_0";
-                                                wf.writeAll("  __c") catch {};
-                                                wf.writeAll(cid2) catch {};
-                                                wf.writeAll(" = null;\n") catch {};
-                                            }
-                                        }
-                                    }
+                                    // Self-invalidation removed: __last_fn handles cross-function
+                                    // cache safety. Within one function, array arg offsets don't overlap
+                                    // (__off += arr.length), so cached data stays valid after mutation
+                                    // of a different arg at a different offset range.
                                     wf.writeAll("  return __r;\n}") catch {};
                                 }
 
