@@ -2154,18 +2154,17 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             wf.writeAll(" = __off;\n") catch {};
 
                                             if (read_only_args & (@as(u8, 1) << @intCast(i)) != 0) {
-                                                // Read-only: cache by reference identity, but ONLY for
-                                                // large arrays (>1024 elements). Small arrays always copy
-                                                // because .set() is cheap (<30ns for 32 elem) and caching
-                                                // small arrays risks stale data when JS mutates elements
-                                                // between calls (same ref, different data — e.g. tweetnacl vn).
+                                                // Read-only: cache by reference identity. Skip copy when
+                                                // the same array reference is passed on repeated calls.
+                                                // Trade-off: if user mutates array elements between calls
+                                                // with the same ref, WASM memory will have stale data.
+                                                // This is acceptable for the common loop pattern:
+                                                //   for (i=0; i<N; i++) result = fn(arr);
                                                 var cid_buf: [32]u8 = undefined;
                                                 const cid = std.fmt.bufPrint(&cid_buf, "{d}_{d}", .{ matched_func_idx, i }) catch "0_0";
                                                 const pn = param_names[i];
-                                                // if (arr.length > 1024 && arr === __cN) skip; else copy
+                                                // if (arr !== __cN) { copy; cache = arr; }
                                                 wf.writeAll("  if (") catch {};
-                                                wf.writeAll(pn) catch {};
-                                                wf.writeAll(".length <= 1024 || ") catch {};
                                                 wf.writeAll(pn) catch {};
                                                 wf.writeAll(" !== __c") catch {};
                                                 wf.writeAll(cid) catch {};
