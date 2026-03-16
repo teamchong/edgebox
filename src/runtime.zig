@@ -1777,17 +1777,16 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             }
 
                             if (matched_func) |mf| {
-                                // Skip trampolining for trivially small leaf functions.
-                                // V8 JIT inlines small JS functions into the caller's loop body,
-                                // which is faster than crossing the JS→WASM boundary per call.
-                                // BUT: always trampoline recursive or cross-call functions.
-                                const min_instrs: u32 = 20;
-                                if (!mf.is_recursive and mf.instr_count > 0 and mf.instr_count < min_instrs) {
-                                    // Check if body calls another WASM function (cross-call)
-                                    // by scanning ahead to the closing brace for WASM func names
+                                // Only trampoline recursive functions and cross-callers.
+                                // Non-recursive flat functions are better left as JS — V8 JIT
+                                // inlines them into the caller's loop body, avoiding the
+                                // ~12ns JS→WASM boundary crossing per call. Recursive functions
+                                // benefit from WASM because recursion stays inside WASM.
+                                if (!mf.is_recursive) {
+                                    // Check if body calls another WASM function (cross-call).
+                                    // Cross-callers benefit because both functions stay in WASM.
                                     var calls_wasm = false;
                                     if (std.mem.indexOfPos(u8, cc, match_end, "{")) |bp| {
-                                        // Quick scan of function body text
                                         var depth_scan: i32 = 1;
                                         var sp = bp + 1;
                                         while (sp < cc.len and depth_scan > 0) : (sp += 1) {
