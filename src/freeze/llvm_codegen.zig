@@ -351,41 +351,84 @@ pub fn generateStandaloneWasm(
     defer builder.dispose();
 
     // === Pass 1: Declare all functions (so cross-function calls can resolve) ===
-    for (functions) |sf| {
+    // For functions that access arr.length, we add extra i32 params for each array length.
+    var length_args_buf: [64]u8 = undefined; // per-function length_args bitmask
+    // Synthetic names for anonymous functions (arrow/IIFE): "__anon_L{line_num}"
+    var synth_names: [64][32]u8 = undefined;
+    for (functions, 0..) |sf, fi| {
         const func = sf.func;
+
+        // Generate synthetic name for anonymous functions (null-terminated for sliceTo)
+        if (sf.name.len == 0 and fi < synth_names.len) {
+            _ = std.fmt.bufPrintZ(&synth_names[fi], "__anon_L{d}", .{sf.func.line_num}) catch {};
+        }
+
         const elem_type: llvm.Type = switch (sf.value_kind) {
             .i32 => llvm.i32Type(),
             .f64 => llvm.doubleType(),
         };
 
-        var export_name_buf: [256]u8 = undefined;
-        const export_name = std.fmt.bufPrintZ(&export_name_buf, "{s}", .{sf.name}) catch continue;
+        // Detect which array args have .length accessed
+        const length_args: u8 = if (fi < length_args_buf.len)
+            numeric_handlers.detectLengthArgs(func.instructions, func.arg_count)
+        else
+            0;
+        if (fi < length_args_buf.len) length_args_buf[fi] = length_args;
 
-        var param_types_buf: [8]llvm.Type = undefined;
+        var export_name_buf: [256]u8 = undefined;
+        const func_name = if (sf.name.len == 0 and fi < synth_names.len)
+            std.mem.sliceTo(&synth_names[fi], 0)
+        else
+            sf.name;
+        const export_name = std.fmt.bufPrintZ(&export_name_buf, "{s}", .{func_name}) catch continue;
+
+        // Count extra length params (one per array arg with .length)
+        var extra_len_count: u32 = 0;
+        for (0..func.arg_count) |i| {
+            if (length_args & (@as(u8, 1) << @intCast(i)) != 0) extra_len_count += 1;
+        }
+
+        var param_types_buf: [16]llvm.Type = undefined;
         for (0..func.arg_count) |i| {
             param_types_buf[i] = elem_type;
         }
-        const fn_ty = llvm.functionType(elem_type, param_types_buf[0..func.arg_count], false);
+        // Append i32 length params for array args with .length
+        for (0..extra_len_count) |i| {
+            param_types_buf[func.arg_count + i] = llvm.i32Type();
+        }
+        const total_params = func.arg_count + extra_len_count;
+        const fn_ty = llvm.functionType(elem_type, param_types_buf[0..total_params], false);
         llvm.setLinkage(native.module.addFunction(export_name, fn_ty), c.LLVMExternalLinkage);
     }
 
     // === Pass 2: Generate bodies (all callees already declared) ===
     var generated_count: u32 = 0;
-    for (functions) |sf| {
+    for (functions, 0..) |sf, fi| {
         const func = sf.func;
+        const length_args: u8 = if (fi < length_args_buf.len) length_args_buf[fi] else 0;
 
         var export_name_buf: [256]u8 = undefined;
-        const export_name = std.fmt.bufPrintZ(&export_name_buf, "{s}", .{sf.name}) catch continue;
+        const func_name2 = if (sf.name.len == 0 and fi < synth_names.len)
+            std.mem.sliceTo(&synth_names[fi], 0)
+        else
+            sf.name;
+        const export_name = std.fmt.bufPrintZ(&export_name_buf, "{s}", .{func_name2}) catch continue;
         const standalone_fn = native.module.getNamedFunction(export_name) orelse continue;
 
-        // Generate body using the appropriate numeric codegen
+        // Generate body using generic numeric codegen (handles i32, f64, array access, and array length)
         const gen_ok = switch (sf.value_kind) {
             .i32 => blk: {
-                generateInt32Body(allocator, builder, standalone_fn, func, sf.cfg, native.module) catch break :blk false;
+                generateNumericBody(.i32, allocator, builder, standalone_fn, func, sf.cfg, native.module, length_args) catch |err| {
+                    std.debug.print("[standalone-wasm] {s}: codegen failed: {}\n", .{ sf.name, err });
+                    break :blk false;
+                };
                 break :blk true;
             },
             .f64 => blk: {
-                generateNumericBody(.f64, allocator, builder, standalone_fn, func, sf.cfg, native.module) catch break :blk false;
+                generateNumericBody(.f64, allocator, builder, standalone_fn, func, sf.cfg, native.module, length_args) catch |err| {
+                    std.debug.print("[standalone-wasm] {s}: codegen failed: {}\n", .{ sf.name, err });
+                    break :blk false;
+                };
                 break :blk true;
             },
         };
@@ -414,6 +457,12 @@ pub fn generateStandaloneWasm(
         return .{ .func_count = 0, .has_functions = false };
     }
 
+    // Dump pre-optimization IR for debugging
+    if (std.posix.getenv("EDGEBOX_DUMP_WASM_IR")) |_| {
+        const ir = native.module.printToString();
+        defer llvm.disposeMessage(ir);
+        std.debug.print("=== STANDALONE WASM IR (pre-opt) ===\n{s}\n=== END ===\n", .{ir});
+    }
     // Use O2 for standalone WASM — enables auto-vectorization for float loops
     module_disposed = try finalizeAndEmitShard(native, obj_path, "standalone-wasm", "default<O2>");
     return .{ .func_count = generated_count, .has_functions = true };
@@ -678,9 +727,9 @@ fn generateInt32Body(
 
     // Allocate local variables if needed
     builder.positionAtEnd(llvm_blocks[0]);
-    var locals_buf: [16]llvm.Value = undefined;
+    var locals_buf: [48]llvm.Value = undefined;
     const local_count = analyzed.var_count;
-    for (0..@min(local_count, 16)) |i| {
+    for (0..@min(local_count, 48)) |i| {
         var loc_name: [16]u8 = undefined;
         const name = std.fmt.bufPrintZ(&loc_name, "loc_{d}", .{i}) catch "loc";
         locals_buf[i] = builder.buildAlloca(llvm.i32Type(), name);
@@ -752,7 +801,7 @@ fn emitInt32Instruction(
     instr: Instruction,
     params: *[8]llvm.Value,
     arg_count: u32,
-    locals: *[16]llvm.Value,
+    locals: *[48]llvm.Value,
     local_count: u32,
     llvm_blocks: []llvm.BasicBlock,
     block_count: usize,
@@ -843,7 +892,7 @@ fn emitInt32Instruction(
                 .u16 => |a| a,
                 else => 0,
             };
-            if (idx >= @min(local_count, 16)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
             const loc_ptr = locals.*[idx];
             const val = builder.buildLoad(llvm.i32Type(), loc_ptr, "loc");
             vstack.append(allocator, val) catch return CodegenError.OutOfMemory;
@@ -856,7 +905,7 @@ fn emitInt32Instruction(
                 else => 0,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
-            if (idx >= @min(local_count, 16)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
             const val = i32VstackPop(vstack);
             _ = builder.buildStore(val, locals.*[idx]);
         },
@@ -868,7 +917,7 @@ fn emitInt32Instruction(
                 else => 0,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
-            if (idx >= @min(local_count, 16)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
             const val = vstack.items[vstack.items.len - 1]; // peek, don't pop
             _ = builder.buildStore(val, locals.*[idx]);
         },
@@ -977,7 +1026,7 @@ fn emitInt32Instruction(
                 .u16 => |a| a,
                 else => 0,
             };
-            if (idx >= @min(local_count, 16)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
             const loc_ptr = locals.*[idx];
             const val = builder.buildLoad(llvm.i32Type(), loc_ptr, "loc");
             vstack.append(allocator, val) catch return CodegenError.OutOfMemory;
@@ -991,7 +1040,7 @@ fn emitInt32Instruction(
                 else => 0,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
-            if (idx >= @min(local_count, 16)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
             const val = i32VstackPop(vstack);
             _ = builder.buildStore(val, locals.*[idx]);
         },
@@ -1003,7 +1052,7 @@ fn emitInt32Instruction(
                 .u16 => |a| a,
                 else => 0,
             };
-            if (idx >= @min(local_count, 16)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
             _ = builder.buildStore(llvm.constInt32(0), locals.*[idx]);
         },
 
@@ -1039,7 +1088,7 @@ fn emitInt32Instruction(
                 else => 0,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
-            if (idx >= @min(local_count, 16)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
             const val = i32VstackPop(vstack);
             const loc_ptr = locals.*[idx];
             const old_val = builder.buildLoad(llvm.i32Type(), loc_ptr, "addloc_old");
@@ -1055,7 +1104,7 @@ fn emitInt32Instruction(
                 .u16 => |a| a,
                 else => 0,
             };
-            if (idx >= @min(local_count, 16)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
             const loc_ptr = locals.*[idx];
             const old_val = builder.buildLoad(llvm.i32Type(), loc_ptr, "incloc_old");
             const new_val = builder.buildNSWAdd(old_val, llvm.constInt32(1), "incloc_new");
@@ -1282,6 +1331,7 @@ fn generateNumericBody(
     analyzed: AnalyzedFunction,
     cfg: *const CFG,
     module: llvm.Module,
+    length_args: u8,
 ) CodegenError!void {
     const blocks = cfg.blocks.items;
     if (blocks.len == 0) return;
@@ -1312,22 +1362,81 @@ fn generateNumericBody(
 
     // Allocate locals with comptime-selected type
     builder.positionAtEnd(llvm_blocks[0]);
-    var locals_buf: [16]llvm.Value = undefined;
+    var locals_buf: [48]llvm.Value = undefined;
     const local_count = analyzed.var_count;
-    for (0..@min(local_count, 16)) |i| {
+    for (0..@min(local_count, 48)) |i| {
         var loc_name: [16]u8 = undefined;
         const name = std.fmt.bufPrintZ(&loc_name, "loc_{d}", .{i}) catch "loc";
         locals_buf[i] = builder.buildAlloca(elem_type, name);
         _ = builder.buildStore(zero_val, locals_buf[i]);
     }
 
-    // Shadow function parameters with allocas (same as generateInt32Body)
+    // Shadow function parameters with allocas
     var params_buf: [8]llvm.Value = undefined;
     for (0..analyzed.arg_count) |i| {
         var arg_name: [16]u8 = undefined;
         const name = std.fmt.bufPrintZ(&arg_name, "arg_{d}", .{i}) catch "arg";
         params_buf[i] = builder.buildAlloca(elem_type, name);
         _ = builder.buildStore(c.LLVMGetParam(func, @intCast(i)), params_buf[i]);
+    }
+
+    // === Array length parameters ===
+    // For each array arg with .length access, we have an extra i32 param appended
+    // after the regular args. Build a map from arg index → length param LLVM value.
+    var length_params: [8]?llvm.Value = .{null} ** 8;
+    {
+        var len_param_idx: u32 = analyzed.arg_count;
+        for (0..analyzed.arg_count) |i| {
+            if (length_args & (@as(u8, 1) << @intCast(i)) != 0) {
+                length_params[i] = c.LLVMGetParam(func, @intCast(len_param_idx));
+                len_param_idx += 1;
+            }
+        }
+    }
+
+    // === Cross-block spill slots for vstack persistence ===
+    // QuickJS bytecode can have values live on the evaluation stack across basic
+    // block boundaries. We use individual alloca spill slots (not an array) so
+    // LLVM's mem2reg promotes them to SSA values / WASM locals — avoiding linear
+    // memory aliasing with user data arrays.
+    const max_spill = 8;
+    var spill_slots: [max_spill]llvm.Value = undefined;
+    for (0..max_spill) |i| {
+        var name_buf: [16]u8 = undefined;
+        const name = std.fmt.bufPrintZ(&name_buf, "spill_{d}", .{i}) catch "spill";
+        spill_slots[i] = builder.buildAlloca(elem_type, name);
+        _ = builder.buildStore(zero_val, spill_slots[i]);
+    }
+
+    // Compute entry stack depth for each block via static analysis
+    var entry_depths = allocator.alloc(i32, blocks.len) catch return CodegenError.OutOfMemory;
+    defer allocator.free(entry_depths);
+    @memset(entry_depths, -1); // -1 = unvisited
+    entry_depths[0] = 0;
+
+    // Forward pass: compute stack depth at each block entry
+    for (blocks, 0..) |block, block_idx| {
+        var depth: i32 = entry_depths[block_idx];
+        if (depth < 0) depth = 0; // unreachable block
+
+        for (block.instructions) |instr| {
+            depth += numericStackEffect(instr);
+        }
+
+        // Propagate to successors
+        for (block.successors.items) |succ| {
+            if (succ < blocks.len) {
+                if (entry_depths[succ] < 0) {
+                    entry_depths[succ] = depth;
+                }
+            }
+        }
+        // Fall-through successor
+        if (block.successors.items.len == 0 and block_idx + 1 < blocks.len) {
+            if (entry_depths[block_idx + 1] < 0) {
+                entry_depths[block_idx + 1] = depth;
+            }
+        }
     }
 
     // Generate each block
@@ -1337,11 +1446,75 @@ fn generateNumericBody(
         var vstack = std.ArrayListUnmanaged(llvm.Value){};
         defer vstack.deinit(allocator);
 
+        // Reload live stack values from spill slots at block entry
+        const entry_depth: u32 = @intCast(@max(entry_depths[block_idx], 0));
+        for (0..@min(entry_depth, max_spill)) |i| {
+            const val = builder.buildLoad(elem_type, spill_slots[i], "reload");
+            vstack.append(allocator, val) catch return CodegenError.OutOfMemory;
+        }
+
         var block_terminated = false;
         var pending_callee: ?llvm.Value = null;
+        var skip_next = false;
 
-        for (block.instructions) |instr| {
+        // Process instructions. For the last instruction that is a terminator,
+        // spill the vstack BEFORE emitting the branch.
+        for (block.instructions, 0..) |instr, instr_idx| {
+            if (skip_next) { skip_next = false; continue; }
             if (block_terminated) break;
+
+            // Peephole: get_arg(N) + get_length → push length_params[N]
+            // When an array arg's .length is accessed, we use the extra WASM param
+            // instead of dereferencing a JS object.
+            if (numeric_handlers.getHandler(instr.opcode).pattern == .get_arg and
+                instr_idx + 1 < block.instructions.len)
+            {
+                const next = block.instructions[instr_idx + 1];
+                if (numeric_handlers.getHandler(next.opcode).pattern == .array_length) {
+                    const arg_handler = numeric_handlers.getHandler(instr.opcode);
+                    const arg_idx: u32 = arg_handler.index orelse switch (instr.operand) {
+                        .arg => |a| a,
+                        .u8 => |a| a,
+                        else => 255,
+                    };
+                    if (arg_idx < 8) {
+                        if (length_params[arg_idx]) |len_param| {
+                            // Fuse get_arg + get_length into a single length param load
+                            const result = switch (kind) {
+                                .i32 => len_param,
+                                .f64 => builder.buildSIToFP(len_param, llvm.doubleType(), "len_f64"),
+                            };
+                            vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
+                            skip_next = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Check if this instruction is a terminator — if so, spill first
+            const is_terminator = switch (numeric_handlers.getHandler(instr.opcode).pattern) {
+                .if_false, .if_true, .goto_br, .ret, .tail_call_self => true,
+                else => false,
+            };
+            if (is_terminator) {
+                // Spill vstack items that the successor blocks will need.
+                // The terminator will pop some values (condition for if/goto, args for tail_call).
+                // We spill everything EXCEPT the values the terminator will consume.
+                const term_pops: usize = switch (numeric_handlers.getHandler(instr.opcode).pattern) {
+                    .if_false, .if_true, .ret => 1,
+                    .tail_call_self => @intCast(instr.operand.u16),
+                    .goto_br => 0,
+                    else => 0,
+                };
+                const spill_count = if (vstack.items.len > term_pops)
+                    vstack.items.len - term_pops
+                else
+                    0;
+                for (0..@min(spill_count, max_spill)) |i| {
+                    _ = builder.buildStore(vstack.items[i], spill_slots[i]);
+                }
+            }
 
             try emitNumericInstruction(
                 kind,
@@ -1361,16 +1534,578 @@ fn generateNumericBody(
                 &pending_callee,
                 module,
                 analyzed,
+                &length_params,
             );
         }
 
+        // For non-terminated blocks (fall-through), spill and branch
         if (!block_terminated) {
+            for (0..@min(vstack.items.len, max_spill)) |i| {
+                _ = builder.buildStore(vstack.items[i], spill_slots[i]);
+            }
             if (block_idx + 1 < blocks.len) {
                 _ = builder.buildBr(llvm_blocks[block_idx + 1]);
             } else {
                 _ = builder.buildRet(zero_val);
             }
         }
+    }
+}
+
+/// Compute the net stack effect of a numeric instruction.
+/// Returns the change in stack depth (positive = push, negative = pop).
+fn numericStackEffect(instr: Instruction) i32 {
+    const handler = numeric_handlers.getHandler(instr.opcode);
+    return switch (handler.pattern) {
+        .push_const, .push_cpool, .push_bool, .get_arg, .get_loc, .get_loc_check => 1,
+        .get_loc_pair => 2, // push 2 locals
+        .put_arg, .put_loc, .put_loc_check, .stack_drop, .add_loc => -1,
+        .set_arg, .set_loc, .nop, .set_loc_uninitialized, .inc_loc => 0,
+        .binary_arith, .binary_cmp, .bitwise_binary, .array_get => -1, // pop 2, push 1
+        .unary, .lnot, .inc_dec, .always_false, .array_length => 0, // pop 1, push 1
+        .post_inc_dec => 1, // pop 1, push 2
+        .stack_dup => 1,
+        .stack_swap => 0,
+        .self_ref => 0, // doesn't affect vstack in our impl (sets pending_callee)
+        .call_self => blk: {
+            const argc: i32 = switch (instr.opcode) {
+                .call1 => 1, .call2 => 2, .call3 => 3,
+                .call => @as(i32, @intCast(instr.operand.u16)),
+                else => 1,
+            };
+            break :blk 1 - argc; // pop argc, push 1
+        },
+        .tail_call_self => blk: {
+            const argc: i32 = @intCast(instr.operand.u16);
+            break :blk -argc; // pop argc (terminates, no push)
+        },
+        .ret, .if_false, .if_true => -1, // pop 1
+        .goto_br => 0,
+        .array_get2 => 0, // pop 1 (index), peek base, push 1 (result) = net 0
+        .array_put => -3, // pop 3
+        .unsupported => 0,
+    };
+}
+
+/// Push a value to the memory-backed vstack array
+inline fn memVstackPush(builder: llvm.Builder, vstack_array: llvm.Value, sp_alloca: llvm.Value, val: llvm.Value, elem_type: llvm.Type) void {
+    const sp = builder.buildLoad(llvm.i32Type(), sp_alloca, "sp_ld");
+    var indices = [_]llvm.Value{ llvm.constInt32(0), sp };
+    const slot = c.LLVMBuildGEP2(builder.ref, c.LLVMArrayType2(elem_type, 16), vstack_array, &indices, 2, "vs_push");
+    _ = builder.buildStore(val, slot);
+    const new_sp = c.LLVMBuildAdd(builder.ref, sp, llvm.constInt32(1), "sp_inc");
+    _ = builder.buildStore(new_sp, sp_alloca);
+}
+
+/// Pop a value from the memory-backed vstack array
+inline fn memVstackPop(builder: llvm.Builder, vstack_array: llvm.Value, sp_alloca: llvm.Value, elem_type: llvm.Type) llvm.Value {
+    const sp = builder.buildLoad(llvm.i32Type(), sp_alloca, "sp_ld");
+    const new_sp = c.LLVMBuildSub(builder.ref, sp, llvm.constInt32(1), "sp_dec");
+    _ = builder.buildStore(new_sp, sp_alloca);
+    var indices = [_]llvm.Value{ llvm.constInt32(0), new_sp };
+    const slot = c.LLVMBuildGEP2(builder.ref, c.LLVMArrayType2(elem_type, 16), vstack_array, &indices, 2, "vs_pop");
+    return builder.buildLoad(elem_type, slot, "vs_val");
+}
+
+/// Peek at the top of the memory-backed vstack (no pop)
+inline fn memVstackPeek(builder: llvm.Builder, vstack_array: llvm.Value, sp_alloca: llvm.Value, elem_type: llvm.Type) llvm.Value {
+    const sp = builder.buildLoad(llvm.i32Type(), sp_alloca, "sp_ld");
+    const top = c.LLVMBuildSub(builder.ref, sp, llvm.constInt32(1), "sp_top");
+    var indices = [_]llvm.Value{ llvm.constInt32(0), top };
+    const slot = c.LLVMBuildGEP2(builder.ref, c.LLVMArrayType2(elem_type, 16), vstack_array, &indices, 2, "vs_peek");
+    return builder.buildLoad(elem_type, slot, "vs_top");
+}
+
+/// Memory-backed version of emitNumericInstruction. Uses an alloca array + sp
+/// for the evaluation stack, enabling values to persist across basic block
+/// boundaries (required when QuickJS bytecode has live stack values at branches).
+fn emitNumericInstructionMem(
+    comptime kind: ValueKind,
+    builder: llvm.Builder,
+    instr: Instruction,
+    params: *[8]llvm.Value,
+    arg_count: u32,
+    locals: *[48]llvm.Value,
+    local_count: u32,
+    llvm_blocks: []llvm.BasicBlock,
+    block_count: usize,
+    successors: []const u32,
+    func: llvm.Value,
+    block_terminated: *bool,
+    pending_callee: *?llvm.Value,
+    module: llvm.Module,
+    analyzed: AnalyzedFunction,
+    va: llvm.Value, // vstack array alloca
+    sp: llvm.Value, // sp alloca (i32)
+    zero_val: llvm.Value,
+    elem_type: llvm.Type,
+) CodegenError!void {
+    const handler = numeric_handlers.getHandler(instr.opcode);
+    const one_val: llvm.Value = switch (kind) {
+        .i32 => llvm.constInt32(1),
+        .f64 => llvm.constF64(1.0),
+    };
+
+    // Helpers bound to our memory stack
+    const push = memVstackPush;
+    const pop = memVstackPop;
+    const peek = memVstackPeek;
+
+    switch (handler.pattern) {
+        .push_const => {
+            const val = if (handler.value) |v| switch (kind) {
+                .i32 => llvm.constInt32(v),
+                .f64 => llvm.constF64(@floatFromInt(v)),
+            } else switch (instr.opcode) {
+                .push_i8 => switch (kind) {
+                    .i32 => llvm.constInt32(@as(i32, instr.operand.i8)),
+                    .f64 => llvm.constF64(@as(f64, @floatFromInt(instr.operand.i8))),
+                },
+                .push_i16 => switch (kind) {
+                    .i32 => llvm.constInt32(@as(i32, instr.operand.i16)),
+                    .f64 => llvm.constF64(@as(f64, @floatFromInt(instr.operand.i16))),
+                },
+                .push_i32 => switch (kind) {
+                    .i32 => llvm.constInt32(instr.operand.i32),
+                    .f64 => llvm.constF64(@as(f64, @floatFromInt(instr.operand.i32))),
+                },
+                else => return CodegenError.UnsupportedOpcode,
+            };
+            push(builder, va, sp, val, elem_type);
+        },
+
+        .push_cpool => {
+            const idx: u32 = switch (instr.operand) {
+                .const_idx => |a| a,
+                else => return CodegenError.UnsupportedOpcode,
+            };
+            if (idx >= analyzed.constants.len) return CodegenError.UnsupportedOpcode;
+            const val: llvm.Value = switch (analyzed.constants[idx]) {
+                .int32 => |v| switch (kind) {
+                    .i32 => llvm.constInt32(v),
+                    .f64 => llvm.constF64(@as(f64, @floatFromInt(v))),
+                },
+                .float64 => |v| switch (kind) {
+                    .i32 => llvm.constInt32(@as(i32, @intFromFloat(v))),
+                    .f64 => llvm.constF64(v),
+                },
+                else => return CodegenError.UnsupportedOpcode,
+            };
+            push(builder, va, sp, val, elem_type);
+        },
+
+        .push_bool => {
+            const val = if (handler.value != null and handler.value.? != 0) one_val else zero_val;
+            push(builder, va, sp, val, elem_type);
+        },
+
+        .get_arg => {
+            const idx: u32 = handler.index orelse switch (instr.operand) {
+                .arg => |a| a, .u8 => |a| a, else => 0,
+            };
+            if (idx >= arg_count) return CodegenError.UnsupportedOpcode;
+            const val = builder.buildLoad(elem_type, params[idx], "arg");
+            push(builder, va, sp, val, elem_type);
+        },
+
+        .put_arg => {
+            const idx: u32 = handler.index orelse switch (instr.operand) {
+                .arg => |a| a, .u8 => |a| a, .u16 => |a| a, else => 0,
+            };
+            if (idx >= arg_count) return CodegenError.UnsupportedOpcode;
+            _ = builder.buildStore(pop(builder, va, sp, elem_type), params.*[idx]);
+        },
+
+        .set_arg => {
+            const idx: u32 = if (handler.index) |i| i else switch (instr.operand) {
+                .arg => |a| a, .u8 => |a| a, .u16 => |a| a, else => 0,
+            };
+            if (idx >= arg_count) return CodegenError.UnsupportedOpcode;
+            _ = builder.buildStore(peek(builder, va, sp, elem_type), params.*[idx]);
+        },
+
+        .get_loc, .get_loc_check => {
+            const idx: u32 = handler.index orelse switch (instr.operand) {
+                .loc => |a| a, .u8 => |a| a, .u16 => |a| a, else => 0,
+            };
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            push(builder, va, sp, builder.buildLoad(elem_type, locals.*[idx], "loc"), elem_type);
+        },
+
+        .get_loc_pair => {
+            if (0 >= @min(local_count, 48) or 1 >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            push(builder, va, sp, builder.buildLoad(elem_type, locals.*[0], "loc0"), elem_type);
+            push(builder, va, sp, builder.buildLoad(elem_type, locals.*[1], "loc1"), elem_type);
+        },
+
+        .put_loc, .put_loc_check => {
+            const idx: u32 = handler.index orelse switch (instr.operand) {
+                .u8 => |a| a, .u16 => |a| a, .loc => |a| a, else => 0,
+            };
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            _ = builder.buildStore(pop(builder, va, sp, elem_type), locals.*[idx]);
+        },
+
+        .set_loc => {
+            const idx: u32 = handler.index orelse switch (instr.operand) {
+                .u8 => |a| a, .u16 => |a| a, .loc => |a| a, else => 0,
+            };
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            _ = builder.buildStore(peek(builder, va, sp, elem_type), locals.*[idx]);
+        },
+
+        .set_loc_uninitialized => {
+            const idx: u32 = switch (instr.operand) {
+                .u8 => |a| a, .u16 => |a| a, .loc => |a| a, else => 0,
+            };
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            _ = builder.buildStore(zero_val, locals.*[idx]);
+        },
+
+        .binary_arith => {
+            const rhs = pop(builder, va, sp, elem_type);
+            const lhs = pop(builder, va, sp, elem_type);
+            const op = handler.op orelse return CodegenError.UnsupportedOpcode;
+            const result = switch (kind) {
+                .i32 => if (std.mem.eql(u8, op, "+")) builder.buildAdd(lhs, rhs, "add")
+                    else if (std.mem.eql(u8, op, "-")) builder.buildSub(lhs, rhs, "sub")
+                    else if (std.mem.eql(u8, op, "*")) builder.buildMul(lhs, rhs, "mul")
+                    else if (std.mem.eql(u8, op, "/")) builder.buildSDiv(lhs, rhs, "div")
+                    else if (std.mem.eql(u8, op, "%")) builder.buildSRem(lhs, rhs, "rem")
+                    else return CodegenError.UnsupportedOpcode,
+                .f64 => if (std.mem.eql(u8, op, "+")) builder.buildFAdd(lhs, rhs, "fadd")
+                    else if (std.mem.eql(u8, op, "-")) builder.buildFSub(lhs, rhs, "fsub")
+                    else if (std.mem.eql(u8, op, "*")) builder.buildFMul(lhs, rhs, "fmul")
+                    else if (std.mem.eql(u8, op, "/")) builder.buildFDiv(lhs, rhs, "fdiv")
+                    else if (std.mem.eql(u8, op, "%")) builder.buildFRem(lhs, rhs, "frem")
+                    else return CodegenError.UnsupportedOpcode,
+            };
+            push(builder, va, sp, result, elem_type);
+        },
+
+        .bitwise_binary => {
+            if (kind != .i32) return CodegenError.UnsupportedOpcode;
+            const rhs = pop(builder, va, sp, elem_type);
+            const lhs = pop(builder, va, sp, elem_type);
+            const op = handler.op orelse return CodegenError.UnsupportedOpcode;
+            const result = if (std.mem.eql(u8, op, "&")) builder.buildAnd(lhs, rhs, "and")
+                else if (std.mem.eql(u8, op, "|")) builder.buildOr(lhs, rhs, "or")
+                else if (std.mem.eql(u8, op, "^")) builder.buildXor(lhs, rhs, "xor")
+                else if (std.mem.eql(u8, op, "<<")) builder.buildShl(lhs, rhs, "shl")
+                else if (std.mem.eql(u8, op, ">>")) builder.buildAShr(lhs, rhs, "shr")
+                else if (std.mem.eql(u8, op, ">>>")) builder.buildLShr(lhs, rhs, "shru")
+                else return CodegenError.UnsupportedOpcode;
+            push(builder, va, sp, result, elem_type);
+        },
+
+        .binary_cmp => {
+            const rhs = pop(builder, va, sp, elem_type);
+            const lhs = pop(builder, va, sp, elem_type);
+            const op = handler.op orelse return CodegenError.UnsupportedOpcode;
+            const cmp = switch (kind) {
+                .i32 => blk: {
+                    const pred: c.LLVMIntPredicate = if (std.mem.eql(u8, op, "<")) c.LLVMIntSLT
+                        else if (std.mem.eql(u8, op, "<=")) c.LLVMIntSLE
+                        else if (std.mem.eql(u8, op, ">")) c.LLVMIntSGT
+                        else if (std.mem.eql(u8, op, ">=")) c.LLVMIntSGE
+                        else if (std.mem.eql(u8, op, "==")) c.LLVMIntEQ
+                        else if (std.mem.eql(u8, op, "!=")) c.LLVMIntNE
+                        else return CodegenError.UnsupportedOpcode;
+                    break :blk builder.buildICmp(pred, lhs, rhs, "cmp");
+                },
+                .f64 => blk: {
+                    const pred: c.LLVMRealPredicate = if (std.mem.eql(u8, op, "<")) c.LLVMRealOLT
+                        else if (std.mem.eql(u8, op, "<=")) c.LLVMRealOLE
+                        else if (std.mem.eql(u8, op, ">")) c.LLVMRealOGT
+                        else if (std.mem.eql(u8, op, ">=")) c.LLVMRealOGE
+                        else if (std.mem.eql(u8, op, "==")) c.LLVMRealOEQ
+                        else if (std.mem.eql(u8, op, "!=")) c.LLVMRealONE
+                        else return CodegenError.UnsupportedOpcode;
+                    break :blk builder.buildFCmp(pred, lhs, rhs, "fcmp");
+                },
+            };
+            const cmpz = builder.buildZExt(cmp, llvm.i32Type(), "cmpz");
+            const result = switch (kind) {
+                .i32 => cmpz,
+                .f64 => builder.buildSIToFP(cmpz, llvm.doubleType(), "cmpf"),
+            };
+            push(builder, va, sp, result, elem_type);
+        },
+
+        .unary => {
+            const val = pop(builder, va, sp, elem_type);
+            const op = handler.op orelse return CodegenError.UnsupportedOpcode;
+            const result = if (std.mem.eql(u8, op, "-")) switch (kind) {
+                .i32 => builder.buildNeg(val, "neg"),
+                .f64 => builder.buildFNeg(val, "fneg"),
+            } else if (std.mem.eql(u8, op, "~")) blk: {
+                if (kind != .i32) return CodegenError.UnsupportedOpcode;
+                break :blk builder.buildNot(val, "bnot");
+            } else return CodegenError.UnsupportedOpcode;
+            push(builder, va, sp, result, elem_type);
+        },
+
+        .lnot => {
+            const val = pop(builder, va, sp, elem_type);
+            const is_zero = switch (kind) {
+                .i32 => builder.buildICmp(c.LLVMIntEQ, val, llvm.constInt32(0), "iszero"),
+                .f64 => builder.buildFCmp(c.LLVMRealOEQ, val, llvm.constF64(0.0), "fiszero"),
+            };
+            const cmpz = builder.buildZExt(is_zero, llvm.i32Type(), "lnot");
+            const result = switch (kind) {
+                .i32 => cmpz,
+                .f64 => builder.buildSIToFP(cmpz, llvm.doubleType(), "lnotf"),
+            };
+            push(builder, va, sp, result, elem_type);
+        },
+
+        .inc_dec => {
+            const val = pop(builder, va, sp, elem_type);
+            const result = if (handler.is_inc orelse false) switch (kind) {
+                .i32 => builder.buildAdd(val, one_val, "inc"),
+                .f64 => builder.buildFAdd(val, one_val, "finc"),
+            } else switch (kind) {
+                .i32 => builder.buildSub(val, one_val, "dec"),
+                .f64 => builder.buildFSub(val, one_val, "fdec"),
+            };
+            push(builder, va, sp, result, elem_type);
+        },
+
+        .post_inc_dec => {
+            const val = pop(builder, va, sp, elem_type);
+            const new_val = if (handler.is_inc orelse false) switch (kind) {
+                .i32 => builder.buildAdd(val, one_val, "postinc"),
+                .f64 => builder.buildFAdd(val, one_val, "fpostinc"),
+            } else switch (kind) {
+                .i32 => builder.buildSub(val, one_val, "postdec"),
+                .f64 => builder.buildFSub(val, one_val, "fpostdec"),
+            };
+            // Push old first (deeper), new on TOS — matches QuickJS semantics
+            push(builder, va, sp, val, elem_type);
+            push(builder, va, sp, new_val, elem_type);
+        },
+
+        .add_loc => {
+            const idx: u32 = switch (instr.operand) {
+                .loc => |a| a, .u8 => |a| a, .u16 => |a| a, else => 0,
+            };
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            const val = pop(builder, va, sp, elem_type);
+            const old = builder.buildLoad(elem_type, locals.*[idx], "addloc_old");
+            const new_val = switch (kind) {
+                .i32 => builder.buildAdd(old, val, "addloc"),
+                .f64 => builder.buildFAdd(old, val, "faddloc"),
+            };
+            _ = builder.buildStore(new_val, locals.*[idx]);
+        },
+
+        .inc_loc => {
+            const idx: u32 = switch (instr.operand) {
+                .loc => |a| a, .u8 => |a| a, .u16 => |a| a, else => 0,
+            };
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            const old = builder.buildLoad(elem_type, locals.*[idx], "incloc_old");
+            const new_val = switch (kind) {
+                .i32 => builder.buildNSWAdd(old, one_val, "incloc"),
+                .f64 => builder.buildFAdd(old, one_val, "fincloc"),
+            };
+            _ = builder.buildStore(new_val, locals.*[idx]);
+        },
+
+        .stack_dup => {
+            push(builder, va, sp, peek(builder, va, sp, elem_type), elem_type);
+        },
+
+        .stack_drop => {
+            _ = pop(builder, va, sp, elem_type);
+        },
+
+        .stack_swap => {
+            // Pop top two, push in reversed order
+            const a = pop(builder, va, sp, elem_type);
+            const b = pop(builder, va, sp, elem_type);
+            push(builder, va, sp, a, elem_type);
+            push(builder, va, sp, b, elem_type);
+        },
+
+        .nop => {},
+
+        .self_ref => {
+            if (instr.opcode == .get_var or instr.opcode == .get_var_undef) {
+                switch (instr.operand) {
+                    .atom => |atom_idx| {
+                        if (getAtomStringStatic(analyzed, atom_idx)) |callee_name| {
+                            if (module.getNamedFunction(callee_name)) |callee_fn| {
+                                if (callee_fn != func) pending_callee.* = callee_fn;
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            } else if (instr.opcode == .get_var_ref0) {
+                if (analyzed.closure_vars.len > 0) {
+                    const cv_name = analyzed.closure_vars[0].name;
+                    if (cv_name.len > 0) {
+                        var name_buf: [256]u8 = undefined;
+                        if (cv_name.len < name_buf.len) {
+                            @memcpy(name_buf[0..cv_name.len], cv_name);
+                            name_buf[cv_name.len] = 0;
+                            const name_z: [*:0]const u8 = @ptrCast(name_buf[0..cv_name.len]);
+                            if (module.getNamedFunction(name_z)) |callee_fn| {
+                                if (callee_fn != func) pending_callee.* = callee_fn;
+                            }
+                        }
+                    }
+                }
+            }
+        },
+
+        .call_self => {
+            const call_argc: u32 = switch (instr.opcode) {
+                .call1 => 1, .call2 => 2, .call3 => 3,
+                .call => instr.operand.u16, else => 1,
+            };
+            const call_target = if (pending_callee.*) |callee| blk: {
+                pending_callee.* = null;
+                break :blk if (c.LLVMCountParams(callee) == call_argc) callee else func;
+            } else func;
+            var call_args: [8]llvm.Value = undefined;
+            var i: u32 = call_argc;
+            while (i > 0) {
+                i -= 1;
+                call_args[i] = pop(builder, va, sp, elem_type);
+            }
+            var param_types_buf: [8]llvm.Type = undefined;
+            for (0..call_argc) |j| param_types_buf[j] = elem_type;
+            const call_fn_ty = llvm.functionType(elem_type, param_types_buf[0..call_argc], false);
+            push(builder, va, sp, builder.buildCall(call_fn_ty, call_target, call_args[0..call_argc], "call"), elem_type);
+        },
+
+        .tail_call_self => {
+            const call_argc: u32 = instr.operand.u16;
+            const call_target = if (pending_callee.*) |callee| blk: {
+                pending_callee.* = null;
+                break :blk if (c.LLVMCountParams(callee) == call_argc) callee else func;
+            } else func;
+            var call_args: [8]llvm.Value = undefined;
+            var i: u32 = call_argc;
+            while (i > 0) {
+                i -= 1;
+                call_args[i] = pop(builder, va, sp, elem_type);
+            }
+            var param_types_buf: [8]llvm.Type = undefined;
+            for (0..call_argc) |j| param_types_buf[j] = elem_type;
+            const call_fn_ty = llvm.functionType(elem_type, param_types_buf[0..call_argc], false);
+            _ = builder.buildRet(builder.buildCall(call_fn_ty, call_target, call_args[0..call_argc], "tail"));
+            block_terminated.* = true;
+        },
+
+        .ret => {
+            if (handler.value) |v| {
+                _ = builder.buildRet(switch (kind) {
+                    .i32 => llvm.constInt32(v),
+                    .f64 => llvm.constF64(@floatFromInt(v)),
+                });
+            } else {
+                _ = builder.buildRet(pop(builder, va, sp, elem_type));
+            }
+            block_terminated.* = true;
+        },
+
+        .if_false => {
+            const cond = pop(builder, va, sp, elem_type);
+            const is_false = switch (kind) {
+                .i32 => builder.buildICmp(c.LLVMIntEQ, cond, llvm.constInt32(0), "ifz"),
+                .f64 => builder.buildFCmp(c.LLVMRealOEQ, cond, llvm.constF64(0.0), "fifz"),
+            };
+            if (successors.len >= 2) {
+                if (successors[0] < block_count and successors[1] < block_count) {
+                    _ = builder.buildCondBr(is_false, llvm_blocks[successors[0]], llvm_blocks[successors[1]]);
+                    block_terminated.* = true;
+                }
+            } else if (successors.len == 1 and successors[0] < block_count) {
+                _ = builder.buildBr(llvm_blocks[successors[0]]);
+                block_terminated.* = true;
+            }
+        },
+
+        .if_true => {
+            const cond = pop(builder, va, sp, elem_type);
+            const is_true = switch (kind) {
+                .i32 => builder.buildICmp(c.LLVMIntNE, cond, llvm.constInt32(0), "ift"),
+                .f64 => builder.buildFCmp(c.LLVMRealONE, cond, llvm.constF64(0.0), "fift"),
+            };
+            if (successors.len >= 2) {
+                if (successors[0] < block_count and successors[1] < block_count) {
+                    _ = builder.buildCondBr(is_true, llvm_blocks[successors[0]], llvm_blocks[successors[1]]);
+                    block_terminated.* = true;
+                }
+            } else if (successors.len == 1 and successors[0] < block_count) {
+                _ = builder.buildBr(llvm_blocks[successors[0]]);
+                block_terminated.* = true;
+            }
+        },
+
+        .goto_br => {
+            if (successors.len >= 1 and successors[0] < block_count) {
+                _ = builder.buildBr(llvm_blocks[successors[0]]);
+                block_terminated.* = true;
+            }
+        },
+
+        .always_false => {
+            _ = pop(builder, va, sp, elem_type);
+            push(builder, va, sp, zero_val, elem_type);
+        },
+
+        .array_get => {
+            const idx_val = pop(builder, va, sp, elem_type);
+            const base_val = pop(builder, va, sp, elem_type);
+            const base_ptr = c.LLVMBuildIntToPtr(builder.ref, base_val, llvm.ptrType(), "arr_base");
+            var gep_idx = [_]llvm.Value{idx_val};
+            const elem_ptr = c.LLVMBuildGEP2(builder.ref, llvm.i32Type(), base_ptr, &gep_idx, 1, "arr_gep");
+            const loaded = builder.buildLoad(llvm.i32Type(), elem_ptr, "arr_elem");
+            const result = switch (kind) {
+                .i32 => loaded,
+                .f64 => builder.buildSIToFP(loaded, llvm.doubleType(), "arr_f64"),
+            };
+            push(builder, va, sp, result, elem_type);
+        },
+
+        .array_get2 => {
+            const idx_val = pop(builder, va, sp, elem_type);
+            const base_val = peek(builder, va, sp, elem_type); // keep base on stack
+            const base_ptr = c.LLVMBuildIntToPtr(builder.ref, base_val, llvm.ptrType(), "arr_base2");
+            var gep_idx = [_]llvm.Value{idx_val};
+            const elem_ptr = c.LLVMBuildGEP2(builder.ref, llvm.i32Type(), base_ptr, &gep_idx, 1, "arr_gep2");
+            const loaded = builder.buildLoad(llvm.i32Type(), elem_ptr, "arr_elem2");
+            const result = switch (kind) {
+                .i32 => loaded,
+                .f64 => builder.buildSIToFP(loaded, llvm.doubleType(), "arr_f64_2"),
+            };
+            push(builder, va, sp, result, elem_type);
+        },
+
+        .array_put => {
+            const val = pop(builder, va, sp, elem_type);
+            const idx_val = pop(builder, va, sp, elem_type);
+            const base_val = pop(builder, va, sp, elem_type);
+            const base_ptr = c.LLVMBuildIntToPtr(builder.ref, base_val, llvm.ptrType(), "arr_base_w");
+            var gep_idx = [_]llvm.Value{idx_val};
+            const elem_ptr = c.LLVMBuildGEP2(builder.ref, llvm.i32Type(), base_ptr, &gep_idx, 1, "arr_gep_w");
+            const store_val = switch (kind) {
+                .i32 => val,
+                .f64 => builder.buildFPToSI(val, llvm.i32Type(), "arr_i32_w"),
+            };
+            _ = builder.buildStore(store_val, elem_ptr);
+        },
+
+        .array_length => {
+            // Fallback for unmatched get_length (peephole in generateNumericBody handles most cases)
+            return CodegenError.UnsupportedOpcode;
+        },
+
+        .unsupported => return CodegenError.UnsupportedOpcode,
     }
 }
 
@@ -1385,7 +2120,7 @@ fn emitNumericInstruction(
     instr: Instruction,
     params: *[8]llvm.Value,
     arg_count: u32,
-    locals: *[16]llvm.Value,
+    locals: *[48]llvm.Value,
     local_count: u32,
     llvm_blocks: []llvm.BasicBlock,
     block_count: usize,
@@ -1395,7 +2130,9 @@ fn emitNumericInstruction(
     pending_callee: *?llvm.Value,
     module: llvm.Module,
     analyzed: AnalyzedFunction,
+    length_params: *const [8]?llvm.Value,
 ) CodegenError!void {
+    _ = length_params; // Handled by peephole in generateNumericBody
     const handler = numeric_handlers.getHandler(instr.opcode);
 
     // Comptime type constants
@@ -1482,6 +2219,7 @@ fn emitNumericInstruction(
 
         .put_arg => {
             const idx: u32 = handler.index orelse switch (instr.operand) {
+                .arg => |a| a,
                 .u8 => |a| a,
                 .u16 => |a| a,
                 else => 0,
@@ -1494,6 +2232,7 @@ fn emitNumericInstruction(
 
         .set_arg => {
             const idx: u32 = if (handler.index) |i| i else switch (instr.operand) {
+                .arg => |a| a,
                 .u8 => |a| a,
                 .u16 => |a| a,
                 else => 0,
@@ -1506,46 +2245,59 @@ fn emitNumericInstruction(
 
         .get_loc, .get_loc_check => {
             const idx: u32 = handler.index orelse switch (instr.operand) {
+                .loc => |a| a,
                 .u8 => |a| a,
                 .u16 => |a| a,
                 else => 0,
             };
-            if (idx >= @min(local_count, 16)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
             const val = builder.buildLoad(elem_type, locals.*[idx], "loc");
             vstack.append(allocator, val) catch return CodegenError.OutOfMemory;
         },
 
+        .get_loc_pair => {
+            // Fused: push loc0, then push loc1
+            if (0 >= @min(local_count, 48) or 1 >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            const val0 = builder.buildLoad(elem_type, locals.*[0], "loc0");
+            const val1 = builder.buildLoad(elem_type, locals.*[1], "loc1");
+            vstack.append(allocator, val0) catch return CodegenError.OutOfMemory;
+            vstack.append(allocator, val1) catch return CodegenError.OutOfMemory;
+        },
+
         .put_loc, .put_loc_check => {
             const idx: u32 = handler.index orelse switch (instr.operand) {
+                .loc => |a| a,
                 .u8 => |a| a,
                 .u16 => |a| a,
                 else => 0,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
-            if (idx >= @min(local_count, 16)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
             const val = numVstackPop(vstack);
             _ = builder.buildStore(val, locals.*[idx]);
         },
 
         .set_loc => {
             const idx: u32 = handler.index orelse switch (instr.operand) {
+                .loc => |a| a,
                 .u8 => |a| a,
                 .u16 => |a| a,
                 else => 0,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
-            if (idx >= @min(local_count, 16)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
             const val = vstack.items[vstack.items.len - 1]; // peek
             _ = builder.buildStore(val, locals.*[idx]);
         },
 
         .set_loc_uninitialized => {
             const idx: u32 = switch (instr.operand) {
+                .loc => |a| a,
                 .u8 => |a| a,
                 .u16 => |a| a,
                 else => 0,
             };
-            if (idx >= @min(local_count, 16)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
             _ = builder.buildStore(zero_val, locals.*[idx]);
         },
 
@@ -1713,6 +2465,24 @@ fn emitNumericInstruction(
             vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
         },
 
+        .post_inc_dec => {
+            // QuickJS post_inc: stack = [... val] → [... val, val+1]
+            // TOS = new (incremented), below = old (original)
+            // Usage: put_loc saves TOS (new) back, leaving old for array index
+            if (vstack.items.len < 1) return CodegenError.StackUnderflow;
+            const val = numVstackPop(vstack);
+            const new_val = if (handler.is_inc orelse false) switch (kind) {
+                .i32 => builder.buildAdd(val, one_val, "postinc"),
+                .f64 => builder.buildFAdd(val, one_val, "fpostinc"),
+            } else switch (kind) {
+                .i32 => builder.buildSub(val, one_val, "postdec"),
+                .f64 => builder.buildFSub(val, one_val, "fpostdec"),
+            };
+            // Push old value first (deeper), then new value (TOS)
+            vstack.append(allocator, val) catch return CodegenError.OutOfMemory;
+            vstack.append(allocator, new_val) catch return CodegenError.OutOfMemory;
+        },
+
         .add_loc => {
             const idx: u32 = switch (instr.operand) {
                 .loc => |a| a,
@@ -1721,7 +2491,7 @@ fn emitNumericInstruction(
                 else => 0,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
-            if (idx >= @min(local_count, 16)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
             const val = numVstackPop(vstack);
             const loc_ptr = locals.*[idx];
             const old_val = builder.buildLoad(elem_type, loc_ptr, "addloc_old");
@@ -1739,7 +2509,7 @@ fn emitNumericInstruction(
                 .u16 => |a| a,
                 else => 0,
             };
-            if (idx >= @min(local_count, 16)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
             const loc_ptr = locals.*[idx];
             const old_val = builder.buildLoad(elem_type, loc_ptr, "incloc_old");
             const new_val = switch (kind) {
@@ -1929,6 +2699,72 @@ fn emitNumericInstruction(
                 _ = builder.buildBr(llvm_blocks[successors[0]]);
                 block_terminated.* = true;
             }
+        },
+
+        .always_false => {
+            // Pop a value, push false (0). In numeric context, values are never undefined/null.
+            if (vstack.items.len < 1) return CodegenError.StackUnderflow;
+            _ = numVstackPop(vstack);
+            vstack.append(allocator, zero_val) catch return CodegenError.OutOfMemory;
+        },
+
+        .array_get => {
+            // arr[idx]: pop index, pop base pointer, load from WASM linear memory
+            if (vstack.items.len < 2) return CodegenError.StackUnderflow;
+            const idx_val = numVstackPop(vstack);
+            const base_val = numVstackPop(vstack);
+            // base_val is a byte offset into WASM linear memory (i32)
+            // Convert to pointer, GEP by index (element size = sizeof(i32) = 4 bytes)
+            const base_ptr = c.LLVMBuildIntToPtr(builder.ref, base_val, llvm.ptrType(), "arr_base");
+            var gep_indices = [_]llvm.Value{idx_val};
+            const elem_ptr = c.LLVMBuildGEP2(builder.ref, llvm.i32Type(), base_ptr, &gep_indices, 1, "arr_gep");
+            const loaded = builder.buildLoad(llvm.i32Type(), elem_ptr, "arr_elem");
+            // For f64 tier, convert loaded i32 to f64
+            const result = switch (kind) {
+                .i32 => loaded,
+                .f64 => builder.buildSIToFP(loaded, llvm.doubleType(), "arr_f64"),
+            };
+            vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
+        },
+
+        .array_get2 => {
+            // arr[idx] keeping arr on stack: pop index, peek base, load, push result
+            if (vstack.items.len < 2) return CodegenError.StackUnderflow;
+            const idx_val = numVstackPop(vstack);
+            // Peek at base (don't pop)
+            const base_val = vstack.items[vstack.items.len - 1];
+            const base_ptr = c.LLVMBuildIntToPtr(builder.ref, base_val, llvm.ptrType(), "arr_base2");
+            var gep_indices = [_]llvm.Value{idx_val};
+            const elem_ptr = c.LLVMBuildGEP2(builder.ref, llvm.i32Type(), base_ptr, &gep_indices, 1, "arr_gep2");
+            const loaded = builder.buildLoad(llvm.i32Type(), elem_ptr, "arr_elem2");
+            const result = switch (kind) {
+                .i32 => loaded,
+                .f64 => builder.buildSIToFP(loaded, llvm.doubleType(), "arr_f64_2"),
+            };
+            vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
+        },
+
+        .array_put => {
+            // arr[idx] = val: pop value, pop index, pop base, store to memory
+            if (vstack.items.len < 3) return CodegenError.StackUnderflow;
+            const val = numVstackPop(vstack);
+            const idx_val = numVstackPop(vstack);
+            const base_val = numVstackPop(vstack);
+            const base_ptr = c.LLVMBuildIntToPtr(builder.ref, base_val, llvm.ptrType(), "arr_base_w");
+            var gep_indices = [_]llvm.Value{idx_val};
+            const elem_ptr = c.LLVMBuildGEP2(builder.ref, llvm.i32Type(), base_ptr, &gep_indices, 1, "arr_gep_w");
+            // For f64 tier, convert f64 value to i32 for storage
+            const store_val = switch (kind) {
+                .i32 => val,
+                .f64 => builder.buildFPToSI(val, llvm.i32Type(), "arr_i32_w"),
+            };
+            _ = builder.buildStore(store_val, elem_ptr);
+        },
+
+        .array_length => {
+            // Fallback: get_length not preceded by get_arg — not supported in standalone WASM
+            // (The peephole in generateNumericBody handles the common get_arg+get_length pattern)
+            return CodegenError.UnsupportedOpcode;
         },
 
         .unsupported => return CodegenError.UnsupportedOpcode,
@@ -4946,13 +5782,13 @@ fn emitFallbackOpcode(tctx: *ThinCodegenCtx, instr: Instruction) void {
         .i32 => |v| v,
         .u8 => |v| @as(i32, @intCast(v)),
         .u16 => |v| @as(i32, @intCast(v)),
-        .atom => |v| @as(i32, @intCast(v)),
+        .atom => |v| @as(i32, @bitCast(v)),
         .loc => |v| @as(i32, @intCast(v)),
         .arg => |v| @as(i32, @intCast(v)),
         .var_ref => |v| @as(i32, @intCast(v)),
-        .const_idx => |v| @as(i32, @intCast(v)),
+        .const_idx => |v| @as(i32, @bitCast(v)),
         .label => |v| v,
-        .atom_u8 => |v| @as(i32, @intCast(v.atom)), // atom only; flags in operand2
+        .atom_u8 => |v| @as(i32, @bitCast(v.atom)), // atom only; flags in operand2
         else => 0,
     });
     // Second operand for atom_u8 format: the flags byte

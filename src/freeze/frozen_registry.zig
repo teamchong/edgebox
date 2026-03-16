@@ -1072,9 +1072,21 @@ pub fn generateModuleZigShardedWithBackend(
             // Track int32 shard count (thin shards follow after these)
             int32_llvm_shard_count = llvm_shard_count;
 
-            // Generate standalone WASM for numeric functions (i32 + f64, no QuickJS runtime)
-            // These can run directly in V8/workerd at near-native speed
-            {
+            // NOTE: Int32 functions are NOT removed from generated_all.
+            // They remain in Zig shards for cross-platform compatibility.
+            // The LLVM .o files re-register the same dispatch keys with LLVM-compiled versions.
+        }
+
+        // Generate standalone WASM for numeric functions (i32 + f64 + array, no QuickJS runtime)
+        // These can run directly in V8/workerd at near-native speed.
+        // Runs independently of whether there are int32 shard functions.
+        if (std.posix.getenv("EDGEBOX_WASM_DEBUG") != null) {
+            std.debug.print("[wasm-scan] generated_all has {d} functions:\n", .{generated_all.items.len});
+            for (generated_all.items) |gf| {
+                std.debug.print("  [{d}] '{s}' (namelen={d}) args={d} vars={d}\n", .{ gf.idx, gf.func.name, gf.func.name.len, gf.func.arg_count, gf.func.var_count });
+            }
+        }
+        {
                 // Collect ALL numeric-tier functions (i32 already in llvm_funcs, plus f64)
                 var wasm_funcs = std.ArrayListUnmanaged(llvm_codegen.ShardFunction){};
                 defer wasm_funcs.deinit(allocator);
@@ -1176,11 +1188,13 @@ pub fn generateModuleZigShardedWithBackend(
                     var cross_infos = std.ArrayListUnmanaged(CrossInfo){};
                     defer cross_infos.deinit(allocator);
 
+                    const cross_debug = std.posix.getenv("EDGEBOX_WASM_DEBUG") != null;
                     for (generated_all.items, 0..) |gf, gi| {
                         // Skip functions already in WASM set
                         if (isPureInt32Function(gf.func)) continue;
                         if (analyzeNumericTier(gf.func) != null) continue;
 
+                        if (cross_debug and gf.func.name.len > 0) std.debug.print("[wasm-cross-scan] {s}: checking cross-call (args={d}, vars={d})\n", .{ gf.func.name, gf.func.arg_count, gf.func.var_count });
                         // Check if it qualifies with cross-call context
                         const tier = analyzeNumericTierWithCrossCall(gf.func, wasm_name_set.items) orelse continue;
                         _ = tier;
@@ -1219,9 +1233,11 @@ pub fn generateModuleZigShardedWithBackend(
                     }
                 }
 
+                std.debug.print("[freeze-debug] wasm_funcs.len = {d}\n", .{wasm_funcs.items.len});
                 var standalone_path_buf: [4096]u8 = undefined;
                 const standalone_path = std.fmt.bufPrintZ(&standalone_path_buf, "{s}/standalone.o", .{cache_dir}) catch null;
                 if (standalone_path) |sp| {
+                    std.debug.print("[freeze-debug] Calling generateStandaloneWasm with {d} functions → {s}\n", .{ wasm_funcs.items.len, sp });
                     if (llvm_codegen.generateStandaloneWasm(allocator, wasm_funcs.items, sp)) |standalone_result| {
                         if (standalone_result.has_functions) {
                             std.debug.print("[freeze] Standalone WASM: {d} numeric functions → {s}\n", .{
@@ -1234,17 +1250,65 @@ pub fn generateModuleZigShardedWithBackend(
                                 if (std.fs.cwd().createFile(mp, .{})) |mf| {
                                     defer mf.close();
                                     mf.writeAll("[") catch {};
+
+                                    // Build name→array_args map for cross-call propagation
+                                    const ArrayInfo = struct { array_args: u8, mutated_args: u8 };
+                                    var array_info_map = std.StringHashMapUnmanaged(ArrayInfo){};
+                                    defer array_info_map.deinit(allocator);
+                                    for (wasm_funcs.items) |sf| {
+                                        const aa = numeric_handlers.detectArrayArgs(sf.func.instructions, sf.func.arg_count);
+                                        const ma = numeric_handlers.detectMutatedArgs(sf.func.instructions, sf.func.arg_count);
+                                        array_info_map.put(allocator, sf.name, .{ .array_args = aa, .mutated_args = ma }) catch {};
+                                    }
+
                                     var first = true;
                                     for (wasm_funcs.items) |sf| {
                                         if (!first) mf.writeAll(",") catch {};
                                         first = false;
-                                        var entry_buf: [512]u8 = undefined;
                                         const type_str: []const u8 = switch (sf.value_kind) {
                                             .i32 => "i32",
                                             .f64 => "f64",
                                         };
                                         const recursive: u8 = if (sf.func.is_self_recursive) 1 else 0;
-                                        const entry = std.fmt.bufPrint(&entry_buf, "{{\"name\":\"{s}\",\"args\":{d},\"type\":\"{s}\",\"instrs\":{d},\"recursive\":{d}}}", .{ sf.name, sf.func.arg_count, type_str, sf.func.instructions.len, recursive }) catch continue;
+                                        var array_args_mask = numeric_handlers.detectArrayArgs(sf.func.instructions, sf.func.arg_count);
+                                        var mutated_args_mask = numeric_handlers.detectMutatedArgs(sf.func.instructions, sf.func.arg_count);
+
+                                        // Propagate array_args from callees to cross-callers
+                                        // If this function calls vn(x, xi, y, yi, n), and vn has array_args=0b10001 (x and y),
+                                        // then this function's args that map to vn's array args also need copying.
+                                        if (array_args_mask == 0) {
+                                            for (sf.func.instructions) |instr| {
+                                                const handler = numeric_handlers.getHandler(instr.opcode);
+                                                if (handler.pattern == .self_ref) {
+                                                    // Resolve callee name (get_var for globals, get_var_ref0 for closures)
+                                                    const callee_name: ?[]const u8 = if (instr.opcode == .get_var or instr.opcode == .get_var_undef) blk: {
+                                                        const atom_val: u32 = switch (instr.operand) { .atom => |a| a, else => break :blk null };
+                                                        break :blk resolveAtomToName(sf.func, atom_val);
+                                                    } else if (instr.opcode == .get_var_ref0) blk: {
+                                                        if (sf.func.closure_vars.len > 0) break :blk sf.func.closure_vars[0].name;
+                                                        break :blk null;
+                                                    } else null;
+                                                    if (callee_name) |cn| {
+                                                        if (array_info_map.get(cn)) |info| {
+                                                            if (info.array_args != 0) {
+                                                                array_args_mask = info.array_args;
+                                                                mutated_args_mask = info.mutated_args;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        const length_args_mask = numeric_handlers.detectLengthArgs(sf.func.instructions, sf.func.arg_count);
+                                        // Use synthetic name for anonymous functions
+                                        var synth_buf: [32]u8 = undefined;
+                                        const manifest_name = if (sf.name.len == 0)
+                                            std.fmt.bufPrint(&synth_buf, "__anon_L{d}", .{sf.func.line_num}) catch sf.name
+                                        else
+                                            sf.name;
+                                        var entry_buf: [512]u8 = undefined;
+                                        const entry = std.fmt.bufPrint(&entry_buf, "{{\"name\":\"{s}\",\"args\":{d},\"type\":\"{s}\",\"instrs\":{d},\"recursive\":{d},\"array_args\":{d},\"mutated_args\":{d},\"length_args\":{d},\"line\":{d}}}", .{ manifest_name, sf.func.arg_count, type_str, sf.func.instructions.len, recursive, array_args_mask, mutated_args_mask, length_args_mask, sf.func.line_num }) catch continue;
                                         mf.writeAll(entry) catch {};
                                     }
                                     mf.writeAll("]") catch {};
@@ -1256,13 +1320,6 @@ pub fn generateModuleZigShardedWithBackend(
                     }
                 }
             }
-
-            // NOTE: Int32 functions are NOT removed from generated_all.
-            // They remain in Zig shards for cross-platform compatibility (embed, standalone/WASM).
-            // The LLVM .o files re-register the same dispatch keys with LLVM-compiled versions.
-            // Since native_dispatch.register() uses put() (overwrites), the LLVM versions win
-            // because LLVM shard constructors run AFTER Zig shard inits.
-        }
 
         // ===== Phase 2: Thin codegen for ALL remaining functions =====
         // Collect non-int32 functions for LLVM thin codegen
@@ -1952,19 +2009,40 @@ pub fn isPureInt32Function(func: AnalyzedFunction) bool {
 /// Unlike isPureInt32Function, this allows backward jumps (while loops)
 /// because LLVM generates proper basic blocks — no Zig hotpath dispatch issues.
 pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
+    const debug = std.posix.getenv("EDGEBOX_WASM_DEBUG") != null;
     // Same preconditions as isPureInt32Function
-    if (func.arg_count < 1 or func.arg_count > 8) return null;
-    if (func.var_count > 16) return null;
+    if (func.arg_count < 1 or func.arg_count > 8) {
+        if (debug) std.debug.print("[wasm-reject] {s}: arg_count={d}\n", .{ func.name, func.arg_count });
+        return null;
+    }
+    if (func.var_count > 48) {
+        if (debug) std.debug.print("[wasm-reject] {s}: var_count={d}\n", .{ func.name, func.var_count });
+        return null;
+    }
 
     // Use comptime numeric analysis
-    const kind = numeric_handlers.analyzeFunction(func.instructions) orelse return null;
+    const kind = numeric_handlers.analyzeFunction(func.instructions) orelse {
+        if (debug) {
+            for (func.instructions) |instr| {
+                const handler = numeric_handlers.getHandler(instr.opcode);
+                if (handler.pattern == .unsupported) {
+                    std.debug.print("[wasm-reject] {s}: unsupported opcode '{s}'\n", .{ func.name, @tagName(instr.opcode) });
+                    break;
+                }
+            }
+        }
+        return null;
+    };
 
     // For non-recursive functions, reject recursive-only patterns
     // (self_ref + call_self without the function being self-recursive)
     if (!func.is_self_recursive) {
         for (func.instructions) |instr| {
             const handler = numeric_handlers.getHandler(instr.opcode);
-            if (handler.pattern == .self_ref or handler.pattern == .call_self or handler.pattern == .tail_call_self) return null;
+            if (handler.pattern == .self_ref or handler.pattern == .call_self or handler.pattern == .tail_call_self) {
+                if (debug) std.debug.print("[wasm-reject] {s}: non-recursive with call pattern '{s}'\n", .{ func.name, @tagName(instr.opcode) });
+                return null;
+            }
         }
     }
 
@@ -2011,7 +2089,7 @@ pub fn analyzeNumericTierWithCrossCall(
     wasm_func_names: []const []const u8,
 ) ?numeric_handlers.ValueKind {
     if (func.arg_count < 1 or func.arg_count > 8) return null;
-    if (func.var_count > 16) return null;
+    if (func.var_count > 48) return null;
 
     const kind = numeric_handlers.analyzeFunction(func.instructions) orelse return null;
 
@@ -2042,8 +2120,14 @@ pub fn analyzeNumericTierWithCrossCall(
                             break;
                         }
                     }
-                    if (!found) return null;
+                    if (!found) {
+                        const debug = std.posix.getenv("EDGEBOX_WASM_DEBUG") != null;
+                        if (debug) std.debug.print("[wasm-cross-reject] {s}: callee '{s}' not in WASM set ({d} funcs)\n", .{ func.name, cn, wasm_func_names.len });
+                        return null;
+                    }
                 } else {
+                    const debug = std.posix.getenv("EDGEBOX_WASM_DEBUG") != null;
+                    if (debug) std.debug.print("[wasm-cross-reject] {s}: could not resolve callee name\n", .{func.name});
                     return null;
                 }
             }

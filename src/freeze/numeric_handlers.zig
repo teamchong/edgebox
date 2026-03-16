@@ -44,6 +44,8 @@ pub const NumericPattern = enum {
     lnot,
     /// Increment/decrement: val +/- 1
     inc_dec,
+    /// Post-increment/decrement: pop val, push (val+/-1), push val (old value)
+    post_inc_dec,
     /// Get local variable
     get_loc,
     /// Put local variable (pop + store)
@@ -54,6 +56,8 @@ pub const NumericPattern = enum {
     add_loc,
     /// Increment local: local[N]++
     inc_loc,
+    /// Get two locals at once (fused: push loc0, push loc1)
+    get_loc_pair,
     /// Get local with TDZ check
     get_loc_check,
     /// Put local with const check
@@ -86,6 +90,17 @@ pub const NumericPattern = enum {
     goto_br,
     /// Push constant from constant pool (resolved at compile time)
     push_cpool,
+    /// Array element read: arr[idx] (pops array+index, pushes element)
+    array_get,
+    /// Array element read keeping array: arr[idx] (pops index, keeps array, pushes element)
+    array_get2,
+    /// Array element write: arr[idx] = val (pops array+index+value)
+    array_put,
+    /// Array length: pops array base, pushes its length (from extra WASM param)
+    array_length,
+    /// Always-false check (pops value, pushes 0). Used for is_undefined/is_null
+    /// in numeric context where values are never undefined or null.
+    always_false,
     /// Unsupported in numeric mode
     unsupported,
 };
@@ -128,6 +143,15 @@ pub fn getHandler(opcode: Opcode) NumericHandler {
         // ── Push booleans ───────────────────────────────────────
         .push_true => .{ .pattern = .push_bool, .value = 1 },
         .push_false => .{ .pattern = .push_bool, .value = 0 },
+
+        // ── Null/undefined checks (always false in numeric context) ──
+        .is_undefined, .is_null, .is_undefined_or_null => .{ .pattern = .always_false },
+
+        // ── Property key conversion (no-op for numeric values) ──────
+        // to_propkey: replaces TOS (n_pop=1, n_push=1) → nop in numeric context
+        .to_propkey => .{ .pattern = .nop },
+        // to_propkey2: keeps original, pushes key copy (n_pop=1, n_push=2) → dup in numeric context
+        .to_propkey2 => .{ .pattern = .stack_dup },
 
         // ── Get arguments ───────────────────────────────────────
         .get_arg0 => .{ .pattern = .get_arg, .index = 0 },
@@ -186,6 +210,7 @@ pub fn getHandler(opcode: Opcode) NumericHandler {
         .get_loc2 => .{ .pattern = .get_loc, .index = 2 },
         .get_loc3 => .{ .pattern = .get_loc, .index = 3 },
         .get_loc, .get_loc8 => .{ .pattern = .get_loc },
+        .get_loc0_loc1 => .{ .pattern = .get_loc_pair },
 
         // ── Put locals ──────────────────────────────────────────
         .put_loc0 => .{ .pattern = .put_loc, .index = 0 },
@@ -208,6 +233,8 @@ pub fn getHandler(opcode: Opcode) NumericHandler {
         // ── Inc/Dec ─────────────────────────────────────────────
         .inc => .{ .pattern = .inc_dec, .is_inc = true },
         .dec => .{ .pattern = .inc_dec, .is_inc = false },
+        .post_inc => .{ .pattern = .post_inc_dec, .is_inc = true },
+        .post_dec => .{ .pattern = .post_inc_dec, .is_inc = false },
 
         // ── Stack ops ───────────────────────────────────────────
         .dup => .{ .pattern = .stack_dup },
@@ -236,10 +263,22 @@ pub fn getHandler(opcode: Opcode) NumericHandler {
         .if_true, .if_true8 => .{ .pattern = .if_true },
         .goto, .goto8, .goto16 => .{ .pattern = .goto_br },
 
+        // ── Array access (via WASM linear memory) ──────────────
+        .get_array_el => .{ .pattern = .array_get },
+        .get_array_el2 => .{ .pattern = .array_get2 },
+        .put_array_el => .{ .pattern = .array_put },
+        .get_length => .{ .pattern = .array_length },
+
         // ── Everything else ─────────────────────────────────────
         else => .{ .pattern = .unsupported },
     };
 }
+
+/// Result of function analysis — includes tier and array usage info.
+pub const AnalysisResult = struct {
+    kind: ValueKind,
+    uses_arrays: bool,
+};
 
 /// Analyze a function's opcodes at comptime to determine which numeric
 /// tier it qualifies for. Returns null if unsupported.
@@ -250,9 +289,16 @@ pub fn getHandler(opcode: Opcode) NumericHandler {
 ///   3. If ALL opcodes are numeric-compatible and none introduce float → i32 tier
 ///   4. Must have at least one "computing" opcode to avoid pass-through functions
 pub fn analyzeFunction(instructions: anytype) ?ValueKind {
+    const result = analyzeFunctionFull(instructions) orelse return null;
+    return result.kind;
+}
+
+/// Full analysis returning both numeric tier and array usage info.
+pub fn analyzeFunctionFull(instructions: anytype) ?AnalysisResult {
     var has_computing_op = false;
     var needs_float = false;
     var has_i32_only = false;
+    var uses_arrays = false;
 
     for (instructions) |instr| {
         const handler = getHandler(instr.opcode);
@@ -263,10 +309,14 @@ pub fn analyzeFunction(instructions: anytype) ?ValueKind {
 
         switch (handler.pattern) {
             .binary_arith, .binary_cmp, .bitwise_binary,
-            .unary, .inc_dec, .lnot, .push_const, .push_cpool,
+            .unary, .inc_dec, .post_inc_dec, .lnot, .push_const, .push_cpool,
             .push_bool, .call_self, .tail_call_self,
             .add_loc, .inc_loc,
             => has_computing_op = true,
+            .array_get, .array_get2, .array_put, .array_length => {
+                has_computing_op = true;
+                uses_arrays = true;
+            },
             else => {},
         }
     }
@@ -276,22 +326,370 @@ pub fn analyzeFunction(instructions: anytype) ?ValueKind {
     // If function uses div AND bitwise ops, compile as i32 with truncating
     // division (sdiv). This matches the JS `(x / y) | 0` idiom for integer
     // division. The bitwise ops prove the programmer expects integer results.
-    if (needs_float and has_i32_only) return .i32;
+    const kind: ValueKind = if (needs_float and has_i32_only) .i32 else if (needs_float) .f64 else .i32;
 
-    if (needs_float) return .f64;
-    return .i32;
+    return .{ .kind = kind, .uses_arrays = uses_arrays };
 }
 
 /// Check if a pattern proves the function does computation (not just pass-through)
 pub fn isComputingPattern(pattern: NumericPattern) bool {
     return switch (pattern) {
         .binary_arith, .binary_cmp, .bitwise_binary,
-        .unary, .inc_dec, .lnot, .push_const, .push_cpool,
+        .unary, .inc_dec, .post_inc_dec, .lnot, .push_const, .push_cpool,
         .push_bool, .call_self, .tail_call_self,
         .add_loc, .inc_loc,
+        .array_get, .array_get2, .array_put, .array_length,
         => true,
         else => false,
     };
+}
+
+/// Detect which function arguments are used as arrays (vs scalars).
+/// Uses lightweight stack simulation to trace argument flow into
+/// get_array_el/put_array_el opcodes.
+/// Returns a bitmask: bit N set = arg N is an array.
+pub fn detectArrayArgs(instructions: anytype, arg_count: u32) u8 {
+    // Stack entries: -1 = not an arg, 0..7 = arg index
+    var stack: [128]i8 = undefined;
+    var sp: usize = 0;
+    var result: u8 = 0;
+
+    for (instructions) |instr| {
+        const handler = getHandler(instr.opcode);
+        switch (handler.pattern) {
+            .get_arg => {
+                const idx: u8 = handler.index orelse switch (instr.operand) {
+                    .arg => |a| @intCast(a),
+                    .u8 => |a| a,
+                    else => 255,
+                };
+                if (sp < stack.len) {
+                    stack[sp] = if (idx < arg_count) @intCast(idx) else -1;
+                    sp += 1;
+                }
+            },
+            .array_get => {
+                // Pop index, pop base. Base might be an arg.
+                if (sp >= 2) {
+                    sp -= 1; // pop index
+                    sp -= 1; // pop base
+                    const base_arg = stack[sp];
+                    if (base_arg >= 0 and base_arg < 8) result |= @as(u8, 1) << @intCast(base_arg);
+                    stack[sp] = -1; // result is not an arg
+                    sp += 1;
+                }
+            },
+            .array_get2 => {
+                // Pop index, keep base. Push result on top.
+                if (sp >= 2) {
+                    sp -= 1; // pop index
+                    // base stays at sp-1
+                    if (sp >= 1) {
+                        const base_arg = stack[sp - 1];
+                        if (base_arg >= 0 and base_arg < 8) result |= @as(u8, 1) << @intCast(base_arg);
+                    }
+                    // push result
+                    if (sp < stack.len) {
+                        stack[sp] = -1;
+                        sp += 1;
+                    }
+                }
+            },
+            .array_put => {
+                // Pop value, pop index, pop base.
+                if (sp >= 3) {
+                    sp -= 1; // pop value
+                    sp -= 1; // pop index
+                    sp -= 1; // pop base
+                    const base_arg = stack[sp];
+                    if (base_arg >= 0 and base_arg < 8) result |= @as(u8, 1) << @intCast(base_arg);
+                }
+            },
+            // For all other patterns, use generic stack effect
+            .push_const, .push_cpool, .push_bool => {
+                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+            },
+            .binary_arith, .binary_cmp, .bitwise_binary => {
+                if (sp >= 2) { sp -= 1; stack[sp - 1] = -1; } // pop 2, push 1
+            },
+            .unary, .lnot, .inc_dec => {
+                if (sp >= 1) { stack[sp - 1] = -1; } // pop 1, push 1
+            },
+            .post_inc_dec => {
+                // Pop 1, push 2 (incremented value + old value)
+                if (sp >= 1) {
+                    stack[sp - 1] = -1; // overwrite with new value
+                    if (sp < stack.len) { stack[sp] = -1; sp += 1; } // push old value
+                }
+            },
+            .get_loc, .get_loc_check => {
+                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+            },
+            .get_loc_pair => {
+                // Push 2 locals (loc0 and loc1)
+                if (sp + 1 < stack.len) { stack[sp] = -1; stack[sp + 1] = -1; sp += 2; }
+            },
+            .put_loc, .put_loc_check, .put_arg => {
+                if (sp >= 1) sp -= 1; // pop 1, push 0
+            },
+            .set_loc, .set_arg => {}, // peek, no pop
+            .stack_dup => {
+                if (sp >= 1 and sp < stack.len) { stack[sp] = stack[sp - 1]; sp += 1; }
+            },
+            .stack_drop => {
+                if (sp >= 1) sp -= 1;
+            },
+            .stack_swap => {
+                if (sp >= 2) {
+                    const tmp = stack[sp - 1];
+                    stack[sp - 1] = stack[sp - 2];
+                    stack[sp - 2] = tmp;
+                }
+            },
+            .self_ref => {
+                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+            },
+            .call_self => {
+                // Pop function ref + args, push result
+                const argc: u32 = switch (instr.opcode) {
+                    .call1 => 1,
+                    .call2 => 2,
+                    .call3 => 3,
+                    .call => instr.operand.u16,
+                    else => 1,
+                };
+                if (sp >= argc) sp -= argc;
+                // pop the function ref too (from self_ref)
+                if (sp >= 1) sp -= 1;
+                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+            },
+            .ret, .if_false, .if_true => {
+                if (sp >= 1) sp -= 1;
+            },
+            .add_loc, .inc_loc => {
+                if (sp >= 1) sp -= 1; // add_loc pops from stack
+            },
+            .array_length => {
+                // Pop array base, push length (not an arg)
+                if (sp >= 1) {
+                    const base_arg = stack[sp - 1];
+                    if (base_arg >= 0 and base_arg < 8) result |= @as(u8, 1) << @intCast(base_arg);
+                    stack[sp - 1] = -1;
+                }
+            },
+            .always_false => {
+                // Pop 1, push 1 (result is not an arg)
+                if (sp >= 1) { stack[sp - 1] = -1; }
+            },
+            .nop, .goto_br, .set_loc_uninitialized, .tail_call_self => {},
+            .unsupported => {},
+        }
+    }
+    return result;
+}
+
+/// Detect which function args are WRITTEN via put_array_el.
+/// Returns a bitmask: bit N set = arg N is mutated (needs copy-back).
+/// Read-only array args (only used via get_array_el) won't have their bit set.
+pub fn detectMutatedArgs(instructions: anytype, arg_count: u32) u8 {
+    var stack: [128]i8 = undefined;
+    var sp: usize = 0;
+    var result: u8 = 0;
+
+    for (instructions) |instr| {
+        const handler = getHandler(instr.opcode);
+        switch (handler.pattern) {
+            .get_arg => {
+                const idx: u8 = handler.index orelse switch (instr.operand) {
+                    .arg => |a| @intCast(a),
+                    .u8 => |a| a,
+                    else => 255,
+                };
+                if (sp < stack.len) {
+                    stack[sp] = if (idx < arg_count) @intCast(idx) else -1;
+                    sp += 1;
+                }
+            },
+            .array_get => {
+                if (sp >= 2) { sp -= 2; stack[sp] = -1; sp += 1; }
+            },
+            .array_get2 => {
+                if (sp >= 2) { sp -= 1; if (sp < stack.len) { stack[sp] = -1; sp += 1; } }
+            },
+            .array_put => {
+                // Only put_array_el marks args as mutated
+                if (sp >= 3) {
+                    sp -= 1; // pop value
+                    sp -= 1; // pop index
+                    sp -= 1; // pop base
+                    const base_arg = stack[sp];
+                    if (base_arg >= 0 and base_arg < 8) result |= @as(u8, 1) << @intCast(base_arg);
+                }
+            },
+            .push_const, .push_cpool, .push_bool => {
+                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+            },
+            .binary_arith, .binary_cmp, .bitwise_binary => {
+                if (sp >= 2) { sp -= 1; stack[sp - 1] = -1; }
+            },
+            .unary, .lnot, .inc_dec => {
+                if (sp >= 1) { stack[sp - 1] = -1; }
+            },
+            .post_inc_dec => {
+                if (sp >= 1) { stack[sp - 1] = -1; if (sp < stack.len) { stack[sp] = -1; sp += 1; } }
+            },
+            .get_loc, .get_loc_check => {
+                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+            },
+            .get_loc_pair => {
+                if (sp + 1 < stack.len) { stack[sp] = -1; stack[sp + 1] = -1; sp += 2; }
+            },
+            .put_loc, .put_loc_check, .put_arg => {
+                if (sp >= 1) sp -= 1;
+            },
+            .set_loc, .set_arg => {},
+            .stack_dup => {
+                if (sp >= 1 and sp < stack.len) { stack[sp] = stack[sp - 1]; sp += 1; }
+            },
+            .stack_drop => {
+                if (sp >= 1) sp -= 1;
+            },
+            .stack_swap => {
+                if (sp >= 2) {
+                    const tmp = stack[sp - 1];
+                    stack[sp - 1] = stack[sp - 2];
+                    stack[sp - 2] = tmp;
+                }
+            },
+            .self_ref => {
+                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+            },
+            .call_self => {
+                const argc: u32 = switch (instr.opcode) {
+                    .call1 => 1, .call2 => 2, .call3 => 3, .call => instr.operand.u16, else => 1,
+                };
+                if (sp >= argc) sp -= argc;
+                if (sp >= 1) sp -= 1;
+                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+            },
+            .ret, .if_false, .if_true => {
+                if (sp >= 1) sp -= 1;
+            },
+            .add_loc, .inc_loc => {
+                if (sp >= 1) sp -= 1;
+            },
+            .array_length => {
+                // Pop array base, push length (not an arg). No mutation.
+                if (sp >= 1) { stack[sp - 1] = -1; }
+            },
+            .always_false => {
+                if (sp >= 1) { stack[sp - 1] = -1; }
+            },
+            .nop, .goto_br, .set_loc_uninitialized, .tail_call_self => {},
+            .unsupported => {},
+        }
+    }
+    return result;
+}
+
+/// Detect which array args have `.length` accessed via `get_length`.
+/// Returns a bitmask: bit N set = arg N's length is read.
+/// Used to add extra length parameters to the WASM function signature.
+pub fn detectLengthArgs(instructions: anytype, arg_count: u32) u8 {
+    // Stack entries: -1 = not an arg, 0..7 = arg index
+    var stack: [128]i8 = undefined;
+    var sp: usize = 0;
+    var result: u8 = 0;
+
+    for (instructions) |instr| {
+        const handler = getHandler(instr.opcode);
+        switch (handler.pattern) {
+            .get_arg => {
+                const idx: u8 = handler.index orelse switch (instr.operand) {
+                    .arg => |a| @intCast(a),
+                    .u8 => |a| a,
+                    else => 255,
+                };
+                if (sp < stack.len) {
+                    stack[sp] = if (idx < arg_count) @intCast(idx) else -1;
+                    sp += 1;
+                }
+            },
+            .array_length => {
+                // Pop array base — if it was an arg, mark its length as used
+                if (sp >= 1) {
+                    const base_arg = stack[sp - 1];
+                    if (base_arg >= 0 and base_arg < 8) result |= @as(u8, 1) << @intCast(base_arg);
+                    stack[sp - 1] = -1; // length is not an arg
+                }
+            },
+            // All other patterns: generic stack simulation
+            .array_get => {
+                if (sp >= 2) { sp -= 2; if (sp < stack.len) { stack[sp] = -1; sp += 1; } }
+            },
+            .array_get2 => {
+                if (sp >= 2) { sp -= 1; if (sp < stack.len) { stack[sp] = -1; sp += 1; } }
+            },
+            .array_put => {
+                if (sp >= 3) { sp -= 3; }
+            },
+            .push_const, .push_cpool, .push_bool => {
+                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+            },
+            .binary_arith, .binary_cmp, .bitwise_binary => {
+                if (sp >= 2) { sp -= 1; stack[sp - 1] = -1; }
+            },
+            .unary, .lnot, .inc_dec, .always_false => {
+                if (sp >= 1) { stack[sp - 1] = -1; }
+            },
+            .post_inc_dec => {
+                if (sp >= 1) { stack[sp - 1] = -1; if (sp < stack.len) { stack[sp] = -1; sp += 1; } }
+            },
+            .get_loc, .get_loc_check => {
+                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+            },
+            .get_loc_pair => {
+                if (sp + 1 < stack.len) { stack[sp] = -1; stack[sp + 1] = -1; sp += 2; }
+            },
+            .put_loc, .put_loc_check, .put_arg => {
+                if (sp >= 1) sp -= 1;
+            },
+            .set_loc, .set_arg => {},
+            .stack_dup => {
+                if (sp >= 1 and sp < stack.len) { stack[sp] = stack[sp - 1]; sp += 1; }
+            },
+            .stack_drop => {
+                if (sp >= 1) sp -= 1;
+            },
+            .stack_swap => {
+                if (sp >= 2) {
+                    const tmp = stack[sp - 1];
+                    stack[sp - 1] = stack[sp - 2];
+                    stack[sp - 2] = tmp;
+                }
+            },
+            .self_ref => {
+                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+            },
+            .call_self => {
+                const argc: u32 = switch (instr.opcode) {
+                    .call1 => 1, .call2 => 2, .call3 => 3, .call => instr.operand.u16, else => 1,
+                };
+                if (sp >= argc) sp -= argc;
+                if (sp >= 1) sp -= 1;
+                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+            },
+            .ret, .if_false, .if_true => {
+                if (sp >= 1) sp -= 1;
+            },
+            .add_loc, .inc_loc => {
+                if (sp >= 1) sp -= 1;
+            },
+            .nop, .goto_br, .set_loc_uninitialized, .tail_call_self => {},
+            .unsupported => {},
+        }
+    }
+    return result;
 }
 
 // ============================================================================

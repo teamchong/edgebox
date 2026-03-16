@@ -1,6 +1,13 @@
 # EdgeBox
 
-QuickJS JavaScript runtime with **WAMR AOT compilation** for fast, sandboxed JavaScript execution at the edge.
+QuickJS JavaScript runtime with **LLVM-compiled frozen functions** and **standalone WASM generation** for fast, sandboxed JavaScript execution at the edge.
+
+## Two Execution Modes
+
+| Mode | Target | How It Works | Best For |
+|------|--------|--------------|----------|
+| **Native (Frozen LLVM)** | CLI binaries | QuickJS bytecode → LLVM IR → native `.o` files, linked into single binary | Standalone tools, CLI apps |
+| **AOT+JIT (V8/workerd)** | Cloudflare Workers | Numeric kernels → standalone `.wasm`, JS source-transformed with WASM call trampolines | Edge serverless, V8 environments |
 
 ## Architecture
 
@@ -30,6 +37,136 @@ QuickJS JavaScript runtime with **WAMR AOT compilation** for fast, sandboxed Jav
 │  │  - 13ms cold start, 454KB binary size               │  │
 │  └─────────────────────────────────────────────────────┘  │
 └───────────────────────────────────────────────────────────┘
+```
+
+## Frozen LLVM Backend (Native Codegen)
+
+The frozen LLVM backend compiles **all** JavaScript functions directly to native machine code via LLVM IR, bypassing WAMR entirely:
+
+```
+JavaScript Source
+    ↓  Bun bundler
+Bundled JS
+    ↓  QuickJS parser
+Bytecodes (11,000+ functions for TypeScript compiler)
+    ↓  LLVM IR codegen (src/freeze/llvm_codegen.zig)
+Native .o files (sharded, parallel compilation)
+    ↓  Zig linker
+Single native binary (edgeboxc output)
+```
+
+### Two Codegen Tiers
+
+| Tier | Description | Opcodes | Example Functions |
+|------|-------------|---------|-------------------|
+| **Int32** | Pure i32 SSA — no JSValue boxing, register-allocated | All arithmetic, bitwise, comparisons, locals, args, control flow | `fib`, `gcd`, `isPrime`, `hashMix` |
+| **Thin** | Full opcode coverage — inline fast paths + runtime call fallbacks | 200+ opcodes including property access, closures, IC, exceptions | All remaining functions |
+
+### Inline Optimizations (Thin Tier)
+
+- **Polymorphic IC (4-way)**: Inline shape check cascade for property access — 4 cached {shape, offset} pairs per callsite
+- **Integer fast paths**: Arithmetic, comparison, bitwise ops check int tag first, skip JSValue conversion
+- **Counted loop specialization**: `for (i=0; i<arr.length; i++) acc += arr[i]` → tight native loop with GEP, zero function calls per element
+- **VStack (virtual stack)**: LLVM SSA values tracked on a virtual stack, eliminating intermediate memory traffic
+- **charCodeAt/Array.push/Math.\***: Pattern-detected method calls compiled to direct C helpers
+
+### Performance (Frozen Native)
+
+Benchmarks on Linux x86_64 (Ryzen 9):
+
+| Benchmark | EdgeBox (Frozen) | Node.js (V8 JIT) | Speedup |
+|-----------|:----------------:|:-----------------:|:-------:|
+| fib(45) | 2,234 ms | 8,987 ms | **4.0x faster** |
+| ackermann(3,10) | 821 ms | 2,968 ms | **3.6x faster** |
+| hashMix 10M | 90 ms | 127 ms | **1.4x faster** |
+| gcd 1M | 62 ms | 76 ms | **1.2x faster** |
+| TSC `--noEmit` | 7.5 s | 0.56 s | 13x slower* |
+
+*\*TSC is dominated by object-heavy code (property access, closures). Frozen compilation excels at compute-intensive functions.*
+
+## AOT+JIT Pipeline (V8/workerd)
+
+For Cloudflare Workers and V8 environments, EdgeBox generates **standalone WASM** + **source-transformed JS** that V8 fuses via WASM inlining:
+
+```
+JavaScript Source
+    ↓  QuickJS bytecode analysis
+Numeric tier detection (i32 / f64 / array)
+    ↓  LLVM IR codegen → standalone .wasm
+Pure numeric kernels as WASM exports
+    ↓  Source-to-source transform
+JS with function bodies replaced by WASM call trampolines
+    ↓  V8 (Node.js / workerd)
+V8 inlines WASM calls into JS — zero boundary overhead
+```
+
+### Smart Trampoline Heuristic
+
+| Function Type | Strategy | Why |
+|---------------|----------|-----|
+| **Recursive** | Always trampoline to WASM | Deep call stacks stay inside WASM |
+| **Cross-callers** | Always trampoline | Calls to other WASM functions stay in WASM |
+| **Array functions** | Always trampoline + identity cache | Amortizes copy cost over iterations |
+| **Pure scalar** | Keep as JS | V8 JIT inlines perfectly, no benefit from WASM |
+
+### Array Copy Caching
+
+For read-only array arguments, the trampoline caches the last-used array identity to skip redundant copies:
+
+```javascript
+// Generated trampoline with identity cache
+let __gen = 0;            // invalidated by mutating functions
+let __c0_1 = null;        // cached array reference
+let __g0_1 = -1;          // generation when cached
+
+function adler32(adler, buf, len, pos) {
+  if (buf !== __c0_1 || __gen !== __g0_1) {
+    for (let __i = 0; __i < buf.length; __i++) __m[1024 + __i] = buf[__i];
+    __c0_1 = buf; __g0_1 = __gen;
+  }
+  return __wasm.exports.adler32(adler, 4096, len, pos);
+}
+```
+
+This eliminates 99.99% of copies for tight loops like `for (i = 0; i < 10000; i++) adler32(1, data, ...)`.
+
+### Performance (AOT+JIT on V8)
+
+Benchmarks running on Node.js v24 (V8):
+
+| Benchmark | WASM+V8 | Node.js | Speedup |
+|-----------|:-------:|:-------:|:-------:|
+| fib(45) | 2,148 ms | 8,987 ms | **4.2x faster** |
+| ackermann(3,10) | 821 ms | 2,968 ms | **3.6x faster** |
+| hanoi(25) | 44 ms | 203 ms | **4.6x faster** |
+| adler32 10K (cached) | 27 ms | 103 ms | **3.8x faster** |
+| vn verify 10M (cached) | 180 ms | 408 ms | **2.3x faster** |
+| hashMix 10M | 90 ms | 127 ms | **1.4x faster** |
+| gcd 1M | 62 ms | 76 ms | **1.2x faster** |
+
+### Real npm Packages Tested
+
+| Package | Functions Compiled | Result |
+|---------|:------------------:|--------|
+| **pako** (zlib) | 7 WASM functions | deflate→inflate roundtrip correct, adler32 3.8x faster |
+| **tweetnacl** (crypto) | 11 WASM functions | SHA-512 hash + secretbox correct, verify 2.3x faster |
+
+### Usage
+
+```bash
+# Compile JS → native binary + standalone WASM + worker JS
+./zig-out/bin/edgeboxc --binary-only my-app.js
+
+# Files generated:
+#   my-app.js/my-app                    - Native binary (QuickJS + frozen)
+#   my-app.js/my-app-standalone.wasm    - Standalone WASM (numeric kernels)
+#   my-app.js/my-app-worker.mjs         - Source-transformed JS for V8/workerd
+
+# Run with V8 (Node.js)
+node my-app.js/my-app-worker.mjs
+
+# Run native
+./my-app.js/my-app
 ```
 
 ## What is WAMR AOT?

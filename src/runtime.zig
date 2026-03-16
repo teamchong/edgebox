@@ -1632,7 +1632,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                 const standalone_wasm = std.fmt.bufPrint(&standalone_wasm_path_buf, "{s}/{s}-standalone.wasm", .{ output_dir, output_base }) catch null;
                 if (standalone_wasm) |sw| {
                     const link_result = runCommand(allocator, &.{
-                        "wasm-ld-19", "--no-entry", "--export-all", "-o", sw, so,
+                        "wasm-ld-19", "--no-entry", "--export-all", "--export-memory",
+                        "--initial-memory=131072", "-o", sw, so,
                     }) catch null;
                     if (link_result) |lr| {
                         defer {
@@ -1694,7 +1695,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     defer wf.close();
 
                     // Collect WASM function metadata from manifest
-                    const WasmFunc = struct { name: []const u8, arg_count: u32, instr_count: u32, is_recursive: bool };
+                    const WasmFunc = struct { name: []const u8, arg_count: u32, instr_count: u32, is_recursive: bool, array_args: u8, mutated_args: u8, length_args: u8, line_num: u32, is_anon: bool };
                     var wasm_funcs: [64]WasmFunc = undefined;
                     var wasm_func_count: usize = 0;
                     if (wasm_manifest) |mc| {
@@ -1722,8 +1723,52 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     const rd = rs + 12;
                                     if (rd < mc.len and mc[rd] == '1') is_rec = true;
                                 }
+                                // Parse array_args bitmask: "array_args":N
+                                var aa: u8 = 0;
+                                if (std.mem.indexOfPos(u8, mc, name_end, "\"array_args\":")) |aas| {
+                                    var aad = aas + 13;
+                                    var aa_val: u32 = 0;
+                                    while (aad < mc.len and mc[aad] >= '0' and mc[aad] <= '9') {
+                                        aa_val = aa_val * 10 + (mc[aad] - '0');
+                                        aad += 1;
+                                    }
+                                    aa = @truncate(aa_val);
+                                }
+                                // Parse mutated_args bitmask: "mutated_args":N
+                                var ma: u8 = aa; // Default: assume all array args mutated
+                                if (std.mem.indexOfPos(u8, mc, name_end, "\"mutated_args\":")) |mas| {
+                                    var mad = mas + 15;
+                                    var ma_val: u32 = 0;
+                                    while (mad < mc.len and mc[mad] >= '0' and mc[mad] <= '9') {
+                                        ma_val = ma_val * 10 + (mc[mad] - '0');
+                                        mad += 1;
+                                    }
+                                    ma = @truncate(ma_val);
+                                }
+                                // Parse length_args bitmask: "length_args":N
+                                var la: u8 = 0;
+                                if (std.mem.indexOfPos(u8, mc, name_end, "\"length_args\":")) |las| {
+                                    var lad = las + 14;
+                                    var la_val: u32 = 0;
+                                    while (lad < mc.len and mc[lad] >= '0' and mc[lad] <= '9') {
+                                        la_val = la_val * 10 + (mc[lad] - '0');
+                                        lad += 1;
+                                    }
+                                    la = @truncate(la_val);
+                                }
+                                // Parse line number: "line":N
+                                var ln: u32 = 0;
+                                if (std.mem.indexOfPos(u8, mc, name_end, "\"line\":")) |ls| {
+                                    var ld = ls + 7;
+                                    while (ld < mc.len and mc[ld] >= '0' and mc[ld] <= '9') {
+                                        ln = ln * 10 + (mc[ld] - '0');
+                                        ld += 1;
+                                    }
+                                }
+                                // Detect anonymous functions (synthetic name starts with __anon_)
+                                const is_anon = std.mem.startsWith(u8, mc[ns..name_end], "__anon_");
                                 if (wasm_func_count < 64) {
-                                    wasm_funcs[wasm_func_count] = .{ .name = mc[ns..name_end], .arg_count = ac, .instr_count = ic, .is_recursive = is_rec };
+                                    wasm_funcs[wasm_func_count] = .{ .name = mc[ns..name_end], .arg_count = ac, .instr_count = ic, .is_recursive = is_rec, .array_args = aa, .mutated_args = ma, .length_args = la, .line_num = ln, .is_anon = is_anon };
                                     wasm_func_count += 1;
                                 }
                                 pos = name_end + 1;
@@ -1732,36 +1777,133 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     }
 
                     // Preamble: load WASM module (compatible with Node.js + workerd)
+                    // Uses static ESM imports + createRequire for CJS compat
                     wf.writeAll("// EdgeBox AOT+JIT (auto-generated)\n") catch {};
                     wf.writeAll("// Source transform: function bodies replaced with WASM calls\n") catch {};
                     wf.writeAll("// V8 inlines these WASM calls into JS (zero overhead)\n\n") catch {};
+                    wf.writeAll("import { readFileSync } from 'fs';\n") catch {};
+                    wf.writeAll("import { fileURLToPath } from 'url';\n") catch {};
+                    wf.writeAll("import { dirname, join } from 'path';\n") catch {};
+                    wf.writeAll("import { createRequire } from 'module';\n") catch {};
+                    wf.writeAll("const require = createRequire(import.meta.url);\n\n") catch {};
                     wf.writeAll("let __wasm;\n") catch {};
                     wf.writeAll("if (typeof process !== 'undefined' && process.versions?.node) {\n") catch {};
-                    wf.writeAll("  const { readFileSync } = await import('fs');\n") catch {};
-                    wf.writeAll("  const { fileURLToPath } = await import('url');\n") catch {};
-                    wf.writeAll("  const { dirname, join } = await import('path');\n") catch {};
                     wf.writeAll("  const __dir = dirname(fileURLToPath(import.meta.url));\n") catch {};
                     wf.writeAll("  const buf = readFileSync(join(__dir, '") catch {};
                     wf.writeAll(wasm_filename) catch {};
                     wf.writeAll("'));\n") catch {};
                     wf.writeAll("  __wasm = new WebAssembly.Instance(new WebAssembly.Module(buf));\n") catch {};
                     wf.writeAll("} else {\n") catch {};
-                    wf.writeAll("  const wasm = await import('") catch {};
-                    wf.writeAll(wasm_filename) catch {};
-                    wf.writeAll("');\n") catch {};
-                    wf.writeAll("  __wasm = new WebAssembly.Instance(wasm.default || wasm);\n") catch {};
-                    wf.writeAll("}\n\n") catch {};
+                    wf.writeAll("  __wasm = null; // workerd loads WASM differently\n") catch {};
+                    wf.writeAll("}\n") catch {};
+                    // Hoist Int32Array view creation to module level (avoids per-call allocation)
+                    {
+                        var has_array_funcs = false;
+                        for (wasm_funcs[0..wasm_func_count]) |wfe| {
+                            if (wfe.array_args != 0) { has_array_funcs = true; break; }
+                        }
+                        if (has_array_funcs) {
+                            wf.writeAll("const __m = __wasm ? new Int32Array(__wasm.exports.memory.buffer) : null;\n") catch {};
+                            // Array copy cache: global generation counter + per-arg identity cache.
+                            // Read-only array args skip copy-in when same JS object is passed again
+                            // and no mutating WASM function has run since last copy.
+                            var has_any_mutating = false;
+                            var has_any_readonly = false;
+                            for (wasm_funcs[0..wasm_func_count]) |wfe| {
+                                if (wfe.mutated_args != 0) has_any_mutating = true;
+                                const read_only = wfe.array_args & ~wfe.mutated_args;
+                                if (read_only != 0) has_any_readonly = true;
+                            }
+                            if (has_any_readonly) {
+                                wf.writeAll("let __gen = 0;\n") catch {};
+                                for (wasm_funcs[0..wasm_func_count], 0..) |wfe, wfi| {
+                                    const read_only = wfe.array_args & ~wfe.mutated_args;
+                                    if (read_only == 0) continue;
+                                    var ai: u32 = 0;
+                                    while (ai < 8) : (ai += 1) {
+                                        if (read_only & (@as(u8, 1) << @intCast(ai)) != 0) {
+                                            var decl_buf: [80]u8 = undefined;
+                                            const decl = std.fmt.bufPrint(&decl_buf, "let __c{d}_{d}=null,__g{d}_{d}=-1;\n", .{ wfi, ai, wfi, ai }) catch continue;
+                                            wf.writeAll(decl) catch {};
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    wf.writeAll("\n") catch {};
 
                     // Source transform: copy original source, but replace function bodies
                     // for WASM-compiled functions with WASM call trampolines.
                     // e.g. `function fib(n) { ... }` → `function fib(n) { return __wasm.exports.fib(n); }`
+                    // Also handles arrow functions: `var adler32 = (a, b) => { ... }` → trampoline
                     if (clean_content) |cc| {
+                        // Compute preamble line offset: hooked bundle has polyfills prepended.
+                        // Module parser line numbers are based on hooked bundle.
+                        // Find the first line of clean content in hooked bundle to get offset.
+                        var preamble_lines: u32 = 0;
+                        {
+                            var hooked_path_buf2: [4096]u8 = undefined;
+                            const hooked_path2 = std.fmt.bufPrint(&hooked_path_buf2, "{s}/bundle_hooked.js", .{cache_dir}) catch null;
+                            if (hooked_path2) |hp| {
+                                if (std.fs.cwd().readFileAlloc(allocator, hp, 50 * 1024 * 1024)) |hc| {
+                                    defer allocator.free(hc);
+                                    // Find where clean content starts in hooked (match first 80 chars)
+                                    const match_len = @min(cc.len, 80);
+                                    if (match_len > 0) {
+                                        if (std.mem.indexOf(u8, hc, cc[0..match_len])) |start_offset| {
+                                            // Count newlines before start_offset
+                                            for (hc[0..start_offset]) |ch| {
+                                                if (ch == '\n') preamble_lines += 1;
+                                            }
+                                        }
+                                    }
+                                } else |_| {}
+                            }
+                        }
+
+                        // Build line→offset table for anonymous function matching
+                        var line_offsets: [8192]u32 = undefined;
+                        var line_count: u32 = 1;
+                        line_offsets[0] = 0; // line 1 starts at offset 0
+                        for (cc, 0..) |ch, ci| {
+                            if (ch == '\n' and line_count < line_offsets.len) {
+                                line_offsets[line_count] = @intCast(ci + 1);
+                                line_count += 1;
+                            }
+                        }
+
+                        // Pre-compute arrow function replacement positions
+                        // For each anonymous WASM function, find `=> {` on its line
+                        // Adjust line_num by preamble offset (hooked → clean)
+                        const ArrowReplace = struct { brace_pos: u32, func_idx: u16 };
+                        var arrow_replacements: [64]ArrowReplace = undefined;
+                        var arrow_count: usize = 0;
+                        for (wasm_funcs[0..wasm_func_count], 0..) |wf_entry, wfi| {
+                            if (!wf_entry.is_anon) continue;
+                            const adjusted_line = if (wf_entry.line_num > preamble_lines) wf_entry.line_num - preamble_lines else wf_entry.line_num;
+                            if (adjusted_line == 0 or adjusted_line >= line_count) continue;
+                            const line_start = line_offsets[adjusted_line - 1]; // 1-based
+                            const line_end = if (adjusted_line < line_count) line_offsets[adjusted_line] else @as(u32, @intCast(cc.len));
+                            // Find `=> {` on this line
+                            if (std.mem.indexOf(u8, cc[line_start..line_end], "=> {")) |arrow_off| {
+                                const brace_pos = line_start + @as(u32, @intCast(arrow_off)) + 3; // position of `{`
+                                if (arrow_count < arrow_replacements.len) {
+                                    arrow_replacements[arrow_count] = .{ .brace_pos = brace_pos, .func_idx = @intCast(wfi) };
+                                    arrow_count += 1;
+                                }
+                            }
+                        }
+
                         var src_pos: usize = 0;
                         while (src_pos < cc.len) {
                             // Try to match `function NAME(` for each WASM function
                             var matched_func: ?WasmFunc = null;
+                            var matched_func_idx: usize = 0;
                             var match_end: usize = 0;
-                            for (wasm_funcs[0..wasm_func_count]) |wf_entry| {
+                            var is_arrow_match = false;
+                            for (wasm_funcs[0..wasm_func_count], 0..) |wf_entry, wfi| {
+                                if (wf_entry.is_anon) continue; // handled separately
                                 // Build search pattern: "function NAME("
                                 if (src_pos + 9 + wf_entry.name.len + 1 > cc.len) continue;
                                 if (!std.mem.startsWith(u8, cc[src_pos..], "function ")) continue;
@@ -1772,19 +1914,41 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 // Verify it's a declaration (not part of a longer identifier)
                                 if (src_pos > 0 and isIdentChar(cc[src_pos - 1])) continue;
                                 matched_func = wf_entry;
+                                matched_func_idx = wfi;
                                 match_end = after_name;
                                 break;
                             }
 
+                            // Check for arrow function replacement at this position
+                            if (matched_func == null) {
+                                for (arrow_replacements[0..arrow_count]) |ar| {
+                                    if (ar.brace_pos == @as(u32, @intCast(src_pos))) {
+                                        matched_func = wasm_funcs[ar.func_idx];
+                                        matched_func_idx = ar.func_idx;
+                                        is_arrow_match = true;
+                                        // For arrows, match_end points to just before '(' in the params
+                                        // We need to find the '(' before ') => {'
+                                        // Scan backwards from brace_pos to find params
+                                        var scan_back = src_pos; // at '{'
+                                        if (scan_back >= 4) scan_back -= 4; // skip ' => '
+                                        // Now find the matching '('
+                                        while (scan_back > 0 and cc[scan_back] != '(') scan_back -= 1;
+                                        match_end = scan_back; // points to '('
+                                        break;
+                                    }
+                                }
+                            }
+
                             if (matched_func) |mf| {
-                                // Only trampoline recursive functions and cross-callers.
-                                // Non-recursive flat functions are better left as JS — V8 JIT
-                                // inlines them into the caller's loop body, avoiding the
-                                // ~12ns JS→WASM boundary crossing per call. Recursive functions
-                                // benefit from WASM because recursion stays inside WASM.
+                                // Smart trampoline heuristic:
+                                // - Recursive functions: ALWAYS trampoline (deep stacks stay in WASM)
+                                // - Cross-callers: ALWAYS trampoline (calls stay in WASM)
+                                // - Array functions with heavy computation (>200 instrs): trampoline
+                                //   (WASM compute amortizes copy cost)
+                                // - Small array/scalar functions (<200 instrs): keep as JS
+                                //   (V8 JIT inlines these perfectly; copy overhead dominates)
                                 if (!mf.is_recursive) {
-                                    // Check if body calls another WASM function (cross-call).
-                                    // Cross-callers benefit because both functions stay in WASM.
+                                    // Check if body calls another WASM function (cross-call)
                                     var calls_wasm = false;
                                     if (std.mem.indexOfPos(u8, cc, match_end, "{")) |bp| {
                                         var depth_scan: i32 = 1;
@@ -1802,7 +1966,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             }
                                         }
                                     }
-                                    if (!calls_wasm) {
+                                    // Keep as JS if: not a cross-caller AND no arrays
+                                    // Array functions always get trampolines (iteration cost >> copy cost)
+                                    if (!calls_wasm and mf.array_args == 0) {
                                         wf.writeAll(cc[src_pos .. src_pos + 1]) catch {};
                                         src_pos += 1;
                                         continue;
@@ -1810,12 +1976,15 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 }
 
                                 // Found a WASM function declaration. Find opening brace.
-                                const brace_pos = std.mem.indexOfPos(u8, cc, match_end, "{") orelse {
-                                    // No brace found — write char and advance
-                                    wf.writeAll(cc[src_pos .. src_pos + 1]) catch {};
-                                    src_pos += 1;
-                                    continue;
-                                };
+                                const brace_pos = if (is_arrow_match)
+                                    src_pos // for arrow functions, src_pos IS the brace
+                                else
+                                    std.mem.indexOfPos(u8, cc, match_end, "{") orelse {
+                                        // No brace found — write char and advance
+                                        wf.writeAll(cc[src_pos .. src_pos + 1]) catch {};
+                                        src_pos += 1;
+                                        continue;
+                                    };
 
                                 // Write everything up to and including the opening brace
                                 wf.writeAll(cc[src_pos .. brace_pos + 1]) catch {};
@@ -1865,17 +2034,154 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     scan += 1;
                                 }
 
-                                // Emit trampoline body: return __wasm.exports.NAME(a0, a1, ...);
-                                wf.writeAll(" return __wasm.exports.") catch {};
-                                wf.writeAll(mf.name) catch {};
-                                wf.writeAll("(") catch {};
-                                // Generate arg list matching original params
-                                // Read param names from original source between ( and )
+                                // Parse param names from original source
                                 const params_start = match_end + 1; // after '('
                                 const params_end = std.mem.indexOfPos(u8, cc, params_start, ")") orelse params_start;
                                 const params_str = cc[params_start..params_end];
-                                wf.writeAll(params_str) catch {};
-                                wf.writeAll("); }") catch {};
+
+                                // Split param names for individual access
+                                var param_names: [8][]const u8 = undefined;
+                                var param_count: u32 = 0;
+                                {
+                                    var ppos: usize = 0;
+                                    while (ppos < params_str.len and param_count < 8) {
+                                        // Skip whitespace
+                                        while (ppos < params_str.len and (params_str[ppos] == ' ' or params_str[ppos] == '\t')) ppos += 1;
+                                        const pstart = ppos;
+                                        while (ppos < params_str.len and params_str[ppos] != ',' and params_str[ppos] != ' ') ppos += 1;
+                                        if (ppos > pstart) {
+                                            param_names[param_count] = params_str[pstart..ppos];
+                                            param_count += 1;
+                                        }
+                                        // Skip comma
+                                        if (ppos < params_str.len and params_str[ppos] == ',') ppos += 1;
+                                    }
+                                }
+
+                                if (mf.array_args == 0) {
+                                    // No array args — simple scalar trampoline
+                                    wf.writeAll(" return __wasm.exports.") catch {};
+                                    wf.writeAll(mf.name) catch {};
+                                    wf.writeAll("(") catch {};
+                                    wf.writeAll(params_str) catch {};
+                                    wf.writeAll("); }") catch {};
+                                } else {
+                                    // Array args — copy to/from WASM linear memory
+                                    wf.writeAll("\n") catch {};
+                                    // __m is hoisted to module level (avoids per-call Int32Array creation)
+
+                                    // Determine which args are read-only (cached) vs mutated (always copy)
+                                    const read_only_args = mf.array_args & ~mf.mutated_args;
+
+                                    // Copy array args to WASM memory (1024 elements each region)
+                                    var byte_offset: u32 = 0;
+                                    var i: u32 = 0;
+                                    while (i < param_count) : (i += 1) {
+                                        if (mf.array_args & (@as(u8, 1) << @intCast(i)) != 0) {
+                                            var off_buf: [32]u8 = undefined;
+                                            const off_str = std.fmt.bufPrint(&off_buf, "{d}", .{byte_offset / 4}) catch "0";
+
+                                            if (read_only_args & (@as(u8, 1) << @intCast(i)) != 0) {
+                                                // Read-only arg: skip copy if same JS object + no mutations since last copy
+                                                var cache_id_buf: [32]u8 = undefined;
+                                                const cid = std.fmt.bufPrint(&cache_id_buf, "{d}_{d}", .{ matched_func_idx, i }) catch "0_0";
+                                                wf.writeAll("  if (") catch {};
+                                                wf.writeAll(param_names[i]) catch {};
+                                                wf.writeAll(" !== __c") catch {};
+                                                wf.writeAll(cid) catch {};
+                                                wf.writeAll(" || __gen !== __g") catch {};
+                                                wf.writeAll(cid) catch {};
+                                                wf.writeAll(") {\n") catch {};
+                                                wf.writeAll("    for (let __i = 0; __i < ") catch {};
+                                                wf.writeAll(param_names[i]) catch {};
+                                                wf.writeAll(".length; __i++) __m[") catch {};
+                                                wf.writeAll(off_str) catch {};
+                                                wf.writeAll(" + __i] = ") catch {};
+                                                wf.writeAll(param_names[i]) catch {};
+                                                wf.writeAll("[__i];\n") catch {};
+                                                wf.writeAll("    __c") catch {};
+                                                wf.writeAll(cid) catch {};
+                                                wf.writeAll(" = ") catch {};
+                                                wf.writeAll(param_names[i]) catch {};
+                                                wf.writeAll("; __g") catch {};
+                                                wf.writeAll(cid) catch {};
+                                                wf.writeAll(" = __gen;\n  }\n") catch {};
+                                            } else {
+                                                // Mutated arg: always copy in
+                                                wf.writeAll("  for (let __i = 0; __i < ") catch {};
+                                                wf.writeAll(param_names[i]) catch {};
+                                                wf.writeAll(".length; __i++) __m[") catch {};
+                                                wf.writeAll(off_str) catch {};
+                                                wf.writeAll(" + __i] = ") catch {};
+                                                wf.writeAll(param_names[i]) catch {};
+                                                wf.writeAll("[__i];\n") catch {};
+                                            }
+                                        }
+                                        byte_offset += 4096; // 1024 elements * 4 bytes each
+                                    }
+                                    // Call WASM with byte offsets for array args, scalars as-is
+                                    wf.writeAll("  const __r = __wasm.exports.") catch {};
+                                    wf.writeAll(mf.name) catch {};
+                                    wf.writeAll("(") catch {};
+                                    i = 0;
+                                    var arg_offset: u32 = 0;
+                                    while (i < param_count) : (i += 1) {
+                                        if (i > 0) wf.writeAll(", ") catch {};
+                                        if (mf.array_args & (@as(u8, 1) << @intCast(i)) != 0) {
+                                            var off_buf2: [32]u8 = undefined;
+                                            const off_str2 = std.fmt.bufPrint(&off_buf2, "{d}", .{arg_offset}) catch "0";
+                                            wf.writeAll(off_str2) catch {};
+                                        } else {
+                                            wf.writeAll(param_names[i]) catch {};
+                                        }
+                                        arg_offset += 4096;
+                                    }
+                                    // Append .length for array args that use get_length
+                                    i = 0;
+                                    while (i < param_count) : (i += 1) {
+                                        if (mf.length_args & (@as(u8, 1) << @intCast(i)) != 0) {
+                                            wf.writeAll(", ") catch {};
+                                            wf.writeAll(param_names[i]) catch {};
+                                            wf.writeAll(".length") catch {};
+                                        }
+                                    }
+                                    wf.writeAll(");\n") catch {};
+                                    // Copy modified arrays back from WASM memory (only mutated ones)
+                                    arg_offset = 0;
+                                    i = 0;
+                                    while (i < param_count) : (i += 1) {
+                                        if (mf.mutated_args & (@as(u8, 1) << @intCast(i)) != 0) {
+                                            var off_buf3: [32]u8 = undefined;
+                                            const off_str3 = std.fmt.bufPrint(&off_buf3, "{d}", .{arg_offset / 4}) catch "0";
+                                            wf.writeAll("  for (let __i = 0; __i < ") catch {};
+                                            wf.writeAll(param_names[i]) catch {};
+                                            wf.writeAll(".length; __i++) ") catch {};
+                                            wf.writeAll(param_names[i]) catch {};
+                                            wf.writeAll("[__i] = __m[") catch {};
+                                            wf.writeAll(off_str3) catch {};
+                                            wf.writeAll(" + __i];\n") catch {};
+                                        }
+                                        arg_offset += 4096;
+                                    }
+                                    // Invalidate caches if this function mutates arrays
+                                    if (mf.mutated_args != 0 and read_only_args != 0) {
+                                        // Only need gen counter if there are also read-only args somewhere
+                                        wf.writeAll("  __gen++;\n") catch {};
+                                    } else if (mf.mutated_args != 0) {
+                                        // Check if ANY other function has read-only args
+                                        var any_other_ro = false;
+                                        for (wasm_funcs[0..wasm_func_count]) |other_wf| {
+                                            if ((other_wf.array_args & ~other_wf.mutated_args) != 0) {
+                                                any_other_ro = true;
+                                                break;
+                                            }
+                                        }
+                                        if (any_other_ro) {
+                                            wf.writeAll("  __gen++;\n") catch {};
+                                        }
+                                    }
+                                    wf.writeAll("  return __r;\n}") catch {};
+                                }
 
                                 // src_pos = scan (past the closing brace we already consumed)
                                 src_pos = scan;
