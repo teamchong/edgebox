@@ -1966,9 +1966,11 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             }
                                         }
                                     }
-                                    // Keep as JS if: not a cross-caller AND no arrays
-                                    // Array functions always get trampolines (iteration cost >> copy cost)
-                                    if (!calls_wasm and mf.array_args == 0) {
+                                    // Keep as JS if: not a cross-caller AND no arrays AND not very heavy
+                                    // Very heavy scalar functions (>150 instrs) get WASM trampolines
+                                    // for consistent performance. Smaller functions are faster as JS
+                                    // when called millions of times (less per-call overhead).
+                                    if (!calls_wasm and mf.array_args == 0 and mf.instr_count < 150) {
                                         wf.writeAll(cc[src_pos .. src_pos + 1]) catch {};
                                         src_pos += 1;
                                         continue;
