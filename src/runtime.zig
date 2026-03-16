@@ -2027,12 +2027,18 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     //    Few iterations over fixed-size arrays (unrolled-in-loop).
                                     //    core_salsa20 (2386 instrs, 15 arrays): 506ms WASM vs 159ms V8.
                                     // 3. Small scalar functions (<150 instrs): V8 JIT already optimal.
-                                    // Compact array loops (has_loop, < 200 instrs) are trampolined:
+                                    // 4. Mutated fixed-size array loops: copy-back per element per call
+                                    //    dominates for small fixed-size arrays (no .length → hardcoded size).
+                                    //    A(o,a,b) in tweetnacl: 16-elem adds, 1313ms WASM vs 184ms V8.
+                                    //    But length-based loops (adler32) amortize copy cost with .length data.
+                                    // Compact array loops with .length (has_loop, < 200 instrs) are trampolined:
                                     // many iterations amortize copy cost.
-                                    // adler32 (68 instrs, has_loop): 29ms WASM vs 109ms V8.
+                                    // adler32 (68 instrs, has_loop, uses .length): 29ms WASM vs 109ms V8.
                                     const is_fixed_array = mf.array_args != 0 and mf.length_args == 0 and
                                         (!mf.has_loop or mf.instr_count >= 200);
-                                    if (!calls_wasm and (is_write_only_array or is_fixed_array or (mf.array_args == 0 and mf.instr_count < 150))) {
+                                    const is_mutated_fixed_loop = mf.mutated_args != 0 and mf.length_args == 0 and
+                                        mf.has_loop and mf.instr_count < 200;
+                                    if (!calls_wasm and (is_write_only_array or is_fixed_array or is_mutated_fixed_loop or (mf.array_args == 0 and mf.instr_count < 150))) {
                                         wf.writeAll(cc[src_pos .. src_pos + 1]) catch {};
                                         src_pos += 1;
                                         continue;
