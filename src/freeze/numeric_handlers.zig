@@ -326,10 +326,14 @@ pub fn analyzeFunctionFull(instructions: anytype) ?AnalysisResult {
 
     if (!has_computing_op) return null;
 
-    // If function uses div AND bitwise ops, compile as i32 with truncating
-    // division (sdiv). This matches the JS `(x / y) | 0` idiom for integer
-    // division. The bitwise ops prove the programmer expects integer results.
-    const kind: ValueKind = if (needs_float and has_i32_only) .i32 else if (needs_float) .f64 else .i32;
+    // Tier selection:
+    // - Pure integer (no float-introducing ops): i32 (optimal for bitwise, loops)
+    // - Any float-introducing ops (division): f64 — matches JS semantics where
+    //   arithmetic always uses double-precision float. The f64 tier handles
+    //   bitwise ops via fptosi→bitwise→sitofp (correct for JS `| 0` idiom).
+    //   Using i32 for `(x * y) | 0` gives WRONG results because i32.mul wraps
+    //   at 32 bits while JS multiplies in float64 then truncates.
+    const kind: ValueKind = if (needs_float) .f64 else .i32;
 
     return .{ .kind = kind, .uses_arrays = uses_arrays };
 }

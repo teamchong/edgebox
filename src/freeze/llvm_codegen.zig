@@ -350,6 +350,34 @@ pub fn generateStandaloneWasm(
     const builder = llvm.Builder.create(native.ctx);
     defer builder.dispose();
 
+    // === Provide fmod for f64 tier (no libc in standalone WASM) ===
+    // fmod(a, b) = a - trunc(a/b) * b, where trunc = fptosi + sitofp (toward zero)
+    {
+        var has_f64 = false;
+        for (functions) |sf| {
+            if (sf.value_kind == .f64) { has_f64 = true; break; }
+        }
+        if (has_f64) {
+            const f64_ty = llvm.doubleType();
+            var fmod_params = [_]llvm.Type{ f64_ty, f64_ty };
+            const fmod_fn_ty = llvm.functionType(f64_ty, &fmod_params, false);
+            const fmod_fn = native.module.addFunction("fmod", fmod_fn_ty);
+            // Must be external linkage so LLVM's frem→fmod lowering can resolve it
+            llvm.setLinkage(fmod_fn, c.LLVMExternalLinkage);
+            const fmod_entry = llvm.appendBasicBlock(fmod_fn, "entry");
+            builder.positionAtEnd(fmod_entry);
+            const a = c.LLVMGetParam(fmod_fn, 0);
+            const b = c.LLVMGetParam(fmod_fn, 1);
+            const div = builder.buildFDiv(a, b, "div");
+            // trunc toward zero: fptosi(f64→i64) then sitofp(i64→f64)
+            const trunc_i64 = builder.buildFPToSI(div, llvm.i64Type(), "trunc_i");
+            const truncated = builder.buildSIToFP(trunc_i64, f64_ty, "trunc_f");
+            const mul = builder.buildFMul(truncated, b, "mul");
+            const result = builder.buildFSub(a, mul, "fmod");
+            _ = builder.buildRet(result);
+        }
+    }
+
     // === Pass 1: Declare all functions (so cross-function calls can resolve) ===
     // For functions that access arr.length, we add extra i32 params for each array length.
     var length_args_buf: [64]u8 = undefined; // per-function length_args bitmask
@@ -2497,17 +2525,25 @@ fn emitNumericInstruction(
             if (vstack.items.len < 2) return CodegenError.StackUnderflow;
             const op = handler.op orelse return CodegenError.UnsupportedOpcode;
 
-            // For f64 tier (Math intrinsic functions), convert to i32, do bitwise, convert back.
-            // JS semantics: bitwise ops always convert operands to i32.
+            // For f64 tier, convert to i32 using JS ToInt32 semantics:
+            // ToInt32(x) = fptosi(x, i64) & 0xFFFFFFFF, then trunc to i32.
+            // This matches JS where (large_float | 0) wraps modularly.
+            // Direct fptosi(f64, i32) would saturate at i32_max for large values.
             const rhs_raw = numVstackPop(vstack);
             const lhs_raw = numVstackPop(vstack);
             const lhs = switch (kind) {
                 .i32 => lhs_raw,
-                .f64 => builder.buildFPToSI(lhs_raw, llvm.i32Type(), "bw_lhs"),
+                .f64 => blk: {
+                    const i64_val = builder.buildFPToSI(lhs_raw, llvm.i64Type(), "bw_lhs64");
+                    break :blk builder.buildTrunc(i64_val, llvm.i32Type(), "bw_lhs");
+                },
             };
             const rhs = switch (kind) {
                 .i32 => rhs_raw,
-                .f64 => builder.buildFPToSI(rhs_raw, llvm.i32Type(), "bw_rhs"),
+                .f64 => blk: {
+                    const i64_val = builder.buildFPToSI(rhs_raw, llvm.i64Type(), "bw_rhs64");
+                    break :blk builder.buildTrunc(i64_val, llvm.i32Type(), "bw_rhs");
+                },
             };
 
             const i32_result = if (std.mem.eql(u8, op, "&"))
