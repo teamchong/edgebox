@@ -1455,13 +1455,65 @@ fn generateNumericBody(
 
         var block_terminated = false;
         var pending_callee: ?llvm.Value = null;
-        var skip_next = false;
+        // Stack of pending Math intrinsics for nested patterns like Math.floor(Math.abs(x))
+        var math_intrinsic_stack: [8]frozen_registry.MathIntrinsic = undefined;
+        var math_intrinsic_depth: u32 = 0;
+        var skip_count: u32 = 0;
 
         // Process instructions. For the last instruction that is a terminator,
         // spill the vstack BEFORE emitting the branch.
         for (block.instructions, 0..) |instr, instr_idx| {
-            if (skip_next) { skip_next = false; continue; }
+            if (skip_count > 0) { skip_count -= 1; continue; }
             if (block_terminated) break;
+
+            // Peephole: Math.abs/sqrt/floor/ceil/round/trunc intrinsics
+            // Phase 1: Detect get_var("Math") + get_field2("method") → push to stack
+            if (instr.opcode == .get_var or instr.opcode == .get_var_undef) {
+                if (frozen_registry.detectMathSetup(analyzed, block.instructions, instr_idx)) |intrinsic| {
+                    if (math_intrinsic_depth < math_intrinsic_stack.len) {
+                        math_intrinsic_stack[math_intrinsic_depth] = intrinsic;
+                        math_intrinsic_depth += 1;
+                    }
+                    skip_count = 1; // skip get_field2
+                    continue;
+                }
+            }
+            // Phase 2: At call_method(1) or tail_call_method(1), emit the most recent intrinsic
+            if (math_intrinsic_depth > 0 and (instr.opcode == .call_method or instr.opcode == .tail_call_method)) {
+                const argc: u16 = switch (instr.operand) {
+                    .u16 => |v| v,
+                    else => 0,
+                };
+                if (argc == 1) {
+                    math_intrinsic_depth -= 1;
+                    const intrinsic = math_intrinsic_stack[math_intrinsic_depth];
+                    // Pop argument from vstack
+                    if (vstack.items.len < 1) return CodegenError.StackUnderflow;
+                    const arg = vstack.items[vstack.items.len - 1];
+                    vstack.items.len -= 1;
+                    // Convert to f64 if needed
+                    const f64_arg = switch (kind) {
+                        .f64 => arg,
+                        .i32 => builder.buildSIToFP(arg, llvm.doubleType(), "math_f64"),
+                    };
+                    // Emit LLVM intrinsic
+                    const result_f64 = emitMathIntrinsic(builder, module, intrinsic, f64_arg);
+                    // Convert back to elem_type if needed
+                    const result = switch (kind) {
+                        .f64 => result_f64,
+                        .i32 => builder.buildFPToSI(result_f64, llvm.i32Type(), "math_i32"),
+                    };
+
+                    // tail_call_method is a terminator — emit ret immediately
+                    if (instr.opcode == .tail_call_method) {
+                        _ = builder.buildRet(result);
+                        block_terminated = true;
+                    } else {
+                        vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
+                    }
+                    continue;
+                }
+            }
 
             // Peephole: get_arg(N) + get_length → push length_params[N]
             // When an array arg's .length is accessed, we use the extra WASM param
@@ -1485,7 +1537,7 @@ fn generateNumericBody(
                                 .f64 => builder.buildSIToFP(len_param, llvm.doubleType(), "len_f64"),
                             };
                             vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
-                            skip_next = true;
+                            skip_count = 1;
                             continue;
                         }
                     }
@@ -1584,6 +1636,54 @@ fn numericStackEffect(instr: Instruction) i32 {
         .array_get2 => 0, // pop 1 (index), peek base, push 1 (result) = net 0
         .array_put => -3, // pop 3
         .unsupported => 0,
+    };
+}
+
+/// Emit an LLVM intrinsic call for a Math.* function.
+/// Maps Math.abs → llvm.fabs.f64, Math.sqrt → llvm.sqrt.f64, etc.
+/// LLVM auto-lowers these to WASM intrinsics (f64.abs, f64.sqrt, etc.).
+fn emitMathIntrinsic(builder: llvm.Builder, module: llvm.Module, intrinsic: frozen_registry.MathIntrinsic, arg: llvm.Value) llvm.Value {
+    const f64_ty = llvm.doubleType();
+    const unary_fn_ty = llvm.functionType(f64_ty, &.{f64_ty}, false);
+
+    switch (intrinsic) {
+        .abs => {
+            const f = getOrDeclareIntrinsic(module, "llvm.fabs.f64", unary_fn_ty);
+            return builder.buildCall(unary_fn_ty, f, &.{arg}, "abs");
+        },
+        .sqrt => {
+            const f = getOrDeclareIntrinsic(module, "llvm.sqrt.f64", unary_fn_ty);
+            return builder.buildCall(unary_fn_ty, f, &.{arg}, "sqrt");
+        },
+        .floor => {
+            const f = getOrDeclareIntrinsic(module, "llvm.floor.f64", unary_fn_ty);
+            return builder.buildCall(unary_fn_ty, f, &.{arg}, "floor");
+        },
+        .ceil => {
+            const f = getOrDeclareIntrinsic(module, "llvm.ceil.f64", unary_fn_ty);
+            return builder.buildCall(unary_fn_ty, f, &.{arg}, "ceil");
+        },
+        .trunc => {
+            const f = getOrDeclareIntrinsic(module, "llvm.trunc.f64", unary_fn_ty);
+            return builder.buildCall(unary_fn_ty, f, &.{arg}, "trunc");
+        },
+        .round => {
+            // JS Math.round(x) = floor(x + 0.5) — NOT the same as llvm.round
+            // (llvm.round rounds ties away from zero; JS rounds ties toward +Inf)
+            const half = llvm.constF64(0.5);
+            const added = builder.buildFAdd(arg, half, "round_add");
+            const f = getOrDeclareIntrinsic(module, "llvm.floor.f64", unary_fn_ty);
+            return builder.buildCall(unary_fn_ty, f, &.{added}, "round");
+        },
+    }
+}
+
+/// Get or declare an LLVM intrinsic function by name.
+fn getOrDeclareIntrinsic(module: llvm.Module, name: [*:0]const u8, fn_ty: llvm.Type) llvm.Value {
+    return module.getNamedFunction(name) orelse blk: {
+        const f = module.addFunction(name, fn_ty);
+        // LLVM intrinsics are always available — no linkage needed
+        break :blk f;
     };
 }
 
@@ -2341,14 +2441,23 @@ fn emitNumericInstruction(
         },
 
         .bitwise_binary => {
-            // Bitwise ops only valid for i32 tier — f64 tier rejects at analysis time
-            if (kind != .i32) return CodegenError.UnsupportedOpcode;
             if (vstack.items.len < 2) return CodegenError.StackUnderflow;
-            const rhs = numVstackPop(vstack);
-            const lhs = numVstackPop(vstack);
             const op = handler.op orelse return CodegenError.UnsupportedOpcode;
 
-            const result = if (std.mem.eql(u8, op, "&"))
+            // For f64 tier (Math intrinsic functions), convert to i32, do bitwise, convert back.
+            // JS semantics: bitwise ops always convert operands to i32.
+            const rhs_raw = numVstackPop(vstack);
+            const lhs_raw = numVstackPop(vstack);
+            const lhs = switch (kind) {
+                .i32 => lhs_raw,
+                .f64 => builder.buildFPToSI(lhs_raw, llvm.i32Type(), "bw_lhs"),
+            };
+            const rhs = switch (kind) {
+                .i32 => rhs_raw,
+                .f64 => builder.buildFPToSI(rhs_raw, llvm.i32Type(), "bw_rhs"),
+            };
+
+            const i32_result = if (std.mem.eql(u8, op, "&"))
                 builder.buildAnd(lhs, rhs, "and")
             else if (std.mem.eql(u8, op, "|"))
                 builder.buildOr(lhs, rhs, "or")
@@ -2363,6 +2472,10 @@ fn emitNumericInstruction(
             else
                 return CodegenError.UnsupportedOpcode;
 
+            const result = switch (kind) {
+                .i32 => i32_result,
+                .f64 => builder.buildSIToFP(i32_result, llvm.doubleType(), "bw_f64"),
+            };
             vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
         },
 
@@ -2711,12 +2824,19 @@ fn emitNumericInstruction(
         .array_get => {
             // arr[idx]: pop index, pop base pointer, load from WASM linear memory
             if (vstack.items.len < 2) return CodegenError.StackUnderflow;
-            const idx_val = numVstackPop(vstack);
-            const base_val = numVstackPop(vstack);
-            // base_val is a byte offset into WASM linear memory (i32)
-            // Convert to pointer, GEP by index (element size = sizeof(i32) = 4 bytes)
-            const base_ptr = c.LLVMBuildIntToPtr(builder.ref, base_val, llvm.ptrType(), "arr_base");
-            var gep_indices = [_]llvm.Value{idx_val};
+            const idx_raw = numVstackPop(vstack);
+            const base_raw = numVstackPop(vstack);
+            // For f64 tier, base and index are f64 — convert to i32 for memory addressing
+            const base_i32 = switch (kind) {
+                .i32 => base_raw,
+                .f64 => builder.buildFPToSI(base_raw, llvm.i32Type(), "arr_base_i32"),
+            };
+            const idx_i32 = switch (kind) {
+                .i32 => idx_raw,
+                .f64 => builder.buildFPToSI(idx_raw, llvm.i32Type(), "arr_idx_i32"),
+            };
+            const base_ptr = c.LLVMBuildIntToPtr(builder.ref, base_i32, llvm.ptrType(), "arr_base");
+            var gep_indices = [_]llvm.Value{idx_i32};
             const elem_ptr = c.LLVMBuildGEP2(builder.ref, llvm.i32Type(), base_ptr, &gep_indices, 1, "arr_gep");
             const loaded = builder.buildLoad(llvm.i32Type(), elem_ptr, "arr_elem");
             // For f64 tier, convert loaded i32 to f64
@@ -2730,11 +2850,19 @@ fn emitNumericInstruction(
         .array_get2 => {
             // arr[idx] keeping arr on stack: pop index, peek base, load, push result
             if (vstack.items.len < 2) return CodegenError.StackUnderflow;
-            const idx_val = numVstackPop(vstack);
+            const idx_raw = numVstackPop(vstack);
             // Peek at base (don't pop)
-            const base_val = vstack.items[vstack.items.len - 1];
-            const base_ptr = c.LLVMBuildIntToPtr(builder.ref, base_val, llvm.ptrType(), "arr_base2");
-            var gep_indices = [_]llvm.Value{idx_val};
+            const base_raw = vstack.items[vstack.items.len - 1];
+            const base_i32 = switch (kind) {
+                .i32 => base_raw,
+                .f64 => builder.buildFPToSI(base_raw, llvm.i32Type(), "arr_base2_i32"),
+            };
+            const idx_i32 = switch (kind) {
+                .i32 => idx_raw,
+                .f64 => builder.buildFPToSI(idx_raw, llvm.i32Type(), "arr_idx2_i32"),
+            };
+            const base_ptr = c.LLVMBuildIntToPtr(builder.ref, base_i32, llvm.ptrType(), "arr_base2");
+            var gep_indices = [_]llvm.Value{idx_i32};
             const elem_ptr = c.LLVMBuildGEP2(builder.ref, llvm.i32Type(), base_ptr, &gep_indices, 1, "arr_gep2");
             const loaded = builder.buildLoad(llvm.i32Type(), elem_ptr, "arr_elem2");
             const result = switch (kind) {
@@ -2748,10 +2876,18 @@ fn emitNumericInstruction(
             // arr[idx] = val: pop value, pop index, pop base, store to memory
             if (vstack.items.len < 3) return CodegenError.StackUnderflow;
             const val = numVstackPop(vstack);
-            const idx_val = numVstackPop(vstack);
-            const base_val = numVstackPop(vstack);
-            const base_ptr = c.LLVMBuildIntToPtr(builder.ref, base_val, llvm.ptrType(), "arr_base_w");
-            var gep_indices = [_]llvm.Value{idx_val};
+            const idx_raw = numVstackPop(vstack);
+            const base_raw = numVstackPop(vstack);
+            const base_i32 = switch (kind) {
+                .i32 => base_raw,
+                .f64 => builder.buildFPToSI(base_raw, llvm.i32Type(), "arr_basew_i32"),
+            };
+            const idx_i32 = switch (kind) {
+                .i32 => idx_raw,
+                .f64 => builder.buildFPToSI(idx_raw, llvm.i32Type(), "arr_idxw_i32"),
+            };
+            const base_ptr = c.LLVMBuildIntToPtr(builder.ref, base_i32, llvm.ptrType(), "arr_base_w");
+            var gep_indices = [_]llvm.Value{idx_i32};
             const elem_ptr = c.LLVMBuildGEP2(builder.ref, llvm.i32Type(), base_ptr, &gep_indices, 1, "arr_gep_w");
             // For f64 tier, convert f64 value to i32 for storage
             const store_val = switch (kind) {

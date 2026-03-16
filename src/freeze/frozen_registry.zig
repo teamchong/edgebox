@@ -2002,12 +2002,75 @@ pub fn isPureInt32Function(func: AnalyzedFunction) bool {
 }
 
 /// Analyze if a function qualifies for standalone numeric WASM compilation.
+/// Supported Math.* intrinsics for standalone WASM compilation.
+/// These map directly to WASM f64 intrinsics (f64.abs, f64.sqrt, etc.).
+pub const MathIntrinsic = enum {
+    abs, // Math.abs(x) → f64.abs
+    sqrt, // Math.sqrt(x) → f64.sqrt
+    floor, // Math.floor(x) → f64.floor
+    ceil, // Math.ceil(x) → f64.ceil
+    round, // Math.round(x) → floor(x + 0.5)
+    trunc, // Math.trunc(x) → f64.trunc
+};
+
+/// Detect a Math.* method setup starting at instruction index `i`.
+/// Looks for the 2-opcode sequence: get_var("Math") → get_field2("method")
+/// The actual call_method(1) comes LATER (after argument computation).
+/// Returns the intrinsic enum or null if not a Math pattern.
+pub fn detectMathSetup(func: AnalyzedFunction, instructions: []const bytecode_parser.Instruction, i: usize) ?MathIntrinsic {
+    if (i + 1 >= instructions.len) return null;
+
+    // Instruction 0: get_var("Math") or get_var_undef("Math")
+    const instr0 = instructions[i];
+    if (instr0.opcode != .get_var and instr0.opcode != .get_var_undef) return null;
+    const atom_idx0: u32 = switch (instr0.operand) {
+        .atom => |a| a,
+        else => return null,
+    };
+    const var_name = resolveAtomToName(func, atom_idx0) orelse return null;
+    if (!std.mem.eql(u8, var_name, "Math")) return null;
+
+    // Instruction 1: get_field2("abs"/"sqrt"/...)
+    const instr1 = instructions[i + 1];
+    if (instr1.opcode != .get_field2) return null;
+    const atom_idx1: u32 = switch (instr1.operand) {
+        .atom => |a| a,
+        else => return null,
+    };
+    const method_name = resolveAtomToName(func, atom_idx1) orelse return null;
+
+    if (std.mem.eql(u8, method_name, "abs")) return .abs;
+    if (std.mem.eql(u8, method_name, "sqrt")) return .sqrt;
+    if (std.mem.eql(u8, method_name, "floor")) return .floor;
+    if (std.mem.eql(u8, method_name, "ceil")) return .ceil;
+    if (std.mem.eql(u8, method_name, "round")) return .round;
+    if (std.mem.eql(u8, method_name, "trunc")) return .trunc;
+    return null;
+}
+
+/// Check if instruction at index `i` is call_method(1) or tail_call_method(1)
+/// — the call part of a Math intrinsic.
+/// QuickJS optimizes `return Math.sqrt(x)` → tail_call_method instead of call_method.
+pub fn isMathCallMethod1(instructions: []const bytecode_parser.Instruction, i: usize) bool {
+    if (i >= instructions.len) return false;
+    const instr = instructions[i];
+    if (instr.opcode != .call_method and instr.opcode != .tail_call_method) return false;
+    const argc: u16 = switch (instr.operand) {
+        .u16 => |v| v,
+        else => return false,
+    };
+    return argc == 1;
+}
+
 /// Returns the ValueKind (.i32 or .f64) or null if unsupported.
 /// This extends isPureInt32Function to also detect float-only functions
 /// (e.g., functions using div, which produces floats in JS).
 ///
 /// Unlike isPureInt32Function, this allows backward jumps (while loops)
 /// because LLVM generates proper basic blocks — no Zig hotpath dispatch issues.
+///
+/// Also detects Math.* intrinsic patterns (Math.abs, Math.sqrt, etc.)
+/// and compiles them to WASM f64 intrinsics.
 pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
     const debug = std.posix.getenv("EDGEBOX_WASM_DEBUG") != null;
     // Same preconditions as isPureInt32Function
@@ -2020,7 +2083,32 @@ pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
         return null;
     }
 
-    // Use comptime numeric analysis
+    // Pre-scan for Math.* intrinsic patterns.
+    // Pattern: get_var("Math") → get_field2("method") → [arg computation] → call_method(1)
+    // The get_var + get_field2 are adjacent, but call_method comes after argument pushes.
+    var has_math_intrinsics = false;
+    {
+        var pending_math_depth: u32 = 0;
+        var mi: usize = 0;
+        while (mi < func.instructions.len) : (mi += 1) {
+            if (detectMathSetup(func, func.instructions, mi)) |_| {
+                pending_math_depth += 1;
+                mi += 1; // skip the get_field2
+                continue;
+            }
+            if (pending_math_depth > 0 and isMathCallMethod1(func.instructions, mi)) {
+                has_math_intrinsics = true;
+                pending_math_depth -= 1;
+            }
+        }
+    }
+
+    if (has_math_intrinsics) {
+        // Math-aware analysis: iterate instructions, skipping Math.* patterns
+        return analyzeFunctionWithMath(func, debug);
+    }
+
+    // Standard analysis (no Math patterns)
     const kind = numeric_handlers.analyzeFunction(func.instructions) orelse {
         if (debug) {
             for (func.instructions) |instr| {
@@ -2062,6 +2150,98 @@ pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
     }
 
     return kind;
+}
+
+/// Analyze a function that contains Math.* intrinsic patterns.
+/// Skips Math.* setup sequences (get_var("Math") + get_field2("method"))
+/// and their matching call_method(1), checking all remaining opcodes
+/// with the standard numeric handler.
+/// Math intrinsics always force f64 tier (they operate on doubles).
+fn analyzeFunctionWithMath(func: AnalyzedFunction, debug: bool) ?numeric_handlers.ValueKind {
+    var has_computing_op = false;
+    var has_i32_only = false;
+    var pending_math_depth: u32 = 0; // Nesting depth for Math.floor(Math.abs(x)) patterns
+    var i: usize = 0;
+    while (i < func.instructions.len) {
+        // Skip Math.* setup (2 opcodes: get_var("Math") + get_field2("method"))
+        if (detectMathSetup(func, func.instructions, i)) |_| {
+            has_computing_op = true;
+            pending_math_depth += 1;
+            i += 2; // skip both get_var and get_field2
+            continue;
+        }
+
+        // Skip the call_method(1) or tail_call_method(1) that completes a pending Math intrinsic
+        if (pending_math_depth > 0 and isMathCallMethod1(func.instructions, i)) {
+            pending_math_depth -= 1;
+            i += 1;
+            continue;
+        }
+
+        const instr = func.instructions[i];
+        const handler = numeric_handlers.getHandler(instr.opcode);
+        if (handler.pattern == .unsupported) {
+            // tail_call_method is unsupported in general, but valid as part of Math patterns
+            // (already handled above). If we get here, it's a non-Math tail_call_method.
+            if (debug) std.debug.print("[wasm-reject] {s}: unsupported opcode '{s}' (math-aware)\n", .{ func.name, @tagName(instr.opcode) });
+            return null;
+        }
+
+        if (handler.requires_i32) has_i32_only = true;
+
+        switch (handler.pattern) {
+            .binary_arith, .binary_cmp, .bitwise_binary, .unary, .inc_dec, .post_inc_dec, .lnot, .push_const, .push_cpool, .push_bool, .call_self, .tail_call_self, .add_loc, .inc_loc => has_computing_op = true,
+            .array_get, .array_get2, .array_put, .array_length => has_computing_op = true,
+            else => {},
+        }
+
+        i += 1;
+    }
+
+    if (!has_computing_op) return null;
+
+    // For non-recursive functions, check that self_ref opcodes are ONLY
+    // part of Math.* patterns (not standalone function references)
+    if (!func.is_self_recursive) {
+        var pending_math_depth2: u32 = 0;
+        var si: usize = 0;
+        while (si < func.instructions.len) {
+            // Skip Math.* setup (get_var("Math") is self_ref but not a function call)
+            if (detectMathSetup(func, func.instructions, si)) |_| {
+                pending_math_depth2 += 1;
+                si += 2;
+                continue;
+            }
+            if (pending_math_depth2 > 0 and isMathCallMethod1(func.instructions, si)) {
+                pending_math_depth2 -= 1;
+                si += 1;
+                continue;
+            }
+            const handler = numeric_handlers.getHandler(func.instructions[si].opcode);
+            if (handler.pattern == .self_ref or handler.pattern == .call_self or handler.pattern == .tail_call_self) {
+                return null; // Non-Math self_ref in non-recursive function
+            }
+            si += 1;
+        }
+    }
+
+    // Validate cpool constants
+    for (func.instructions) |instr| {
+        if (instr.opcode == .push_const8 or instr.opcode == .push_const) {
+            const idx: u32 = switch (instr.operand) {
+                .const_idx => |a| a,
+                else => return null,
+            };
+            if (idx >= func.constants.len) return null;
+            switch (func.constants[idx]) {
+                .int32, .float64 => {},
+                else => return null,
+            }
+        }
+    }
+
+    // Math intrinsics always force f64 tier (abs, sqrt, floor, ceil work on doubles)
+    return .f64;
 }
 
 /// Resolve an atom index to a function name string slice.
