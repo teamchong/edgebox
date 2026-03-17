@@ -947,11 +947,9 @@ pub fn generateModuleZigShardedWithBackend(
                     }
                 }
 
-                std.debug.print("[freeze-debug] wasm_funcs.len = {d}\n", .{wasm_funcs.items.len});
                 var standalone_path_buf: [4096]u8 = undefined;
                 const standalone_path = std.fmt.bufPrintZ(&standalone_path_buf, "{s}/standalone.o", .{cache_dir}) catch null;
                 if (standalone_path) |sp| {
-                    std.debug.print("[freeze-debug] Calling generateStandaloneWasm with {d} functions → {s}\n", .{ wasm_funcs.items.len, sp });
                     if (llvm_codegen.generateStandaloneWasm(allocator, wasm_funcs.items, sp)) |standalone_result| {
                         if (standalone_result.has_functions) {
                             std.debug.print("[freeze] Standalone WASM: {d} numeric functions → {s}\n", .{
@@ -1072,10 +1070,7 @@ pub fn generateModuleZigShardedWithBackend(
             }
 
 
-            const cfg = cfg_builder.buildCFG(allocator, gf.func.instructions) catch |err| {
-                std.debug.print("[freeze-debug] CFG build failed for '{s}'@{d} (gen_idx={d}): {}\n", .{ gf.func.name, gf.func.line_num, gi, err });
-                continue;
-            };
+            const cfg = cfg_builder.buildCFG(allocator, gf.func.instructions) catch continue;
             const cfg_idx = thin_cfgs.items.len;
             try thin_cfgs.append(allocator, cfg);
 
@@ -1091,10 +1086,6 @@ pub fn generateModuleZigShardedWithBackend(
                 .func_name_idx = func_name_idx,
             });
         }
-
-        std.debug.print("[freeze-debug] Thin loop: {d} generated_all, {d} skipped int32, {d} thin infos, {d} CFG fail\n", .{
-            generated_all.items.len, thin_skipped_int32, thin_infos.items.len, generated_all.items.len - thin_skipped_int32 - thin_infos.items.len,
-        });
 
         // Pass 2: Build ThinShardFunction structs
         for (thin_infos.items) |info| {

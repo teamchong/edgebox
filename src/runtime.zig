@@ -5,7 +5,6 @@
 ///   edgebox build [app-directory]  - Build app (bundle + bytecode + AOT)
 const std = @import("std");
 const builtin = @import("builtin");
-const wizer = @import("wizer_wamr.zig");
 const qjsc_wrapper = @import("qjsc_wrapper.zig");
 const freeze = @import("freeze/frozen_registry.zig");
 const wasm_opt = @import("wasm_opt.zig");
@@ -546,7 +545,6 @@ pub fn main() !void {
     }.parse;
 
     // Parse arguments
-    var dynamic_mode = false;
     var force_rebuild = false;
     var no_polyfill = false;
     var no_freeze = false;
@@ -571,8 +569,6 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
             std.debug.print("edgebox {s}\n", .{VERSION});
             return;
-        } else if (std.mem.eql(u8, arg, "--dynamic")) {
-            dynamic_mode = true;
         } else if (std.mem.eql(u8, arg, "--force") or std.mem.eql(u8, arg, "-f")) {
             force_rebuild = true;
         } else if (std.mem.eql(u8, arg, "--no-polyfill")) {
@@ -658,24 +654,19 @@ pub fn main() !void {
         cleanBuildOutputs();
     }
 
-    if (dynamic_mode) {
-        try runBuild(allocator, dir);
-    } else {
-        // ONE code path: JS → Zig QuickJS + Freeze + Polyfill → {Binary (with host), WASM (no host)} → WAMR → AOT
-        try runStaticBuild(allocator, dir, .{
-            .no_polyfill = no_polyfill,
-            .no_freeze = no_freeze,
-            .no_bundle = no_bundle,
-            .binary_only = binary_only,
-            .wasm_only = wasm_only,
-            .debug_build = debug_build,
-            .allocator_type = allocator_type,
-            .output_prefix = output_prefix,
-            .freeze_max_functions = freeze_max_functions,
-            .freeze_profile_path = freeze_profile_path,
-            .freeze_code_budget = freeze_code_budget,
-        });
-    }
+    try runStaticBuild(allocator, dir, .{
+        .no_polyfill = no_polyfill,
+        .no_freeze = no_freeze,
+        .no_bundle = no_bundle,
+        .binary_only = binary_only,
+        .wasm_only = wasm_only,
+        .debug_build = debug_build,
+        .allocator_type = allocator_type,
+        .output_prefix = output_prefix,
+        .freeze_max_functions = freeze_max_functions,
+        .freeze_profile_path = freeze_profile_path,
+        .freeze_code_budget = freeze_code_budget,
+    });
 }
 
 fn printUsage() void {
@@ -714,237 +705,11 @@ fn cleanBuildOutputs() void {
     const files_to_clean = [_][]const u8{
         "zig-out/bundle.js",
         "zig-out/bundle.bin",
-        "edgebox-static.wasm",
-        "edgebox-static.aot",
-        "edgebox-base.wasm",
-        "edgebox.aot",
-        "bundle.js.cache",
         "zig-out/frozen_manifest.json",
     };
     for (files_to_clean) |file| {
         std.fs.cwd().deleteFile(file) catch {};
     }
-}
-
-fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
-    // Check if input is a single JS file or a directory
-    const is_js_file = std.mem.endsWith(u8, app_dir, ".js");
-
-    var entry_path_buf: [4096]u8 = undefined;
-    var entry_path: []const u8 = undefined;
-
-    if (is_js_file) {
-        // Single JS file - use it directly as entry point
-        std.debug.print("[build] Entry point: {s}\n", .{app_dir});
-        const file = std.fs.cwd().openFile(app_dir, .{}) catch {
-            std.debug.print("[error] File not found: {s}\n", .{app_dir});
-            std.process.exit(1);
-        };
-        file.close();
-        entry_path = app_dir;
-    } else {
-        // Directory - find entry point
-        std.debug.print("[build] App directory: {s}\n", .{app_dir});
-
-        var dir = std.fs.cwd().openDir(app_dir, .{}) catch {
-            std.debug.print("[error] App directory not found: {s}\n", .{app_dir});
-            std.process.exit(1);
-        };
-        dir.close();
-
-        entry_path = findEntryPoint(app_dir, &entry_path_buf) catch {
-            std.debug.print("[error] No entry point found in {s} (index.js, main.js, or app.js)\n", .{app_dir});
-            std.process.exit(1);
-        };
-        std.debug.print("[build] Entry point: {s}\n", .{entry_path});
-    }
-
-    // Step 3: Bundle with Bun (output to zig-out/)
-    std.debug.print("[build] Bundling with Bun...\n", .{});
-    std.fs.cwd().makePath("zig-out") catch {};
-    const bun_result = try runCommand(allocator, &.{
-        "bun",           "build",        entry_path,        "--outfile=zig-out/bundle.js",
-        "--target=node", "--format=cjs", "--minify",        "--external=fs",
-        "--external=path", "--external=os", "--external=crypto", "--external=util",
-        "--external=stream", "--external=events", "--external=buffer", "--external=module",
-    });
-    defer {
-        if (bun_result.stdout) |s| allocator.free(s);
-        if (bun_result.stderr) |s| allocator.free(s);
-    }
-
-    if (bun_result.term.Exited != 0) {
-        // Try without minify
-        std.debug.print("[warn] Bun minify failed, trying without...\n", .{});
-        const retry = try runCommand(allocator, &.{
-            "bun",           "build",        entry_path,        "--outfile=zig-out/bundle.js",
-            "--target=node", "--format=cjs", "--external=fs",   "--external=path",
-            "--external=os", "--external=crypto", "--external=util", "--external=stream",
-            "--external=events", "--external=buffer", "--external=module",
-        });
-        defer {
-            if (retry.stdout) |s| allocator.free(s);
-            if (retry.stderr) |s| allocator.free(s);
-        }
-        if (retry.term.Exited != 0) {
-            std.debug.print("[error] Bun bundling failed\n", .{});
-            std.process.exit(1);
-        }
-    }
-
-    // Step 4: Prepend polyfills
-    // Prepend order is reversed - last prepend ends up at top of file
-    // We want final order: runtime.js (globals), then polyfill modules, then user code
-    const runtime_path = "src/polyfills/runtime.js";
-
-    // Polyfill modules in dependency order (prepended in reverse order)
-    // NOTE: process.js and os.js removed - fully implemented in native Zig
-    const polyfill_modules = [_][]const u8{
-        "src/polyfills/modules/child_process.js",
-        "src/polyfills/modules/readline.js",
-        "src/polyfills/modules/dns.js",
-        "src/polyfills/modules/cluster.js",
-        "src/polyfills/modules/zlib.js",
-        "src/polyfills/modules/dgram.js",
-        "src/polyfills/modules/tls.js",
-        "src/polyfills/modules/net.js",
-        "src/polyfills/modules/http2.js",
-        "src/polyfills/modules/http.js",
-        "src/polyfills/modules/url.js",
-        "src/polyfills/modules/crypto.js",
-        "src/polyfills/modules/fs.js",
-        "src/polyfills/modules/stream.js",
-        "src/polyfills/modules/events.js",
-        "src/polyfills/modules/encoding.js",
-        "src/polyfills/modules/buffer.js",
-        "src/polyfills/modules/path.js",
-        "src/polyfills/modules/core.js",
-    };
-
-    // Prepend each module (in reverse order so core.js ends up first)
-    std.debug.print("[build] Prepending polyfill modules...\n", .{});
-    for (polyfill_modules) |mod_path| {
-        if (std.fs.cwd().access(mod_path, .{})) |_| {
-            try prependPolyfills(allocator, mod_path, "zig-out/bundle.js");
-        } else |_| {}
-    }
-
-    // Then prepend runtime.js (this ends up at TOP of file)
-    if (std.fs.cwd().access(runtime_path, .{})) |_| {
-        std.debug.print("[build] Prepending runtime polyfills...\n", .{});
-        try prependPolyfills(allocator, runtime_path, "zig-out/bundle.js");
-    } else |_| {}
-
-    // Print bundle size
-    if (std.fs.cwd().statFile("zig-out/bundle.js")) |stat| {
-        const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
-        std.debug.print("[build] Bundle: bundle.js ({d:.1}KB)\n", .{size_kb});
-    } else |_| {}
-
-    // Step 5: Build WASM if not exists
-    const wasm_exists = std.fs.cwd().access("edgebox-base.wasm", .{}) catch null;
-    if (wasm_exists == null) {
-        std.debug.print("[build] Building QuickJS WASM with Zig...\n", .{});
-        const zig_result = try runCommand(allocator, &.{
-            "zig", "build", "-j4", "wasm", "-Doptimize=ReleaseFast",
-        });
-        defer {
-            if (zig_result.stdout) |s| allocator.free(s);
-            if (zig_result.stderr) |s| allocator.free(s);
-        }
-
-        if (zig_result.term.Exited == 0) {
-            // Copy from zig-out
-            std.fs.cwd().copyFile("zig-out/bin/edgebox-base.wasm", std.fs.cwd(), "edgebox-base.wasm", .{}) catch {};
-
-            // Run Wizer pre-initialization
-            // DISABLED: WAMR SIMDE not working for v128.load/v128.store opcodes in QuickJS
-            // TODO: Fix WAMR SIMDE support or use classic interpreter mode for wizer
-            // try runWizer(allocator);
-
-            // Run wasm-opt
-            try runWasmOpt(allocator);
-        } else {
-            std.debug.print("[warn] Zig WASM build failed\n", .{});
-        }
-    } else {
-        std.debug.print("[build] Using existing edgebox-base.wasm\n", .{});
-    }
-
-    // Step 6: Pre-compile bytecode cache
-    const wasm_ok = std.fs.cwd().access("edgebox-base.wasm", .{}) catch null;
-    const bundle_ok = std.fs.cwd().access("zig-out/bundle.js", .{}) catch null;
-    if (wasm_ok != null and bundle_ok != null) {
-        std.debug.print("[build] Pre-compiling bytecode cache...\n", .{});
-
-        var cwd_buf: [4096]u8 = undefined;
-        const cwd = std.process.getCwd(&cwd_buf) catch ".";
-
-        var bundle_abs_buf: [4096]u8 = undefined;
-        const bundle_abs = std.fmt.bufPrint(&bundle_abs_buf, "{s}/bundle.js", .{cwd}) catch "zig-out/bundle.js";
-
-        var dir_arg_buf: [4096]u8 = undefined;
-        const dir_arg = std.fmt.bufPrint(&dir_arg_buf, "--dir={s}", .{cwd}) catch "--dir=.";
-
-        const compile_result = try runCommand(allocator, &.{
-            "wasmedge", dir_arg, "edgebox-base.wasm", "--compile-only", bundle_abs,
-        });
-        defer {
-            if (compile_result.stdout) |s| allocator.free(s);
-            if (compile_result.stderr) |s| allocator.free(s);
-        }
-
-        if (std.fs.cwd().statFile("bundle.js.cache")) |stat| {
-            const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
-            std.debug.print("[build] Bytecode cache: bundle.js.cache ({d:.1}KB)\n", .{size_kb});
-        } else |_| {
-            std.debug.print("[warn] Bytecode pre-compilation failed (will compile on first run)\n", .{});
-        }
-    }
-
-    // Step 7: AOT compile
-    const aot_ext = if (builtin.os.tag == .macos) "dylib" else "so";
-    var aot_path_buf: [256]u8 = undefined;
-    const aot_path = std.fmt.bufPrint(&aot_path_buf, "edgebox-aot.{s}", .{aot_ext}) catch "edgebox-aot.so";
-
-    const aot_exists = std.fs.cwd().access(aot_path, .{}) catch null;
-    if (aot_exists == null and wasm_ok != null) {
-        std.debug.print("[build] AOT compiling with WAMR...\n", .{});
-        const aot_result = try runCommand(allocator, &.{
-            "wamrc", "-o", aot_path, "edgebox-base.wasm",
-        });
-        defer {
-            if (aot_result.stdout) |s| allocator.free(s);
-            if (aot_result.stderr) |s| allocator.free(s);
-        }
-
-        if (aot_result.term.Exited == 0) {
-            if (std.fs.cwd().statFile(aot_path)) |stat| {
-                const size_mb = @as(f64, @floatFromInt(stat.size)) / 1024.0 / 1024.0;
-                std.debug.print("[build] AOT compiled: {s} ({d:.1}MB)\n", .{ aot_path, size_mb });
-            } else |_| {}
-        } else {
-            std.debug.print("[warn] AOT compilation failed, WASM module still usable\n", .{});
-        }
-    } else if (aot_exists != null) {
-        std.debug.print("[build] Using existing {s}\n", .{aot_path});
-    }
-
-    // Copy .edgebox.json if exists
-    var config_path_buf: [4096]u8 = undefined;
-    const config_path = std.fmt.bufPrint(&config_path_buf, "{s}/.edgebox.json", .{app_dir}) catch null;
-    if (config_path) |cp| {
-        if (std.fs.cwd().access(cp, .{})) |_| {
-            std.fs.cwd().copyFile(cp, std.fs.cwd(), ".edgebox.json", .{}) catch {};
-            std.debug.print("[build] Config copied to .edgebox.json\n", .{});
-        } else |_| {}
-    }
-
-    // Summary
-    std.debug.print("\n[build] === Build Complete ===\n\n", .{});
-    std.debug.print("To run:\n", .{});
-    std.debug.print("  edgebox run bundle.js\n", .{});
-    std.debug.print("  edgebox bundle.js\n\n", .{});
 }
 
 /// Allocator types for native binaries
@@ -2530,51 +2295,21 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             }
         }
 
-        if (options.wasm_only) {
-            // Summary for wasm-only build
-            std.debug.print("\n[build] === WASM Build Complete ===\n\n", .{});
-            std.debug.print("Files created:\n", .{});
-            std.debug.print("  {s}   - WASM with embedded bytecode\n", .{wasm_path});
-            std.debug.print("  {s}  - AOT native module\n", .{aot_path});
-            if (has_standalone_wasm) {
-                const sw_path = std.fmt.bufPrint(&standalone_wasm_path_buf, "{s}/{s}-standalone.wasm", .{ output_dir, output_base }) catch "";
-                std.debug.print("  {s}  - Standalone WASM (pure functions, for workerd/V8)\n", .{sw_path});
-            }
-            if (has_worker_files) {
-                var wp_buf: [4096]u8 = undefined;
-                var cp_buf2: [4096]u8 = undefined;
-                const wp = std.fmt.bufPrint(&wp_buf, "{s}/{s}-worker.mjs", .{ output_dir, output_base }) catch "";
-                const cp = std.fmt.bufPrint(&cp_buf2, "{s}/{s}-config.capnp", .{ output_dir, output_base }) catch "";
-                std.debug.print("  {s}  - workerd Worker module\n", .{wp});
-                std.debug.print("  {s}  - workerd config\n", .{cp});
-            }
-            std.debug.print("\n", .{});
-            std.debug.print("To run:\n", .{});
-            std.debug.print("  edgebox {s}   # WASM (sandboxed)\n", .{wasm_path});
-            std.debug.print("  edgebox {s}  # AOT (sandboxed, fast)\n", .{aot_path});
-            if (has_worker_files) {
-                var cp_buf3: [4096]u8 = undefined;
-                const cp2 = std.fmt.bufPrint(&cp_buf3, "{s}/{s}-config.capnp", .{ output_dir, output_base }) catch "";
-                std.debug.print("  npx workerd serve {s}  # workerd (V8 JIT)\n", .{cp2});
-            }
-            std.debug.print("\n", .{});
-        } else {
-            // Summary for full build
-            std.debug.print("\n[build] === Static Build Complete ===\n\n", .{});
-            std.debug.print("Files created:\n", .{});
-            std.debug.print("  {s}     - Native binary (QuickJS + frozen)\n", .{binary_path});
-            std.debug.print("  {s}   - WASM with embedded bytecode\n", .{wasm_path});
-            std.debug.print("  {s}  - AOT native module\n", .{aot_path});
-            if (has_standalone_wasm) {
-                const sw_path = std.fmt.bufPrint(&standalone_wasm_path_buf, "{s}/{s}-standalone.wasm", .{ output_dir, output_base }) catch "";
-                std.debug.print("  {s}  - Standalone WASM (pure functions, for workerd/V8)\n", .{sw_path});
-            }
-            std.debug.print("\n", .{});
-            std.debug.print("To run:\n", .{});
-            std.debug.print("  ./{s}            # Binary (fastest startup)\n", .{binary_path});
-            std.debug.print("  edgebox {s}   # WASM (sandboxed)\n", .{wasm_path});
-            std.debug.print("  edgebox {s}  # AOT (sandboxed, fast)\n\n", .{aot_path});
+        // Summary for full build (wasm_only already returned above)
+        std.debug.print("\n[build] === Static Build Complete ===\n\n", .{});
+        std.debug.print("Files created:\n", .{});
+        std.debug.print("  {s}     - Native binary (QuickJS + frozen)\n", .{binary_path});
+        std.debug.print("  {s}   - WASM with embedded bytecode\n", .{wasm_path});
+        std.debug.print("  {s}  - AOT native module\n", .{aot_path});
+        if (has_standalone_wasm) {
+            const sw_path = std.fmt.bufPrint(&standalone_wasm_path_buf, "{s}/{s}-standalone.wasm", .{ output_dir, output_base }) catch "";
+            std.debug.print("  {s}  - Standalone WASM (pure functions, for workerd/V8)\n", .{sw_path});
         }
+        std.debug.print("\n", .{});
+        std.debug.print("To run:\n", .{});
+        std.debug.print("  ./{s}            # Binary (fastest startup)\n", .{binary_path});
+        std.debug.print("  edgebox {s}   # WASM (sandboxed)\n", .{wasm_path});
+        std.debug.print("  edgebox {s}  # AOT (sandboxed, fast)\n\n", .{aot_path});
     } else {
         // Summary for binary-only build
         std.debug.print("\n[build] === Build Complete ===\n\n", .{});
@@ -2599,41 +2334,6 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
     }
 }
 
-fn runWizerStatic(allocator: std.mem.Allocator, wasm_path: []const u8) !void {
-    std.debug.print("[build] Running Wizer pre-initialization (built-in WAMR)...\n", .{});
-
-    // Use wizer library directly (no external CLI needed!)
-    var wz = wizer.Wizer.init(allocator, .{});
-
-    // Create temp output path: "path/to/file.wasm" -> "path/to/file-wizer.wasm"
-    var wizer_path_buf: [4096]u8 = undefined;
-    const base = if (wasm_path.len > 5) wasm_path[0 .. wasm_path.len - 5] else wasm_path;
-    const wizer_path = std.fmt.bufPrint(&wizer_path_buf, "{s}-wizer.wasm", .{base}) catch |err| {
-        std.debug.print("[error] Wizer failed: path too long\n", .{});
-        return err;
-    };
-
-    wz.run(wasm_path, wizer_path) catch |err| {
-        std.debug.print("[error] Wizer pre-initialization FAILED: {}\n", .{err});
-        std.debug.print("[error] Wizer is REQUIRED for static builds. Build cannot continue.\n", .{});
-        std.debug.print("[error] This may be due to:\n", .{});
-        std.debug.print("[error]   - WASM runtime incompatibility (check WAMR build)\n", .{});
-        std.debug.print("[error]   - Insufficient memory (wizer needs ~4x WASM file size)\n", .{});
-        std.debug.print("[error]   - WASM module using unsupported features\n", .{});
-        return err;
-    };
-
-    std.fs.cwd().deleteFile(wasm_path) catch {};
-    std.fs.cwd().rename(wizer_path, wasm_path) catch |err| {
-        std.debug.print("[error] Failed to rename wizer output: {}\n", .{err});
-        return err;
-    };
-
-    if (std.fs.cwd().statFile(wasm_path)) |stat| {
-        const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
-        std.debug.print("[build] Wizer snapshot: {d:.1}KB\n", .{size_kb});
-    } else |_| {}
-}
 
 /// Optimize WASM file using Binaryen (wasm-opt C API)
 fn optimizeWasm(allocator: std.mem.Allocator, wasm_path: []const u8) !void {
@@ -2771,100 +2471,6 @@ fn stripWasmDebug(allocator: std.mem.Allocator, input_path: []const u8, output_p
     });
 }
 
-fn runWasmOptStaticWithPath(allocator: std.mem.Allocator, wasm_path: []const u8) !void {
-    // Validate wasm path before manipulation
-    if (wasm_path.len < 6 or !std.mem.endsWith(u8, wasm_path, ".wasm")) {
-        std.debug.print("[warn] Invalid wasm path for optimization: {s}\n", .{wasm_path});
-        return;
-    }
-
-    // Read input WASM file
-    const file = std.fs.cwd().openFile(wasm_path, .{}) catch |err| {
-        std.debug.print("[build] wasm-opt: Could not open {s}: {}\n", .{ wasm_path, err });
-        return;
-    };
-    defer file.close();
-
-    const input_data = file.readToEndAlloc(allocator, 100 * 1024 * 1024) catch |err| { // 100MB max
-        std.debug.print("[build] wasm-opt: Could not read {s}: {}\n", .{ wasm_path, err });
-        return;
-    };
-    defer allocator.free(input_data);
-
-    const before_kb = @as(f64, @floatFromInt(input_data.len)) / 1024.0;
-    std.debug.print("[build] Running wasm-opt (-Oz aggressive size optimization)...\n", .{});
-    std.debug.print("[build]   Input: {s} ({d:.1}KB)\n", .{ wasm_path, before_kb });
-
-    // Run optimization using Binaryen library directly (no subprocess needed)
-    // Note: wasm-opt may fail on wizered WASM due to bulk memory assertions - skip silently
-    const opt_result = wasm_opt.optimize(allocator, input_data, .Oz) catch |err| {
-        std.debug.print("[build]   wasm-opt skipped: {}\n", .{err});
-        return;
-    };
-    defer allocator.free(opt_result.binary);
-
-    // Write optimized output back to same path
-    const out_file = std.fs.cwd().createFile(wasm_path, .{}) catch |err| {
-        std.debug.print("[build]   Could not write optimized output: {}\n", .{err});
-        return;
-    };
-    defer out_file.close();
-
-    out_file.writeAll(opt_result.binary) catch |err| {
-        std.debug.print("[build]   Could not write optimized data: {}\n", .{err});
-        return;
-    };
-
-    // Report results
-    const after_kb = @as(f64, @floatFromInt(opt_result.optimized_size)) / 1024.0;
-    const reduction = ((before_kb - after_kb) / before_kb) * 100.0;
-    std.debug.print("[build]   Output: {d:.1}KB ({d:.1}% reduction)\n", .{ after_kb, reduction });
-}
-
-fn runWizer(allocator: std.mem.Allocator) !void {
-    std.debug.print("[build] Running edgebox-wizer pre-initialization...\n", .{});
-    const wizer_result = try runCommand(allocator, &.{
-        "edgebox-wizer",
-        "edgebox-base.wasm",
-        "edgebox-wizer.wasm",
-        "--init-func=wizer_init",
-    });
-    defer {
-        if (wizer_result.stdout) |s| allocator.free(s);
-        if (wizer_result.stderr) |s| allocator.free(s);
-    }
-
-    if (wizer_result.term.Exited == 0) {
-        std.fs.cwd().deleteFile("edgebox-base.wasm") catch {};
-        std.fs.cwd().rename("edgebox-wizer.wasm", "edgebox-base.wasm") catch {};
-        if (std.fs.cwd().statFile("edgebox-base.wasm")) |stat| {
-            const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
-            std.debug.print("[build] Wizer snapshot: edgebox-base.wasm ({d:.1}KB)\n", .{size_kb});
-        } else |_| {}
-    } else {
-        std.debug.print("[warn] Wizer pre-initialization failed (will use slower init path)\n", .{});
-    }
-}
-
-fn runWasmOpt(allocator: std.mem.Allocator) !void {
-    std.debug.print("[build] Optimizing WASM with edgebox-wasm-opt...\n", .{});
-    const opt_result = try runCommand(allocator, &.{
-        "edgebox-wasm-opt", "edgebox-base.wasm", "edgebox-base-opt.wasm", "-Oz",
-    });
-    defer {
-        if (opt_result.stdout) |s| allocator.free(s);
-        if (opt_result.stderr) |s| allocator.free(s);
-    }
-
-    if (opt_result.term.Exited == 0) {
-        std.fs.cwd().deleteFile("edgebox-base.wasm") catch {};
-        std.fs.cwd().rename("edgebox-base-opt.wasm", "edgebox-base.wasm") catch {};
-        if (std.fs.cwd().statFile("edgebox-base.wasm")) |stat| {
-            const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
-            std.debug.print("[build] Optimized WASM: {d:.1}KB\n", .{size_kb});
-        } else |_| {}
-    }
-}
 
 fn findEntryPoint(app_dir: []const u8, buf: *[4096]u8) ![]const u8 {
     // First, check for .edgebox.json with npm field
