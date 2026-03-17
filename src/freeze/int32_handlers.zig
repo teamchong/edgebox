@@ -6,6 +6,7 @@
 const std = @import("std");
 const opcodes = @import("opcodes.zig");
 const Opcode = opcodes.Opcode;
+const OpKind = @import("numeric_handlers.zig").OpKind;
 
 /// Int32 handler pattern types
 pub const Int32Pattern = enum {
@@ -78,7 +79,7 @@ pub const Int32Pattern = enum {
 /// Int32 handler definition
 pub const Int32Handler = struct {
     pattern: Int32Pattern,
-    op: ?[]const u8 = null, // C operator like "+", "-", "&"
+    op: ?OpKind = null,
     value: ?i32 = null, // Constant value
     index: ?u8 = null, // Argument index
     is_inc: ?bool = null, // For inc/dec: true=inc, false=dec
@@ -118,34 +119,34 @@ pub fn getInt32Handler(opcode: Opcode) Int32Handler {
         .put_arg3 => .{ .pattern = .put_arg_i32, .index = 3 },
 
         // Binary arithmetic
-        .add => .{ .pattern = .binary_arith_i32, .op = "+" },
-        .sub => .{ .pattern = .binary_arith_i32, .op = "-" },
+        .add => .{ .pattern = .binary_arith_i32, .op = .add },
+        .sub => .{ .pattern = .binary_arith_i32, .op = .sub },
         // mul excluded from int32 tier: JS mul is f64, intermediate products
         // can exceed i32 range and affect subsequent f64 additions
         .mul => .{ .pattern = .unsupported },
         // div excluded from int32 tier: JS division can produce float (9/2 = 4.5)
         .div => .{ .pattern = .unsupported },
-        .mod => .{ .pattern = .binary_arith_i32, .op = "%" },
+        .mod => .{ .pattern = .binary_arith_i32, .op = .mod },
 
         // Bitwise
-        .shl => .{ .pattern = .bitwise_binary_i32, .op = "<<" },
-        .sar => .{ .pattern = .bitwise_binary_i32, .op = ">>" },   // JS >> (arithmetic/signed shift right)
-        .shr => .{ .pattern = .bitwise_binary_i32, .op = ">>>" },  // JS >>> (logical/unsigned shift right)
-        .@"and" => .{ .pattern = .bitwise_binary_i32, .op = "&" },
-        .@"or" => .{ .pattern = .bitwise_binary_i32, .op = "|" },
-        .@"xor" => .{ .pattern = .bitwise_binary_i32, .op = "^" },
+        .shl => .{ .pattern = .bitwise_binary_i32, .op = .shl },
+        .sar => .{ .pattern = .bitwise_binary_i32, .op = .sar },
+        .shr => .{ .pattern = .bitwise_binary_i32, .op = .shr },
+        .@"and" => .{ .pattern = .bitwise_binary_i32, .op = .band },
+        .@"or" => .{ .pattern = .bitwise_binary_i32, .op = .bor },
+        .@"xor" => .{ .pattern = .bitwise_binary_i32, .op = .bxor },
 
         // Comparisons
-        .lt => .{ .pattern = .binary_cmp_i32, .op = "<" },
-        .lte => .{ .pattern = .binary_cmp_i32, .op = "<=" },
-        .gt => .{ .pattern = .binary_cmp_i32, .op = ">" },
-        .gte => .{ .pattern = .binary_cmp_i32, .op = ">=" },
-        .eq, .strict_eq => .{ .pattern = .binary_cmp_i32, .op = "==" },
-        .neq, .strict_neq => .{ .pattern = .binary_cmp_i32, .op = "!=" },
+        .lt => .{ .pattern = .binary_cmp_i32, .op = .lt },
+        .lte => .{ .pattern = .binary_cmp_i32, .op = .lte },
+        .gt => .{ .pattern = .binary_cmp_i32, .op = .gt },
+        .gte => .{ .pattern = .binary_cmp_i32, .op = .gte },
+        .eq, .strict_eq => .{ .pattern = .binary_cmp_i32, .op = .eq },
+        .neq, .strict_neq => .{ .pattern = .binary_cmp_i32, .op = .neq },
 
         // Unary
-        .neg => .{ .pattern = .unary_i32, .op = "-" },
-        .not => .{ .pattern = .unary_i32, .op = "~" },
+        .neg => .{ .pattern = .unary_i32, .op = .neg },
+        .not => .{ .pattern = .unary_i32, .op = .bnot },
 
         // Logical NOT
         .lnot => .{ .pattern = .lnot_i32 },
@@ -176,8 +177,8 @@ pub fn getInt32Handler(opcode: Opcode) Int32Handler {
         .dec => .{ .pattern = .inc_dec_i32, .is_inc = false },
 
         // Stack ops
-        .dup => .{ .pattern = .stack_op_i32, .op = "dup" },
-        .drop => .{ .pattern = .stack_op_i32, .op = "drop" },
+        .dup => .{ .pattern = .stack_op_i32, .op = .dup },
+        .drop => .{ .pattern = .stack_op_i32, .op = .drop },
 
         // Self-ref (for recursive calls)
         .get_var_ref0, .get_var, .get_var_undef => .{ .pattern = .self_ref_i32 },

@@ -29,9 +29,36 @@ const Int32Pattern = int32_handlers.Int32Pattern;
 const numeric_handlers = @import("numeric_handlers.zig");
 const ValueKind = numeric_handlers.ValueKind;
 const NumericPattern = numeric_handlers.NumericPattern;
+const OpKind = numeric_handlers.OpKind;
 const AnalyzedFunction = frozen_registry.AnalyzedFunction;
 
 const c = llvm.c;
+
+/// Map OpKind comparison to LLVM integer predicate.
+fn intPred(op: OpKind) ?c.LLVMIntPredicate {
+    return switch (op) {
+        .lt => c.LLVMIntSLT,
+        .lte => c.LLVMIntSLE,
+        .gt => c.LLVMIntSGT,
+        .gte => c.LLVMIntSGE,
+        .eq => c.LLVMIntEQ,
+        .neq => c.LLVMIntNE,
+        else => null,
+    };
+}
+
+/// Map OpKind comparison to LLVM float predicate.
+fn realPred(op: OpKind) ?c.LLVMRealPredicate {
+    return switch (op) {
+        .lt => c.LLVMRealOLT,
+        .lte => c.LLVMRealOLE,
+        .gt => c.LLVMRealOGT,
+        .gte => c.LLVMRealOGE,
+        .eq => c.LLVMRealOEQ,
+        .neq => c.LLVMRealONE,
+        else => null,
+    };
+}
 
 /// Target-dependent type information for frozen codegen.
 /// On native x86_64: JSValue = {i64, i64} (16 bytes), usize = i64
@@ -956,26 +983,24 @@ fn emitInt32Instruction(
             const lhs = i32VstackPop(vstack);
             const op = handler.op orelse return CodegenError.UnsupportedOpcode;
 
-            const result = if (std.mem.eql(u8, op, "+"))
-                builder.buildAdd(lhs, rhs, "add")
-            else if (std.mem.eql(u8, op, "-"))
-                builder.buildSub(lhs, rhs, "sub")
-            else if (std.mem.eql(u8, op, "*")) mul_blk: {
-                // JS mul is f64: large products lose precision in float64,
-                // so ToInt32(f64_mul(a,b)) differs from i32_wrap(a*b).
-                // fptosi to i64 first (safe: i32*i32 max ~2^62 < 2^63),
-                // then trunc to i32 = low 32 bits = JS ToInt32() wrapping.
-                const fa = builder.buildSIToFP(lhs, llvm.doubleType(), "fma");
-                const fb = builder.buildSIToFP(rhs, llvm.doubleType(), "fmb");
-                const fprod = builder.buildFMul(fa, fb, "fmprod");
-                const i64_prod = builder.buildFPToSI(fprod, llvm.i64Type(), "mul64");
-                break :mul_blk builder.buildTrunc(i64_prod, llvm.i32Type(), "mul32");
-            } else if (std.mem.eql(u8, op, "/"))
-                builder.buildSDiv(lhs, rhs, "div")
-            else if (std.mem.eql(u8, op, "%"))
-                builder.buildSRem(lhs, rhs, "rem")
-            else
-                return CodegenError.UnsupportedOpcode;
+            const result = switch (op) {
+                .add => builder.buildAdd(lhs, rhs, "add"),
+                .sub => builder.buildSub(lhs, rhs, "sub"),
+                .mul => mul_blk: {
+                    // JS mul is f64: large products lose precision in float64,
+                    // so ToInt32(f64_mul(a,b)) differs from i32_wrap(a*b).
+                    // fptosi to i64 first (safe: i32*i32 max ~2^62 < 2^63),
+                    // then trunc to i32 = low 32 bits = JS ToInt32() wrapping.
+                    const fa = builder.buildSIToFP(lhs, llvm.doubleType(), "fma");
+                    const fb = builder.buildSIToFP(rhs, llvm.doubleType(), "fmb");
+                    const fprod = builder.buildFMul(fa, fb, "fmprod");
+                    const i64_prod = builder.buildFPToSI(fprod, llvm.i64Type(), "mul64");
+                    break :mul_blk builder.buildTrunc(i64_prod, llvm.i32Type(), "mul32");
+                },
+                .div => builder.buildSDiv(lhs, rhs, "div"),
+                .mod => builder.buildSRem(lhs, rhs, "rem"),
+                else => return CodegenError.UnsupportedOpcode,
+            };
 
             vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
         },
@@ -986,20 +1011,15 @@ fn emitInt32Instruction(
             const lhs = i32VstackPop(vstack);
             const op = handler.op orelse return CodegenError.UnsupportedOpcode;
 
-            const result = if (std.mem.eql(u8, op, "&"))
-                builder.buildAnd(lhs, rhs, "and")
-            else if (std.mem.eql(u8, op, "|"))
-                builder.buildOr(lhs, rhs, "or")
-            else if (std.mem.eql(u8, op, "^"))
-                builder.buildXor(lhs, rhs, "xor")
-            else if (std.mem.eql(u8, op, "<<"))
-                builder.buildShl(lhs, rhs, "shl")
-            else if (std.mem.eql(u8, op, ">>"))
-                builder.buildAShr(lhs, rhs, "shr")
-            else if (std.mem.eql(u8, op, ">>>"))
-                builder.buildLShr(lhs, rhs, "shru")
-            else
-                return CodegenError.UnsupportedOpcode;
+            const result = switch (op) {
+                .band => builder.buildAnd(lhs, rhs, "and"),
+                .bor => builder.buildOr(lhs, rhs, "or"),
+                .bxor => builder.buildXor(lhs, rhs, "xor"),
+                .shl => builder.buildShl(lhs, rhs, "shl"),
+                .sar => builder.buildAShr(lhs, rhs, "shr"),
+                .shr => builder.buildLShr(lhs, rhs, "shru"),
+                else => return CodegenError.UnsupportedOpcode,
+            };
 
             vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
         },
@@ -1010,20 +1030,15 @@ fn emitInt32Instruction(
             const lhs = i32VstackPop(vstack);
             const op = handler.op orelse return CodegenError.UnsupportedOpcode;
 
-            const pred: c.LLVMIntPredicate = if (std.mem.eql(u8, op, "<"))
-                c.LLVMIntSLT
-            else if (std.mem.eql(u8, op, "<="))
-                c.LLVMIntSLE
-            else if (std.mem.eql(u8, op, ">"))
-                c.LLVMIntSGT
-            else if (std.mem.eql(u8, op, ">="))
-                c.LLVMIntSGE
-            else if (std.mem.eql(u8, op, "=="))
-                c.LLVMIntEQ
-            else if (std.mem.eql(u8, op, "!="))
-                c.LLVMIntNE
-            else
-                return CodegenError.UnsupportedOpcode;
+            const pred: c.LLVMIntPredicate = switch (op) {
+                .lt => c.LLVMIntSLT,
+                .lte => c.LLVMIntSLE,
+                .gt => c.LLVMIntSGT,
+                .gte => c.LLVMIntSGE,
+                .eq => c.LLVMIntEQ,
+                .neq => c.LLVMIntNE,
+                else => return CodegenError.UnsupportedOpcode,
+            };
 
             const cmp = builder.buildICmp(pred, lhs, rhs, "cmp");
             // Zero-extend i1 to i32 (false=0, true=1)
@@ -1036,12 +1051,11 @@ fn emitInt32Instruction(
             const val = i32VstackPop(vstack);
             const op = handler.op orelse return CodegenError.UnsupportedOpcode;
 
-            const result = if (std.mem.eql(u8, op, "-"))
-                builder.buildNeg(val, "neg")
-            else if (std.mem.eql(u8, op, "~"))
-                builder.buildNot(val, "bnot")
-            else
-                return CodegenError.UnsupportedOpcode;
+            const result = switch (op) {
+                .neg => builder.buildNeg(val, "neg"),
+                .bnot => builder.buildNot(val, "bnot"),
+                else => return CodegenError.UnsupportedOpcode,
+            };
 
             vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
         },
@@ -1175,14 +1189,17 @@ fn emitInt32Instruction(
 
         .stack_op_i32 => {
             const op = handler.op orelse return CodegenError.UnsupportedOpcode;
-            if (std.mem.eql(u8, op, "dup")) {
-                if (vstack.items.len < 1) return CodegenError.StackUnderflow;
-                const top = vstack.items[vstack.items.len - 1];
-                vstack.append(allocator, top) catch return CodegenError.OutOfMemory;
-            } else {
-                // drop
-                if (vstack.items.len < 1) return CodegenError.StackUnderflow;
-                _ = i32VstackPop(vstack);
+            switch (op) {
+                .dup => {
+                    if (vstack.items.len < 1) return CodegenError.StackUnderflow;
+                    const top = vstack.items[vstack.items.len - 1];
+                    vstack.append(allocator, top) catch return CodegenError.OutOfMemory;
+                },
+                .drop => {
+                    if (vstack.items.len < 1) return CodegenError.StackUnderflow;
+                    _ = i32VstackPop(vstack);
+                },
+                else => return CodegenError.UnsupportedOpcode,
             }
         },
 
@@ -2137,40 +2154,34 @@ fn emitNumericInstruction(
 
             const result = switch (kind) {
                 .i32 => blk: {
-                    break :blk if (std.mem.eql(u8, op, "+"))
-                        builder.buildAdd(lhs, rhs, "add")
-                    else if (std.mem.eql(u8, op, "-"))
-                        builder.buildSub(lhs, rhs, "sub")
-                    else if (std.mem.eql(u8, op, "*")) mul_blk: {
-                        // JS mul is f64: large products lose precision in float64,
-                        // so ToInt32(f64_mul(a,b)) differs from i32_wrap(a*b).
-                        // fptosi to i64 first (safe: i32*i32 max ~2^62 < 2^63),
-                        // then trunc to i32 = low 32 bits = JS ToInt32() wrapping.
-                        const fa = builder.buildSIToFP(lhs, llvm.doubleType(), "fma");
-                        const fb = builder.buildSIToFP(rhs, llvm.doubleType(), "fmb");
-                        const fprod = builder.buildFMul(fa, fb, "fmprod");
-                        const i64_prod = builder.buildFPToSI(fprod, llvm.i64Type(), "mul64");
-                        break :mul_blk builder.buildTrunc(i64_prod, llvm.i32Type(), "mul32");
-                    } else if (std.mem.eql(u8, op, "/"))
-                        builder.buildSDiv(lhs, rhs, "div")
-                    else if (std.mem.eql(u8, op, "%"))
-                        builder.buildSRem(lhs, rhs, "rem")
-                    else
-                        return CodegenError.UnsupportedOpcode;
+                    break :blk switch (op) {
+                        .add => builder.buildAdd(lhs, rhs, "add"),
+                        .sub => builder.buildSub(lhs, rhs, "sub"),
+                        .mul => mul_blk: {
+                            // JS mul is f64: large products lose precision in float64,
+                            // so ToInt32(f64_mul(a,b)) differs from i32_wrap(a*b).
+                            // fptosi to i64 first (safe: i32*i32 max ~2^62 < 2^63),
+                            // then trunc to i32 = low 32 bits = JS ToInt32() wrapping.
+                            const fa = builder.buildSIToFP(lhs, llvm.doubleType(), "fma");
+                            const fb = builder.buildSIToFP(rhs, llvm.doubleType(), "fmb");
+                            const fprod = builder.buildFMul(fa, fb, "fmprod");
+                            const i64_prod = builder.buildFPToSI(fprod, llvm.i64Type(), "mul64");
+                            break :mul_blk builder.buildTrunc(i64_prod, llvm.i32Type(), "mul32");
+                        },
+                        .div => builder.buildSDiv(lhs, rhs, "div"),
+                        .mod => builder.buildSRem(lhs, rhs, "rem"),
+                        else => return CodegenError.UnsupportedOpcode,
+                    };
                 },
                 .f64 => blk: {
-                    const fval = if (std.mem.eql(u8, op, "+"))
-                        builder.buildFAdd(lhs, rhs, "fadd")
-                    else if (std.mem.eql(u8, op, "-"))
-                        builder.buildFSub(lhs, rhs, "fsub")
-                    else if (std.mem.eql(u8, op, "*"))
-                        builder.buildFMul(lhs, rhs, "fmul")
-                    else if (std.mem.eql(u8, op, "/"))
-                        builder.buildFDiv(lhs, rhs, "fdiv")
-                    else if (std.mem.eql(u8, op, "%"))
-                        builder.buildFRem(lhs, rhs, "frem")
-                    else
-                        return CodegenError.UnsupportedOpcode;
+                    const fval = switch (op) {
+                        .add => builder.buildFAdd(lhs, rhs, "fadd"),
+                        .sub => builder.buildFSub(lhs, rhs, "fsub"),
+                        .mul => builder.buildFMul(lhs, rhs, "fmul"),
+                        .div => builder.buildFDiv(lhs, rhs, "fdiv"),
+                        .mod => builder.buildFRem(lhs, rhs, "frem"),
+                        else => return CodegenError.UnsupportedOpcode,
+                    };
                     // Allow reassociation + FMA contraction for SIMD vectorization
                     llvm.Builder.setFastMathFlags(fval, llvm.Builder.FMF_VECTORIZE);
                     break :blk fval;
@@ -2204,20 +2215,15 @@ fn emitNumericInstruction(
                 },
             };
 
-            const i32_result = if (std.mem.eql(u8, op, "&"))
-                builder.buildAnd(lhs, rhs, "and")
-            else if (std.mem.eql(u8, op, "|"))
-                builder.buildOr(lhs, rhs, "or")
-            else if (std.mem.eql(u8, op, "^"))
-                builder.buildXor(lhs, rhs, "xor")
-            else if (std.mem.eql(u8, op, "<<"))
-                builder.buildShl(lhs, rhs, "shl")
-            else if (std.mem.eql(u8, op, ">>"))
-                builder.buildAShr(lhs, rhs, "shr")
-            else if (std.mem.eql(u8, op, ">>>"))
-                builder.buildLShr(lhs, rhs, "shru")
-            else
-                return CodegenError.UnsupportedOpcode;
+            const i32_result = switch (op) {
+                .band => builder.buildAnd(lhs, rhs, "and"),
+                .bor => builder.buildOr(lhs, rhs, "or"),
+                .bxor => builder.buildXor(lhs, rhs, "xor"),
+                .shl => builder.buildShl(lhs, rhs, "shl"),
+                .sar => builder.buildAShr(lhs, rhs, "shr"),
+                .shr => builder.buildLShr(lhs, rhs, "shru"),
+                else => return CodegenError.UnsupportedOpcode,
+            };
 
             const result = switch (kind) {
                 .i32 => i32_result,
@@ -2234,20 +2240,7 @@ fn emitNumericInstruction(
 
             const cmp = switch (kind) {
                 .i32 => blk: {
-                    const pred: c.LLVMIntPredicate = if (std.mem.eql(u8, op, "<"))
-                        c.LLVMIntSLT
-                    else if (std.mem.eql(u8, op, "<="))
-                        c.LLVMIntSLE
-                    else if (std.mem.eql(u8, op, ">"))
-                        c.LLVMIntSGT
-                    else if (std.mem.eql(u8, op, ">="))
-                        c.LLVMIntSGE
-                    else if (std.mem.eql(u8, op, "=="))
-                        c.LLVMIntEQ
-                    else if (std.mem.eql(u8, op, "!="))
-                        c.LLVMIntNE
-                    else
-                        return CodegenError.UnsupportedOpcode;
+                    const pred = intPred(op) orelse return CodegenError.UnsupportedOpcode;
                     break :blk builder.buildICmp(pred, lhs, rhs, "cmp");
                 },
                 .f64 => blk: {
@@ -2257,20 +2250,7 @@ fn emitNumericInstruction(
                     const lhs_is_sitofp = c.LLVMGetInstructionOpcode(lhs) == c.LLVMSIToFP;
                     const rhs_is_sitofp = c.LLVMGetInstructionOpcode(rhs) == c.LLVMSIToFP;
                     if (lhs_is_sitofp or rhs_is_sitofp) {
-                        const pred_i: c.LLVMIntPredicate = if (std.mem.eql(u8, op, "<"))
-                            c.LLVMIntSLT
-                        else if (std.mem.eql(u8, op, "<="))
-                            c.LLVMIntSLE
-                        else if (std.mem.eql(u8, op, ">"))
-                            c.LLVMIntSGT
-                        else if (std.mem.eql(u8, op, ">="))
-                            c.LLVMIntSGE
-                        else if (std.mem.eql(u8, op, "=="))
-                            c.LLVMIntEQ
-                        else if (std.mem.eql(u8, op, "!="))
-                            c.LLVMIntNE
-                        else
-                            return CodegenError.UnsupportedOpcode;
+                        const pred_i = intPred(op) orelse return CodegenError.UnsupportedOpcode;
                         const i32_lhs = if (lhs_is_sitofp)
                             c.LLVMGetOperand(lhs, 0)
                         else
@@ -2279,24 +2259,10 @@ fn emitNumericInstruction(
                             c.LLVMGetOperand(rhs, 0)
                         else
                             builder.buildFPToSI(rhs, llvm.i32Type(), "cmp_rhs_i32");
-                        // Push i1 directly — if_false handler detects i1 type
                         break :blk builder.buildICmp(pred_i, i32_lhs, i32_rhs, "icmp_iv");
                     }
 
-                    const pred: c.LLVMRealPredicate = if (std.mem.eql(u8, op, "<"))
-                        c.LLVMRealOLT
-                    else if (std.mem.eql(u8, op, "<="))
-                        c.LLVMRealOLE
-                    else if (std.mem.eql(u8, op, ">"))
-                        c.LLVMRealOGT
-                    else if (std.mem.eql(u8, op, ">="))
-                        c.LLVMRealOGE
-                    else if (std.mem.eql(u8, op, "=="))
-                        c.LLVMRealOEQ
-                    else if (std.mem.eql(u8, op, "!="))
-                        c.LLVMRealONE
-                    else
-                        return CodegenError.UnsupportedOpcode;
+                    const pred = realPred(op) orelse return CodegenError.UnsupportedOpcode;
                     const fc = builder.buildFCmp(pred, lhs, rhs, "fcmp");
                     llvm.Builder.setFastMathFlags(fc, llvm.Builder.FMF_VECTORIZE | 0x2);
                     break :blk fc;
@@ -2324,13 +2290,17 @@ fn emitNumericInstruction(
             const val = numVstackPop(vstack);
             const op = handler.op orelse return CodegenError.UnsupportedOpcode;
 
-            const result = if (std.mem.eql(u8, op, "-")) switch (kind) {
-                .i32 => builder.buildNeg(val, "neg"),
-                .f64 => builder.buildFNeg(val, "fneg"),
-            } else if (std.mem.eql(u8, op, "~")) blk: {
-                if (kind != .i32) return CodegenError.UnsupportedOpcode;
-                break :blk builder.buildNot(val, "bnot");
-            } else return CodegenError.UnsupportedOpcode;
+            const result = switch (op) {
+                .neg => switch (kind) {
+                    .i32 => builder.buildNeg(val, "neg"),
+                    .f64 => builder.buildFNeg(val, "fneg"),
+                },
+                .bnot => blk: {
+                    if (kind != .i32) return CodegenError.UnsupportedOpcode;
+                    break :blk builder.buildNot(val, "bnot");
+                },
+                else => return CodegenError.UnsupportedOpcode,
+            };
 
             vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
         },
@@ -2575,12 +2545,43 @@ fn emitNumericInstruction(
                 call_args[i] = numVstackPop(vstack);
             }
 
-            var param_types_buf: [8]llvm.Type = undefined;
-            for (0..call_argc) |j| {
-                param_types_buf[j] = elem_type;
+            // Cross-tier call: detect if callee has different param types (i32 vs f64)
+            // and insert conversions (sitofp for i32→f64, fptosi for f64→i32)
+            const callee_type = c.LLVMGlobalGetValueType(call_target);
+            const callee_ret = c.LLVMGetReturnType(callee_type);
+            const needs_conv = call_target != func and callee_ret != elem_type;
+
+            if (needs_conv) {
+                // Convert args from caller type to callee type
+                const callee_param_type = if (call_argc > 0)
+                    c.LLVMGetReturnType(callee_type) // callee uses same type for params and return
+                else
+                    elem_type;
+                for (0..call_argc) |j| {
+                    if (c.LLVMTypeOf(call_args[j]) != callee_param_type) {
+                        call_args[j] = if (kind == .i32)
+                            builder.buildSIToFP(call_args[j], callee_param_type, "xcall_a")
+                        else
+                            builder.buildFPToSI(call_args[j], callee_param_type, "xcall_a");
+                    }
+                }
             }
-            const call_fn_ty = llvm.functionType(elem_type, param_types_buf[0..call_argc], false);
-            const result = builder.buildCall(call_fn_ty, call_target, call_args[0..call_argc], "call");
+
+            var param_types_buf: [8]llvm.Type = undefined;
+            const call_elem = if (needs_conv) callee_ret else elem_type;
+            for (0..call_argc) |j| {
+                param_types_buf[j] = call_elem;
+            }
+            const call_fn_ty = llvm.functionType(call_elem, param_types_buf[0..call_argc], false);
+            var result = builder.buildCall(call_fn_ty, call_target, call_args[0..call_argc], "call");
+
+            // Convert return value back to caller type
+            if (needs_conv) {
+                result = if (kind == .i32)
+                    builder.buildFPToSI(result, elem_type, "xcall_r")
+                else
+                    builder.buildSIToFP(result, elem_type, "xcall_r");
+            }
             vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
         },
 
@@ -2601,12 +2602,37 @@ fn emitNumericInstruction(
                 call_args[i] = numVstackPop(vstack);
             }
 
-            var param_types_buf: [8]llvm.Type = undefined;
-            for (0..call_argc) |j| {
-                param_types_buf[j] = elem_type;
+            // Cross-tier tail call: same conversion logic as call_self
+            const tc_callee_type = c.LLVMGlobalGetValueType(call_target);
+            const tc_callee_ret = c.LLVMGetReturnType(tc_callee_type);
+            const tc_needs_conv = call_target != func and tc_callee_ret != elem_type;
+
+            if (tc_needs_conv) {
+                for (0..call_argc) |j| {
+                    if (c.LLVMTypeOf(call_args[j]) != tc_callee_ret) {
+                        call_args[j] = if (kind == .i32)
+                            builder.buildSIToFP(call_args[j], tc_callee_ret, "xtc_a")
+                        else
+                            builder.buildFPToSI(call_args[j], tc_callee_ret, "xtc_a");
+                    }
+                }
             }
-            const call_fn_ty = llvm.functionType(elem_type, param_types_buf[0..call_argc], false);
-            const result = builder.buildCall(call_fn_ty, call_target, call_args[0..call_argc], "tail");
+
+            var param_types_buf: [8]llvm.Type = undefined;
+            const tc_elem = if (tc_needs_conv) tc_callee_ret else elem_type;
+            for (0..call_argc) |j| {
+                param_types_buf[j] = tc_elem;
+            }
+            const call_fn_ty = llvm.functionType(tc_elem, param_types_buf[0..call_argc], false);
+            var result = builder.buildCall(call_fn_ty, call_target, call_args[0..call_argc], "tail");
+
+            // Convert return value back to caller's type before returning
+            if (tc_needs_conv) {
+                result = if (kind == .i32)
+                    builder.buildFPToSI(result, elem_type, "xtc_r")
+                else
+                    builder.buildSIToFP(result, elem_type, "xtc_r");
+            }
             _ = builder.buildRet(result);
             block_terminated.* = true;
         },

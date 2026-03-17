@@ -1,13 +1,13 @@
 #!/bin/bash
 # EdgeBox vs Node.js Benchmark Runner
-# Compiles each benchmark with edgeboxc, runs in both EdgeBox and Node.js,
+# Compiles each benchmark with edgebox, runs in both EdgeBox and Node.js,
 # and outputs a comparison table.
 #
 # Usage: ./bench/bench_vs_node.sh
 
 set -e
 
-EDGEBOXC="./zig-out/bin/edgeboxc"
+EDGEBOXC="./zig-out/bin/edgebox"
 NODE="node"
 RESULTS_FILE="bench/results_vs_node.md"
 

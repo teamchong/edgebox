@@ -69,7 +69,7 @@ fi
 echo "=== EdgeBox Polyfill Test Suite ==="
 echo ""
 
-EDGEBOXC="$ROOT_DIR/zig-out/bin/edgeboxc"
+EDGEBOXC="$ROOT_DIR/zig-out/bin/edgebox"
 
 if [ ! -f "$EDGEBOXC" ]; then
     echo "EdgeBox CLI not found at $EDGEBOXC"

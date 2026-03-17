@@ -2,7 +2,7 @@
 set -e
 
 # Compile edgebox-base.wasm to edgebox-base.aot
-# This uses edgeboxc's embedded AOT compiler (WAMR + LLVM)
+# This uses edgebox's embedded AOT compiler (WAMR + LLVM)
 
 WASM_FILE="zig-out/bin/edgebox-base.wasm"
 AOT_FILE="zig-out/bin/edgebox-base.aot"
@@ -23,9 +23,9 @@ trap "rm -rf $TEMP_DIR" EXIT
 mkdir -p "$TEMP_DIR/app"
 cp "$WASM_FILE" "$TEMP_DIR/app/app.wasm"
 
-# Compile using edgeboxc's AOT compiler
+# Compile using edgebox's AOT compiler
 # The build process will generate app.aot from app.wasm
-./zig-out/bin/edgeboxc build "$TEMP_DIR/app" --force
+./zig-out/bin/edgebox build "$TEMP_DIR/app" --force
 
 # Copy the AOT file to the target location
 if [ -f "zig-out/bin/app/app.aot" ]; then

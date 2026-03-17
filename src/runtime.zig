@@ -2,7 +2,7 @@
 /// Compiles JS to AOT WASM using WAMR with SIMD support
 ///
 /// Usage:
-///   edgeboxc build [app-directory]  - Build app (bundle + bytecode + AOT)
+///   edgebox build [app-directory]  - Build app (bundle + bytecode + AOT)
 const std = @import("std");
 const builtin = @import("builtin");
 const wizer = @import("wizer_wamr.zig");
@@ -429,6 +429,29 @@ fn isIdentChar(ch: u8) bool {
         (ch >= '0' and ch <= '9') or ch == '_' or ch == '$';
 }
 
+/// Extract integer from a JSON object field, defaulting to 0.
+fn jsonInt(obj: std.json.ObjectMap, key: []const u8) u32 {
+    return jsonIntOr(obj, key, 0);
+}
+
+/// Extract integer from a JSON object field with a custom default.
+fn jsonIntOr(obj: std.json.ObjectMap, key: []const u8, default: u32) u32 {
+    const v = obj.get(key) orelse return default;
+    return switch (v) {
+        .integer => |i| @intCast(@max(0, i)),
+        else => default,
+    };
+}
+
+/// Extract string from a JSON object field.
+fn jsonStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = obj.get(key) orelse return null;
+    return switch (v) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
 /// Expand ${VAR} references in a string with host environment variables
 /// Example: "${GH_TOKEN}" -> actual value from host env
 fn expandEnvVar(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
@@ -546,7 +569,7 @@ pub fn main() !void {
             printUsage();
             return;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
-            std.debug.print("edgeboxc {s}\n", .{VERSION});
+            std.debug.print("edgebox {s}\n", .{VERSION});
             return;
         } else if (std.mem.eql(u8, arg, "--dynamic")) {
             dynamic_mode = true;
@@ -657,10 +680,10 @@ pub fn main() !void {
 
 fn printUsage() void {
     std.debug.print(
-        \\EdgeBox Compiler — JIT+AOT for V8/workerd
+        \\EdgeBox — JIT+AOT JavaScript compiler for V8
         \\
         \\Usage:
-        \\  edgeboxc <app.js>   Compile JS with AOT numeric kernels for V8/workerd
+        \\  edgebox <app.js>   Compile JS with AOT numeric kernels for V8/workerd
         \\
         \\Output (in zig-out/bin/<app.js>/):
         \\  <app>-worker.mjs        Worker module (V8 JIT + WASM AOT)
@@ -679,7 +702,7 @@ fn printUsage() void {
         \\  -v, --version    Show version
         \\
         \\Examples:
-        \\  edgeboxc app.js                         Build Worker + WASM AOT
+        \\  edgebox app.js                          Build Worker + WASM AOT
         \\  node zig-out/bin/app.js/app-worker.mjs  Run on Node.js (V8 + WASM)
         \\  npx workerd serve zig-out/bin/app.js/app-config.capnp  Run on workerd
         \\
@@ -1693,141 +1716,70 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     const WasmFunc = struct { name: []const u8, arg_count: u32, instr_count: u32, is_recursive: bool, array_args: u8, mutated_args: u8, read_array_args: u8, length_args: u8, has_loop: bool, has_bitwise: bool, line_num: u32, is_anon: bool, is_f64: bool };
                     var wasm_funcs: [64]WasmFunc = undefined;
                     var wasm_func_count: usize = 0;
-                    if (wasm_manifest) |mc| {
-                        var pos: usize = 0;
-                        while (std.mem.indexOfPos(u8, mc, pos, "\"name\":\"")) |name_start| {
-                            const ns = name_start + 8;
-                            if (std.mem.indexOfPos(u8, mc, ns, "\"")) |name_end| {
-                                var ac: u32 = 1;
-                                if (std.mem.indexOfPos(u8, mc, name_end, "\"args\":")) |as| {
-                                    const ad = as + 7;
-                                    if (ad < mc.len and mc[ad] >= '0' and mc[ad] <= '9') ac = mc[ad] - '0';
-                                }
-                                // Parse instruction count: "instrs":N
-                                var ic: u32 = 0;
-                                if (std.mem.indexOfPos(u8, mc, name_end, "\"instrs\":")) |is| {
-                                    var id = is + 9;
-                                    while (id < mc.len and mc[id] >= '0' and mc[id] <= '9') {
-                                        ic = ic * 10 + (mc[id] - '0');
-                                        id += 1;
-                                    }
-                                }
-                                // Parse recursive flag: "recursive":1
-                                var is_rec = false;
-                                if (std.mem.indexOfPos(u8, mc, name_end, "\"recursive\":")) |rs| {
-                                    const rd = rs + 12;
-                                    if (rd < mc.len and mc[rd] == '1') is_rec = true;
-                                }
-                                // Parse array_args bitmask: "array_args":N
-                                var aa: u8 = 0;
-                                if (std.mem.indexOfPos(u8, mc, name_end, "\"array_args\":")) |aas| {
-                                    var aad = aas + 13;
-                                    var aa_val: u32 = 0;
-                                    while (aad < mc.len and mc[aad] >= '0' and mc[aad] <= '9') {
-                                        aa_val = aa_val * 10 + (mc[aad] - '0');
-                                        aad += 1;
-                                    }
-                                    aa = @truncate(aa_val);
-                                }
-                                // Parse mutated_args bitmask: "mutated_args":N
-                                var ma: u8 = aa; // Default: assume all array args mutated
-                                if (std.mem.indexOfPos(u8, mc, name_end, "\"mutated_args\":")) |mas| {
-                                    var mad = mas + 15;
-                                    var ma_val: u32 = 0;
-                                    while (mad < mc.len and mc[mad] >= '0' and mc[mad] <= '9') {
-                                        ma_val = ma_val * 10 + (mc[mad] - '0');
-                                        mad += 1;
-                                    }
-                                    ma = @truncate(ma_val);
-                                }
-                                // Parse read_array_args bitmask: "read_array_args":N
-                                var ra: u8 = aa; // Default: assume all array args are read
-                                if (std.mem.indexOfPos(u8, mc, name_end, "\"read_array_args\":")) |ras| {
-                                    var rad = ras + 18;
-                                    var ra_val: u32 = 0;
-                                    while (rad < mc.len and mc[rad] >= '0' and mc[rad] <= '9') {
-                                        ra_val = ra_val * 10 + (mc[rad] - '0');
-                                        rad += 1;
-                                    }
-                                    ra = @truncate(ra_val);
-                                }
-                                // Parse length_args bitmask: "length_args":N
-                                var la: u8 = 0;
-                                if (std.mem.indexOfPos(u8, mc, name_end, "\"length_args\":")) |las| {
-                                    var lad = las + 14;
-                                    var la_val: u32 = 0;
-                                    while (lad < mc.len and mc[lad] >= '0' and mc[lad] <= '9') {
-                                        la_val = la_val * 10 + (mc[lad] - '0');
-                                        lad += 1;
-                                    }
-                                    la = @truncate(la_val);
-                                }
-                                // Parse has_loop: "has_loop":1
-                                var has_loop = false;
-                                if (std.mem.indexOfPos(u8, mc, name_end, "\"has_loop\":1")) |hls| {
-                                    const next_name = std.mem.indexOfPos(u8, mc, name_end + 1, "\"name\":\"") orelse mc.len;
-                                    if (hls < next_name) has_loop = true;
-                                }
-                                // Parse has_bitwise: "has_bitwise":1
-                                var has_bitwise = false;
-                                if (std.mem.indexOfPos(u8, mc, name_end, "\"has_bitwise\":1")) |hbs| {
-                                    const next_name = std.mem.indexOfPos(u8, mc, name_end + 1, "\"name\":\"") orelse mc.len;
-                                    if (hbs < next_name) has_bitwise = true;
-                                }
-                                // Parse line number: "line":N
-                                var ln: u32 = 0;
-                                if (std.mem.indexOfPos(u8, mc, name_end, "\"line\":")) |ls| {
-                                    var ld = ls + 7;
-                                    while (ld < mc.len and mc[ld] >= '0' and mc[ld] <= '9') {
-                                        ln = ln * 10 + (mc[ld] - '0');
-                                        ld += 1;
-                                    }
-                                }
-                                // Parse type: "type":"f64" or "type":"i32"
-                                var is_f64 = false;
-                                if (std.mem.indexOfPos(u8, mc, name_end, "\"type\":\"f64\"")) |ts| {
-                                    // Only match if within this entry (before next "name")
-                                    const next_name = std.mem.indexOfPos(u8, mc, name_end + 1, "\"name\":\"") orelse mc.len;
-                                    if (ts < next_name) is_f64 = true;
-                                }
-                                // Detect anonymous functions (synthetic name starts with __anon_)
-                                const is_anon = std.mem.startsWith(u8, mc[ns..name_end], "__anon_");
-                                if (wasm_func_count < 64) {
-                                    wasm_funcs[wasm_func_count] = .{ .name = mc[ns..name_end], .arg_count = ac, .instr_count = ic, .is_recursive = is_rec, .array_args = aa, .mutated_args = ma, .read_array_args = ra, .length_args = la, .has_loop = has_loop, .has_bitwise = has_bitwise, .line_num = ln, .is_anon = is_anon, .is_f64 = is_f64 };
-                                    wasm_func_count += 1;
-                                }
-                                pos = name_end + 1;
-                            } else break;
+                    // Parse manifest JSON (same std.json used throughout the codebase)
+                    var json_parsed: ?std.json.Parsed(std.json.Value) = if (wasm_manifest) |mc|
+                        std.json.parseFromSlice(std.json.Value, allocator, mc, .{}) catch null
+                    else
+                        null;
+                    defer if (json_parsed) |*p| p.deinit();
+                    if (json_parsed) |p| {
+                        if (p.value == .array) {
+                            for (p.value.array.items) |item| {
+                                if (item != .object) continue;
+                                if (wasm_func_count >= 64) break;
+                                const obj = item.object;
+                                const name = jsonStr(obj, "name") orelse continue;
+                                const aa = jsonInt(obj, "array_args");
+                                wasm_funcs[wasm_func_count] = .{
+                                    .name = name,
+                                    .arg_count = @max(1, jsonInt(obj, "args")),
+                                    .instr_count = jsonInt(obj, "instrs"),
+                                    .is_recursive = jsonInt(obj, "recursive") == 1,
+                                    .array_args = @truncate(aa),
+                                    .mutated_args = @truncate(jsonIntOr(obj, "mutated_args", aa)),
+                                    .read_array_args = @truncate(jsonIntOr(obj, "read_array_args", aa)),
+                                    .length_args = @truncate(jsonInt(obj, "length_args")),
+                                    .has_loop = jsonInt(obj, "has_loop") == 1,
+                                    .has_bitwise = jsonInt(obj, "has_bitwise") == 1,
+                                    .line_num = jsonInt(obj, "line"),
+                                    .is_anon = std.mem.startsWith(u8, name, "__anon_"),
+                                    .is_f64 = if (jsonStr(obj, "type")) |t| std.mem.eql(u8, t, "f64") else false,
+                                };
+                                wasm_func_count += 1;
+                            }
                         }
                     }
 
                     // Preamble: load WASM module (compatible with Node.js + workerd)
-                    // Node.js: readFileSync + sync instantiation
-                    // workerd: WASM binding from capnp config — import resolves to WebAssembly.Module
-                    wf.writeAll("// EdgeBox AOT+JIT (auto-generated)\n") catch {};
-                    wf.writeAll("// Source transform: function bodies replaced with WASM calls\n") catch {};
-                    wf.writeAll("// V8 inlines these WASM calls into JS (zero overhead)\n\n") catch {};
-                    wf.writeAll("import { readFileSync } from 'fs';\n") catch {};
-                    wf.writeAll("import { fileURLToPath } from 'url';\n") catch {};
-                    wf.writeAll("import { dirname, join } from 'path';\n") catch {};
-                    wf.writeAll("import { createRequire } from 'module';\n") catch {};
-                    wf.writeAll("const require = createRequire(import.meta.url);\n\n") catch {};
-                    wf.writeAll("let __wasm;\n") catch {};
-                    wf.writeAll("if (typeof process !== 'undefined' && process.versions?.node) {\n") catch {};
-                    wf.writeAll("  const __dir = dirname(fileURLToPath(import.meta.url));\n") catch {};
-                    wf.writeAll("  const buf = readFileSync(join(__dir, '") catch {};
-                    wf.writeAll(wasm_filename) catch {};
-                    wf.writeAll("'));\n") catch {};
-                    wf.writeAll("  __wasm = new WebAssembly.Instance(new WebAssembly.Module(buf), { env: { pow: Math.pow } });\n") catch {};
-                    wf.writeAll("  __wasm.exports.memory.grow(254);\n") catch {}; // 256 pages = 16MB
-                    wf.writeAll("} else {\n") catch {};
-                    // workerd: WASM module bound via capnp config as ESM module
-                    wf.writeAll("  const { default: __wasmModule } = await import('") catch {};
-                    wf.writeAll(wasm_filename) catch {};
-                    wf.writeAll("');\n") catch {};
-                    wf.writeAll("  __wasm = new WebAssembly.Instance(__wasmModule, { env: { pow: Math.pow } });\n") catch {};
-                    wf.writeAll("  __wasm.exports.memory.grow(254);\n") catch {};
-                    wf.writeAll("}\n") catch {};
+                    var w_buf: [4096]u8 = undefined;
+                    var w_state = wf.writer(&w_buf);
+                    const w = &w_state.interface;
+                    defer w.flush() catch {};
+                    w.print(
+                        \\// EdgeBox AOT+JIT (auto-generated)
+                        \\// Source transform: function bodies replaced with WASM calls
+                        \\// V8 inlines these WASM calls into JS (zero overhead)
+                        \\
+                        \\import {{ readFileSync }} from 'fs';
+                        \\import {{ fileURLToPath }} from 'url';
+                        \\import {{ dirname, join }} from 'path';
+                        \\import {{ createRequire }} from 'module';
+                        \\const require = createRequire(import.meta.url);
+                        \\
+                        \\let __wasm;
+                        \\if (typeof process !== 'undefined' && process.versions?.node) {{
+                        \\  const __dir = dirname(fileURLToPath(import.meta.url));
+                        \\  const buf = readFileSync(join(__dir, '{s}'));
+                        \\  __wasm = new WebAssembly.Instance(new WebAssembly.Module(buf), {{ env: {{ pow: Math.pow }} }});
+                        \\  __wasm.exports.memory.grow(254);
+                        \\}} else {{
+                        \\  const {{ default: __wasmModule }} = await import('{s}');
+                        \\  __wasm = new WebAssembly.Instance(__wasmModule, {{ env: {{ pow: Math.pow }} }});
+                        \\  __wasm.exports.memory.grow(254);
+                        \\}}
+                        \\
+                    , .{ wasm_filename, wasm_filename }) catch {};
+
                     // Hoist TypedArray views to module level (avoids per-call allocation).
                     // i32 tier: Int32Array (4 bytes/element), f64 tier: Float64Array (8 bytes/element)
                     // Flags lifted to outer scope so trampoline body can reference them.
@@ -1844,39 +1796,33 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         }
                     }
                     if (has_array_funcs) {
-                        // __wbuf: raw ArrayBuffer backing WASM linear memory.
-                        // Used for zero-copy detection: if arr.buffer === __wbuf, array is already
-                        // in WASM memory (allocated via __wasmArray) — skip copy entirely.
-                        wf.writeAll("const __wbuf = __wasm ? __wasm.exports.memory.buffer : null;\n") catch {};
-                        if (has_i32_array_funcs)
-                            wf.writeAll("const __m = __wasm ? new Int32Array(__wbuf) : null;\n") catch {};
-                        if (has_f64_array_funcs)
-                            wf.writeAll("const __m_f64 = __wasm ? new Float64Array(__wbuf) : null;\n") catch {};
-                        // __wasmArray: allocate a TypedArray directly in WASM linear memory.
-                        // Returns a view — no copy needed when passed to WASM trampolines.
-                        // Usage: const data = __wasmArray(Int32Array, 100000);
-                        wf.writeAll("let __ao = 1024;\n") catch {};
-                        wf.writeAll("function __wasmArray(T, n) { const a = T.BYTES_PER_ELEMENT; __ao = (__ao + a - 1) & ~(a - 1); const v = new T(__wbuf, __ao, n); __ao += n * a; return v; }\n") catch {};
-                        // Per-arg identity cache: skip copy when same array reference is passed.
-                        // __last_fn tracks which function last wrote to WASM memory, so cached
-                        // functions detect when a different function has overwritten their region.
+                        // Memory views + stack allocator for WASM linear memory
+                        w.writeAll("const __wbuf = __wasm ? __wasm.exports.memory.buffer : null;\n") catch {};
+                        if (has_i32_array_funcs) w.writeAll("const __m = __wasm ? new Int32Array(__wbuf) : null;\n") catch {};
+                        if (has_f64_array_funcs) w.writeAll("const __m_f64 = __wasm ? new Float64Array(__wbuf) : null;\n") catch {};
+                        w.writeAll(
+                            \\let __sp = __wbuf.byteLength;
+                            \\function __wasmStackSave() { return __sp; }
+                            \\function __wasmStackRestore(p) { __sp = p; }
+                            \\function __wasmStackAlloc(n) { __sp = (__sp - n) & ~7; return __sp; }
+                            \\function __wasmArray(T, n) { return new T(__wbuf, __wasmStackAlloc(n * T.BYTES_PER_ELEMENT), n); }
+                            \\
+                        ) catch {};
+                        // Per-arg identity cache for repeated calls with same array ref
                         if (any_cacheable_args) {
-                            wf.writeAll("let __last_fn = -1;\n") catch {};
+                            w.writeAll("let __last_fn = -1;\n") catch {};
                             for (wasm_funcs[0..wasm_func_count], 0..) |wfe, wfi| {
                                 const read_only = wfe.array_args & ~wfe.mutated_args;
                                 if (read_only == 0) continue;
                                 var ai: u32 = 0;
                                 while (ai < 8) : (ai += 1) {
-                                    if (read_only & (@as(u8, 1) << @intCast(ai)) != 0) {
-                                        var decl_buf: [80]u8 = undefined;
-                                        const decl = std.fmt.bufPrint(&decl_buf, "let __c{d}_{d}=null;\n", .{ wfi, ai }) catch continue;
-                                        wf.writeAll(decl) catch {};
-                                    }
+                                    if (read_only & (@as(u8, 1) << @intCast(ai)) != 0)
+                                        w.print("let __c{d}_{d}=null;\n", .{ wfi, ai }) catch {};
                                 }
                             }
                         }
                     }
-                    wf.writeAll("\n") catch {};
+                    w.writeAll("\n") catch {};
 
                     // Source transform: copy original source, but replace function bodies
                     // for WASM-compiled functions with WASM call trampolines.
@@ -2070,7 +2016,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     // f64+bitwise recursive: integer code forced into f64 tier by division.
                                     // WASM pays fptosi/sitofp roundtrip per |0, fmod polyfill per %.
                                     // V8 JIT specializes to native i32 ops — always faster.
-                                    wf.writeAll(cc[src_pos .. src_pos + 1]) catch {};
+                                    w.writeAll(cc[src_pos .. src_pos + 1]) catch {};
                                     src_pos += 1;
                                     continue;
                                 }
@@ -2144,7 +2090,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         mf.length_args == 0 and mf.has_loop and mf.instr_count < 200 and
                                         array_arg_count >= 2 and scalar_arg_count >= 2;
                                     if (!calls_wasm and !is_write_only_heavy and (is_write_only_light or is_fixed_array or is_mutated_fixed_loop or is_readonly_fixed_loop or (mf.array_args == 0 and mf.instr_count < 150))) {
-                                        wf.writeAll(cc[src_pos .. src_pos + 1]) catch {};
+                                        w.writeAll(cc[src_pos .. src_pos + 1]) catch {};
                                         src_pos += 1;
                                         continue;
                                     }
@@ -2156,13 +2102,13 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 else
                                     std.mem.indexOfPos(u8, cc, match_end, "{") orelse {
                                         // No brace found — write char and advance
-                                        wf.writeAll(cc[src_pos .. src_pos + 1]) catch {};
+                                        w.writeAll(cc[src_pos .. src_pos + 1]) catch {};
                                         src_pos += 1;
                                         continue;
                                     };
 
                                 // Write everything up to and including the opening brace
-                                wf.writeAll(cc[src_pos .. brace_pos + 1]) catch {};
+                                w.writeAll(cc[src_pos .. brace_pos + 1]) catch {};
 
                                 // Skip the original function body by brace-matching
                                 var depth: i32 = 1;
@@ -2235,51 +2181,48 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
 
                                 if (mf.array_args == 0) {
                                     // No array args — simple scalar trampoline
-                                    wf.writeAll(" return __wasm.exports.") catch {};
-                                    wf.writeAll(mf.name) catch {};
-                                    wf.writeAll("(") catch {};
-                                    wf.writeAll(params_str) catch {};
-                                    wf.writeAll("); }") catch {};
+                                    w.print(" return __wasm.exports.{s}({s}); }}", .{ mf.name, params_str }) catch {};
                                 } else {
                                     // Array args — copy to/from WASM linear memory
-                                    wf.writeAll("\n") catch {};
+                                    w.writeAll("\n") catch {};
                                     // i32 tier: Int32Array (4 bytes/elem), byte offset = idx << 2
                                     // f64 tier: Float64Array (8 bytes/elem), byte offset = idx << 3
                                     // Float64Array lets copy-back handle type conversion (e.g.
                                     // Uint8ClampedArray.set(Float64Array) rounds+clamps correctly).
                                     const mem_view: []const u8 = if (mf.is_f64) "__m_f64" else "__m";
-                                    const byte_shift: []const u8 = if (mf.is_f64) " << 3" else " << 2";
+                                    const alloc_shift: []const u8 = if (mf.is_f64) " << 3" else " << 2";
+                                    const elem_shift: []const u8 = if (mf.is_f64) " >> 3" else " >> 2";
 
                                     // Zero-copy fast path: if ALL array args are backed by WASM memory
                                     // (allocated via __wasmArray), skip copy entirely.
                                     // arr.buffer === __wbuf means the TypedArray is a view into WASM linear memory.
-                                    wf.writeAll("  if (") catch {};
+                                    w.writeAll("  if (") catch {};
                                     {
                                         var first_zc = true;
                                         var zi: u32 = 0;
                                         while (zi < param_count) : (zi += 1) {
                                             if (mf.array_args & (@as(u8, 1) << @intCast(zi)) != 0) {
-                                                if (!first_zc) wf.writeAll(" && ") catch {};
-                                                wf.writeAll(param_names[zi]) catch {};
-                                                wf.writeAll(".buffer === __wbuf") catch {};
+                                                if (!first_zc) w.writeAll(" && ") catch {};
+                                                w.writeAll(param_names[zi]) catch {};
+                                                w.writeAll(".buffer === __wbuf") catch {};
                                                 first_zc = false;
                                             }
                                         }
                                     }
-                                    wf.writeAll(") return __wasm.exports.") catch {};
-                                    wf.writeAll(mf.name) catch {};
-                                    wf.writeAll("(") catch {};
+                                    w.writeAll(") return __wasm.exports.") catch {};
+                                    w.writeAll(mf.name) catch {};
+                                    w.writeAll("(") catch {};
                                     {
                                         var first_arg = true;
                                         var zi: u32 = 0;
                                         while (zi < param_count) : (zi += 1) {
-                                            if (!first_arg) wf.writeAll(", ") catch {};
+                                            if (!first_arg) w.writeAll(", ") catch {};
                                             if (mf.array_args & (@as(u8, 1) << @intCast(zi)) != 0) {
                                                 // Pass byte offset directly from the TypedArray view
-                                                wf.writeAll(param_names[zi]) catch {};
-                                                wf.writeAll(".byteOffset") catch {};
+                                                w.writeAll(param_names[zi]) catch {};
+                                                w.writeAll(".byteOffset") catch {};
                                             } else {
-                                                wf.writeAll(param_names[zi]) catch {};
+                                                w.writeAll(param_names[zi]) catch {};
                                             }
                                             first_arg = false;
                                         }
@@ -2287,31 +2230,34 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         zi = 0;
                                         while (zi < param_count) : (zi += 1) {
                                             if (mf.length_args & (@as(u8, 1) << @intCast(zi)) != 0) {
-                                                wf.writeAll(", ") catch {};
-                                                wf.writeAll(param_names[zi]) catch {};
-                                                wf.writeAll(".length") catch {};
+                                                w.writeAll(", ") catch {};
+                                                w.writeAll(param_names[zi]) catch {};
+                                                w.writeAll(".length") catch {};
                                             }
                                         }
                                     }
-                                    wf.writeAll(");\n") catch {};
+                                    w.writeAll(");\n") catch {};
 
-                                    // Dynamic offsets: each array arg gets space = arr.length elements.
-                                    // Uses bulk .set() for fast TypedArray transfer (memcpy under the hood).
-                                    // Read-only args cached by reference identity (skip copy when same array).
+                                    // Stack-scoped copy: save SP, allocate, copy, call, restore.
+                                    // Identity cache: skip copy when same array ref on repeated calls.
                                     const read_only_args = mf.array_args & ~mf.mutated_args;
                                     // Format function index for __last_fn tracking
                                     var mfi_buf: [16]u8 = undefined;
                                     const mfi_str = std.fmt.bufPrint(&mfi_buf, "{d}", .{matched_func_idx}) catch "0";
-                                    wf.writeAll("  let __off = 0;\n") catch {};
+                                    w.writeAll("  const __sp0 = __wasmStackSave();\n") catch {};
                                     var i: u32 = 0;
                                     while (i < param_count) : (i += 1) {
                                         if (mf.array_args & (@as(u8, 1) << @intCast(i)) != 0) {
                                             var idx_buf: [8]u8 = undefined;
                                             const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{i}) catch "0";
-                                            // Emit: const __bN = __off;
-                                            wf.writeAll("  const __b") catch {};
-                                            wf.writeAll(idx_str) catch {};
-                                            wf.writeAll(" = __off;\n") catch {};
+                                            // Stack-allocate: __pN = __wasmStackAlloc(arr.length * bytes_per_elem)
+                                            w.writeAll("  const __p") catch {};
+                                            w.writeAll(idx_str) catch {};
+                                            w.writeAll(" = __wasmStackAlloc(") catch {};
+                                            w.writeAll(param_names[i]) catch {};
+                                            w.writeAll(".length") catch {};
+                                            w.writeAll(alloc_shift) catch {};
+                                            w.writeAll(");\n") catch {};
 
                                             if (read_only_args & (@as(u8, 1) << @intCast(i)) != 0) {
                                                 // Read-only: cache by reference identity. Skip copy when
@@ -2327,76 +2273,75 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                                 // Small arrays (< 128 = 512 bytes) always re-copy — too cheap to
                                                 // risk stale data from same-ref mutation (e.g. crypto_verify_32).
                                                 // Large arrays use identity cache for performance.
-                                                wf.writeAll("  if (__last_fn !== ") catch {};
-                                                wf.writeAll(mfi_str) catch {};
-                                                wf.writeAll(" || ") catch {};
-                                                wf.writeAll(pn) catch {};
-                                                wf.writeAll(".length < 128 || ") catch {};
-                                                wf.writeAll(pn) catch {};
-                                                wf.writeAll(" !== __c") catch {};
-                                                wf.writeAll(cid) catch {};
-                                                wf.writeAll(") { ") catch {};
-                                                wf.writeAll(mem_view) catch {};
-                                                wf.writeAll(".set(") catch {};
-                                                wf.writeAll(pn) catch {};
-                                                wf.writeAll(", __off); __c") catch {};
-                                                wf.writeAll(cid) catch {};
-                                                wf.writeAll(" = ") catch {};
-                                                wf.writeAll(pn) catch {};
-                                                wf.writeAll("; }\n") catch {};
+                                                w.writeAll("  if (__last_fn !== ") catch {};
+                                                w.writeAll(mfi_str) catch {};
+                                                w.writeAll(" || ") catch {};
+                                                w.writeAll(pn) catch {};
+                                                w.writeAll(".length < 128 || ") catch {};
+                                                w.writeAll(pn) catch {};
+                                                w.writeAll(" !== __c") catch {};
+                                                w.writeAll(cid) catch {};
+                                                w.writeAll(") { ") catch {};
+                                                w.writeAll(mem_view) catch {};
+                                                w.writeAll(".set(") catch {};
+                                                w.writeAll(pn) catch {};
+                                                w.writeAll(", __p") catch {};
+                                                w.writeAll(idx_str) catch {};
+                                                w.writeAll(elem_shift) catch {};
+                                                w.writeAll("); __c") catch {};
+                                                w.writeAll(cid) catch {};
+                                                w.writeAll(" = ") catch {};
+                                                w.writeAll(pn) catch {};
+                                                w.writeAll("; }\n") catch {};
                                             } else if (mf.read_array_args & (@as(u8, 1) << @intCast(i)) != 0) {
                                                 // Mutated + read: must copy in (function reads then writes)
-                                                wf.writeAll("  ") catch {};
-                                                wf.writeAll(mem_view) catch {};
-                                                wf.writeAll(".set(") catch {};
-                                                wf.writeAll(param_names[i]) catch {};
-                                                wf.writeAll(", __off);\n") catch {};
+                                                w.writeAll("  ") catch {};
+                                                w.writeAll(mem_view) catch {};
+                                                w.writeAll(".set(") catch {};
+                                                w.writeAll(param_names[i]) catch {};
+                                                w.writeAll(", __p") catch {};
+                                                w.writeAll(idx_str) catch {};
+                                                w.writeAll(elem_shift) catch {};
+                                                w.writeAll(");\n") catch {};
                                             } else {
                                                 // Write-only: skip copy-in (data will be overwritten)
                                             }
 
-                                            // Advance offset past this array
-                                            wf.writeAll("  __off += ") catch {};
-                                            wf.writeAll(param_names[i]) catch {};
-                                            wf.writeAll(".length;\n") catch {};
                                         }
                                     }
                                     // Track which function last wrote to WASM memory (cross-function cache safety)
                                     if (any_cacheable_args) {
-                                        wf.writeAll("  __last_fn = ") catch {};
-                                        wf.writeAll(mfi_str) catch {};
-                                        wf.writeAll(";\n") catch {};
+                                        w.writeAll("  __last_fn = ") catch {};
+                                        w.writeAll(mfi_str) catch {};
+                                        w.writeAll(";\n") catch {};
                                     }
-                                    // Call WASM with byte offsets (__bN << 2) for array args, scalars as-is
-                                    wf.writeAll("  const __r = __wasm.exports.") catch {};
-                                    wf.writeAll(mf.name) catch {};
-                                    wf.writeAll("(") catch {};
+                                    // Call WASM — __pN is already a byte offset from stack allocator
+                                    w.writeAll("  const __r = __wasm.exports.") catch {};
+                                    w.writeAll(mf.name) catch {};
+                                    w.writeAll("(") catch {};
                                     i = 0;
                                     while (i < param_count) : (i += 1) {
-                                        if (i > 0) wf.writeAll(", ") catch {};
+                                        if (i > 0) w.writeAll(", ") catch {};
                                         if (mf.array_args & (@as(u8, 1) << @intCast(i)) != 0) {
                                             var idx_buf2: [8]u8 = undefined;
                                             const idx_str2 = std.fmt.bufPrint(&idx_buf2, "{d}", .{i}) catch "0";
-                                            wf.writeAll("__b") catch {};
-                                            wf.writeAll(idx_str2) catch {};
-                                            wf.writeAll(byte_shift) catch {};
+                                            w.writeAll("__p") catch {};
+                                            w.writeAll(idx_str2) catch {};
                                         } else {
-                                            wf.writeAll(param_names[i]) catch {};
+                                            w.writeAll(param_names[i]) catch {};
                                         }
                                     }
                                     // Append .length for array args that use get_length
                                     i = 0;
                                     while (i < param_count) : (i += 1) {
                                         if (mf.length_args & (@as(u8, 1) << @intCast(i)) != 0) {
-                                            wf.writeAll(", ") catch {};
-                                            wf.writeAll(param_names[i]) catch {};
-                                            wf.writeAll(".length") catch {};
+                                            w.writeAll(", ") catch {};
+                                            w.writeAll(param_names[i]) catch {};
+                                            w.writeAll(".length") catch {};
                                         }
                                     }
-                                    wf.writeAll(");\n") catch {};
+                                    w.writeAll(");\n") catch {};
                                     // Copy modified arrays back from WASM memory (only mutated ones)
-                                    // TypedArrays: use bulk .set(subarray) for native memcpy speed
-                                    // Plain Arrays: fall back to per-element copy
                                     i = 0;
                                     while (i < param_count) : (i += 1) {
                                         if (mf.mutated_args & (@as(u8, 1) << @intCast(i)) != 0) {
@@ -2404,48 +2349,47 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             const idx_str3 = std.fmt.bufPrint(&idx_buf3, "{d}", .{i}) catch "0";
                                             const pn = param_names[i];
                                             // TypedArray fast path: .set(subarray)
-                                            wf.writeAll("  if (") catch {};
-                                            wf.writeAll(pn) catch {};
-                                            wf.writeAll(".set) ") catch {};
-                                            wf.writeAll(pn) catch {};
-                                            wf.writeAll(".set(") catch {};
-                                            wf.writeAll(mem_view) catch {};
-                                            wf.writeAll(".subarray(__b") catch {};
-                                            wf.writeAll(idx_str3) catch {};
-                                            wf.writeAll(", __b") catch {};
-                                            wf.writeAll(idx_str3) catch {};
-                                            wf.writeAll(" + ") catch {};
-                                            wf.writeAll(pn) catch {};
-                                            wf.writeAll(".length));\n") catch {};
+                                            w.writeAll("  if (") catch {};
+                                            w.writeAll(pn) catch {};
+                                            w.writeAll(".set) ") catch {};
+                                            w.writeAll(pn) catch {};
+                                            w.writeAll(".set(") catch {};
+                                            w.writeAll(mem_view) catch {};
+                                            w.writeAll(".subarray(__p") catch {};
+                                            w.writeAll(idx_str3) catch {};
+                                            w.writeAll(elem_shift) catch {};
+                                            w.writeAll(", (__p") catch {};
+                                            w.writeAll(idx_str3) catch {};
+                                            w.writeAll(elem_shift) catch {};
+                                            w.writeAll(") + ") catch {};
+                                            w.writeAll(pn) catch {};
+                                            w.writeAll(".length));\n") catch {};
                                             // Plain Array fallback
-                                            wf.writeAll("  else for (let __i = 0; __i < ") catch {};
-                                            wf.writeAll(pn) catch {};
-                                            wf.writeAll(".length; __i++) ") catch {};
-                                            wf.writeAll(pn) catch {};
-                                            wf.writeAll("[__i] = ") catch {};
-                                            wf.writeAll(mem_view) catch {};
-                                            wf.writeAll("[__b") catch {};
-                                            wf.writeAll(idx_str3) catch {};
-                                            wf.writeAll(" + __i];\n") catch {};
+                                            w.writeAll("  else for (let __i = 0; __i < ") catch {};
+                                            w.writeAll(pn) catch {};
+                                            w.writeAll(".length; __i++) ") catch {};
+                                            w.writeAll(pn) catch {};
+                                            w.writeAll("[__i] = ") catch {};
+                                            w.writeAll(mem_view) catch {};
+                                            w.writeAll("[(__p") catch {};
+                                            w.writeAll(idx_str3) catch {};
+                                            w.writeAll(elem_shift) catch {};
+                                            w.writeAll(") + __i];\n") catch {};
                                         }
                                     }
-                                    // Self-invalidation removed: __last_fn handles cross-function
-                                    // cache safety. Within one function, array arg offsets don't overlap
-                                    // (__off += arr.length), so cached data stays valid after mutation
-                                    // of a different arg at a different offset range.
-                                    wf.writeAll("  return __r;\n}") catch {};
+                                    w.writeAll("  __wasmStackRestore(__sp0);\n  return __r;\n}") catch {};
                                 }
 
                                 // src_pos = scan (past the closing brace we already consumed)
                                 src_pos = scan;
                             } else {
                                 // No match — copy one character
-                                wf.writeAll(cc[src_pos .. src_pos + 1]) catch {};
+                                w.writeAll(cc[src_pos .. src_pos + 1]) catch {};
                                 src_pos += 1;
                             }
                         }
                     } else {
-                        wf.writeAll("// ERROR: Original source not available\n") catch {};
+                        w.writeAll("// ERROR: Original source not available\n") catch {};
                     }
 
                     has_worker_files = true;
@@ -2459,30 +2403,32 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     defer cf.close();
                     var wn_buf: [256]u8 = undefined;
                     const wn = std.fmt.bufPrint(&wn_buf, "{s}-worker.mjs", .{output_base}) catch "worker.mjs";
-                    cf.writeAll("using Workerd = import \"/workerd/workerd.capnp\";\n\n") catch {};
-                    cf.writeAll("const config :Workerd.Config = (\n") catch {};
-                    cf.writeAll("  services = [\n") catch {};
-                    cf.writeAll("    (name = \"main\", worker = .worker),\n") catch {};
-                    cf.writeAll("  ],\n") catch {};
-                    cf.writeAll("  sockets = [\n") catch {};
-                    cf.writeAll("    (name = \"http\", address = \"*:8787\", http = (), service = \"main\"),\n") catch {};
-                    cf.writeAll("  ],\n") catch {};
-                    cf.writeAll(");\n\n") catch {};
-                    cf.writeAll("const worker :Workerd.Worker = (\n") catch {};
-                    cf.writeAll("  modules = [\n") catch {};
-                    cf.writeAll("    (name = \"entrypoint\", esModule = embed \"") catch {};
-                    cf.writeAll(wn) catch {};
-                    cf.writeAll("\"),\n") catch {};
-                    cf.writeAll("    (name = \"") catch {};
-                    cf.writeAll(wasm_filename) catch {};
-                    cf.writeAll("\", wasm = embed \"") catch {};
-                    cf.writeAll(wasm_filename) catch {};
-                    cf.writeAll("\"),\n") catch {};
-                    cf.writeAll("  ],\n") catch {};
-                    cf.writeAll("  compatibilityDate = \"2024-09-23\",\n") catch {};
-                    cf.writeAll("  compatibilityFlags = [\"nodejs_compat\"],\n") catch {};
-                    cf.writeAll(");\n") catch {};
-
+                    var cf_buf: [4096]u8 = undefined;
+                    var cf_state = cf.writer(&cf_buf);
+                    const cw = &cf_state.interface;
+                    defer cw.flush() catch {};
+                    cw.print(
+                        \\using Workerd = import "/workerd/workerd.capnp";
+                        \\
+                        \\const config :Workerd.Config = (
+                        \\  services = [
+                        \\    (name = "main", worker = .worker),
+                        \\  ],
+                        \\  sockets = [
+                        \\    (name = "http", address = "*:8787", http = (), service = "main"),
+                        \\  ],
+                        \\);
+                        \\
+                        \\const worker :Workerd.Worker = (
+                        \\  modules = [
+                        \\    (name = "entrypoint", esModule = embed "{s}"),
+                        \\    (name = "{s}", wasm = embed "{s}"),
+                        \\  ],
+                        \\  compatibilityDate = "2024-09-23",
+                        \\  compatibilityFlags = ["nodejs_compat"],
+                        \\);
+                        \\
+                    , .{ wn, wasm_filename, wasm_filename }) catch {};
                     std.debug.print("[build] Config: {s}\n", .{cp});
                 } else |_| {}
             }

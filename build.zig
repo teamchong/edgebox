@@ -1384,7 +1384,7 @@ pub fn build(b: *std.Build) void {
         "vendor/binaryen/build/lib";
 
     const run_exe = b.addExecutable(.{
-        .name = "edgebox",
+        .name = "edgebox-runner",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/edgebox_wamr.zig"),
             .target = target,
@@ -1407,7 +1407,7 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(run_exe);
 
-    const runner_step = b.step("runner", "Build edgebox runner (fast, minimal)");
+    const runner_step = b.step("runner", "Build edgebox-runner (WAMR runtime for --with-binary)");
     runner_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
 
     // ===================
@@ -1682,12 +1682,11 @@ pub fn build(b: *std.Build) void {
     }
 
     // ===================
-    // edgeboxc - full CLI for building with integrated AOT compiler
-    // Uses WAMR's AOT compiler library (with SIMD support)
-    // Now with HTTP/2 support from metal0!
+    // edgebox - the compiler/build tool (JIT+AOT for V8/workerd)
+    // Compiles JS → WASM numeric kernels + worker.mjs trampolines
     // ===================
     const build_exe = b.addExecutable(.{
-        .name = "edgeboxc",
+        .name = "edgebox",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/runtime.zig"),
             .target = target,
@@ -1950,8 +1949,8 @@ pub fn build(b: *std.Build) void {
     aot_tool_step.dependOn(&b.addInstallArtifact(aot_tool_exe, .{}).step);
 
     // ===================
-    // Freeze is built-in to edgeboxc (no separate CLI needed)
-    // The freeze module (src/freeze/) is used internally by edgeboxc build
+    // Freeze is built-in to edgebox (no separate CLI needed)
+    // The freeze module (src/freeze/) is used internally by edgebox build
     // ===================
 
     // ===================
@@ -1994,8 +1993,8 @@ pub fn build(b: *std.Build) void {
     // ===================
     // cli - builds all CLI tools
     // ===================
-    // cli: build edgeboxc (compiler) + wasm-opt — the worker path tools
-    const cli_step = b.step("cli", "Build edgeboxc compiler (JIT+AOT for V8/workerd)");
+    // cli: build edgebox (compiler) + wasm-opt — the worker path tools
+    const cli_step = b.step("cli", "Build edgebox compiler (JIT+AOT for V8/workerd)");
     cli_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
 

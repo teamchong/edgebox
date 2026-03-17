@@ -98,7 +98,7 @@ V8 inlines WASM calls into JS — zero boundary overhead
 zig build cli
 
 # Compile your JS → optimized output
-./zig-out/bin/edgeboxc my-app.js
+./zig-out/bin/edgebox my-app.js
 
 # Output:
 #   zig-out/bin/my-app.js/my-app-worker.mjs        — JS module (with WASM trampolines)
@@ -149,7 +149,8 @@ Numeric functions are compiled through LLVM to a standalone `.wasm` binary:
 - **Constant pool**: QuickJS `push_const` values resolved at compile time
 - **Math intrinsics**: `Math.sqrt`, `Math.abs`, `Math.floor` → WASM f64 intrinsics
 - **Up to 24 parameters**: Supports functions with many scalar arguments
-- **O2 optimization**: LLVM auto-vectorization for float loops
+- **O3 optimization**: LLVM auto-vectorization for array loops
+- **WASM SIMD**: `i32x4`/`f64x2` vector instructions (auto-vectorized by LLVM)
 
 ### 3. Source-to-Source Transform
 
@@ -164,18 +165,19 @@ function adler32(adler, buf, len, pos) {
 // Transformed (auto-generated)
 function adler32(adler, buf, len, pos) {
   if (buf.buffer === __wbuf) return __wasm.exports.adler32(adler, buf.byteOffset, len, pos);
-  let __off = 0;
-  const __b1 = __off;
+  const __sp0 = __wasmStackSave();
+  const __p1 = __wasmStackAlloc(buf.length << 2);
   if (__last_fn !== 0 || buf.length < 128 || buf !== __c0_1) {
-    __m.set(buf, __off); __c0_1 = buf;
+    __m.set(buf, __p1 >> 2); __c0_1 = buf;
   }
-  __off += buf.length;
   __last_fn = 0;
-  return __wasm.exports.adler32(adler, __b1 << 2, len, pos);
+  const __r = __wasm.exports.adler32(adler, __p1, len, pos);
+  __wasmStackRestore(__sp0);
+  return __r;
 }
 ```
 
-V8 TurboFan sees the `__wasm.exports.adler32(...)` call and inlines the WASM code directly — the trampoline's copy-or-skip logic and the WASM compute kernel compile into a single native code stream.
+V8 TurboFan sees the `__wasm.exports.adler32(...)` call and inlines the WASM code directly — the trampoline's copy-or-skip logic and the WASM compute kernel compile into a single native code stream. The stack allocator (`__wasmStackSave`/`__wasmStackRestore`) scopes temporary copies to each trampoline call — nested calls and multiple scopes work correctly with LIFO lifetime management.
 
 ### 4. Smart Trampoline Decisions
 

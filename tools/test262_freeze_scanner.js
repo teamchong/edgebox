@@ -3,7 +3,7 @@
  * Test262 Freeze Scanner
  *
  * Scans test262 test suite to find opcodes that prevent functions from being frozen.
- * Compiles each test with edgeboxc and analyzes the freeze log output.
+ * Compiles each test with edgebox and analyzes the freeze log output.
  */
 
 const fs = require('fs');
@@ -11,7 +11,7 @@ const path = require('path');
 const { execSync, spawnSync } = require('child_process');
 
 const TEST262_DIR = path.join(__dirname, '../test262/test');
-const EDGEBOXC = path.join(__dirname, '../zig-out/bin/edgeboxc');
+const EDGEBOXC = path.join(__dirname, '../zig-out/bin/edgebox');
 const TMP_DIR = '/tmp/test262_freeze_scan';
 
 // Track opcode statistics
@@ -34,7 +34,7 @@ function scanTest(testFile) {
         fs.mkdirSync(tmpTestDir, { recursive: true });
         fs.copyFileSync(testFile, path.join(tmpTestDir, 'index.js'));
 
-        // Build with edgeboxc and capture output
+        // Build with edgebox and capture output
         const result = spawnSync(EDGEBOXC, ['build', tmpTestDir], {
             encoding: 'utf8',
             timeout: 10000,
@@ -108,9 +108,9 @@ function main() {
     console.log('Test262 Freeze Scanner');
     console.log('======================\n');
 
-    // Check edgeboxc exists
+    // Check edgebox exists
     if (!fs.existsSync(EDGEBOXC)) {
-        console.error('Error: edgeboxc not found. Run: zig build cli -Doptimize=ReleaseFast');
+        console.error('Error: edgebox not found. Run: zig build cli -Doptimize=ReleaseFast');
         process.exit(1);
     }
 

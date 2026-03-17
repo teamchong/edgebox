@@ -111,7 +111,7 @@ done
 WASMTIME_RUN="wasmtime run -W unknown-imports-default"
 
 EDGEBOX="$ROOT_DIR/zig-out/bin/edgebox"
-EDGEBOXC="$ROOT_DIR/zig-out/bin/edgeboxc"
+EDGEBOXC="$ROOT_DIR/zig-out/bin/edgebox"
 
 # Suppress debug/info messages during benchmarks
 export EDGEBOX_QUIET=1
@@ -223,14 +223,14 @@ build_bench() {
     if [ "$BINARY_ONLY" = true ]; then
         # Binary-only mode: skip WASM/AOT
         if ! BUILD_OUTPUT=$("$EDGEBOXC" build --binary-only "$js_file" 2>&1); then
-            echo "ERROR: edgeboxc build failed for $js_file:"
+            echo "ERROR: edgebox build failed for $js_file:"
             echo "$BUILD_OUTPUT"
             exit 1
         fi
     else
         # Full mode: Build all three: Binary + WASM + AOT
         if ! BUILD_OUTPUT=$("$EDGEBOXC" build "$js_file" 2>&1); then
-            echo "ERROR: edgeboxc build failed for $js_file:"
+            echo "ERROR: edgebox build failed for $js_file:"
             echo "$BUILD_OUTPUT"
             exit 1
         fi

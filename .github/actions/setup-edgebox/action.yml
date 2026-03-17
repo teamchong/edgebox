@@ -156,7 +156,7 @@ runs:
         echo "Building all benchmarks..."
         for bench in hello memory fib loop tail_recursive typed_array mandelbrot prime_factors gaussian_blur average path_trace; do
           echo "Building $bench..."
-          ./zig-out/bin/edgeboxc build bench/$bench.js
+          ./zig-out/bin/edgebox build bench/$bench.js
         done
         ls -la zig-out/bin/bench/
 

@@ -6,7 +6,7 @@
 
 set -e
 
-EDGEBOXC="./zig-out/bin/edgeboxc"
+EDGEBOXC="./zig-out/bin/edgebox"
 NODE="node"
 FILE="${1:-bench/compute_heavy.js}"
 RUNS=3  # Run each N times, take best

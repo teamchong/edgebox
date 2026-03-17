@@ -79,7 +79,7 @@ AOT_PATH="../zig-out/bin/bench/tsc_bench.aot"
 if [ -f "$EDGEBOX" ] && [ -f "$AOT_PATH" ]; then
   benchmark "EdgeBox AOT" "$EDGEBOX $AOT_PATH"
 else
-  echo -e "${RED}EdgeBox AOT not found. Build with: edgeboxc build bench/typescript/tsc_bench.js${NC}"
+  echo -e "${RED}EdgeBox AOT not found. Build with: edgebox build bench/typescript/tsc_bench.js${NC}"
   echo ""
 fi
 
@@ -99,5 +99,5 @@ echo "Lower times are better."
 echo ""
 echo "Note: To test EdgeBox, first build the TSC benchmark:"
 echo "  cd $(dirname $BENCH_DIR)"
-echo "  zig-out/bin/edgeboxc build bench/typescript/tsc_bench.js"
+echo "  zig-out/bin/edgebox build bench/typescript/tsc_bench.js"
 echo ""

@@ -109,11 +109,36 @@ pub const NumericPattern = enum {
     unsupported,
 };
 
+/// Comptime operator kind — replaces runtime string comparisons with enum dispatch.
+pub const OpKind = enum {
+    add, // +
+    sub, // -
+    mul, // *
+    div, // /
+    mod, // %
+    shl, // <<
+    sar, // >> (arithmetic)
+    shr, // >>> (logical)
+    band, // &
+    bor, // |
+    bxor, // ^
+    lt, // <
+    lte, // <=
+    gt, // >
+    gte, // >=
+    eq, // ==
+    neq, // !=
+    neg, // unary -
+    bnot, // ~
+    dup, // stack dup
+    drop, // stack drop
+};
+
 /// Numeric handler definition — comptime-evaluated per opcode
 pub const NumericHandler = struct {
     pattern: NumericPattern,
-    /// C/LLVM operator string: "+", "-", "&", "<<", etc.
-    op: ?[]const u8 = null,
+    /// Operator kind for arithmetic/comparison/bitwise dispatch
+    op: ?OpKind = null,
     /// Constant value (for push_const with known value)
     value: ?i32 = null,
     /// Argument/local index (for get_arg0..3, get_loc0..3, etc.)
@@ -184,33 +209,33 @@ pub fn getHandler(opcode: Opcode) NumericHandler {
         .set_arg => .{ .pattern = .set_arg },
 
         // ── Binary arithmetic ───────────────────────────────────
-        .add => .{ .pattern = .binary_arith, .op = "+" },
-        .sub => .{ .pattern = .binary_arith, .op = "-" },
+        .add => .{ .pattern = .binary_arith, .op = .add },
+        .sub => .{ .pattern = .binary_arith, .op = .sub },
         // mul: JS mul is f64, products can exceed i32 range affecting subsequent ops
-        .mul => .{ .pattern = .binary_arith, .op = "*", .introduces_float = true },
+        .mul => .{ .pattern = .binary_arith, .op = .mul, .introduces_float = true },
         // div: produces float in JS (9/2=4.5), so marks introduces_float
-        .div => .{ .pattern = .binary_arith, .op = "/", .introduces_float = true },
-        .mod => .{ .pattern = .binary_arith, .op = "%" },
+        .div => .{ .pattern = .binary_arith, .op = .div, .introduces_float = true },
+        .mod => .{ .pattern = .binary_arith, .op = .mod },
 
         // ── Bitwise (i32 only) ──────────────────────────────────
-        .shl => .{ .pattern = .bitwise_binary, .op = "<<", .requires_i32 = true },
-        .sar => .{ .pattern = .bitwise_binary, .op = ">>", .requires_i32 = true },
-        .shr => .{ .pattern = .bitwise_binary, .op = ">>>", .requires_i32 = true },
-        .@"and" => .{ .pattern = .bitwise_binary, .op = "&", .requires_i32 = true },
-        .@"or" => .{ .pattern = .bitwise_binary, .op = "|", .requires_i32 = true },
-        .@"xor" => .{ .pattern = .bitwise_binary, .op = "^", .requires_i32 = true },
+        .shl => .{ .pattern = .bitwise_binary, .op = .shl, .requires_i32 = true },
+        .sar => .{ .pattern = .bitwise_binary, .op = .sar, .requires_i32 = true },
+        .shr => .{ .pattern = .bitwise_binary, .op = .shr, .requires_i32 = true },
+        .@"and" => .{ .pattern = .bitwise_binary, .op = .band, .requires_i32 = true },
+        .@"or" => .{ .pattern = .bitwise_binary, .op = .bor, .requires_i32 = true },
+        .@"xor" => .{ .pattern = .bitwise_binary, .op = .bxor, .requires_i32 = true },
 
         // ── Comparisons ─────────────────────────────────────────
-        .lt => .{ .pattern = .binary_cmp, .op = "<" },
-        .lte => .{ .pattern = .binary_cmp, .op = "<=" },
-        .gt => .{ .pattern = .binary_cmp, .op = ">" },
-        .gte => .{ .pattern = .binary_cmp, .op = ">=" },
-        .eq, .strict_eq => .{ .pattern = .binary_cmp, .op = "==" },
-        .neq, .strict_neq => .{ .pattern = .binary_cmp, .op = "!=" },
+        .lt => .{ .pattern = .binary_cmp, .op = .lt },
+        .lte => .{ .pattern = .binary_cmp, .op = .lte },
+        .gt => .{ .pattern = .binary_cmp, .op = .gt },
+        .gte => .{ .pattern = .binary_cmp, .op = .gte },
+        .eq, .strict_eq => .{ .pattern = .binary_cmp, .op = .eq },
+        .neq, .strict_neq => .{ .pattern = .binary_cmp, .op = .neq },
 
         // ── Unary ───────────────────────────────────────────────
-        .neg => .{ .pattern = .unary, .op = "-" },
-        .not => .{ .pattern = .unary, .op = "~", .requires_i32 = true },
+        .neg => .{ .pattern = .unary, .op = .neg },
+        .not => .{ .pattern = .unary, .op = .bnot, .requires_i32 = true },
 
         // ── Logical NOT ─────────────────────────────────────────
         .lnot => .{ .pattern = .lnot },
@@ -909,51 +934,3 @@ pub fn detectHasBitwise(instructions: anytype) bool {
     return false;
 }
 
-// ============================================================================
-// Comptime LLVM instruction selection
-// ============================================================================
-
-/// Select the right LLVM binary arithmetic instruction based on ValueKind.
-/// This is evaluated at comptime when the codegen is monomorphized.
-pub fn selectArithOp(comptime kind: ValueKind, comptime op: []const u8) ArithOp {
-    return switch (kind) {
-        .i32 => switch (op[0]) {
-            '+' => .{ .i32_op = .add },
-            '-' => .{ .i32_op = .sub },
-            '*' => .{ .i32_op = .mul },
-            '%' => .{ .i32_op = .srem },
-            '/' => .{ .i32_op = .sdiv }, // truncating division (matches JS `(x/y)|0`)
-            else => @compileError("unknown arith op: " ++ op),
-        },
-        .f64 => switch (op[0]) {
-            '+' => .{ .f64_op = .fadd },
-            '-' => .{ .f64_op = .fsub },
-            '*' => .{ .f64_op = .fmul },
-            '/' => .{ .f64_op = .fdiv },
-            '%' => .{ .f64_op = .frem },
-            else => @compileError("unknown arith op: " ++ op),
-        },
-    };
-}
-
-pub const I32ArithKind = enum { add, sub, mul, sdiv, srem };
-pub const F64ArithKind = enum { fadd, fsub, fmul, fdiv, frem };
-
-pub const ArithOp = union {
-    i32_op: I32ArithKind,
-    f64_op: F64ArithKind,
-};
-
-/// Comparison predicate mapping for ICmp (i32) vs FCmp (f64)
-pub fn selectCmpOp(comptime kind: ValueKind, comptime op: []const u8) CmpOp {
-    _ = kind; // both tiers use same op strings
-    if (std.mem.eql(u8, op, "<")) return .lt;
-    if (std.mem.eql(u8, op, "<=")) return .le;
-    if (std.mem.eql(u8, op, ">")) return .gt;
-    if (std.mem.eql(u8, op, ">=")) return .ge;
-    if (std.mem.eql(u8, op, "==")) return .eq;
-    if (std.mem.eql(u8, op, "!=")) return .ne;
-    @compileError("unknown cmp op: " ++ op);
-}
-
-pub const CmpOp = enum { lt, le, gt, ge, eq, ne };
