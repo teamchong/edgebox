@@ -428,6 +428,131 @@ fn isIdentChar(ch: u8) bool {
         (ch >= '0' and ch <= '9') or ch == '_' or ch == '$';
 }
 
+/// WASM function metadata parsed from standalone_manifest.json.
+const WasmFunc = struct {
+    name: []const u8,
+    arg_count: u32,
+    instr_count: u32,
+    is_recursive: bool,
+    array_args: u8,
+    mutated_args: u8,
+    read_array_args: u8,
+    length_args: u8,
+    has_loop: bool,
+    has_bitwise: bool,
+    line_num: u32,
+    is_anon: bool,
+    is_f64: bool,
+};
+
+/// Decide whether a WASM-compiled function should get a trampoline or stay as JS.
+/// Returns true if the function should be trampolined to WASM.
+fn shouldTrampolineToWasm(mf: WasmFunc, calls_wasm: bool) bool {
+    // f64+bitwise recursive: integer code forced into f64 tier by division.
+    // WASM pays fptosi/sitofp roundtrip per |0, fmod polyfill per %.
+    // V8 JIT specializes to native i32 ops — always faster.
+    if (mf.is_recursive and mf.is_f64 and mf.has_bitwise) return false;
+
+    // Recursive: entire call stack stays in WASM, no JS↔WASM boundary per recursion
+    if (mf.is_recursive) return true;
+
+    // Cross-callers: calls stay in WASM
+    if (calls_wasm) return true;
+
+    const is_write_only_array = mf.mutated_args != 0 and mf.read_array_args == 0;
+
+    // Compute-heavy write-only: ALWAYS trampoline.
+    // Copy-in is skipped (write-only), only copy-back overhead remains.
+    // mandelbrot_compute: 157 instrs × 40K iters, Math.abs/sqrt.
+    if (is_write_only_array and mf.has_loop and mf.instr_count >= 50) return true;
+
+    // Write-only light: V8 handles write loops perfectly.
+    // zero(buf): 162ms WASM vs 43ms V8 (3.8x slower due to copies).
+    if (is_write_only_array and (!mf.has_loop or mf.instr_count < 50)) return false;
+
+    // Fixed-size array ops (no .length): copy cost dominates.
+    // No-loop: wrapper/delegation (crypto_verify_16, dot16).
+    // Large-body loops (>=200 instrs): sha256_compress 408ms WASM vs 305ms V8.
+    if (mf.array_args != 0 and mf.length_args == 0 and
+        (!mf.has_loop or mf.instr_count >= 200)) return false;
+
+    // Mutated fixed-size array loops: copy-back per element per call dominates.
+    // A(o,a,b) in tweetnacl: 16-elem adds, 1313ms WASM vs 184ms V8.
+    if (mf.mutated_args != 0 and mf.length_args == 0 and
+        mf.has_loop and mf.instr_count < 200) return false;
+
+    // Offset-indexed multi-array: >=2 arrays + >=2 scalars, no .length, small body.
+    // vn(x,xi,y,yi,n): offset access, kept as JS.
+    const array_arg_count = @popCount(mf.array_args);
+    const scalar_arg_count = if (mf.arg_count > array_arg_count) mf.arg_count - array_arg_count else 0;
+    if (mf.mutated_args == 0 and mf.array_args != 0 and
+        mf.length_args == 0 and mf.has_loop and mf.instr_count < 200 and
+        array_arg_count >= 2 and scalar_arg_count >= 2) return false;
+
+    // Small scalar functions (<150 instrs): V8 JIT already optimal
+    if (mf.array_args == 0 and mf.instr_count < 150) return false;
+
+    return true;
+}
+
+/// Skip past a JS function body starting at `{`, handling strings, comments, and nesting.
+/// Returns the position after the closing `}`.
+fn skipJsFunctionBody(cc: []const u8, brace_pos: usize) usize {
+    var depth: i32 = 1;
+    var scan = brace_pos + 1;
+    while (scan < cc.len and depth > 0) {
+        const ch = cc[scan];
+        if (ch == '\'' or ch == '"' or ch == '`') {
+            scan += 1;
+            while (scan < cc.len) {
+                if (cc[scan] == '\\') {
+                    scan += 2;
+                    continue;
+                }
+                if (cc[scan] == ch) {
+                    scan += 1;
+                    break;
+                }
+                scan += 1;
+            }
+            continue;
+        }
+        if (ch == '/' and scan + 1 < cc.len) {
+            if (cc[scan + 1] == '/') {
+                while (scan < cc.len and cc[scan] != '\n') scan += 1;
+                continue;
+            }
+            if (cc[scan + 1] == '*') {
+                scan += 2;
+                while (scan + 1 < cc.len) {
+                    if (cc[scan] == '*' and cc[scan + 1] == '/') {
+                        scan += 2;
+                        break;
+                    }
+                    scan += 1;
+                }
+                continue;
+            }
+        }
+        if (ch == '{') depth += 1;
+        if (ch == '}') depth -= 1;
+        scan += 1;
+    }
+    return scan;
+}
+
+/// Check if a function body calls any other WASM function.
+fn bodyCallsWasmFunc(cc: []const u8, match_end: usize, self_name: []const u8, wasm_funcs: []const WasmFunc) bool {
+    const bp = std.mem.indexOfPos(u8, cc, match_end, "{") orelse return false;
+    const end = skipJsFunctionBody(cc, bp);
+    const body = cc[bp + 1 .. @min(end, cc.len)];
+    for (wasm_funcs) |other| {
+        if (std.mem.eql(u8, other.name, self_name)) continue;
+        if (std.mem.indexOf(u8, body, other.name) != null) return true;
+    }
+    return false;
+}
+
 /// Extract integer from a JSON object field, defaulting to 0.
 fn jsonInt(obj: std.json.ObjectMap, key: []const u8) u32 {
     return jsonIntOr(obj, key, 0);
@@ -1478,7 +1603,6 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     defer wf.close();
 
                     // Collect WASM function metadata from manifest
-                    const WasmFunc = struct { name: []const u8, arg_count: u32, instr_count: u32, is_recursive: bool, array_args: u8, mutated_args: u8, read_array_args: u8, length_args: u8, has_loop: bool, has_bitwise: bool, line_num: u32, is_anon: bool, is_f64: bool };
                     var wasm_funcs: [64]WasmFunc = undefined;
                     var wasm_func_count: usize = 0;
                     // Parse manifest JSON (same std.json used throughout the codebase)
@@ -1767,98 +1891,15 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             }
 
                             if (matched_func) |mf| {
-                                // Smart trampoline heuristic:
-                                // - Recursive functions: ALWAYS trampoline (deep stacks stay in WASM)
-                                //   EXCEPT: f64 tier + bitwise = integer code forced into float
-                                //   (V8 JIT specializes to i32; WASM f64 has fptosi/sitofp overhead)
-                                //   fastPow: 430ms WASM vs 165ms V8 due to |0 roundtrips
-                                // - Cross-callers: ALWAYS trampoline (calls stay in WASM)
-                                // - Array functions with heavy computation (>200 instrs): trampoline
-                                //   (WASM compute amortizes copy cost)
-                                // - Small array/scalar functions (<200 instrs): keep as JS
-                                //   (V8 JIT inlines these perfectly; copy overhead dominates)
-                                if (mf.is_recursive and mf.is_f64 and mf.has_bitwise) {
-                                    // f64+bitwise recursive: integer code forced into f64 tier by division.
-                                    // WASM pays fptosi/sitofp roundtrip per |0, fmod polyfill per %.
-                                    // V8 JIT specializes to native i32 ops — always faster.
+                                // Decide: trampoline to WASM or keep as JS?
+                                const calls_wasm = if (!mf.is_recursive)
+                                    bodyCallsWasmFunc(cc, match_end, mf.name, wasm_funcs[0..wasm_func_count])
+                                else
+                                    false;
+                                if (!shouldTrampolineToWasm(mf, calls_wasm)) {
                                     w.writeAll(cc[src_pos .. src_pos + 1]) catch {};
                                     src_pos += 1;
                                     continue;
-                                }
-                                if (!mf.is_recursive) {
-                                    // Check if body calls another WASM function (cross-call)
-                                    var calls_wasm = false;
-                                    if (std.mem.indexOfPos(u8, cc, match_end, "{")) |bp| {
-                                        var depth_scan: i32 = 1;
-                                        var sp = bp + 1;
-                                        while (sp < cc.len and depth_scan > 0) : (sp += 1) {
-                                            if (cc[sp] == '{') depth_scan += 1;
-                                            if (cc[sp] == '}') depth_scan -= 1;
-                                        }
-                                        const body = cc[bp + 1 .. @min(sp, cc.len)];
-                                        for (wasm_funcs[0..wasm_func_count]) |other| {
-                                            if (std.mem.eql(u8, other.name, mf.name)) continue;
-                                            if (std.mem.indexOf(u8, body, other.name)) |_| {
-                                                calls_wasm = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    // Keep as JS when trampoline overhead exceeds WASM benefit:
-                                    // 0. Write-only array functions: all array args are written,
-                                    //    never read via get_array_el. Copy-in is wasted (data overwritten).
-                                    //    V8 JIT handles write loops perfectly (direct memory writes).
-                                    //    zero(buf): 162ms WASM vs 43ms V8 (3.8x slower due to copies).
-                                    //    fillData(arr,seed): 1803ms WASM vs 1043ms V8 (1.7x slower).
-                                    //    Exception: compute-heavy write-only (has_loop + >= 200 instrs)
-                                    //    should be trampolined — copy-back is negligible vs compute savings.
-                                    //    mandelbrot_compute: nested loops + Math.abs/sqrt, heavy f64 compute.
-                                    const is_write_only_array = mf.mutated_args != 0 and mf.read_array_args == 0;
-                                    const is_write_only_light = is_write_only_array and
-                                        (!mf.has_loop or mf.instr_count < 50);
-                                    // Compute-heavy write-only: ALWAYS trampoline.
-                                    // Copy-in is skipped (write-only), only copy-back overhead remains.
-                                    // For looping functions, instrs execute O(N²+) times so compute
-                                    // dominates copy-back even at modest instruction counts.
-                                    // mandelbrot_compute: 157 instrs × 40K iters, Math.abs/sqrt.
-                                    // Threshold: 50 (vs 200 for read-write) since no copy-in cost.
-                                    const is_write_only_heavy = is_write_only_array and
-                                        mf.has_loop and mf.instr_count >= 50;
-                                    // 1. No-loop array ops (no .length, no loop): wrapper/delegation
-                                    //    functions — .set() copy cost always dominates.
-                                    //    crypto_verify_16 (7 instrs), dot16 (128 instrs).
-                                    // 2. Large-body array loops (no .length, has_loop, >= 200 instrs):
-                                    //    copy overhead for fixed-size arrays dominates.
-                                    //    core_salsa20 (4 arrays, 2386i): 506ms WASM vs 159ms V8.
-                                    //    sha256_compress (3 arrays, 418i): 408ms WASM vs 305ms V8.
-                                    // 3. Small scalar functions (<150 instrs): V8 JIT already optimal.
-                                    // 4. Mutated fixed-size array loops: copy-back per element per call
-                                    //    dominates for small fixed-size arrays (no .length → hardcoded size).
-                                    //    A(o,a,b) in tweetnacl: 16-elem adds, 1313ms WASM vs 184ms V8.
-                                    //    But length-based loops (adler32) amortize copy cost with .length data.
-                                    // Compact array loops with .length (has_loop, < 200 instrs) are trampolined:
-                                    // many iterations amortize copy cost.
-                                    // adler32 (68 instrs, has_loop, uses .length): 29ms WASM vs 109ms V8.
-                                    const is_fixed_array = mf.array_args != 0 and mf.length_args == 0 and
-                                        (!mf.has_loop or mf.instr_count >= 200);
-                                    const is_mutated_fixed_loop = mf.mutated_args != 0 and mf.length_args == 0 and
-                                        mf.has_loop and mf.instr_count < 200;
-                                    // 5. Offset-indexed multi-array loops: functions with >=2 arrays,
-                                    //    >=2 scalar args (offset params), no .length, and small body.
-                                    //    Extra scalar args beyond 1 are typically per-array offsets.
-                                    //    vn(x,xi,y,yi,n): 2 arrays, 3 scalars → offset access, kept as JS.
-                                    //    dotProductNorm(a,b,len): 2 arrays, 1 scalar → bulk op, 3.2x faster.
-                                    //    adler32(adler,buf,len,pos): 1 array, 3 scalars → bulk op, 3.8x faster.
-                                    const array_arg_count = @popCount(mf.array_args);
-                                    const scalar_arg_count = if (mf.arg_count > array_arg_count) mf.arg_count - array_arg_count else 0;
-                                    const is_readonly_fixed_loop = mf.mutated_args == 0 and mf.array_args != 0 and
-                                        mf.length_args == 0 and mf.has_loop and mf.instr_count < 200 and
-                                        array_arg_count >= 2 and scalar_arg_count >= 2;
-                                    if (!calls_wasm and !is_write_only_heavy and (is_write_only_light or is_fixed_array or is_mutated_fixed_loop or is_readonly_fixed_loop or (mf.array_args == 0 and mf.instr_count < 150))) {
-                                        w.writeAll(cc[src_pos .. src_pos + 1]) catch {};
-                                        src_pos += 1;
-                                        continue;
-                                    }
                                 }
 
                                 // Found a WASM function declaration. Find opening brace.
@@ -1875,50 +1916,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 // Write everything up to and including the opening brace
                                 w.writeAll(cc[src_pos .. brace_pos + 1]) catch {};
 
-                                // Skip the original function body by brace-matching
-                                var depth: i32 = 1;
-                                var scan = brace_pos + 1;
-                                while (scan < cc.len and depth > 0) {
-                                    const ch = cc[scan];
-                                    if (ch == '\'' or ch == '"' or ch == '`') {
-                                        // Skip string literals
-                                        scan += 1;
-                                        while (scan < cc.len) {
-                                            if (cc[scan] == '\\') {
-                                                scan += 2; // skip escape
-                                                continue;
-                                            }
-                                            if (cc[scan] == ch) {
-                                                scan += 1;
-                                                break;
-                                            }
-                                            scan += 1;
-                                        }
-                                        continue;
-                                    }
-                                    if (ch == '/' and scan + 1 < cc.len) {
-                                        if (cc[scan + 1] == '/') {
-                                            // Skip line comment
-                                            while (scan < cc.len and cc[scan] != '\n') scan += 1;
-                                            continue;
-                                        }
-                                        if (cc[scan + 1] == '*') {
-                                            // Skip block comment
-                                            scan += 2;
-                                            while (scan + 1 < cc.len) {
-                                                if (cc[scan] == '*' and cc[scan + 1] == '/') {
-                                                    scan += 2;
-                                                    break;
-                                                }
-                                                scan += 1;
-                                            }
-                                            continue;
-                                        }
-                                    }
-                                    if (ch == '{') depth += 1;
-                                    if (ch == '}') depth -= 1;
-                                    scan += 1;
-                                }
+                                const scan = skipJsFunctionBody(cc, brace_pos);
 
                                 // Parse param names from original source
                                 const params_start = match_end + 1; // after '('

@@ -72,44 +72,6 @@ pub const promiseReject = js_value.promiseReject;
 pub const FrozenAsyncState = js_value.FrozenAsyncState;
 
 /// Create an async resume callback that calls the target function with state pointer and resolved value
-/// data[0] = target function to call
-/// data[1] = state pointer (as JSValue int64)
-/// When the callback is invoked with (resolved_value), it calls: target_func(state_ptr, resolved_value)
-pub fn createAsyncResumeCallback(ctx: *JSContext, target_func: JSValue, state_ptr: JSValue) JSValue {
-    var data = [_]JSValue{ target_func, state_ptr };
-    return quickjs.JS_NewCFunctionData(
-        ctx,
-        &asyncResumeCallbackImpl,
-        1, // length (expects 1 argument: resolved value)
-        0, // magic (unused)
-        2, // data_len
-        &data,
-    );
-}
-
-/// Implementation of the async resume callback
-fn asyncResumeCallbackImpl(
-    ctx: *JSContext,
-    this_val: JSValue,
-    argc: c_int,
-    argv: [*]JSValue,
-    magic: c_int,
-    func_data: [*]JSValue,
-) callconv(.c) JSValue {
-    _ = this_val;
-    _ = magic;
-
-    // Extract target function and state pointer from closure data
-    const target_func = func_data[0];
-    const state_ptr = func_data[1];
-
-    // Get the resolved value from arguments (or undefined if not provided)
-    const resolved_value = if (argc > 0) argv[0] else JSValue.UNDEFINED;
-
-    // Call target function with (state_ptr, resolved_value)
-    var call_args = [_]JSValue{ state_ptr, resolved_value };
-    return quickjs.JS_Call(ctx, target_func, JSValue.UNDEFINED, 2, &call_args);
-}
 // Global return slot for WASM32 - exported so native_dispatch can read from it
 pub const g_return_slot = &js_value.g_return_slot;
 // Split return slots for WASM32 - reading two u32s avoids any u64 operations
@@ -529,15 +491,6 @@ test "StringPool intern" {
     // Content is correct
     try std.testing.expectEqualStrings("hello", s1);
     try std.testing.expectEqualStrings("world", s3);
-}
-
-// ============================================================================
-// Debug: SP overflow detection
-// ============================================================================
-
-pub fn spOverflow(func_name: [*:0]const u8, block_id: u32, sp: usize) noreturn {
-    std.debug.print("\n!!! SP OVERFLOW: sp={d} in {s} block {d}\n", .{ sp, func_name, block_id });
-    @trap();
 }
 
 // ============================================================================

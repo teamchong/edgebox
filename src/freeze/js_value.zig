@@ -2152,10 +2152,6 @@ const JSValueWasm32 = extern struct {
         return quickjs.JS_SetPropertyUint32(ctx, this, idx, val);
     }
 
-    pub inline fn definePropertyUint32(ctx: *JSContext, obj: JSValueWasm32, idx: u32, val: JSValueWasm32) c_int {
-        return quickjs.JS_SetPropertyUint32(ctx, obj, idx, val);
-    }
-
     /// Dynamic property access (prop can be string or number)
     /// Note: prop is consumed (ownership transferred)
     pub inline fn getPropertyValue(ctx: *JSContext, obj: JSValueWasm32, prop: JSValueWasm32) JSValueWasm32 {
@@ -2341,46 +2337,6 @@ const JSValueWasm32 = extern struct {
         return quickjs.JS_NewObject(ctx);
     }
 
-    /// Create closure from bytecode function
-    /// Creates a new closure that captures the specified variables.
-    /// @param bfunc - Bytecode function to wrap (from cpool)
-    /// @param cur_var_refs - Current var_refs chain (may be null)
-    /// @param locals_js - Array of local variables as JSValues (for capturing locals)
-    /// @param args - Slice of argument JSValues (for capturing args)
-    pub fn createClosure(
-        ctx: *JSContext,
-        bfunc: JSValueWasm32,
-        cur_var_refs: ?[*]*JSVarRef,
-        locals_js: ?[*]const JSValueWasm32,
-        num_locals: usize,
-        args: []const JSValueWasm32,
-    ) JSValueWasm32 {
-        return quickjs.js_frozen_create_closure(
-            ctx,
-            bfunc,
-            cur_var_refs,
-            if (locals_js) |l| @constCast(l) else null,
-            @intCast(num_locals),
-            if (args.len > 0) @constCast(args.ptr) else null,
-            @intCast(args.len),
-        );
-    }
-
-    /// Wrap a value in Promise.resolve() for async function returns
-    pub fn promiseResolve(ctx: *JSContext, val: JSValueWasm32) JSValueWasm32 {
-        // Use Promise.resolve(val)
-        const global = quickjs.JS_GetGlobalObject(ctx);
-        defer quickjs.JS_FreeValue(ctx, global);
-
-        const promise_ctor = quickjs.JS_GetPropertyStr(ctx, global, "Promise");
-        defer quickjs.JS_FreeValue(ctx, promise_ctor);
-
-        const resolve_fn = quickjs.JS_GetPropertyStr(ctx, promise_ctor, "resolve");
-        defer quickjs.JS_FreeValue(ctx, resolve_fn);
-
-        var args = [_]JSValueWasm32{val};
-        return quickjs.JS_Call(ctx, resolve_fn, promise_ctor, 1, &args);
-    }
 };
 
 // Native 64-bit: 16-byte struct
@@ -2800,76 +2756,6 @@ const JSValueNative = extern struct {
         return quickjs.JS_GetLength(ctx, obj, len);
     }
 
-    /// Create a closure from a function bytecode object.
-    /// Wraps js_frozen_create_closure for use in frozen codegen.
-    /// @param ctx - JSContext pointer
-    /// @param bfunc - Function bytecode JSValue from constant pool
-    /// @param cur_var_refs - Current var_refs chain (may be null)
-    /// @param locals_js - Array of local variables as JSValues (for capturing locals)
-    /// @param args - Slice of argument JSValues (for capturing args)
-    pub fn createClosure(
-        ctx: *JSContext,
-        bfunc: JSValueNative,
-        cur_var_refs: ?[*]*JSVarRef,
-        locals_js: ?[*]const JSValueNative,
-        num_locals: usize,
-        args: []const JSValueNative,
-    ) JSValueNative {
-        return quickjs.js_frozen_create_closure(
-            ctx,
-            bfunc,
-            cur_var_refs,
-            if (locals_js) |l| @constCast(l) else null,
-            @intCast(num_locals),
-            if (args.len > 0) @constCast(args.ptr) else null,
-            @intCast(args.len),
-        );
-    }
-
-    /// Create a closure with shared var_refs for function hoisting support.
-    /// V2 version that uses a tracking list so closures see updates to captured locals.
-    /// @param ctx - JSContext pointer
-    /// @param bfunc - Function bytecode JSValue from constant pool
-    /// @param cur_var_refs - Current var_refs chain (may be null)
-    /// @param local_var_ref_list - List for tracking shared var_refs (may be null for immediate detach)
-    /// @param locals_js - Array of local variables as JSValues (for capturing locals)
-    /// @param args - Slice of argument JSValues (for capturing args)
-    pub fn createClosureV2(
-        ctx: *JSContext,
-        bfunc: JSValueNative,
-        cur_var_refs: ?[*]*JSVarRef,
-        local_var_ref_list: ?*ListHead,
-        locals_js: ?[*]const JSValueNative,
-        num_locals: usize,
-        args: []const JSValueNative,
-    ) JSValueNative {
-        return quickjs.js_frozen_create_closure_v2(
-            ctx,
-            bfunc,
-            cur_var_refs,
-            local_var_ref_list,
-            if (locals_js) |l| @constCast(l) else null,
-            @intCast(num_locals),
-            if (args.len > 0) @constCast(args.ptr) else null,
-            @intCast(args.len),
-        );
-    }
-
-    /// Wrap a value in Promise.resolve() for async function returns
-    pub fn promiseResolve(ctx: *JSContext, val: JSValueNative) JSValueNative {
-        // Use Promise.resolve(val)
-        const global = quickjs.JS_GetGlobalObject(ctx);
-        defer quickjs.JS_FreeValue(ctx, global);
-
-        const promise_ctor = quickjs.JS_GetPropertyStr(ctx, global, "Promise");
-        defer quickjs.JS_FreeValue(ctx, promise_ctor);
-
-        const resolve_fn = quickjs.JS_GetPropertyStr(ctx, promise_ctor, "resolve");
-        defer quickjs.JS_FreeValue(ctx, resolve_fn);
-
-        var args = [_]JSValueNative{val};
-        return quickjs.JS_Call(ctx, resolve_fn, promise_ctor, 1, &args);
-    }
 };
 
 // ============================================================================
@@ -2992,15 +2878,6 @@ pub const quickjs = struct {
             JS_FreeCString(self.ctx, self.ptr);
         }
     };
-
-    /// Borrow string data without copying. Returns null if not a string.
-    /// Caller MUST call deinit() when done (unlike true zero-copy).
-    pub fn borrowString(ctx: *JSContext, val: JSValue) ?BorrowedString {
-        var len: usize = 0;
-        const ptr = JS_ToCStringLen2(ctx, &len, val, false);
-        if (ptr == null) return null;
-        return BorrowedString{ .ptr = ptr.?, .len = len, .ctx = ctx };
-    }
 
     // Object creation
     pub extern fn JS_NewObject(ctx: *JSContext) JSValue;

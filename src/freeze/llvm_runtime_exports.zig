@@ -29,29 +29,6 @@ inline fn cvOut(cv: CV) CvAbi {
 }
 
 // ============================================================================
-// Debug trace for diagnosing codegen bugs
-// ============================================================================
-
-export fn llvm_rt_debug_trace_cv(label: [*:0]const u8, cv_abi: CvAbi) callconv(.c) void {
-    const cv = cvIn(cv_abi);
-    if (cv.isInt()) {
-        std.debug.print("[TRACE] {s}: int({d})\n", .{ std.mem.span(label), cv.getInt() });
-    } else if (cv.isUndefined()) {
-        std.debug.print("[TRACE] {s}: undefined\n", .{std.mem.span(label)});
-    } else if (cv.isNull()) {
-        std.debug.print("[TRACE] {s}: null\n", .{std.mem.span(label)});
-    } else if (cv.isObject()) {
-        std.debug.print("[TRACE] {s}: object({?*})\n", .{ std.mem.span(label), cv.getPtr() });
-    } else if (cv.isRefType()) {
-        std.debug.print("[TRACE] {s}: ref({?*})\n", .{ std.mem.span(label), cv.getPtr() });
-    } else if (cv.isBool()) {
-        std.debug.print("[TRACE] {s}: bool({any})\n", .{ std.mem.span(label), cv.getBool() });
-    } else {
-        std.debug.print("[TRACE] {s}: other\n", .{std.mem.span(label)});
-    }
-}
-
-// ============================================================================
 // Stack operations (simple — inlined in LLVM IR, but exported as fallback)
 // ============================================================================
 
@@ -844,10 +821,6 @@ export fn llvm_rt_op_iterator_close(ctx: *JSContext, stack: [*]CV, sp: *usize, f
     thin.op_iterator_close(ctx, stack, sp, for_of_iter_stack, for_of_depth);
 }
 
-export fn llvm_rt_op_iterator_get_value_done(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) void {
-    thin.op_iterator_get_value_done(ctx, stack, sp);
-}
-
 export fn llvm_rt_op_for_in_start(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) c_int {
     thin.op_for_in_start(ctx, stack, sp) catch return 1;
     return 0;
@@ -883,11 +856,6 @@ export fn llvm_rt_op_to_propkey2(ctx: *JSContext, stack: [*]CV, sp: *usize) call
         return 1;
     }
     return llvm_rt_op_to_propkey(ctx, stack, sp);
-}
-
-export fn llvm_rt_op_in(ctx: *JSContext, stack: [*]CV, sp: *usize) callconv(.c) c_int {
-    thin.op_in(ctx, stack, sp) catch return 1;
-    return 0;
 }
 
 // ============================================================================
@@ -933,39 +901,6 @@ export fn llvm_rt_fast_array_probe(cv_abi: CvAbi, out_values_ptr: *?[*]u8, out_c
     out_values_ptr.* = null;
     out_count.* = 0;
     return 0;
-}
-
-/// Check if a CV value is a fast array (contiguous JSValue[] backing store).
-/// Returns 1 if fast array, 0 otherwise.
-export fn llvm_rt_fast_array_is_fast(cv_abi: CvAbi) callconv(.c) c_int {
-    const cv = cvIn(cv_abi);
-    if (!cv.isObject()) return 0;
-    const jsv = cv.toJSValue();
-    const result = zig_runtime.getFastArrayDirect(jsv);
-    return if (result.success) @as(c_int, 1) else @as(c_int, 0);
-}
-
-/// Get the raw JSValue[] pointer from a fast array CV.
-/// Caller must check is_fast first. Returns null if not a fast array.
-export fn llvm_rt_fast_array_get_values(cv_abi: CvAbi) callconv(.c) ?[*]u8 {
-    const cv = cvIn(cv_abi);
-    const jsv = cv.toJSValue();
-    const result = zig_runtime.getFastArrayDirect(jsv);
-    if (!result.success) return null;
-    if (result.values) |vals| {
-        return @ptrCast(vals);
-    }
-    return null;
-}
-
-/// Get the element count from a fast array CV.
-/// Caller must check is_fast first. Returns 0 if not a fast array.
-export fn llvm_rt_fast_array_get_count(cv_abi: CvAbi) callconv(.c) c_int {
-    const cv = cvIn(cv_abi);
-    const jsv = cv.toJSValue();
-    const result = zig_runtime.getFastArrayDirect(jsv);
-    if (!result.success) return 0;
-    return @intCast(result.count);
 }
 
 /// Load a JSValue at index from a raw values pointer, convert to CV (with refcount dup).
@@ -1154,10 +1089,6 @@ export fn llvm_rt_add_loc(ctx: *JSContext, stack: [*]CV, sp: *usize, locals: [*]
 
 export fn llvm_rt_cv_from_jsvalue(val: JSValue) callconv(.c) CvAbi {
     return cvOut(CV.fromJSValue(val));
-}
-
-export fn llvm_rt_cv_to_jsvalue_with_ctx(ctx: *JSContext, cv: *CV) callconv(.c) JSValue {
-    return cv.toJSValueWithCtx(ctx);
 }
 
 export fn llvm_rt_cv_dup_ref(cv_abi: CvAbi) callconv(.c) CvAbi {
@@ -1545,48 +1476,6 @@ export fn llvm_rt_exec_opcode(
     return 0;
 }
 
-// ============================================================================
-// QuickJS FFI helpers
-// ============================================================================
-
-export fn llvm_rt_js_get_global_object(ctx: *JSContext) callconv(.c) JSValue {
-    return zig_runtime.quickjs.JS_GetGlobalObject(ctx);
-}
-
-export fn llvm_rt_js_free_value(ctx: *JSContext, val: JSValue) callconv(.c) void {
-    zig_runtime.quickjs.JS_FreeValue(ctx, val);
-}
-
-export fn llvm_rt_js_dup_value(ctx: *JSContext, val: JSValue) callconv(.c) JSValue {
-    return zig_runtime.quickjs.JS_DupValue(ctx, val);
-}
-
-// ============================================================================
-// Higher-level frozen helpers
-// ============================================================================
-
-/// Debug: print a CV value with a label (for tracing codegen bugs)
-var debug_trace_invocation: u32 = 0;
-export fn llvm_rt_debug_trace(label: c_int, v_abi: CvAbi) callconv(.c) void {
-    const v = cvIn(v_abi);
-    // Increment invocation counter when we see label 0 (start of locals dump)
-    if (label == 0) debug_trace_invocation += 1;
-    const inv = debug_trace_invocation;
-    if (v.isUndefined()) {
-        std.debug.print("[TRACE #{d}] L{d}: UNDEFINED\n", .{ inv, label });
-    } else if (v.isNull()) {
-        std.debug.print("[TRACE #{d}] L{d}: NULL\n", .{ inv, label });
-    } else if (v.isInt()) {
-        std.debug.print("[TRACE #{d}] L{d}: INT({d})\n", .{ inv, label, v.getInt() });
-    } else if (v.isBool()) {
-        std.debug.print("[TRACE #{d}] L{d}: BOOL\n", .{ inv, label });
-    } else if (v.isRefType()) {
-        std.debug.print("[TRACE #{d}] L{d}: REF({?*})\n", .{ inv, label, v.getPtr() });
-    } else {
-        std.debug.print("[TRACE #{d}] L{d}: OTHER\n", .{ inv, label });
-    }
-}
-
 /// Dedicated array_from handler — bypasses exec_opcode's full-stack CV↔JSValue round-trip.
 /// JS_NewArrayFrom takes ownership of values via memcpy (no dup, no free on success).
 export fn llvm_rt_array_from(ctx: *JSContext, stack: [*]CV, sp: *usize, count: c_int) callconv(.c) c_int {
@@ -1648,29 +1537,7 @@ export fn llvm_rt_close_loc(ctx: *JSContext, locals: [*]CV, locals_jsv: ?[*]JSVa
     // iteration, which properly frees the old value before overwriting.
 }
 
-export fn llvm_rt_get_closure_var_safe(ctx: *JSContext, var_refs: ?[*]*JSVarRef, idx: u32, closure_var_count: c_int) callconv(.c) JSValue {
-    return zig_runtime.getClosureVarSafe(ctx, var_refs, idx, closure_var_count);
-}
 
-export fn llvm_rt_set_closure_var_safe(ctx: *JSContext, var_refs: ?[*]*JSVarRef, idx: u32, closure_var_count: c_int, val: JSValue) callconv(.c) void {
-    zig_runtime.setClosureVarSafe(ctx, var_refs, idx, closure_var_count, val);
-}
-
-export fn llvm_rt_ic_load(ctx: *JSContext, obj: JSValue, ic: *ICSlot, name: [*:0]const u8) callconv(.c) JSValue {
-    return zig_runtime.icLoad(ctx, obj, ic, name) catch JSValue.EXCEPTION;
-}
-
-export fn llvm_rt_get_field_checked(ctx: *JSContext, obj: JSValue, name: [*:0]const u8) callconv(.c) JSValue {
-    return zig_runtime.getFieldChecked(ctx, obj, name) catch JSValue.EXCEPTION;
-}
-
-export fn llvm_rt_make_rest_array(ctx: *JSContext, argc: c_int, argv: [*]JSValue, first_arg_index: u32) callconv(.c) JSValue {
-    return zig_runtime.makeRestArray(ctx, argc, argv, first_arg_index);
-}
-
-export fn llvm_rt_cleanup_locals(ctx: *JSContext, locals_ptr: [*]CV, count: usize) callconv(.c) void {
-    zig_runtime.cleanupLocals(ctx, locals_ptr, count);
-}
 
 // ============================================================================
 // Apply operation
