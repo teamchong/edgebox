@@ -170,6 +170,17 @@ pub const Builder = struct {
         return c.LLVMBuildFDiv(self.ref, lhs, rhs, name);
     }
 
+    /// Set fast-math flags on a floating-point instruction.
+    /// Flags: reassoc=1, nnan=2, ninf=4, nsz=8, arcp=16, contract=32, afn=64
+    pub fn setFastMathFlags(val: Value, flags: c_uint) void {
+        c.LLVMSetFastMathFlags(val, flags);
+    }
+
+    // Fast-math flag constants
+    pub const FMF_REASSOC: c_uint = 1; // LLVMFastMathAllowReassoc
+    pub const FMF_CONTRACT: c_uint = 32; // LLVMFastMathAllowContract
+    pub const FMF_VECTORIZE: c_uint = FMF_REASSOC | FMF_CONTRACT; // minimum for vectorization
+
     pub fn buildFRem(self: Builder, lhs: Value, rhs: Value, name: [*:0]const u8) Value {
         return c.LLVMBuildFRem(self.ref, lhs, rhs, name);
     }

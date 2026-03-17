@@ -70,6 +70,8 @@ pub const NumericPattern = enum {
     push_bool,
     /// Stack: dup
     stack_dup,
+    /// Stack: dup2 (duplicate top 2 values)
+    stack_dup2,
     /// Stack: drop
     stack_drop,
     /// Stack: swap
@@ -178,7 +180,8 @@ pub fn getHandler(opcode: Opcode) NumericHandler {
         // ── Binary arithmetic ───────────────────────────────────
         .add => .{ .pattern = .binary_arith, .op = "+" },
         .sub => .{ .pattern = .binary_arith, .op = "-" },
-        .mul => .{ .pattern = .binary_arith, .op = "*" },
+        // mul: JS mul is f64, products can exceed i32 range affecting subsequent ops
+        .mul => .{ .pattern = .binary_arith, .op = "*", .introduces_float = true },
         // div: produces float in JS (9/2=4.5), so marks introduces_float
         .div => .{ .pattern = .binary_arith, .op = "/", .introduces_float = true },
         .mod => .{ .pattern = .binary_arith, .op = "%" },
@@ -241,15 +244,16 @@ pub fn getHandler(opcode: Opcode) NumericHandler {
 
         // ── Stack ops ───────────────────────────────────────────
         .dup => .{ .pattern = .stack_dup },
+        .dup2 => .{ .pattern = .stack_dup2 },
         .drop => .{ .pattern = .stack_drop },
         .swap => .{ .pattern = .stack_swap },
         .nop => .{ .pattern = .nop },
 
-        // ── Self-reference (recursive calls) ────────────────────
-        .get_var_ref0, .get_var, .get_var_undef => .{ .pattern = .self_ref },
+        // ── Self-reference (recursive calls / destructured Math) ────────────────────
+        .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3, .get_var_ref, .get_var, .get_var_undef => .{ .pattern = .self_ref },
 
         // ── Calls ───────────────────────────────────────────────
-        .call1, .call2, .call3, .call => .{ .pattern = .call_self },
+        .call0, .call1, .call2, .call3, .call => .{ .pattern = .call_self },
         .tail_call => .{ .pattern = .tail_call_self },
 
         // ── Return ──────────────────────────────────────────────
@@ -351,6 +355,42 @@ pub fn isComputingPattern(pattern: NumericPattern) bool {
     };
 }
 
+/// Apply stack effects for opcodes that map to .unsupported in the numeric handler table
+/// but have well-defined stack semantics (Math.* pattern opcodes: get_field2, call_method,
+/// tail_call_method). Without this, stack simulation drifts and subsequent put_array_el
+/// checks fail to detect mutations.
+fn applyUnsupportedStackEffect(instr: anytype, stack: *[128]i8, sp: *usize) void {
+    switch (instr.opcode) {
+        // get_field2: pop obj, push (obj, method) → net +1
+        .get_field2 => {
+            // obj stays, method pushed on top
+            if (sp.* < stack.len) {
+                stack[sp.*] = -1;
+                sp.* += 1;
+            }
+        },
+        // call_method(N): pop (N args + method + receiver), push result → net -(N+1)
+        .call_method, .tail_call_method => {
+            const argc: u32 = switch (instr.operand) {
+                .u16 => |v| v,
+                else => 1,
+            };
+            // pop N args
+            if (sp.* >= argc) sp.* -= argc;
+            // pop method
+            if (sp.* >= 1) sp.* -= 1;
+            // pop receiver
+            if (sp.* >= 1) sp.* -= 1;
+            // push result
+            if (sp.* < stack.len) {
+                stack[sp.*] = -1;
+                sp.* += 1;
+            }
+        },
+        else => {},
+    }
+}
+
 /// Detect which function arguments are used as arrays (vs scalars).
 /// Uses lightweight stack simulation to trace argument flow into
 /// get_array_el/put_array_el opcodes.
@@ -443,6 +483,9 @@ pub fn detectArrayArgs(instructions: anytype, arg_count: u32) u8 {
             .stack_dup => {
                 if (sp >= 1 and sp < stack.len) { stack[sp] = stack[sp - 1]; sp += 1; }
             },
+            .stack_dup2 => {
+                if (sp >= 2 and sp + 1 < stack.len) { stack[sp] = stack[sp - 2]; stack[sp + 1] = stack[sp - 1]; sp += 2; }
+            },
             .stack_drop => {
                 if (sp >= 1) sp -= 1;
             },
@@ -490,7 +533,11 @@ pub fn detectArrayArgs(instructions: anytype, arg_count: u32) u8 {
                 if (sp >= 1) { stack[sp - 1] = -1; }
             },
             .nop, .goto_br, .set_loc_uninitialized, .tail_call_self => {},
-            .unsupported => {},
+            .unsupported => {
+                // Math.* opcodes (get_field2, call_method, tail_call_method) fall through
+                // to .unsupported but have well-defined stack effects that must be tracked.
+                applyUnsupportedStackEffect(instr, &stack, &sp);
+            },
         }
     }
     return result;
@@ -559,6 +606,9 @@ pub fn detectMutatedArgs(instructions: anytype, arg_count: u32) u8 {
             .stack_dup => {
                 if (sp >= 1 and sp < stack.len) { stack[sp] = stack[sp - 1]; sp += 1; }
             },
+            .stack_dup2 => {
+                if (sp >= 2 and sp + 1 < stack.len) { stack[sp] = stack[sp - 2]; stack[sp + 1] = stack[sp - 1]; sp += 2; }
+            },
             .stack_drop => {
                 if (sp >= 1) sp -= 1;
             },
@@ -595,7 +645,9 @@ pub fn detectMutatedArgs(instructions: anytype, arg_count: u32) u8 {
                 if (sp >= 1) { stack[sp - 1] = -1; }
             },
             .nop, .goto_br, .set_loc_uninitialized, .tail_call_self => {},
-            .unsupported => {},
+            .unsupported => {
+                applyUnsupportedStackEffect(instr, &stack, &sp);
+            },
         }
     }
     return result;
@@ -675,6 +727,9 @@ pub fn detectReadArrayArgs(instructions: anytype, arg_count: u32) u8 {
             .stack_dup => {
                 if (sp >= 1 and sp < stack.len) { stack[sp] = stack[sp - 1]; sp += 1; }
             },
+            .stack_dup2 => {
+                if (sp >= 2 and sp + 1 < stack.len) { stack[sp] = stack[sp - 2]; stack[sp + 1] = stack[sp - 1]; sp += 2; }
+            },
             .stack_drop => {
                 if (sp >= 1) sp -= 1;
             },
@@ -711,7 +766,9 @@ pub fn detectReadArrayArgs(instructions: anytype, arg_count: u32) u8 {
                 if (sp >= 1) { stack[sp - 1] = -1; }
             },
             .nop, .goto_br, .set_loc_uninitialized, .tail_call_self => {},
-            .unsupported => {},
+            .unsupported => {
+                applyUnsupportedStackEffect(instr, &stack, &sp);
+            },
         }
     }
     return result;
@@ -783,6 +840,9 @@ pub fn detectLengthArgs(instructions: anytype, arg_count: u32) u8 {
             .stack_dup => {
                 if (sp >= 1 and sp < stack.len) { stack[sp] = stack[sp - 1]; sp += 1; }
             },
+            .stack_dup2 => {
+                if (sp >= 2 and sp + 1 < stack.len) { stack[sp] = stack[sp - 2]; stack[sp + 1] = stack[sp - 1]; sp += 2; }
+            },
             .stack_drop => {
                 if (sp >= 1) sp -= 1;
             },
@@ -812,7 +872,9 @@ pub fn detectLengthArgs(instructions: anytype, arg_count: u32) u8 {
             },
             .inc_loc, .dec_loc => {},
             .nop, .goto_br, .set_loc_uninitialized, .tail_call_self => {},
-            .unsupported => {},
+            .unsupported => {
+                applyUnsupportedStackEffect(instr, &stack, &sp);
+            },
         }
     }
     return result;

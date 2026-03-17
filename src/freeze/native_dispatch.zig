@@ -20,7 +20,7 @@ const qjs = zig_runtime.quickjs;
 // WASM32 detection - same as in js_value.zig
 const is_wasm32 = @sizeOf(*anyopaque) == 4;
 
-/// C function pointer type for frozen functions (includes var_refs and cpool for closure/fclosure support)
+/// C function pointer type for frozen functions (includes var_refs, cpool)
 pub const FrozenFnPtr = *const fn (*JSContext, JSValue, c_int, [*]JSValue, ?[*]*JSVarRef, c_int, ?[*]JSValue) callconv(.c) JSValue;
 
 // ============================================================================

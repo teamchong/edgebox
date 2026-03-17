@@ -3043,6 +3043,7 @@ pub const quickjs = struct {
 
     // Constructor calls
     pub extern fn JS_CallConstructor(ctx: *JSContext, func: JSValue, argc: c_int, argv: [*]const JSValue) JSValue;
+    pub extern fn JS_CallConstructor2(ctx: *JSContext, func: JSValue, new_target: JSValue, argc: c_int, argv: [*]const JSValue) JSValue;
 
     // Property definition
     pub extern fn JS_DefinePropertyValueStr(ctx: *JSContext, this_obj: JSValue, prop: [*:0]const u8, val: JSValue, flags: c_int) c_int;
@@ -3115,6 +3116,10 @@ pub const quickjs = struct {
 
     // Class constructor creation (for define_class opcode)
     pub extern fn js_frozen_define_class(ctx: *JSContext, bfunc: JSValue, parent_class: JSValue, class_flags: c_int, class_name: u32, cur_var_refs: ?[*]*JSVarRef, local_var_ref_list: ?*ListHead, locals: ?[*]JSValue, num_locals: c_int, args: ?[*]JSValue, num_args: c_int, out_ctor: *JSValue, out_proto: *JSValue) c_int;
+
+    // Exception handling for try/catch/finally
+    pub extern fn js_frozen_exception_find_catch(ctx: *JSContext, stack_buf: [*]JSValue, sp_ptr: *[*]JSValue) i32;
+    pub extern fn js_frozen_nip_catch(ctx: *JSContext, stack_buf: [*]JSValue, sp_ptr: *[*]JSValue) i32;
 
     // Inline cache for property access
     pub extern fn js_frozen_ic_load(ctx: *JSContext, obj: JSValue, ic_slot: *anyopaque, name: [*:0]const u8) JSValue;

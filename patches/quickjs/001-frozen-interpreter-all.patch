@@ -43,7 +43,7 @@ index ae01300..587c949 100644
  }
  
 diff --git a/quickjs.c b/quickjs.c
-index 62f4381..50bdec8 100644
+index 62f4381..154c298 100644
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -29,6 +29,10 @@
@@ -308,7 +308,7 @@ index 62f4381..50bdec8 100644
  #define GLOBAL_VAR_OFFSET 0x40000000
  #define ARGUMENT_VAR_OFFSET 0x20000000
  
-@@ -15598,6 +15712,1793 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
+@@ -15598,6 +15712,1920 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
      return 0;
  }
  
@@ -627,7 +627,14 @@ index 62f4381..50bdec8 100644
 + * - func_obj: for special_object (THIS_FUNC), init_ctor
 + * - new_target: for special_object (NEW_TARGET), check_ctor
 + * - cpool: for regexp (constant pool)
++ *
++ * Constructor opcodes (check_ctor, special_object, init_ctor) read func_obj/new_target
++ * from globals set by JS_CallInternal before calling the frozen function.
 + */
++/* Globals set by JS_CallInternal before frozen function dispatch */
++static JSValue frozen_cur_func_obj = JS_UNDEFINED;
++static JSValue frozen_cur_new_target = JS_UNDEFINED;
++
 +JSValue js_frozen_exec_opcode(JSContext *ctx, int opcode, uint32_t operand,
 +                               JSValue *stack, int *sp, JSValue *locals, int local_count,
 +                               JSVarRef **var_refs, int closure_var_count,
@@ -637,6 +644,10 @@ index 62f4381..50bdec8 100644
 +                               int operand2)
 +{
 +    (void)local_count;
++    /* Use globals for constructor opcodes — func_obj/new_target params may be UNDEFINED
++     * when called from LLVM-compiled frozen functions (7-param ABI doesn't pass them) */
++    (void)func_obj;
++    (void)new_target;
 +    JSValue ret_val;
 +
 +    switch (opcode) {
@@ -859,7 +870,7 @@ index 62f4381..50bdec8 100644
 +
 +    /* ---- Constructor/class opcodes ---- */
 +    case OP_check_ctor:
-+        if (JS_IsUndefined(new_target)) {
++        if (JS_IsUndefined(frozen_cur_new_target)) {
 +            JS_ThrowTypeError(ctx, "class constructors must be invoked with 'new'");
 +            return JS_EXCEPTION;
 +        }
@@ -867,14 +878,14 @@ index 62f4381..50bdec8 100644
 +    case OP_init_ctor:
 +        {
 +            JSValue super, ret;
-+            if (JS_IsUndefined(new_target)) {
++            if (JS_IsUndefined(frozen_cur_new_target)) {
 +                JS_ThrowTypeError(ctx, "class constructors must be invoked with 'new'");
 +                return JS_EXCEPTION;
 +            }
-+            super = JS_GetPrototype(ctx, func_obj);
++            super = JS_GetPrototype(ctx, frozen_cur_func_obj);
 +            if (JS_IsException(super))
 +                return JS_EXCEPTION;
-+            ret = JS_CallConstructor2(ctx, super, new_target, argc, argv);
++            ret = JS_CallConstructor2(ctx, super, frozen_cur_new_target, argc, argv);
 +            JS_FreeValue(ctx, super);
 +            if (JS_IsException(ret))
 +                return JS_EXCEPTION;
@@ -895,16 +906,16 @@ index 62f4381..50bdec8 100644
 +                (*sp)++;
 +                break;
 +            case 2: /* THIS_FUNC */
-+                stack[(*sp)++] = js_dup(func_obj);
++                stack[(*sp)++] = js_dup(frozen_cur_func_obj);
 +                break;
 +            case 3: /* NEW_TARGET */
-+                stack[(*sp)++] = js_dup(new_target);
++                stack[(*sp)++] = js_dup(frozen_cur_new_target);
 +                break;
 +            case 4: /* HOME_OBJECT */
 +                {
 +                    JSObject *p1;
-+                    if (JS_VALUE_GET_TAG(func_obj) == JS_TAG_OBJECT) {
-+                        p1 = JS_VALUE_GET_OBJ(func_obj)->u.func.home_object;
++                    if (JS_VALUE_GET_TAG(frozen_cur_func_obj) == JS_TAG_OBJECT) {
++                        p1 = JS_VALUE_GET_OBJ(frozen_cur_func_obj)->u.func.home_object;
 +                        if (p1)
 +                            stack[(*sp)++] = js_dup(JS_MKPTR(JS_TAG_OBJECT, p1));
 +                        else
@@ -930,6 +941,20 @@ index 62f4381..50bdec8 100644
 +                return JS_ThrowTypeError(ctx, "unsupported special_object type %d", arg);
 +            }
 +        }
++        break;
++
++    case OP_check_ctor_return:
++        /* return true if 'this' should be returned */
++        if (!JS_IsObject(stack[*sp - 1])) {
++            if (!JS_IsUndefined(stack[*sp - 1])) {
++                JS_ThrowTypeError(ctx, "derived class constructor must return an object or undefined");
++                return JS_EXCEPTION;
++            }
++            stack[*sp] = JS_TRUE;
++        } else {
++            stack[*sp] = JS_FALSE;
++        }
++        (*sp)++;
 +        break;
 +
 +    /* ---- Method definition opcodes ---- */
@@ -1227,6 +1252,26 @@ index 62f4381..50bdec8 100644
 +            *sp -= 3;
 +            if (ret3 < 0) return JS_EXCEPTION;
 +        }
++        break;
++
++    case OP_check_brand:
++        {
++            int ret = JS_CheckBrand(ctx, stack[*sp - 2], stack[*sp - 1]);
++            if (ret < 0)
++                return JS_EXCEPTION;
++            if (!ret) {
++                JS_ThrowTypeError(ctx, "invalid brand on object");
++                return JS_EXCEPTION;
++            }
++        }
++        break;
++
++    case OP_add_brand:
++        if (JS_AddBrand(ctx, stack[*sp - 2], stack[*sp - 1]) < 0)
++            return JS_EXCEPTION;
++        JS_FreeValue(ctx, stack[*sp - 2]);
++        JS_FreeValue(ctx, stack[*sp - 1]);
++        *sp -= 2;
 +        break;
 +
 +    default:
@@ -1711,6 +1756,7 @@ index 62f4381..50bdec8 100644
 +    JSObject *p;
 +    JSVarRef **var_refs;
 +    int i;
++    bool local_parent_class = false; /* true if parent_class was locally duped */
 +
 +    /* Get bytecode pointer */
 +    b = JS_VALUE_GET_PTR(bfunc);
@@ -1720,6 +1766,7 @@ index 62f4381..50bdec8 100644
 +        if (JS_IsNull(parent_class)) {
 +            parent_proto = JS_NULL;
 +            parent_class = js_dup(ctx->function_proto);
++            local_parent_class = true;
 +        } else {
 +            if (!JS_IsConstructor(ctx, parent_class)) {
 +                JS_ThrowTypeError(ctx, "parent class must be constructor");
@@ -1737,6 +1784,7 @@ index 62f4381..50bdec8 100644
 +        /* parent_class is JS_UNDEFINED in this case */
 +        parent_proto = js_dup(ctx->class_proto[JS_CLASS_OBJECT]);
 +        parent_class = js_dup(ctx->function_proto);
++        local_parent_class = true;
 +    }
 +
 +    /* Create prototype object */
@@ -1842,15 +1890,16 @@ index 62f4381..50bdec8 100644
 +        goto fail;
 +
 +    JS_FreeValue(ctx, parent_proto);
-+    if (class_flags & JS_DEFINE_CLASS_HAS_HERITAGE) {
-+        /* parent_class was duped if null, need to free */
-+    }
++    if (local_parent_class)
++        JS_FreeValue(ctx, parent_class);
 +
 +    *out_ctor = ctor;
 +    *out_proto = proto;
 +    return 0;
 +
 +fail:
++    if (local_parent_class)
++        JS_FreeValue(ctx, parent_class);
 +    JS_FreeValue(ctx, parent_proto);
 +    JS_FreeValue(ctx, proto);
 +    JS_FreeValue(ctx, ctor);
@@ -1950,6 +1999,84 @@ index 62f4381..50bdec8 100644
 +                               JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE);
 +    }
 +    return args;
++}
++
++/* ========================================================================
++ * Frozen Exception Handling for try/catch/finally
++ *
++ * These helpers implement the exception dispatch mechanism for frozen
++ * (AOT-compiled) functions. They replicate the interpreter's exception
++ * handler logic: walking the stack backward looking for CATCH_OFFSET
++ * values, handling iterator close (pos==0), and pushing the exception
++ * value when a catch handler is found.
++ * ======================================================================== */
++
++/* Walk stack backward for CATCH_OFFSET. Returns handler bytecode offset
++ * (>0) or -1 if no handler. Pushes exception onto stack when found. */
++int32_t js_frozen_exception_find_catch(JSContext *ctx,
++                                        JSValue *stack_buf,
++                                        JSValue **sp_ptr)
++{
++    JSRuntime *rt = ctx->rt;
++    JSValue *sp = *sp_ptr;
++
++    if (JS_IsUncatchableError(rt->current_exception)) {
++        *sp_ptr = sp;
++        return -1;
++    }
++
++    while (sp > stack_buf) {
++        JSValue val = *--sp;
++        JS_FreeValue(ctx, val);
++        if (JS_VALUE_GET_TAG(val) == JS_TAG_CATCH_OFFSET) {
++            int pos = JS_VALUE_GET_INT(val);
++            if (pos == 0) {
++                /* Enumerator: close it with a throw */
++                JS_FreeValue(ctx, sp[-1]); /* drop the next method */
++                sp--;
++                if (!JS_IsUndefined(sp[-1]))
++                    JS_IteratorClose(ctx, sp[-1], true);
++                JS_FreeValue(ctx, sp[-1]);
++                sp--;
++                continue;
++            }
++            /* Found catch handler — push exception onto stack */
++            *sp++ = rt->current_exception;
++            rt->current_exception = JS_UNINITIALIZED;
++            JS_FreeValueRT(rt, ctx->error_back_trace);
++            ctx->error_back_trace = JS_UNDEFINED;
++            *sp_ptr = sp;
++            return pos;
++        }
++    }
++    *sp_ptr = sp;
++    return -1;
++}
++
++/* nip_catch: pop values from stack until CATCH_OFFSET found.
++ * Stack before: [... catch_offset ... values ... ret_val]
++ * Stack after:  [... ret_val] (catch_offset and intermediate values freed)
++ * Returns 0 on success, 1 on error (no CATCH_OFFSET found). */
++int32_t js_frozen_nip_catch(JSContext *ctx,
++                             JSValue *stack_buf,
++                             JSValue **sp_ptr)
++{
++    JSValue *sp = *sp_ptr;
++    JSValue ret_val = *--sp;
++
++    while (sp > stack_buf &&
++           JS_VALUE_GET_TAG(sp[-1]) != JS_TAG_CATCH_OFFSET) {
++        JS_FreeValue(ctx, *--sp);
++    }
++    if (unlikely(sp == stack_buf)) {
++        JS_ThrowInternalError(ctx, "nip_catch");
++        JS_FreeValue(ctx, ret_val);
++        *sp_ptr = sp;
++        return 1;
++    }
++    sp[-1] = ret_val;
++    *sp_ptr = sp;
++    return 0;
 +}
 +
 +/* ========================================================================
@@ -2102,7 +2229,7 @@ index 62f4381..50bdec8 100644
  static JSValue JS_IteratorGetCompleteValue(JSContext *ctx, JSValue obj,
                                             int *pdone)
  {
-@@ -15853,7 +17745,7 @@ static __exception int JS_CopyDataProperties(JSContext *ctx,
+@@ -15853,7 +17881,7 @@ static __exception int JS_CopyDataProperties(JSContext *ctx,
  }
  
  /* only valid inside C functions */
@@ -2111,7 +2238,7 @@ index 62f4381..50bdec8 100644
  {
      return ctx->rt->current_stack_frame->cur_func;
  }
-@@ -15955,15 +17847,16 @@ static const uint16_t func_kind_to_class_id[] = {
+@@ -15955,15 +17983,16 @@ static const uint16_t func_kind_to_class_id[] = {
      [JS_FUNC_ASYNC_GENERATOR] = JS_CLASS_ASYNC_GENERATOR_FUNCTION,
  };
  
@@ -2131,7 +2258,7 @@ index 62f4381..50bdec8 100644
      func_obj = JS_NewObjectClass(ctx, func_kind_to_class_id[b->func_kind]);
      if (JS_IsException(func_obj)) {
          JS_FreeValue(ctx, bfunc);
-@@ -16383,6 +18276,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16383,6 +18412,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  
      if (js_poll_interrupts(caller_ctx))
          return JS_EXCEPTION;
@@ -2139,7 +2266,7 @@ index 62f4381..50bdec8 100644
      if (unlikely(JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT)) {
          if (flags & JS_CALL_FLAG_GENERATOR) {
              JSAsyncFunctionState *s = JS_VALUE_GET_PTR(func_obj);
-@@ -16415,12 +18309,139 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16415,12 +18445,148 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          call_func = rt->class_array[p->class_id].call;
          if (!call_func) {
          not_a_function:
@@ -2256,6 +2383,11 @@ index 62f4381..50bdec8 100644
 +                typedef JSValue (*FrozenFn)(JSContext *, JSValue, int, JSValue *,
 +                                           JSVarRef **, int, JSValue *);
 +                FrozenFn fn = (FrozenFn)impl;
++                /* Store func_obj/new_target for constructor opcodes in exec_opcode */
++                if (unlikely(b->new_target_allowed)) {
++                    frozen_cur_func_obj = func_obj;
++                    frozen_cur_new_target = new_target;
++                }
 +                return fn(caller_ctx, this_obj, argc, (JSValue *)argv,
 +                         p->u.func.var_refs, b->closure_var_count, b->cpool);
 +            }
@@ -2268,6 +2400,10 @@ index 62f4381..50bdec8 100644
 +                typedef JSValue (*FrozenFn)(JSContext *, JSValue, int, JSValue *,
 +                                           JSVarRef **, int, JSValue *);
 +                FrozenFn fn = (FrozenFn)fn_ptr;
++                if (unlikely(b->new_target_allowed)) {
++                    frozen_cur_func_obj = func_obj;
++                    frozen_cur_new_target = new_target;
++                }
 +                return fn(caller_ctx, this_obj, argc, (JSValue *)argv,
 +                         p->u.func.var_refs, b->closure_var_count, b->cpool);
 +            }
@@ -2279,7 +2415,7 @@ index 62f4381..50bdec8 100644
  
      if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
          arg_allocated_size = b->arg_count;
-@@ -16781,7 +18802,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16781,7 +18947,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  
          CASE(OP_fclosure):
              {
@@ -2289,7 +2425,7 @@ index 62f4381..50bdec8 100644
                  pc += 4;
                  *sp++ = js_closure(ctx, bfunc, var_refs, sf);
                  if (unlikely(JS_IsException(sp[-1])))
-@@ -16803,6 +18825,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16803,6 +18970,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              has_call_argc:
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -2308,7 +2444,7 @@ index 62f4381..50bdec8 100644
                  ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                            JS_UNDEFINED, call_argc,
                                            vc(call_argv), 0);
-@@ -16840,6 +18874,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16840,6 +19019,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                  pc += 2;
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -2334,7 +2470,7 @@ index 62f4381..50bdec8 100644
                  ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
                                            JS_UNDEFINED, call_argc,
                                            vc(call_argv), 0);
-@@ -17190,6 +19243,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -17190,6 +19388,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                  int idx;
                  idx = get_u16(pc);
                  pc += 2;
@@ -2351,7 +2487,7 @@ index 62f4381..50bdec8 100644
                  set_value(ctx, &var_buf[idx], sp[-1]);
                  sp--;
              }
-@@ -17199,6 +19262,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -17199,6 +19407,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                  int idx;
                  idx = get_u16(pc);
                  pc += 2;
@@ -2368,7 +2504,7 @@ index 62f4381..50bdec8 100644
                  set_value(ctx, &var_buf[idx], js_dup(sp[-1]));
              }
              BREAK;
-@@ -17281,11 +19354,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -17281,11 +19499,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          CASE(OP_get_var_ref):
              {
                  int idx;
@@ -2381,7 +2517,7 @@ index 62f4381..50bdec8 100644
                  sp++;
              }
              BREAK;
-@@ -17393,6 +19464,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -17393,6 +19609,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                             "'this' can be initialized only once");
                      goto exception;
                  }
@@ -2398,7 +2534,7 @@ index 62f4381..50bdec8 100644
                  set_value(ctx, &var_buf[idx], sp[-1]);
                  sp--;
              }
-@@ -29006,7 +31087,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
+@@ -29006,7 +31232,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
      return promise;
  }
  
@@ -2407,7 +2543,7 @@ index 62f4381..50bdec8 100644
                                       int argc, JSValueConst *argv)
  {
      JSValueConst *resolving_funcs = argv;
-@@ -29041,7 +31122,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
+@@ -29041,7 +31267,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
      return JS_UNDEFINED;
  }
  
@@ -2416,7 +2552,7 @@ index 62f4381..50bdec8 100644
  {
      JSAtom basename;
      JSValue promise, resolving_funcs[2], basename_val;
-@@ -33920,6 +36001,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+@@ -33920,6 +36146,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
      if (!b)
          goto fail;
      b->header.ref_count = 1;
@@ -2424,7 +2560,7 @@ index 62f4381..50bdec8 100644
  
      b->byte_code_buf = (void *)((uint8_t*)b + byte_code_offset);
      b->byte_code_len = fd->byte_code.size;
-@@ -33979,6 +36061,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+@@ -33979,6 +36206,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
      b->has_prototype = fd->has_prototype;
      b->has_simple_parameter_list = fd->has_simple_parameter_list;
      b->is_strict_mode = fd->is_strict_mode;
@@ -2432,7 +2568,7 @@ index 62f4381..50bdec8 100644
      b->is_derived_class_constructor = fd->is_derived_class_constructor;
      b->func_kind = fd->func_kind;
      b->need_home_object = (fd->home_object_var_idx >= 0 ||
-@@ -35616,6 +37699,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+@@ -35616,6 +37844,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
      assert(idx <= 16);
      bc_put_u16(s, flags);
      bc_put_u8(s, b->is_strict_mode);
@@ -2440,7 +2576,7 @@ index 62f4381..50bdec8 100644
      bc_put_atom(s, b->func_name);
  
      bc_put_leb128(s, b->arg_count);
-@@ -36158,6 +38242,7 @@ typedef struct BCReaderState {
+@@ -36158,6 +38387,7 @@ typedef struct BCReaderState {
      /* used for JS_DUMP_READ_OBJECT */
      const uint8_t *ptr_last;
      int level;
@@ -2448,7 +2584,7 @@ index 62f4381..50bdec8 100644
  } BCReaderState;
  
  #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
-@@ -36552,6 +38637,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -36552,6 +38782,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
      if (bc_get_u8(s, &v8))
          goto fail;
      bc.is_strict_mode = (v8 > 0);
@@ -2458,7 +2594,7 @@ index 62f4381..50bdec8 100644
      if (bc_get_atom(s, &bc.func_name))
          goto fail;
      if (bc_get_leb128_u16(s, &bc.arg_count))
-@@ -36588,6 +38676,8 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -36588,6 +38821,8 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
      memcpy(b, &bc, sizeof(*b));
      bc.func_name = JS_ATOM_NULL;
      b->header.ref_count = 1;
@@ -2467,7 +2603,7 @@ index 62f4381..50bdec8 100644
      if (local_count != 0) {
          b->vardefs = (void *)((uint8_t*)b + vardefs_offset);
      }
-@@ -36697,6 +38787,13 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -36697,6 +38932,13 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
          }
          bc_read_trace(s, "}\n");
      }
@@ -2481,7 +2617,7 @@ index 62f4381..50bdec8 100644
      {
          bc_read_trace(s, "bytecode {\n");
          if (JS_ReadFunctionBytecode(s, b, byte_code_offset, b->byte_code_len))
-@@ -45524,6 +47621,12 @@ static JSValue js_regexp_constructor_internal(JSContext *ctx, JSValueConst ctor,
+@@ -45524,6 +47766,12 @@ static JSValue js_regexp_constructor_internal(JSContext *ctx, JSValueConst ctor,
      return obj;
  }
  
@@ -2495,7 +2631,7 @@ index 62f4381..50bdec8 100644
                                 bool throw_error)
  {
 diff --git a/quickjs.h b/quickjs.h
-index 3165256..b2c9cef 100644
+index 3165256..444caa8 100644
 --- a/quickjs.h
 +++ b/quickjs.h
 @@ -443,6 +443,7 @@ JS_EXTERN void JS_SetDumpFlags(JSRuntime *rt, uint64_t flags);
@@ -2524,7 +2660,7 @@ index 3165256..b2c9cef 100644
  
  /* C function definition */
  typedef enum JSCFunctionEnum {  /* XXX: should rename for namespace isolation */
-@@ -1291,6 +1296,115 @@ JS_EXTERN const char* JS_GetVersion(void);
+@@ -1291,6 +1296,128 @@ JS_EXTERN const char* JS_GetVersion(void);
  /* Integration point for quickjs-libc.c, not for public use. */
  JS_EXTERN uintptr_t js_std_cmd(int cmd, ...);
  
@@ -2632,6 +2768,19 @@ index 3165256..b2c9cef 100644
 +
 +/* Frozen interpreter support - method home object for super calls */
 +JS_EXTERN void JS_SetHomeObject(JSContext *ctx, JSValue func_obj, JSValue home_obj);
++
++/* Frozen interpreter support - exception handling for try/catch/finally */
++/* Walk stack for CATCH_OFFSET on exception. Returns catch handler bytecode
++ * offset (>0), or -1 if no handler found. Pushes exception value onto stack
++ * when handler found. Handles iterator close for pos==0 entries. */
++JS_EXTERN int32_t js_frozen_exception_find_catch(JSContext *ctx,
++                                                  JSValue *stack_buf,
++                                                  JSValue **sp_ptr);
++/* nip_catch: pop values until CATCH_OFFSET, replace with top value.
++ * Returns 0 on success, 1 if no CATCH_OFFSET found. */
++JS_EXTERN int32_t js_frozen_nip_catch(JSContext *ctx,
++                                       JSValue *stack_buf,
++                                       JSValue **sp_ptr);
 +
 +/* Frozen interpreter support - inline cache for property access */
 +JS_EXTERN JSValue js_frozen_ic_load(JSContext *ctx, JSValueConst obj,

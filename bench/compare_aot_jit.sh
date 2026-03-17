@@ -24,7 +24,7 @@ wasm="$outdir/${basename}-standalone.wasm"
 # Step 1: Compile
 echo "--- Compiling $FILE ---"
 rm -rf "$outdir"
-$EDGEBOXC --wasm-only "$FILE" 2>&1 | grep -E 'Standalone WASM:|Cross-call:|Numeric'
+$EDGEBOXC "$FILE" 2>&1 | grep -E 'Standalone WASM:|Cross-call:|Numeric'
 
 if [ ! -f "$worker" ]; then
     echo "ERROR: Worker not generated: $worker"

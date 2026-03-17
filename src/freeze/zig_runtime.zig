@@ -1036,7 +1036,12 @@ pub const thin = struct {
         if (result.isException()) return error.JsException;
         // Pop func + args, push result
         sp.* = func_idx;
-        stack[sp.*] = CV.fromJSValue(result);
+        const result_cv = CV.fromJSValue(result);
+        // Debug: detect null ref-counted return value from JS_Call
+        if (result_cv.tag < 0 and result_cv.u == 0) {
+            std.debug.print("[BUG-CALL] null ref return tag={d} argc={d} sp={d} ra=0x{x}\n", .{ result_cv.tag, argc, sp.*, @returnAddress() });
+        }
+        stack[sp.*] = result_cv;
         sp.* += 1;
         // Sync closure variables back
         syncLocalsFrom(locals, locals_jsv, var_count, closure_alive, captured_indices);
@@ -1286,34 +1291,36 @@ pub const thin = struct {
         argc: u16,
     ) GetFieldError!void {
         const n: usize = @intCast(argc);
-        // Stack: [new_target, func, arg0, ..., argN-1]
-        const new_target_idx = sp.* - n - 2;
-        const fn_val = stack[new_target_idx + 1].toJSValue();
+        // Stack: [func, new_target, arg0, ..., argN-1]
+        // QuickJS: call_argv[-2] = func, call_argv[-1] = new_target
+        const func_idx = sp.* - n - 2;
+        const fn_val = stack[func_idx].toJSValue();
+        const new_target_val = stack[func_idx + 1].toJSValue();
 
-        // On native, CV=JSValue — pass stack args directly (zero copy).
+        // Use JS_CallConstructor2 to pass the correct new_target (needed for super() calls)
         const result = if (comptime !is_wasm32) blk: {
             const argv_ptr: [*]JSValue = @ptrCast(&stack[sp.* - n]);
-            break :blk quickjs.JS_CallConstructor(ctx, fn_val, @intCast(argc), argv_ptr);
+            break :blk quickjs.JS_CallConstructor2(ctx, fn_val, new_target_val, @intCast(argc), argv_ptr);
         } else blk: {
             if (n > 0) {
                 var args: [256]JSValue = undefined;
                 for (0..n) |i| {
                     args[i] = CV.toJSValuePtr(&stack[sp.* - n + i]);
                 }
-                break :blk quickjs.JS_CallConstructor(ctx, fn_val, @intCast(argc), @ptrCast(&args));
+                break :blk quickjs.JS_CallConstructor2(ctx, fn_val, new_target_val, @intCast(argc), @ptrCast(&args));
             } else {
                 var no_args: [0]JSValue = .{};
-                break :blk quickjs.JS_CallConstructor(ctx, fn_val, 0, &no_args);
+                break :blk quickjs.JS_CallConstructor2(ctx, fn_val, new_target_val, 0, &no_args);
             }
         };
 
-        // FreeRef all consumed CVs (new_target + func + args) directly from stack
-        for (new_target_idx..sp.*) |i| {
+        // FreeRef all consumed CVs (func + new_target + args) directly from stack
+        for (func_idx..sp.*) |i| {
             CV.freeRef(ctx, stack[i]);
         }
 
         if (result.isException()) return error.JsException;
-        sp.* = new_target_idx;
+        sp.* = func_idx;
         stack[sp.*] = CV.fromJSValue(result);
         sp.* += 1;
     }

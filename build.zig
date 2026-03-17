@@ -1994,17 +1994,19 @@ pub fn build(b: *std.Build) void {
     // ===================
     // cli - builds all CLI tools
     // ===================
-    const cli_step = b.step("cli", "Build all CLI tools (edgebox with daemon mode, edgeboxc with integrated AOT, edgebox-sandbox, edgebox-wasm-opt)");
-    cli_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
+    // cli: build edgeboxc (compiler) + wasm-opt — the worker path tools
+    const cli_step = b.step("cli", "Build edgeboxc compiler (JIT+AOT for V8/workerd)");
     cli_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
-    cli_step.dependOn(&b.addInstallArtifact(sandbox_exe, .{}).step);
-    // NOTE: wizer not currently used, but kept available via `zig build wizer`
-    // Wizer uses prebuilt WAMR (libiwasm.a) so it benefits from caching
-    // cli_step.dependOn(&b.addInstallArtifact(wizer_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
-    // Include GPU worker when -Denable-gpu=true
+
+    // cli-full: also builds WAMR runner, sandbox, etc. (for --with-binary)
+    const cli_full_step = b.step("cli-full", "Build all CLI tools including WAMR runner and sandbox");
+    cli_full_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
+    cli_full_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
+    cli_full_step.dependOn(&b.addInstallArtifact(sandbox_exe, .{}).step);
+    cli_full_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
     if (enable_gpu) {
-        cli_step.dependOn(gpu_worker_step);
+        cli_full_step.dependOn(gpu_worker_step);
     }
 
     // ===================

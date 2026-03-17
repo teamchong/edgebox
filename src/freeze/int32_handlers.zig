@@ -120,7 +120,9 @@ pub fn getInt32Handler(opcode: Opcode) Int32Handler {
         // Binary arithmetic
         .add => .{ .pattern = .binary_arith_i32, .op = "+" },
         .sub => .{ .pattern = .binary_arith_i32, .op = "-" },
-        .mul => .{ .pattern = .binary_arith_i32, .op = "*" },
+        // mul excluded from int32 tier: JS mul is f64, intermediate products
+        // can exceed i32 range and affect subsequent f64 additions
+        .mul => .{ .pattern = .unsupported },
         // div excluded from int32 tier: JS division can produce float (9/2 = 4.5)
         .div => .{ .pattern = .unsupported },
         .mod => .{ .pattern = .binary_arith_i32, .op = "%" },

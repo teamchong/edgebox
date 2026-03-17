@@ -31,5 +31,5 @@ var avg = elapsed / RUNS;
 if (result !== EXPECTED) {
     log("FAIL: got " + result + ", expected " + EXPECTED);
 } else {
-    log(EXPECTED + " (" + elapsed.toFixed(1) + "ms total, " + avg.toFixed(3) + "ms avg)");
+    log("loop: " + Math.round(elapsed) + "ms (" + RUNS + " runs, result=" + EXPECTED + ")");
 }

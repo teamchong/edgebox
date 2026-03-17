@@ -529,7 +529,7 @@ pub fn main() !void {
     var no_freeze = false;
     var no_bundle = false;
     var binary_only = false;
-    var wasm_only = false;
+    var wasm_only = true; // Default: worker path (V8+WASM). Use --with-binary for native.
     var debug_build = false;
     var allocator_type: AllocatorType = .gpa; // Default: GPA for debugging (use --allocator=c for production)
     var allocator_explicitly_set = false;
@@ -562,6 +562,8 @@ pub fn main() !void {
             binary_only = true;
         } else if (std.mem.eql(u8, arg, "--wasm-only")) {
             wasm_only = true;
+        } else if (std.mem.eql(u8, arg, "--with-binary")) {
+            wasm_only = false; // Opt-in: also build native binary
         } else if (std.mem.eql(u8, arg, "--debug")) {
             debug_build = true;
         } else if (std.mem.startsWith(u8, arg, "--allocator=")) {
@@ -655,38 +657,31 @@ pub fn main() !void {
 
 fn printUsage() void {
     std.debug.print(
-        \\EdgeBox Compiler
+        \\EdgeBox Compiler — JIT+AOT for V8/workerd
         \\
         \\Usage:
-        \\  edgeboxc <app.js>   AOT-compile numeric JS kernels to WASM for V8/workerd
+        \\  edgeboxc <app.js>   Compile JS with AOT numeric kernels for V8/workerd
         \\
-        \\Output (all in zig-out/bin/<app.js>/):
-        \\  <app>-worker.mjs        Worker module (source-transformed JS + WASM calls)
-        \\  <app>-standalone.wasm   Standalone WASM (AOT-compiled numeric kernels)
+        \\Output (in zig-out/bin/<app.js>/):
+        \\  <app>-worker.mjs        Worker module (V8 JIT + WASM AOT)
+        \\  <app>-standalone.wasm   WASM AOT-compiled numeric kernels
         \\  <app>-config.capnp      workerd configuration
-        \\  <app>                   Native binary (optional, QuickJS + frozen)
         \\
         \\Options:
         \\  -f, --force      Clean previous build outputs first
-        \\  --no-polyfill    Skip Node.js polyfills (faster builds for simple JS)
-        \\  --no-freeze      Skip freeze analysis (faster builds, no optimization)
-        \\  --no-bundle      Skip Bun bundler (for simple JS without imports)
-        \\  --binary-only    Only build native binary (skip WASM/AOT)
-        \\  --wasm-only      Only build WASM + AOT (skip native binary)
-        \\  --debug          Use Debug optimization (faster compile, slower runtime)
-        \\  --allocator=X    Allocator for native binary: gpa (default), c, arena
+        \\  --no-polyfill    Skip Node.js polyfills
+        \\  --no-freeze      Skip freeze analysis (faster builds)
+        \\  --no-bundle      Skip Bun bundler (simple JS without imports)
+        \\  --debug          Debug optimization (faster compile)
         \\  --output-dir=X   Custom output directory (default: zig-out)
-        \\  --freeze-max-functions=N  Freeze only top N functions (0=all, requires --freeze-profile)
-        \\  --freeze-code-budget=SIZE  Max frozen code size (e.g., 1500K, 2M; 0=auto-detect L2)
-        \\  --freeze-profile=PATH    PGO: sort functions by call profile (from --profile-out)
-        \\  --minimal        All of the above (fastest, for test262)
+        \\  --with-binary    Also build native binary (QuickJS + frozen interpreter)
         \\  -h, --help       Show this help
         \\  -v, --version    Show version
         \\
         \\Examples:
-        \\  edgeboxc app.js                        Build Worker + WASM + native
+        \\  edgeboxc app.js                         Build Worker + WASM AOT
         \\  node zig-out/bin/app.js/app-worker.mjs  Run on Node.js (V8 + WASM)
-        \\  npx wrangler dev                        Deploy to Cloudflare Workers
+        \\  npx workerd serve zig-out/bin/app.js/app-config.capnp  Run on workerd
         \\
     , .{});
 }
@@ -1633,7 +1628,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                 if (standalone_wasm) |sw| {
                     const link_result = runCommand(allocator, &.{
                         "wasm-ld-19", "--no-entry", "--export-all", "--export-memory",
-                        "--initial-memory=131072", "-o", sw, so,
+                        "--allow-undefined", "--initial-memory=131072", "-o", sw, so,
                     }) catch null;
                     if (link_result) |lr| {
                         defer {
@@ -1823,30 +1818,45 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     wf.writeAll("  const buf = readFileSync(join(__dir, '") catch {};
                     wf.writeAll(wasm_filename) catch {};
                     wf.writeAll("'));\n") catch {};
-                    wf.writeAll("  __wasm = new WebAssembly.Instance(new WebAssembly.Module(buf));\n") catch {};
+                    wf.writeAll("  __wasm = new WebAssembly.Instance(new WebAssembly.Module(buf), { env: { pow: Math.pow } });\n") catch {};
                     wf.writeAll("  __wasm.exports.memory.grow(254);\n") catch {}; // 256 pages = 16MB
                     wf.writeAll("} else {\n") catch {};
                     // workerd: WASM module bound via capnp config as ESM module
                     wf.writeAll("  const { default: __wasmModule } = await import('") catch {};
                     wf.writeAll(wasm_filename) catch {};
                     wf.writeAll("');\n") catch {};
-                    wf.writeAll("  __wasm = new WebAssembly.Instance(__wasmModule);\n") catch {};
+                    wf.writeAll("  __wasm = new WebAssembly.Instance(__wasmModule, { env: { pow: Math.pow } });\n") catch {};
                     wf.writeAll("  __wasm.exports.memory.grow(254);\n") catch {};
                     wf.writeAll("}\n") catch {};
-                    // Hoist Int32Array view creation to module level (avoids per-call allocation).
-                    // Array elements are always i32 in WASM linear memory regardless of function tier.
+                    // Hoist TypedArray views to module level (avoids per-call allocation).
+                    // i32 tier: Int32Array (4 bytes/element), f64 tier: Float64Array (8 bytes/element)
                     // Flags lifted to outer scope so trampoline body can reference them.
                     var has_array_funcs = false;
+                    var has_i32_array_funcs = false;
+                    var has_f64_array_funcs = false;
                     var any_cacheable_args = false;
                     for (wasm_funcs[0..wasm_func_count]) |wfe| {
                         if (wfe.array_args != 0) {
                             has_array_funcs = true;
+                            if (wfe.is_f64) has_f64_array_funcs = true else has_i32_array_funcs = true;
                             const ro = wfe.array_args & ~wfe.mutated_args;
                             if (ro != 0) any_cacheable_args = true;
                         }
                     }
                     if (has_array_funcs) {
-                        wf.writeAll("const __m = __wasm ? new Int32Array(__wasm.exports.memory.buffer) : null;\n") catch {};
+                        // __wbuf: raw ArrayBuffer backing WASM linear memory.
+                        // Used for zero-copy detection: if arr.buffer === __wbuf, array is already
+                        // in WASM memory (allocated via __wasmArray) — skip copy entirely.
+                        wf.writeAll("const __wbuf = __wasm ? __wasm.exports.memory.buffer : null;\n") catch {};
+                        if (has_i32_array_funcs)
+                            wf.writeAll("const __m = __wasm ? new Int32Array(__wbuf) : null;\n") catch {};
+                        if (has_f64_array_funcs)
+                            wf.writeAll("const __m_f64 = __wasm ? new Float64Array(__wbuf) : null;\n") catch {};
+                        // __wasmArray: allocate a TypedArray directly in WASM linear memory.
+                        // Returns a view — no copy needed when passed to WASM trampolines.
+                        // Usage: const data = __wasmArray(Int32Array, 100000);
+                        wf.writeAll("let __ao = 1024;\n") catch {};
+                        wf.writeAll("function __wasmArray(T, n) { const a = T.BYTES_PER_ELEMENT; __ao = (__ao + a - 1) & ~(a - 1); const v = new T(__wbuf, __ao, n); __ao += n * a; return v; }\n") catch {};
                         // Per-arg identity cache: skip copy when same array reference is passed.
                         // __last_fn tracks which function last wrote to WASM memory, so cached
                         // functions detect when a different function has overwritten their region.
@@ -1908,8 +1918,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             }
                         }
 
-                        // Pre-compute arrow function replacement positions
-                        // For each anonymous WASM function, find `=> {` on its line
+                        // Pre-compute anonymous function replacement positions
+                        // For each anonymous WASM function, find its definition on the corresponding line:
+                        //   1. Arrow functions: `=> {`
+                        //   2. Shorthand methods: `name(params) {` (class/object methods)
                         // Adjust line_num by preamble offset (hooked → clean)
                         const ArrowReplace = struct { brace_pos: u32, func_idx: u16 };
                         var arrow_replacements: [64]ArrowReplace = undefined;
@@ -1920,12 +1932,46 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             if (adjusted_line == 0 or adjusted_line >= line_count) continue;
                             const line_start = line_offsets[adjusted_line - 1]; // 1-based
                             const line_end = if (adjusted_line < line_count) line_offsets[adjusted_line] else @as(u32, @intCast(cc.len));
-                            // Find `=> {` on this line
+                            // Try arrow: `=> {`
                             if (std.mem.indexOf(u8, cc[line_start..line_end], "=> {")) |arrow_off| {
                                 const brace_pos = line_start + @as(u32, @intCast(arrow_off)) + 3; // position of `{`
                                 if (arrow_count < arrow_replacements.len) {
                                     arrow_replacements[arrow_count] = .{ .brace_pos = brace_pos, .func_idx = @intCast(wfi) };
                                     arrow_count += 1;
+                                }
+                            } else {
+                                // Try shorthand method: `name(params) {` — scan for `identifier(` followed by `) {`
+                                // Skip leading whitespace to find the method name
+                                const line = cc[line_start..line_end];
+                                var pos: usize = 0;
+                                while (pos < line.len and (line[pos] == ' ' or line[pos] == '\t')) pos += 1;
+                                // Check for `async ` prefix
+                                if (pos + 6 < line.len and std.mem.eql(u8, line[pos .. pos + 6], "async ")) pos += 6;
+                                // Now pos should be at the start of the method name
+                                const name_start = pos;
+                                while (pos < line.len and isIdentChar(line[pos])) pos += 1;
+                                if (pos > name_start and pos < line.len and line[pos] == '(') {
+                                    // Found `name(` — scan to closing `)` then check for `{`
+                                    var pdepth: i32 = 1;
+                                    var scan = pos + 1;
+                                    while (scan < line.len and pdepth > 0) : (scan += 1) {
+                                        if (line[scan] == '(') pdepth += 1;
+                                        if (line[scan] == ')') pdepth -= 1;
+                                    }
+                                    // Skip whitespace after `)`, check for `{`
+                                    while (scan < line.len and (line[scan] == ' ' or line[scan] == '\n' or line[scan] == '\r' or line[scan] == '\t')) scan += 1;
+                                    if (scan < line.len and line[scan] == '{') {
+                                        // Exclude `function ` prefix (named functions handled elsewhere)
+                                        const abs_name_start = line_start + @as(u32, @intCast(name_start));
+                                        const has_fn_prefix = abs_name_start >= 9 and std.mem.eql(u8, cc[abs_name_start - 9 .. abs_name_start], "function ");
+                                        if (!has_fn_prefix) {
+                                            const brace_pos = line_start + @as(u32, @intCast(scan));
+                                            if (arrow_count < arrow_replacements.len) {
+                                                arrow_replacements[arrow_count] = .{ .brace_pos = brace_pos, .func_idx = @intCast(wfi) };
+                                                arrow_count += 1;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1974,6 +2020,41 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 }
                             }
 
+                            // Check for shorthand method syntax: `NAME(` without `function ` prefix
+                            // Matches: class methods `gammaCorrect(pixels) {`
+                            //          object methods `magnitude(positions, out) {`
+                            if (matched_func == null) {
+                                for (wasm_funcs[0..wasm_func_count], 0..) |wf_entry, wfi| {
+                                    if (wf_entry.is_anon) continue;
+                                    if (src_pos + wf_entry.name.len + 1 > cc.len) continue;
+                                    // Must not be preceded by an ident char (avoid matching function calls)
+                                    if (src_pos > 0 and isIdentChar(cc[src_pos - 1])) continue;
+                                    // Match NAME(
+                                    if (!std.mem.startsWith(u8, cc[src_pos..], wf_entry.name)) continue;
+                                    const after_name = src_pos + wf_entry.name.len;
+                                    if (after_name >= cc.len or cc[after_name] != '(') continue;
+                                    // Verify this is a method DEFINITION, not a function CALL:
+                                    // scan forward past the closing `)` and check for `{`
+                                    var paren_depth: i32 = 1;
+                                    var scan_fwd = after_name + 1;
+                                    while (scan_fwd < cc.len and paren_depth > 0) : (scan_fwd += 1) {
+                                        if (cc[scan_fwd] == '(') paren_depth += 1;
+                                        if (cc[scan_fwd] == ')') paren_depth -= 1;
+                                    }
+                                    // After closing `)`, skip whitespace and check for `{`
+                                    while (scan_fwd < cc.len and (cc[scan_fwd] == ' ' or cc[scan_fwd] == '\n' or cc[scan_fwd] == '\r' or cc[scan_fwd] == '\t')) scan_fwd += 1;
+                                    if (scan_fwd >= cc.len or cc[scan_fwd] != '{') continue;
+                                    // Exclude `function ` prefix (already handled by main match above)
+                                    if (src_pos >= 9 and std.mem.eql(u8, cc[src_pos - 9 .. src_pos], "function ")) continue;
+                                    // Exclude `=> {` (already handled by arrow match above)
+                                    if (src_pos >= 4 and std.mem.eql(u8, cc[src_pos - 4 .. src_pos], "=> {")) continue;
+                                    matched_func = wf_entry;
+                                    matched_func_idx = wfi;
+                                    match_end = after_name;
+                                    break;
+                                }
+                            }
+
                             if (matched_func) |mf| {
                                 // Smart trampoline heuristic:
                                 // - Recursive functions: ALWAYS trampoline (deep stacks stay in WASM)
@@ -2018,13 +2099,27 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     //    V8 JIT handles write loops perfectly (direct memory writes).
                                     //    zero(buf): 162ms WASM vs 43ms V8 (3.8x slower due to copies).
                                     //    fillData(arr,seed): 1803ms WASM vs 1043ms V8 (1.7x slower).
+                                    //    Exception: compute-heavy write-only (has_loop + >= 200 instrs)
+                                    //    should be trampolined — copy-back is negligible vs compute savings.
+                                    //    mandelbrot_compute: nested loops + Math.abs/sqrt, heavy f64 compute.
                                     const is_write_only_array = mf.mutated_args != 0 and mf.read_array_args == 0;
+                                    const is_write_only_light = is_write_only_array and
+                                        (!mf.has_loop or mf.instr_count < 50);
+                                    // Compute-heavy write-only: ALWAYS trampoline.
+                                    // Copy-in is skipped (write-only), only copy-back overhead remains.
+                                    // For looping functions, instrs execute O(N²+) times so compute
+                                    // dominates copy-back even at modest instruction counts.
+                                    // mandelbrot_compute: 157 instrs × 40K iters, Math.abs/sqrt.
+                                    // Threshold: 50 (vs 200 for read-write) since no copy-in cost.
+                                    const is_write_only_heavy = is_write_only_array and
+                                        mf.has_loop and mf.instr_count >= 50;
                                     // 1. No-loop array ops (no .length, no loop): wrapper/delegation
                                     //    functions — .set() copy cost always dominates.
                                     //    crypto_verify_16 (7 instrs), dot16 (128 instrs).
                                     // 2. Large-body array loops (no .length, has_loop, >= 200 instrs):
-                                    //    Few iterations over fixed-size arrays (unrolled-in-loop).
-                                    //    core_salsa20 (2386 instrs, 15 arrays): 506ms WASM vs 159ms V8.
+                                    //    copy overhead for fixed-size arrays dominates.
+                                    //    core_salsa20 (4 arrays, 2386i): 506ms WASM vs 159ms V8.
+                                    //    sha256_compress (3 arrays, 418i): 408ms WASM vs 305ms V8.
                                     // 3. Small scalar functions (<150 instrs): V8 JIT already optimal.
                                     // 4. Mutated fixed-size array loops: copy-back per element per call
                                     //    dominates for small fixed-size arrays (no .length → hardcoded size).
@@ -2037,7 +2132,18 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         (!mf.has_loop or mf.instr_count >= 200);
                                     const is_mutated_fixed_loop = mf.mutated_args != 0 and mf.length_args == 0 and
                                         mf.has_loop and mf.instr_count < 200;
-                                    if (!calls_wasm and (is_write_only_array or is_fixed_array or is_mutated_fixed_loop or (mf.array_args == 0 and mf.instr_count < 150))) {
+                                    // 5. Offset-indexed multi-array loops: functions with >=2 arrays,
+                                    //    >=2 scalar args (offset params), no .length, and small body.
+                                    //    Extra scalar args beyond 1 are typically per-array offsets.
+                                    //    vn(x,xi,y,yi,n): 2 arrays, 3 scalars → offset access, kept as JS.
+                                    //    dotProductNorm(a,b,len): 2 arrays, 1 scalar → bulk op, 3.2x faster.
+                                    //    adler32(adler,buf,len,pos): 1 array, 3 scalars → bulk op, 3.8x faster.
+                                    const array_arg_count = @popCount(mf.array_args);
+                                    const scalar_arg_count = if (mf.arg_count > array_arg_count) mf.arg_count - array_arg_count else 0;
+                                    const is_readonly_fixed_loop = mf.mutated_args == 0 and mf.array_args != 0 and
+                                        mf.length_args == 0 and mf.has_loop and mf.instr_count < 200 and
+                                        array_arg_count >= 2 and scalar_arg_count >= 2;
+                                    if (!calls_wasm and !is_write_only_heavy and (is_write_only_light or is_fixed_array or is_mutated_fixed_loop or is_readonly_fixed_loop or (mf.array_args == 0 and mf.instr_count < 150))) {
                                         wf.writeAll(cc[src_pos .. src_pos + 1]) catch {};
                                         src_pos += 1;
                                         continue;
@@ -2109,11 +2215,11 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 const params_str = cc[params_start..params_end];
 
                                 // Split param names for individual access
-                                var param_names: [8][]const u8 = undefined;
+                                var param_names: [24][]const u8 = undefined;
                                 var param_count: u32 = 0;
                                 {
                                     var ppos: usize = 0;
-                                    while (ppos < params_str.len and param_count < 8) {
+                                    while (ppos < params_str.len and param_count < 24) {
                                         // Skip whitespace
                                         while (ppos < params_str.len and (params_str[ppos] == ' ' or params_str[ppos] == '\t')) ppos += 1;
                                         const pstart = ppos;
@@ -2137,11 +2243,57 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 } else {
                                     // Array args — copy to/from WASM linear memory
                                     wf.writeAll("\n") catch {};
-                                    // Array elements are always i32 in WASM linear memory
-                                    // (array_get/array_put use i32.load/i32.store regardless of tier).
-                                    // The f64 tier only affects scalar locals/args/return, not array elements.
-                                    const mem_view: []const u8 = "__m";
-                                    const byte_shift: []const u8 = " << 2";
+                                    // i32 tier: Int32Array (4 bytes/elem), byte offset = idx << 2
+                                    // f64 tier: Float64Array (8 bytes/elem), byte offset = idx << 3
+                                    // Float64Array lets copy-back handle type conversion (e.g.
+                                    // Uint8ClampedArray.set(Float64Array) rounds+clamps correctly).
+                                    const mem_view: []const u8 = if (mf.is_f64) "__m_f64" else "__m";
+                                    const byte_shift: []const u8 = if (mf.is_f64) " << 3" else " << 2";
+
+                                    // Zero-copy fast path: if ALL array args are backed by WASM memory
+                                    // (allocated via __wasmArray), skip copy entirely.
+                                    // arr.buffer === __wbuf means the TypedArray is a view into WASM linear memory.
+                                    wf.writeAll("  if (") catch {};
+                                    {
+                                        var first_zc = true;
+                                        var zi: u32 = 0;
+                                        while (zi < param_count) : (zi += 1) {
+                                            if (mf.array_args & (@as(u8, 1) << @intCast(zi)) != 0) {
+                                                if (!first_zc) wf.writeAll(" && ") catch {};
+                                                wf.writeAll(param_names[zi]) catch {};
+                                                wf.writeAll(".buffer === __wbuf") catch {};
+                                                first_zc = false;
+                                            }
+                                        }
+                                    }
+                                    wf.writeAll(") return __wasm.exports.") catch {};
+                                    wf.writeAll(mf.name) catch {};
+                                    wf.writeAll("(") catch {};
+                                    {
+                                        var first_arg = true;
+                                        var zi: u32 = 0;
+                                        while (zi < param_count) : (zi += 1) {
+                                            if (!first_arg) wf.writeAll(", ") catch {};
+                                            if (mf.array_args & (@as(u8, 1) << @intCast(zi)) != 0) {
+                                                // Pass byte offset directly from the TypedArray view
+                                                wf.writeAll(param_names[zi]) catch {};
+                                                wf.writeAll(".byteOffset") catch {};
+                                            } else {
+                                                wf.writeAll(param_names[zi]) catch {};
+                                            }
+                                            first_arg = false;
+                                        }
+                                        // Append .length for array args that use get_length
+                                        zi = 0;
+                                        while (zi < param_count) : (zi += 1) {
+                                            if (mf.length_args & (@as(u8, 1) << @intCast(zi)) != 0) {
+                                                wf.writeAll(", ") catch {};
+                                                wf.writeAll(param_names[zi]) catch {};
+                                                wf.writeAll(".length") catch {};
+                                            }
+                                        }
+                                    }
+                                    wf.writeAll(");\n") catch {};
 
                                     // Dynamic offsets: each array arg gets space = arr.length elements.
                                     // Uses bulk .set() for fast TypedArray transfer (memcpy under the hood).
@@ -2338,7 +2490,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
     }
 
     // Step 7: Build WASM static (with host imports for edgebox daemon AOT)
-    if (!options.binary_only) {
+    // Skip when wasm_only — worker path only needs standalone.wasm + worker.mjs (generated in step 6f)
+    if (!options.binary_only and !options.wasm_only) {
         std.debug.print("[build] Building WASM static with embedded bytecode...\n", .{});
         const wasm_result = if (source_dir_arg.len > 0)
             try runCommand(allocator, &.{
@@ -2427,7 +2580,40 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         }
     }
 
-    // Steps 8-10: Strip, wasm-opt, AOT (skip if binary_only)
+    // Worker-only summary (default path)
+    if (options.wasm_only) {
+        std.debug.print("\n[build] === Worker Build Complete ===\n\n", .{});
+        std.debug.print("Files created:\n", .{});
+        if (has_standalone_wasm) {
+            const sw_path2 = std.fmt.bufPrint(&standalone_wasm_path_buf, "{s}/{s}-standalone.wasm", .{ output_dir, output_base }) catch "";
+            if (std.fs.cwd().statFile(sw_path2)) |stat| {
+                std.debug.print("  {s}  ({d} bytes)\n", .{ sw_path2, stat.size });
+            } else |_| {
+                std.debug.print("  {s}\n", .{sw_path2});
+            }
+        }
+        if (has_worker_files) {
+            var wp_summary: [4096]u8 = undefined;
+            var cp_summary: [4096]u8 = undefined;
+            const wp_s = std.fmt.bufPrint(&wp_summary, "{s}/{s}-worker.mjs", .{ output_dir, output_base }) catch "";
+            const cp_s = std.fmt.bufPrint(&cp_summary, "{s}/{s}-config.capnp", .{ output_dir, output_base }) catch "";
+            std.debug.print("  {s}  (V8 + WASM AOT)\n", .{wp_s});
+            std.debug.print("  {s}  (workerd config)\n", .{cp_s});
+        }
+        std.debug.print("\nTo run:\n", .{});
+        if (has_worker_files) {
+            var wp_run: [4096]u8 = undefined;
+            var cp_run: [4096]u8 = undefined;
+            const wp_r = std.fmt.bufPrint(&wp_run, "{s}/{s}-worker.mjs", .{ output_dir, output_base }) catch "";
+            const cp_r = std.fmt.bufPrint(&cp_run, "{s}/{s}-config.capnp", .{ output_dir, output_base }) catch "";
+            std.debug.print("  node {s}  # Node.js (V8 JIT + WASM AOT)\n", .{wp_r});
+            std.debug.print("  npx workerd serve {s}  # Cloudflare Workers\n", .{cp_r});
+        }
+        std.debug.print("\n", .{});
+        return;
+    }
+
+    // Steps 8-10: Strip, wasm-opt, AOT (only for edgebox daemon, skip for worker-only)
     if (!options.binary_only) {
         // Step 8: Strip debug sections (reduces size significantly)
         std.debug.print("[build] Stripping debug sections...\n", .{});

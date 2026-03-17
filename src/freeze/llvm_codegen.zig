@@ -491,8 +491,8 @@ pub fn generateStandaloneWasm(
         defer llvm.disposeMessage(ir);
         std.debug.print("=== STANDALONE WASM IR (pre-opt) ===\n{s}\n=== END ===\n", .{ir});
     }
-    // Use O2 for standalone WASM — enables auto-vectorization for float loops
-    module_disposed = try finalizeAndEmitShard(native, obj_path, "standalone-wasm", "default<O2>");
+    // Use O3 for standalone WASM — enables IndVarSimplify + LoopVectorize for float loops
+    module_disposed = try finalizeAndEmitShard(native, obj_path, "standalone-wasm", "default<O3>");
     return .{ .func_count = generated_count, .has_functions = true };
 }
 
@@ -960,9 +960,17 @@ fn emitInt32Instruction(
                 builder.buildAdd(lhs, rhs, "add")
             else if (std.mem.eql(u8, op, "-"))
                 builder.buildSub(lhs, rhs, "sub")
-            else if (std.mem.eql(u8, op, "*"))
-                builder.buildMul(lhs, rhs, "mul")
-            else if (std.mem.eql(u8, op, "/"))
+            else if (std.mem.eql(u8, op, "*")) mul_blk: {
+                // JS mul is f64: large products lose precision in float64,
+                // so ToInt32(f64_mul(a,b)) differs from i32_wrap(a*b).
+                // fptosi to i64 first (safe: i32*i32 max ~2^62 < 2^63),
+                // then trunc to i32 = low 32 bits = JS ToInt32() wrapping.
+                const fa = builder.buildSIToFP(lhs, llvm.doubleType(), "fma");
+                const fb = builder.buildSIToFP(rhs, llvm.doubleType(), "fmb");
+                const fprod = builder.buildFMul(fa, fb, "fmprod");
+                const i64_prod = builder.buildFPToSI(fprod, llvm.i64Type(), "mul64");
+                break :mul_blk builder.buildTrunc(i64_prod, llvm.i32Type(), "mul32");
+            } else if (std.mem.eql(u8, op, "/"))
                 builder.buildSDiv(lhs, rhs, "div")
             else if (std.mem.eql(u8, op, "%"))
                 builder.buildSRem(lhs, rhs, "rem")
@@ -1220,6 +1228,7 @@ fn emitInt32Instruction(
         .call_self_i32 => {
             // Function call — self-recursive or cross-function
             const call_argc: u32 = switch (instr.opcode) {
+                .call0 => 0,
                 .call1 => 1,
                 .call2 => 2,
                 .call3 => 3,
@@ -1441,6 +1450,40 @@ fn generateNumericBody(
         }
     }
 
+    // === i32 shadow allocas for f64 tier loop counters ===
+    // LLVM can't auto-vectorize loops with f64 induction variables (fptosi
+    // in the GEP breaks stride detection). We maintain i32 shadows for locals
+    // modified by inc_loc/dec_loc. get_loc pushes sitofp(shadow) — the sitofp
+    // is peephole-eliminated in array_get, giving LLVM a clean i32 stride.
+    var counter_mask: u48 = 0;
+    var i32_shadows: [48]llvm.Value = undefined;
+    if (kind == .f64) {
+        for (blocks) |block| {
+            for (block.instructions) |cinstr| {
+                const ch = numeric_handlers.getHandler(cinstr.opcode);
+                if (ch.pattern == .inc_loc or ch.pattern == .dec_loc) {
+                    const cidx: u32 = switch (cinstr.operand) {
+                        .loc => |a| a,
+                        .u8 => |a| a,
+                        .u16 => |a| a,
+                        else => continue,
+                    };
+                    if (cidx < 48) counter_mask |= @as(u48, 1) << @intCast(cidx);
+                }
+            }
+        }
+        if (counter_mask != 0) {
+            for (0..@min(local_count, 48)) |i| {
+                if (counter_mask & (@as(u48, 1) << @intCast(i)) != 0) {
+                    var sname: [16]u8 = undefined;
+                    const sn = std.fmt.bufPrintZ(&sname, "is_{d}", .{i}) catch "is";
+                    i32_shadows[i] = builder.buildAlloca(llvm.i32Type(), sn);
+                    _ = builder.buildStore(llvm.constInt32(0), i32_shadows[i]);
+                }
+            }
+        }
+    }
+
     // === Cross-block spill slots for vstack persistence ===
     // QuickJS bytecode can have values live on the evaluation stack across basic
     // block boundaries. We use individual alloca spill slots (not an array) so
@@ -1517,7 +1560,7 @@ fn generateNumericBody(
             if (block_terminated) break;
 
             // Peephole: Math.abs/sqrt/floor/ceil/round/trunc intrinsics
-            // Phase 1: Detect get_var("Math") + get_field2("method") → push to stack
+            // Phase 1a: Detect get_var("Math") + get_field2("method") → push to stack
             if (instr.opcode == .get_var or instr.opcode == .get_var_undef) {
                 if (frozen_registry.detectMathSetup(analyzed, block.instructions, instr_idx)) |intrinsic| {
                     if (math_intrinsic_depth < math_intrinsic_stack.len) {
@@ -1528,17 +1571,34 @@ fn generateNumericBody(
                     continue;
                 }
             }
-            // Phase 2: At call_method(N) or tail_call_method(N), emit the most recent intrinsic
-            if (math_intrinsic_depth > 0 and (instr.opcode == .call_method or instr.opcode == .tail_call_method)) {
-                const argc: u16 = switch (instr.operand) {
-                    .u16 => |v| v,
-                    else => 0,
+            // Phase 1b: Detect destructured Math (get_var_ref{N} for known Math builtin)
+            if (frozen_registry.detectDestructuredMathRef(analyzed, block.instructions, instr_idx)) |intrinsic| {
+                if (math_intrinsic_depth < math_intrinsic_stack.len) {
+                    math_intrinsic_stack[math_intrinsic_depth] = intrinsic;
+                    math_intrinsic_depth += 1;
+                }
+                continue; // skip the get_var_ref (no get_field2 to skip for destructured)
+            }
+            // Phase 2: At call_method/call/tail_call_method/tail_call, emit the most recent intrinsic
+            if (math_intrinsic_depth > 0 and (instr.opcode == .call_method or instr.opcode == .tail_call_method or
+                instr.opcode == .call1 or instr.opcode == .call2 or instr.opcode == .call3 or
+                instr.opcode == .call or instr.opcode == .tail_call))
+            {
+                const argc: u16 = switch (instr.opcode) {
+                    .call1 => 1,
+                    .call2 => 2,
+                    .call3 => 3,
+                    else => switch (instr.operand) {
+                        .u16 => |v| v,
+                        else => 0,
+                    },
                 };
                 if (argc == 1 or argc == 2) {
                     math_intrinsic_depth -= 1;
                     const intrinsic = math_intrinsic_stack[math_intrinsic_depth];
                     const expected_arity = intrinsic.arity();
                     if (argc == expected_arity) {
+                        const is_tail = (instr.opcode == .tail_call_method or instr.opcode == .tail_call);
                         if (argc == 1) {
                             // Unary: pop 1 arg
                             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
@@ -1553,7 +1613,7 @@ fn generateNumericBody(
                                 .f64 => result_f64,
                                 .i32 => builder.buildFPToSI(result_f64, llvm.i32Type(), "math_i32"),
                             };
-                            if (instr.opcode == .tail_call_method) {
+                            if (is_tail) {
                                 _ = builder.buildRet(result);
                                 block_terminated = true;
                             } else {
@@ -1579,7 +1639,7 @@ fn generateNumericBody(
                                 .f64 => result_f64,
                                 .i32 => builder.buildFPToSI(result_f64, llvm.i32Type(), "math_i32"),
                             };
-                            if (instr.opcode == .tail_call_method) {
+                            if (is_tail) {
                                 _ = builder.buildRet(result);
                                 block_terminated = true;
                             } else {
@@ -1663,6 +1723,8 @@ fn generateNumericBody(
                 module,
                 analyzed,
                 &length_params,
+                &i32_shadows,
+                counter_mask,
             );
         }
 
@@ -1693,11 +1755,12 @@ fn numericStackEffect(instr: Instruction) i32 {
         .unary, .lnot, .inc_dec, .always_false, .array_length => 0, // pop 1, push 1
         .post_inc_dec => 1, // pop 1, push 2
         .stack_dup => 1,
+        .stack_dup2 => 2,
         .stack_swap => 0,
         .self_ref => 0, // doesn't affect vstack in our impl (sets pending_callee)
         .call_self => blk: {
             const argc: i32 = switch (instr.opcode) {
-                .call1 => 1, .call2 => 2, .call3 => 3,
+                .call0 => 0, .call1 => 1, .call2 => 2, .call3 => 3,
                 .call => @as(i32, @intCast(instr.operand.u16)),
                 else => 1,
             };
@@ -1760,7 +1823,6 @@ fn emitMathIntrinsic(builder: llvm.Builder, module: llvm.Module, intrinsic: froz
 /// Uses fcmp+select for min/max (avoids external fmin/fmax calls in standalone WASM).
 /// pow uses an integer exponent fast path with loop.
 fn emitMathBinaryIntrinsic(builder: llvm.Builder, module: llvm.Module, intrinsic: frozen_registry.MathIntrinsic, arg0: llvm.Value, arg1: llvm.Value) llvm.Value {
-    _ = module;
     switch (intrinsic) {
         .min => {
             // Math.min(a, b): a < b ? a : b, with NaN propagation (JS spec)
@@ -1779,7 +1841,17 @@ fn emitMathBinaryIntrinsic(builder: llvm.Builder, module: llvm.Module, intrinsic
             const nan_const = llvm.constF64(std.math.nan(f64));
             return builder.buildSelect(is_nan, nan_const, max_val, "max");
         },
-        .pow => unreachable, // pow not yet supported (needs exp/log polyfill)
+        .pow => {
+            // Math.pow(base, exp): use llvm.pow.f64 intrinsic
+            // LLVM optimizes pow(x,2)→x*x, pow(x,0.5)→sqrt(x), etc.
+            // For general cases, LLVM lowers to a call to "pow" which becomes
+            // a WASM import from "env" (provided by host as Math.pow).
+            const f64_ty = llvm.doubleType();
+            var pow_params = [_]llvm.Type{ f64_ty, f64_ty };
+            const pow_fn_ty = llvm.functionType(f64_ty, &pow_params, false);
+            const pow_fn = getOrDeclareIntrinsic(module, "llvm.pow.f64", pow_fn_ty);
+            return builder.buildCall(pow_fn_ty, pow_fn, &.{ arg0, arg1 }, "pow");
+        },
         // Unary intrinsics should not reach here
         .abs, .sqrt, .floor, .ceil, .round, .trunc => unreachable,
     }
@@ -1823,522 +1895,6 @@ inline fn memVstackPeek(builder: llvm.Builder, vstack_array: llvm.Value, sp_allo
     return builder.buildLoad(elem_type, slot, "vs_top");
 }
 
-/// Memory-backed version of emitNumericInstruction. Uses an alloca array + sp
-/// for the evaluation stack, enabling values to persist across basic block
-/// boundaries (required when QuickJS bytecode has live stack values at branches).
-fn emitNumericInstructionMem(
-    comptime kind: ValueKind,
-    builder: llvm.Builder,
-    instr: Instruction,
-    params: *[8]llvm.Value,
-    arg_count: u32,
-    locals: *[48]llvm.Value,
-    local_count: u32,
-    llvm_blocks: []llvm.BasicBlock,
-    block_count: usize,
-    successors: []const u32,
-    func: llvm.Value,
-    block_terminated: *bool,
-    pending_callee: *?llvm.Value,
-    module: llvm.Module,
-    analyzed: AnalyzedFunction,
-    va: llvm.Value, // vstack array alloca
-    sp: llvm.Value, // sp alloca (i32)
-    zero_val: llvm.Value,
-    elem_type: llvm.Type,
-) CodegenError!void {
-    const handler = numeric_handlers.getHandler(instr.opcode);
-    const one_val: llvm.Value = switch (kind) {
-        .i32 => llvm.constInt32(1),
-        .f64 => llvm.constF64(1.0),
-    };
-
-    // Helpers bound to our memory stack
-    const push = memVstackPush;
-    const pop = memVstackPop;
-    const peek = memVstackPeek;
-
-    switch (handler.pattern) {
-        .push_const => {
-            const val = if (handler.value) |v| switch (kind) {
-                .i32 => llvm.constInt32(v),
-                .f64 => llvm.constF64(@floatFromInt(v)),
-            } else switch (instr.opcode) {
-                .push_i8 => switch (kind) {
-                    .i32 => llvm.constInt32(@as(i32, instr.operand.i8)),
-                    .f64 => llvm.constF64(@as(f64, @floatFromInt(instr.operand.i8))),
-                },
-                .push_i16 => switch (kind) {
-                    .i32 => llvm.constInt32(@as(i32, instr.operand.i16)),
-                    .f64 => llvm.constF64(@as(f64, @floatFromInt(instr.operand.i16))),
-                },
-                .push_i32 => switch (kind) {
-                    .i32 => llvm.constInt32(instr.operand.i32),
-                    .f64 => llvm.constF64(@as(f64, @floatFromInt(instr.operand.i32))),
-                },
-                else => return CodegenError.UnsupportedOpcode,
-            };
-            push(builder, va, sp, val, elem_type);
-        },
-
-        .push_cpool => {
-            const idx: u32 = switch (instr.operand) {
-                .const_idx => |a| a,
-                else => return CodegenError.UnsupportedOpcode,
-            };
-            if (idx >= analyzed.constants.len) return CodegenError.UnsupportedOpcode;
-            const val: llvm.Value = switch (analyzed.constants[idx]) {
-                .int32 => |v| switch (kind) {
-                    .i32 => llvm.constInt32(v),
-                    .f64 => llvm.constF64(@as(f64, @floatFromInt(v))),
-                },
-                .float64 => |v| switch (kind) {
-                    .i32 => blk: {
-                        // JS bitwise ops use unsigned 32-bit, reinterpret as signed i32.
-                        // E.g., 0x85ebca6b (2246822219) → -2048145077 as i32.
-                        const u: u32 = if (v >= 0 and v <= @as(f64, @floatFromInt(std.math.maxInt(u32))))
-                            @intFromFloat(v)
-                        else if (v < 0 and v >= @as(f64, @floatFromInt(std.math.minInt(i32))))
-                            @bitCast(@as(i32, @intFromFloat(v)))
-                        else
-                            return CodegenError.UnsupportedOpcode;
-                        break :blk llvm.constInt32(@bitCast(u));
-                    },
-                    .f64 => llvm.constF64(v),
-                },
-                else => return CodegenError.UnsupportedOpcode,
-            };
-            push(builder, va, sp, val, elem_type);
-        },
-
-        .push_bool => {
-            const val = if (handler.value != null and handler.value.? != 0) one_val else zero_val;
-            push(builder, va, sp, val, elem_type);
-        },
-
-        .get_arg => {
-            const idx: u32 = handler.index orelse switch (instr.operand) {
-                .arg => |a| a, .u8 => |a| a, else => 0,
-            };
-            if (idx >= arg_count) return CodegenError.UnsupportedOpcode;
-            const val = builder.buildLoad(elem_type, params[idx], "arg");
-            push(builder, va, sp, val, elem_type);
-        },
-
-        .put_arg => {
-            const idx: u32 = handler.index orelse switch (instr.operand) {
-                .arg => |a| a, .u8 => |a| a, .u16 => |a| a, else => 0,
-            };
-            if (idx >= arg_count) return CodegenError.UnsupportedOpcode;
-            _ = builder.buildStore(pop(builder, va, sp, elem_type), params.*[idx]);
-        },
-
-        .set_arg => {
-            const idx: u32 = if (handler.index) |i| i else switch (instr.operand) {
-                .arg => |a| a, .u8 => |a| a, .u16 => |a| a, else => 0,
-            };
-            if (idx >= arg_count) return CodegenError.UnsupportedOpcode;
-            _ = builder.buildStore(peek(builder, va, sp, elem_type), params.*[idx]);
-        },
-
-        .get_loc, .get_loc_check => {
-            const idx: u32 = handler.index orelse switch (instr.operand) {
-                .loc => |a| a, .u8 => |a| a, .u16 => |a| a, else => 0,
-            };
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
-            push(builder, va, sp, builder.buildLoad(elem_type, locals.*[idx], "loc"), elem_type);
-        },
-
-        .get_loc_pair => {
-            if (0 >= @min(local_count, 48) or 1 >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
-            push(builder, va, sp, builder.buildLoad(elem_type, locals.*[0], "loc0"), elem_type);
-            push(builder, va, sp, builder.buildLoad(elem_type, locals.*[1], "loc1"), elem_type);
-        },
-
-        .put_loc, .put_loc_check => {
-            const idx: u32 = handler.index orelse switch (instr.operand) {
-                .u8 => |a| a, .u16 => |a| a, .loc => |a| a, else => 0,
-            };
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
-            _ = builder.buildStore(pop(builder, va, sp, elem_type), locals.*[idx]);
-        },
-
-        .set_loc => {
-            const idx: u32 = handler.index orelse switch (instr.operand) {
-                .u8 => |a| a, .u16 => |a| a, .loc => |a| a, else => 0,
-            };
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
-            _ = builder.buildStore(peek(builder, va, sp, elem_type), locals.*[idx]);
-        },
-
-        .set_loc_uninitialized => {
-            const idx: u32 = switch (instr.operand) {
-                .u8 => |a| a, .u16 => |a| a, .loc => |a| a, else => 0,
-            };
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
-            _ = builder.buildStore(zero_val, locals.*[idx]);
-        },
-
-        .binary_arith => {
-            const rhs = pop(builder, va, sp, elem_type);
-            const lhs = pop(builder, va, sp, elem_type);
-            const op = handler.op orelse return CodegenError.UnsupportedOpcode;
-            const result = switch (kind) {
-                .i32 => if (std.mem.eql(u8, op, "+")) builder.buildAdd(lhs, rhs, "add")
-                    else if (std.mem.eql(u8, op, "-")) builder.buildSub(lhs, rhs, "sub")
-                    else if (std.mem.eql(u8, op, "*")) builder.buildMul(lhs, rhs, "mul")
-                    else if (std.mem.eql(u8, op, "/")) builder.buildSDiv(lhs, rhs, "div")
-                    else if (std.mem.eql(u8, op, "%")) builder.buildSRem(lhs, rhs, "rem")
-                    else return CodegenError.UnsupportedOpcode,
-                .f64 => if (std.mem.eql(u8, op, "+")) builder.buildFAdd(lhs, rhs, "fadd")
-                    else if (std.mem.eql(u8, op, "-")) builder.buildFSub(lhs, rhs, "fsub")
-                    else if (std.mem.eql(u8, op, "*")) builder.buildFMul(lhs, rhs, "fmul")
-                    else if (std.mem.eql(u8, op, "/")) builder.buildFDiv(lhs, rhs, "fdiv")
-                    else if (std.mem.eql(u8, op, "%")) builder.buildFRem(lhs, rhs, "frem")
-                    else return CodegenError.UnsupportedOpcode,
-            };
-            push(builder, va, sp, result, elem_type);
-        },
-
-        .bitwise_binary => {
-            if (kind != .i32) return CodegenError.UnsupportedOpcode;
-            const rhs = pop(builder, va, sp, elem_type);
-            const lhs = pop(builder, va, sp, elem_type);
-            const op = handler.op orelse return CodegenError.UnsupportedOpcode;
-            const result = if (std.mem.eql(u8, op, "&")) builder.buildAnd(lhs, rhs, "and")
-                else if (std.mem.eql(u8, op, "|")) builder.buildOr(lhs, rhs, "or")
-                else if (std.mem.eql(u8, op, "^")) builder.buildXor(lhs, rhs, "xor")
-                else if (std.mem.eql(u8, op, "<<")) builder.buildShl(lhs, rhs, "shl")
-                else if (std.mem.eql(u8, op, ">>")) builder.buildAShr(lhs, rhs, "shr")
-                else if (std.mem.eql(u8, op, ">>>")) builder.buildLShr(lhs, rhs, "shru")
-                else return CodegenError.UnsupportedOpcode;
-            push(builder, va, sp, result, elem_type);
-        },
-
-        .binary_cmp => {
-            const rhs = pop(builder, va, sp, elem_type);
-            const lhs = pop(builder, va, sp, elem_type);
-            const op = handler.op orelse return CodegenError.UnsupportedOpcode;
-            const cmp = switch (kind) {
-                .i32 => blk: {
-                    const pred: c.LLVMIntPredicate = if (std.mem.eql(u8, op, "<")) c.LLVMIntSLT
-                        else if (std.mem.eql(u8, op, "<=")) c.LLVMIntSLE
-                        else if (std.mem.eql(u8, op, ">")) c.LLVMIntSGT
-                        else if (std.mem.eql(u8, op, ">=")) c.LLVMIntSGE
-                        else if (std.mem.eql(u8, op, "==")) c.LLVMIntEQ
-                        else if (std.mem.eql(u8, op, "!=")) c.LLVMIntNE
-                        else return CodegenError.UnsupportedOpcode;
-                    break :blk builder.buildICmp(pred, lhs, rhs, "cmp");
-                },
-                .f64 => blk: {
-                    const pred: c.LLVMRealPredicate = if (std.mem.eql(u8, op, "<")) c.LLVMRealOLT
-                        else if (std.mem.eql(u8, op, "<=")) c.LLVMRealOLE
-                        else if (std.mem.eql(u8, op, ">")) c.LLVMRealOGT
-                        else if (std.mem.eql(u8, op, ">=")) c.LLVMRealOGE
-                        else if (std.mem.eql(u8, op, "==")) c.LLVMRealOEQ
-                        else if (std.mem.eql(u8, op, "!=")) c.LLVMRealONE
-                        else return CodegenError.UnsupportedOpcode;
-                    break :blk builder.buildFCmp(pred, lhs, rhs, "fcmp");
-                },
-            };
-            const cmpz = builder.buildZExt(cmp, llvm.i32Type(), "cmpz");
-            const result = switch (kind) {
-                .i32 => cmpz,
-                .f64 => builder.buildSIToFP(cmpz, llvm.doubleType(), "cmpf"),
-            };
-            push(builder, va, sp, result, elem_type);
-        },
-
-        .unary => {
-            const val = pop(builder, va, sp, elem_type);
-            const op = handler.op orelse return CodegenError.UnsupportedOpcode;
-            const result = if (std.mem.eql(u8, op, "-")) switch (kind) {
-                .i32 => builder.buildNeg(val, "neg"),
-                .f64 => builder.buildFNeg(val, "fneg"),
-            } else if (std.mem.eql(u8, op, "~")) blk: {
-                if (kind != .i32) return CodegenError.UnsupportedOpcode;
-                break :blk builder.buildNot(val, "bnot");
-            } else return CodegenError.UnsupportedOpcode;
-            push(builder, va, sp, result, elem_type);
-        },
-
-        .lnot => {
-            const val = pop(builder, va, sp, elem_type);
-            const is_zero = switch (kind) {
-                .i32 => builder.buildICmp(c.LLVMIntEQ, val, llvm.constInt32(0), "iszero"),
-                .f64 => builder.buildFCmp(c.LLVMRealOEQ, val, llvm.constF64(0.0), "fiszero"),
-            };
-            const cmpz = builder.buildZExt(is_zero, llvm.i32Type(), "lnot");
-            const result = switch (kind) {
-                .i32 => cmpz,
-                .f64 => builder.buildSIToFP(cmpz, llvm.doubleType(), "lnotf"),
-            };
-            push(builder, va, sp, result, elem_type);
-        },
-
-        .inc_dec => {
-            const val = pop(builder, va, sp, elem_type);
-            const result = if (handler.is_inc orelse false) switch (kind) {
-                .i32 => builder.buildAdd(val, one_val, "inc"),
-                .f64 => builder.buildFAdd(val, one_val, "finc"),
-            } else switch (kind) {
-                .i32 => builder.buildSub(val, one_val, "dec"),
-                .f64 => builder.buildFSub(val, one_val, "fdec"),
-            };
-            push(builder, va, sp, result, elem_type);
-        },
-
-        .post_inc_dec => {
-            const val = pop(builder, va, sp, elem_type);
-            const new_val = if (handler.is_inc orelse false) switch (kind) {
-                .i32 => builder.buildAdd(val, one_val, "postinc"),
-                .f64 => builder.buildFAdd(val, one_val, "fpostinc"),
-            } else switch (kind) {
-                .i32 => builder.buildSub(val, one_val, "postdec"),
-                .f64 => builder.buildFSub(val, one_val, "fpostdec"),
-            };
-            // Push old first (deeper), new on TOS — matches QuickJS semantics
-            push(builder, va, sp, val, elem_type);
-            push(builder, va, sp, new_val, elem_type);
-        },
-
-        .add_loc => {
-            const idx: u32 = switch (instr.operand) {
-                .loc => |a| a, .u8 => |a| a, .u16 => |a| a, else => 0,
-            };
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
-            const val = pop(builder, va, sp, elem_type);
-            const old = builder.buildLoad(elem_type, locals.*[idx], "addloc_old");
-            const new_val = switch (kind) {
-                .i32 => builder.buildAdd(old, val, "addloc"),
-                .f64 => builder.buildFAdd(old, val, "faddloc"),
-            };
-            _ = builder.buildStore(new_val, locals.*[idx]);
-        },
-
-        .inc_loc => {
-            const idx: u32 = switch (instr.operand) {
-                .loc => |a| a, .u8 => |a| a, .u16 => |a| a, else => 0,
-            };
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
-            const old = builder.buildLoad(elem_type, locals.*[idx], "incloc_old");
-            const new_val = switch (kind) {
-                .i32 => builder.buildNSWAdd(old, one_val, "incloc"),
-                .f64 => builder.buildFAdd(old, one_val, "fincloc"),
-            };
-            _ = builder.buildStore(new_val, locals.*[idx]);
-        },
-
-        .dec_loc => {
-            const idx: u32 = switch (instr.operand) {
-                .loc => |a| a, .u8 => |a| a, .u16 => |a| a, else => 0,
-            };
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
-            const old = builder.buildLoad(elem_type, locals.*[idx], "decloc_old");
-            const new_val = switch (kind) {
-                .i32 => builder.buildNSWSub(old, one_val, "decloc"),
-                .f64 => builder.buildFSub(old, one_val, "fdecloc"),
-            };
-            _ = builder.buildStore(new_val, locals.*[idx]);
-        },
-
-        .stack_dup => {
-            push(builder, va, sp, peek(builder, va, sp, elem_type), elem_type);
-        },
-
-        .stack_drop => {
-            _ = pop(builder, va, sp, elem_type);
-        },
-
-        .stack_swap => {
-            // Pop top two, push in reversed order
-            const a = pop(builder, va, sp, elem_type);
-            const b = pop(builder, va, sp, elem_type);
-            push(builder, va, sp, a, elem_type);
-            push(builder, va, sp, b, elem_type);
-        },
-
-        .nop => {},
-
-        .self_ref => {
-            if (instr.opcode == .get_var or instr.opcode == .get_var_undef) {
-                switch (instr.operand) {
-                    .atom => |atom_idx| {
-                        if (getAtomStringStatic(analyzed, atom_idx)) |callee_name| {
-                            if (module.getNamedFunction(callee_name)) |callee_fn| {
-                                if (callee_fn != func) pending_callee.* = callee_fn;
-                            }
-                        }
-                    },
-                    else => {},
-                }
-            } else if (instr.opcode == .get_var_ref0) {
-                if (analyzed.closure_vars.len > 0) {
-                    const cv_name = analyzed.closure_vars[0].name;
-                    if (cv_name.len > 0) {
-                        var name_buf: [256]u8 = undefined;
-                        if (cv_name.len < name_buf.len) {
-                            @memcpy(name_buf[0..cv_name.len], cv_name);
-                            name_buf[cv_name.len] = 0;
-                            const name_z: [*:0]const u8 = @ptrCast(name_buf[0..cv_name.len]);
-                            if (module.getNamedFunction(name_z)) |callee_fn| {
-                                if (callee_fn != func) pending_callee.* = callee_fn;
-                            }
-                        }
-                    }
-                }
-            }
-        },
-
-        .call_self => {
-            const call_argc: u32 = switch (instr.opcode) {
-                .call1 => 1, .call2 => 2, .call3 => 3,
-                .call => instr.operand.u16, else => 1,
-            };
-            const call_target = if (pending_callee.*) |callee| blk: {
-                pending_callee.* = null;
-                break :blk if (c.LLVMCountParams(callee) == call_argc) callee else func;
-            } else func;
-            var call_args: [8]llvm.Value = undefined;
-            var i: u32 = call_argc;
-            while (i > 0) {
-                i -= 1;
-                call_args[i] = pop(builder, va, sp, elem_type);
-            }
-            var param_types_buf: [8]llvm.Type = undefined;
-            for (0..call_argc) |j| param_types_buf[j] = elem_type;
-            const call_fn_ty = llvm.functionType(elem_type, param_types_buf[0..call_argc], false);
-            push(builder, va, sp, builder.buildCall(call_fn_ty, call_target, call_args[0..call_argc], "call"), elem_type);
-        },
-
-        .tail_call_self => {
-            const call_argc: u32 = instr.operand.u16;
-            const call_target = if (pending_callee.*) |callee| blk: {
-                pending_callee.* = null;
-                break :blk if (c.LLVMCountParams(callee) == call_argc) callee else func;
-            } else func;
-            var call_args: [8]llvm.Value = undefined;
-            var i: u32 = call_argc;
-            while (i > 0) {
-                i -= 1;
-                call_args[i] = pop(builder, va, sp, elem_type);
-            }
-            var param_types_buf: [8]llvm.Type = undefined;
-            for (0..call_argc) |j| param_types_buf[j] = elem_type;
-            const call_fn_ty = llvm.functionType(elem_type, param_types_buf[0..call_argc], false);
-            _ = builder.buildRet(builder.buildCall(call_fn_ty, call_target, call_args[0..call_argc], "tail"));
-            block_terminated.* = true;
-        },
-
-        .ret => {
-            if (handler.value) |v| {
-                _ = builder.buildRet(switch (kind) {
-                    .i32 => llvm.constInt32(v),
-                    .f64 => llvm.constF64(@floatFromInt(v)),
-                });
-            } else {
-                _ = builder.buildRet(pop(builder, va, sp, elem_type));
-            }
-            block_terminated.* = true;
-        },
-
-        .if_false => {
-            const cond = pop(builder, va, sp, elem_type);
-            const is_false = switch (kind) {
-                .i32 => builder.buildICmp(c.LLVMIntEQ, cond, llvm.constInt32(0), "ifz"),
-                .f64 => builder.buildFCmp(c.LLVMRealOEQ, cond, llvm.constF64(0.0), "fifz"),
-            };
-            if (successors.len >= 2) {
-                if (successors[0] < block_count and successors[1] < block_count) {
-                    _ = builder.buildCondBr(is_false, llvm_blocks[successors[0]], llvm_blocks[successors[1]]);
-                    block_terminated.* = true;
-                }
-            } else if (successors.len == 1 and successors[0] < block_count) {
-                _ = builder.buildBr(llvm_blocks[successors[0]]);
-                block_terminated.* = true;
-            }
-        },
-
-        .if_true => {
-            const cond = pop(builder, va, sp, elem_type);
-            const is_true = switch (kind) {
-                .i32 => builder.buildICmp(c.LLVMIntNE, cond, llvm.constInt32(0), "ift"),
-                .f64 => builder.buildFCmp(c.LLVMRealONE, cond, llvm.constF64(0.0), "fift"),
-            };
-            if (successors.len >= 2) {
-                if (successors[0] < block_count and successors[1] < block_count) {
-                    _ = builder.buildCondBr(is_true, llvm_blocks[successors[0]], llvm_blocks[successors[1]]);
-                    block_terminated.* = true;
-                }
-            } else if (successors.len == 1 and successors[0] < block_count) {
-                _ = builder.buildBr(llvm_blocks[successors[0]]);
-                block_terminated.* = true;
-            }
-        },
-
-        .goto_br => {
-            if (successors.len >= 1 and successors[0] < block_count) {
-                _ = builder.buildBr(llvm_blocks[successors[0]]);
-                block_terminated.* = true;
-            }
-        },
-
-        .always_false => {
-            _ = pop(builder, va, sp, elem_type);
-            push(builder, va, sp, zero_val, elem_type);
-        },
-
-        .array_get => {
-            const idx_val = pop(builder, va, sp, elem_type);
-            const base_val = pop(builder, va, sp, elem_type);
-            const base_ptr = c.LLVMBuildIntToPtr(builder.ref, base_val, llvm.ptrType(), "arr_base");
-            var gep_idx = [_]llvm.Value{idx_val};
-            const elem_ptr = c.LLVMBuildGEP2(builder.ref, llvm.i32Type(), base_ptr, &gep_idx, 1, "arr_gep");
-            const loaded = builder.buildLoad(llvm.i32Type(), elem_ptr, "arr_elem");
-            const result = switch (kind) {
-                .i32 => loaded,
-                .f64 => builder.buildSIToFP(loaded, llvm.doubleType(), "arr_f64"),
-            };
-            push(builder, va, sp, result, elem_type);
-        },
-
-        .array_get2 => {
-            const idx_val = pop(builder, va, sp, elem_type);
-            const base_val = peek(builder, va, sp, elem_type); // keep base on stack
-            const base_ptr = c.LLVMBuildIntToPtr(builder.ref, base_val, llvm.ptrType(), "arr_base2");
-            var gep_idx = [_]llvm.Value{idx_val};
-            const elem_ptr = c.LLVMBuildGEP2(builder.ref, llvm.i32Type(), base_ptr, &gep_idx, 1, "arr_gep2");
-            const loaded = builder.buildLoad(llvm.i32Type(), elem_ptr, "arr_elem2");
-            const result = switch (kind) {
-                .i32 => loaded,
-                .f64 => builder.buildSIToFP(loaded, llvm.doubleType(), "arr_f64_2"),
-            };
-            push(builder, va, sp, result, elem_type);
-        },
-
-        .array_put => {
-            const val = pop(builder, va, sp, elem_type);
-            const idx_val = pop(builder, va, sp, elem_type);
-            const base_val = pop(builder, va, sp, elem_type);
-            const base_ptr = c.LLVMBuildIntToPtr(builder.ref, base_val, llvm.ptrType(), "arr_base_w");
-            var gep_idx = [_]llvm.Value{idx_val};
-            const elem_ptr = c.LLVMBuildGEP2(builder.ref, llvm.i32Type(), base_ptr, &gep_idx, 1, "arr_gep_w");
-            const store_val = switch (kind) {
-                .i32 => val,
-                .f64 => builder.buildFPToSI(val, llvm.i32Type(), "arr_i32_w"),
-            };
-            _ = builder.buildStore(store_val, elem_ptr);
-        },
-
-        .array_length => {
-            // Fallback for unmatched get_length (peephole in generateNumericBody handles most cases)
-            return CodegenError.UnsupportedOpcode;
-        },
-
-        .unsupported => return CodegenError.UnsupportedOpcode,
-    }
-}
-
 /// Emit a single instruction using comptime ValueKind for type dispatch.
 /// At comptime, Zig monomorphizes this — the f64 path emits fXxx instructions,
 /// the i32 path emits integer instructions. Dead branches are eliminated.
@@ -2361,6 +1917,8 @@ fn emitNumericInstruction(
     module: llvm.Module,
     analyzed: AnalyzedFunction,
     length_params: *const [8]?llvm.Value,
+    i32_shadows: *[48]llvm.Value,
+    counter_mask: u48,
 ) CodegenError!void {
     _ = length_params; // Handled by peephole in generateNumericBody
     const handler = numeric_handlers.getHandler(instr.opcode);
@@ -2489,8 +2047,18 @@ fn emitNumericInstruction(
                 else => 0,
             };
             if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
-            const val = builder.buildLoad(elem_type, locals.*[idx], "loc");
-            vstack.append(allocator, val) catch return CodegenError.OutOfMemory;
+            // f64 tier: for loop counter locals, load i32 shadow and sitofp.
+            // array_get peephole detects the sitofp and uses the i32 directly.
+            if (kind == .f64 and counter_mask != 0 and idx < 48 and
+                counter_mask & (@as(u48, 1) << @intCast(idx)) != 0)
+            {
+                const i32_val = builder.buildLoad(llvm.i32Type(), i32_shadows.*[idx], "loc_i32");
+                const f64_val = builder.buildSIToFP(i32_val, llvm.doubleType(), "loc_sitofp");
+                vstack.append(allocator, f64_val) catch return CodegenError.OutOfMemory;
+            } else {
+                const val = builder.buildLoad(elem_type, locals.*[idx], "loc");
+                vstack.append(allocator, val) catch return CodegenError.OutOfMemory;
+            }
         },
 
         .get_loc_pair => {
@@ -2513,6 +2081,15 @@ fn emitNumericInstruction(
             if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
             const val = numVstackPop(vstack);
             _ = builder.buildStore(val, locals.*[idx]);
+            // Sync i32 shadow for loop counter locals
+            if (kind == .f64 and counter_mask != 0 and idx < 48 and
+                counter_mask & (@as(u48, 1) << @intCast(idx)) != 0)
+            {
+                _ = builder.buildStore(
+                    builder.buildFPToSI(val, llvm.i32Type(), "sh_fptosi"),
+                    i32_shadows.*[idx],
+                );
+            }
         },
 
         .set_loc => {
@@ -2526,6 +2103,14 @@ fn emitNumericInstruction(
             if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
             const val = vstack.items[vstack.items.len - 1]; // peek
             _ = builder.buildStore(val, locals.*[idx]);
+            if (kind == .f64 and counter_mask != 0 and idx < 48 and
+                counter_mask & (@as(u48, 1) << @intCast(idx)) != 0)
+            {
+                _ = builder.buildStore(
+                    builder.buildFPToSI(val, llvm.i32Type(), "sh_fptosi"),
+                    i32_shadows.*[idx],
+                );
+            }
         },
 
         .set_loc_uninitialized => {
@@ -2537,6 +2122,11 @@ fn emitNumericInstruction(
             };
             if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
             _ = builder.buildStore(zero_val, locals.*[idx]);
+            if (kind == .f64 and counter_mask != 0 and idx < 48 and
+                counter_mask & (@as(u48, 1) << @intCast(idx)) != 0)
+            {
+                _ = builder.buildStore(llvm.constInt32(0), i32_shadows.*[idx]);
+            }
         },
 
         .binary_arith => {
@@ -2551,9 +2141,17 @@ fn emitNumericInstruction(
                         builder.buildAdd(lhs, rhs, "add")
                     else if (std.mem.eql(u8, op, "-"))
                         builder.buildSub(lhs, rhs, "sub")
-                    else if (std.mem.eql(u8, op, "*"))
-                        builder.buildMul(lhs, rhs, "mul")
-                    else if (std.mem.eql(u8, op, "/"))
+                    else if (std.mem.eql(u8, op, "*")) mul_blk: {
+                        // JS mul is f64: large products lose precision in float64,
+                        // so ToInt32(f64_mul(a,b)) differs from i32_wrap(a*b).
+                        // fptosi to i64 first (safe: i32*i32 max ~2^62 < 2^63),
+                        // then trunc to i32 = low 32 bits = JS ToInt32() wrapping.
+                        const fa = builder.buildSIToFP(lhs, llvm.doubleType(), "fma");
+                        const fb = builder.buildSIToFP(rhs, llvm.doubleType(), "fmb");
+                        const fprod = builder.buildFMul(fa, fb, "fmprod");
+                        const i64_prod = builder.buildFPToSI(fprod, llvm.i64Type(), "mul64");
+                        break :mul_blk builder.buildTrunc(i64_prod, llvm.i32Type(), "mul32");
+                    } else if (std.mem.eql(u8, op, "/"))
                         builder.buildSDiv(lhs, rhs, "div")
                     else if (std.mem.eql(u8, op, "%"))
                         builder.buildSRem(lhs, rhs, "rem")
@@ -2561,7 +2159,7 @@ fn emitNumericInstruction(
                         return CodegenError.UnsupportedOpcode;
                 },
                 .f64 => blk: {
-                    break :blk if (std.mem.eql(u8, op, "+"))
+                    const fval = if (std.mem.eql(u8, op, "+"))
                         builder.buildFAdd(lhs, rhs, "fadd")
                     else if (std.mem.eql(u8, op, "-"))
                         builder.buildFSub(lhs, rhs, "fsub")
@@ -2573,6 +2171,9 @@ fn emitNumericInstruction(
                         builder.buildFRem(lhs, rhs, "frem")
                     else
                         return CodegenError.UnsupportedOpcode;
+                    // Allow reassociation + FMA contraction for SIMD vectorization
+                    llvm.Builder.setFastMathFlags(fval, llvm.Builder.FMF_VECTORIZE);
+                    break :blk fval;
                 },
             };
             vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
@@ -2650,7 +2251,38 @@ fn emitNumericInstruction(
                     break :blk builder.buildICmp(pred, lhs, rhs, "cmp");
                 },
                 .f64 => blk: {
-                    // Use ordered comparisons (OLT etc.) — NaN propagation
+                    // Peephole: if one operand is sitofp(i32) (from i32 shadow counter),
+                    // use icmp instead of fcmp. This gives SCEV a clean integer trip count
+                    // enabling LoopVectorize to emit f64x2 SIMD.
+                    const lhs_is_sitofp = c.LLVMGetInstructionOpcode(lhs) == c.LLVMSIToFP;
+                    const rhs_is_sitofp = c.LLVMGetInstructionOpcode(rhs) == c.LLVMSIToFP;
+                    if (lhs_is_sitofp or rhs_is_sitofp) {
+                        const pred_i: c.LLVMIntPredicate = if (std.mem.eql(u8, op, "<"))
+                            c.LLVMIntSLT
+                        else if (std.mem.eql(u8, op, "<="))
+                            c.LLVMIntSLE
+                        else if (std.mem.eql(u8, op, ">"))
+                            c.LLVMIntSGT
+                        else if (std.mem.eql(u8, op, ">="))
+                            c.LLVMIntSGE
+                        else if (std.mem.eql(u8, op, "=="))
+                            c.LLVMIntEQ
+                        else if (std.mem.eql(u8, op, "!="))
+                            c.LLVMIntNE
+                        else
+                            return CodegenError.UnsupportedOpcode;
+                        const i32_lhs = if (lhs_is_sitofp)
+                            c.LLVMGetOperand(lhs, 0)
+                        else
+                            builder.buildFPToSI(lhs, llvm.i32Type(), "cmp_lhs_i32");
+                        const i32_rhs = if (rhs_is_sitofp)
+                            c.LLVMGetOperand(rhs, 0)
+                        else
+                            builder.buildFPToSI(rhs, llvm.i32Type(), "cmp_rhs_i32");
+                        // Push i1 directly — if_false handler detects i1 type
+                        break :blk builder.buildICmp(pred_i, i32_lhs, i32_rhs, "icmp_iv");
+                    }
+
                     const pred: c.LLVMRealPredicate = if (std.mem.eql(u8, op, "<"))
                         c.LLVMRealOLT
                     else if (std.mem.eql(u8, op, "<="))
@@ -2665,18 +2297,26 @@ fn emitNumericInstruction(
                         c.LLVMRealONE
                     else
                         return CodegenError.UnsupportedOpcode;
-                    break :blk builder.buildFCmp(pred, lhs, rhs, "fcmp");
+                    const fc = builder.buildFCmp(pred, lhs, rhs, "fcmp");
+                    llvm.Builder.setFastMathFlags(fc, llvm.Builder.FMF_VECTORIZE | 0x2);
+                    break :blk fc;
                 },
             };
 
-            // Comparisons always produce i32 result (0 or 1), even in f64 tier
-            // For f64 tier: zero-extend i1 → i32, then sitofp → f64
-            const cmpz = builder.buildZExt(cmp, llvm.i32Type(), "cmpz");
-            const result = switch (kind) {
-                .i32 => cmpz,
-                .f64 => builder.buildSIToFP(cmpz, llvm.doubleType(), "cmpf"),
-            };
-            vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
+            // If cmp is i1 (from icmp peephole), push directly for if_false to consume
+            if (kind == .f64 and c.LLVMGetTypeKind(c.LLVMTypeOf(cmp)) == c.LLVMIntegerTypeKind and
+                c.LLVMGetIntTypeWidth(c.LLVMTypeOf(cmp)) == 1)
+            {
+                vstack.append(allocator, cmp) catch return CodegenError.OutOfMemory;
+            } else {
+                // Normal path: zext → sitofp for f64 tier
+                const cmpz = builder.buildZExt(cmp, llvm.i32Type(), "cmpz");
+                const result = switch (kind) {
+                    .i32 => cmpz,
+                    .f64 => builder.buildSIToFP(cmpz, llvm.doubleType(), "cmpf"),
+                };
+                vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
+            }
         },
 
         .unary => {
@@ -2756,9 +2396,21 @@ fn emitNumericInstruction(
             const old_val = builder.buildLoad(elem_type, loc_ptr, "addloc_old");
             const new_val = switch (kind) {
                 .i32 => builder.buildAdd(old_val, val, "addloc"),
-                .f64 => builder.buildFAdd(old_val, val, "faddloc"),
+                .f64 => blk: {
+                    const fv = builder.buildFAdd(old_val, val, "faddloc");
+                    llvm.Builder.setFastMathFlags(fv, llvm.Builder.FMF_VECTORIZE);
+                    break :blk fv;
+                },
             };
             _ = builder.buildStore(new_val, loc_ptr);
+            if (kind == .f64 and counter_mask != 0 and idx < 48 and
+                counter_mask & (@as(u48, 1) << @intCast(idx)) != 0)
+            {
+                _ = builder.buildStore(
+                    builder.buildFPToSI(new_val, llvm.i32Type(), "sh_addloc"),
+                    i32_shadows.*[idx],
+                );
+            }
         },
 
         .inc_loc => {
@@ -2773,9 +2425,23 @@ fn emitNumericInstruction(
             const old_val = builder.buildLoad(elem_type, loc_ptr, "incloc_old");
             const new_val = switch (kind) {
                 .i32 => builder.buildNSWAdd(old_val, one_val, "incloc"),
-                .f64 => builder.buildFAdd(old_val, one_val, "fincloc"),
+                .f64 => blk: {
+                    const fv = builder.buildFAdd(old_val, one_val, "fincloc");
+                    llvm.Builder.setFastMathFlags(fv, llvm.Builder.FMF_VECTORIZE);
+                    break :blk fv;
+                },
             };
             _ = builder.buildStore(new_val, loc_ptr);
+            // Maintain i32 shadow: shadow += 1 (clean stride for vectorization)
+            if (kind == .f64 and counter_mask != 0 and idx < 48 and
+                counter_mask & (@as(u48, 1) << @intCast(idx)) != 0)
+            {
+                const sh_old = builder.buildLoad(llvm.i32Type(), i32_shadows.*[idx], "sh_inc_old");
+                _ = builder.buildStore(
+                    builder.buildNSWAdd(sh_old, llvm.constInt32(1), "sh_inc"),
+                    i32_shadows.*[idx],
+                );
+            }
         },
 
         .dec_loc => {
@@ -2790,15 +2456,36 @@ fn emitNumericInstruction(
             const old_val = builder.buildLoad(elem_type, loc_ptr, "decloc_old");
             const new_val = switch (kind) {
                 .i32 => builder.buildNSWSub(old_val, one_val, "decloc"),
-                .f64 => builder.buildFSub(old_val, one_val, "fdecloc"),
+                .f64 => blk: {
+                    const fv = builder.buildFSub(old_val, one_val, "fdecloc");
+                    llvm.Builder.setFastMathFlags(fv, llvm.Builder.FMF_VECTORIZE);
+                    break :blk fv;
+                },
             };
             _ = builder.buildStore(new_val, loc_ptr);
+            if (kind == .f64 and counter_mask != 0 and idx < 48 and
+                counter_mask & (@as(u48, 1) << @intCast(idx)) != 0)
+            {
+                const sh_old = builder.buildLoad(llvm.i32Type(), i32_shadows.*[idx], "sh_dec_old");
+                _ = builder.buildStore(
+                    builder.buildNSWSub(sh_old, llvm.constInt32(1), "sh_dec"),
+                    i32_shadows.*[idx],
+                );
+            }
         },
 
         .stack_dup => {
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
             const top = vstack.items[vstack.items.len - 1];
             vstack.append(allocator, top) catch return CodegenError.OutOfMemory;
+        },
+
+        .stack_dup2 => {
+            if (vstack.items.len < 2) return CodegenError.StackUnderflow;
+            const a = vstack.items[vstack.items.len - 2];
+            const b = vstack.items[vstack.items.len - 1];
+            vstack.append(allocator, a) catch return CodegenError.OutOfMemory;
+            vstack.append(allocator, b) catch return CodegenError.OutOfMemory;
         },
 
         .stack_drop => {
@@ -2831,9 +2518,21 @@ fn emitNumericInstruction(
                     },
                     else => {},
                 }
-            } else if (instr.opcode == .get_var_ref0) {
-                if (analyzed.closure_vars.len > 0) {
-                    const cv_name = analyzed.closure_vars[0].name;
+            } else {
+                // Handle get_var_ref0/1/2/3/get_var_ref — resolve closure var index to callee
+                const cv_idx: u32 = switch (instr.opcode) {
+                    .get_var_ref0 => 0,
+                    .get_var_ref1 => 1,
+                    .get_var_ref2 => 2,
+                    .get_var_ref3 => 3,
+                    .get_var_ref => switch (instr.operand) {
+                        .u16 => |v| v,
+                        else => 0xFFFFFFFF,
+                    },
+                    else => 0xFFFFFFFF,
+                };
+                if (cv_idx < analyzed.closure_vars.len) {
+                    const cv_name = analyzed.closure_vars[cv_idx].name;
                     if (cv_name.len > 0) {
                         var name_buf: [256]u8 = undefined;
                         if (cv_name.len < name_buf.len) {
@@ -2853,6 +2552,7 @@ fn emitNumericInstruction(
 
         .call_self => {
             const call_argc: u32 = switch (instr.opcode) {
+                .call0 => 0,
                 .call1 => 1,
                 .call2 => 2,
                 .call3 => 3,
@@ -2930,7 +2630,13 @@ fn emitNumericInstruction(
             const cond_val = numVstackPop(vstack);
 
             // For f64 tier: compare != 0.0 to get truthiness as i1
-            const is_false = switch (kind) {
+            // Peephole: if cond_val is already i1 (from icmp peephole), invert directly
+            const is_false = if (kind == .f64 and
+                c.LLVMGetTypeKind(c.LLVMTypeOf(cond_val)) == c.LLVMIntegerTypeKind and
+                c.LLVMGetIntTypeWidth(c.LLVMTypeOf(cond_val)) == 1)
+                // i1 from icmp — invert: if_false branches when cmp is false
+                builder.buildNot(cond_val, "ifz_inv")
+            else switch (kind) {
                 .i32 => builder.buildICmp(c.LLVMIntEQ, cond_val, llvm.constInt32(0), "ifz"),
                 .f64 => builder.buildFCmp(c.LLVMRealOEQ, cond_val, llvm.constF64(0.0), "fifz"),
             };
@@ -2952,7 +2658,12 @@ fn emitNumericInstruction(
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
             const cond_val = numVstackPop(vstack);
 
-            const is_true = switch (kind) {
+            // Peephole: if cond_val is already i1 (from icmp peephole), use directly
+            const is_true = if (kind == .f64 and
+                c.LLVMGetTypeKind(c.LLVMTypeOf(cond_val)) == c.LLVMIntegerTypeKind and
+                c.LLVMGetIntTypeWidth(c.LLVMTypeOf(cond_val)) == 1)
+                cond_val // i1 from icmp — use directly
+            else switch (kind) {
                 .i32 => builder.buildICmp(c.LLVMIntNE, cond_val, llvm.constInt32(0), "ift"),
                 .f64 => builder.buildFCmp(c.LLVMRealONE, cond_val, llvm.constF64(0.0), "fift"),
             };
@@ -2989,50 +2700,65 @@ fn emitNumericInstruction(
             if (vstack.items.len < 2) return CodegenError.StackUnderflow;
             const idx_raw = numVstackPop(vstack);
             const base_raw = numVstackPop(vstack);
-            // For f64 tier, base and index are f64 — convert to i32 for memory addressing
+            // For f64 tier, base and index are f64 — convert to i32 for memory addressing.
+            // Peephole: if value is sitofp(i32), grab the i32 operand directly.
+            // This happens for loop counter locals (i32 shadow → sitofp at get_loc).
+            // Eliminating the fptosi(sitofp(x)) round-trip gives LLVM a clean i32
+            // induction variable for stride detection → enables SIMD vectorization.
             const base_i32 = switch (kind) {
                 .i32 => base_raw,
-                .f64 => builder.buildFPToSI(base_raw, llvm.i32Type(), "arr_base_i32"),
+                .f64 => if (c.LLVMGetInstructionOpcode(base_raw) == c.LLVMSIToFP)
+                    c.LLVMGetOperand(base_raw, 0)
+                else
+                    builder.buildFPToSI(base_raw, llvm.i32Type(), "arr_base_i32"),
             };
             const idx_i32 = switch (kind) {
                 .i32 => idx_raw,
-                .f64 => builder.buildFPToSI(idx_raw, llvm.i32Type(), "arr_idx_i32"),
+                .f64 => if (c.LLVMGetInstructionOpcode(idx_raw) == c.LLVMSIToFP)
+                    c.LLVMGetOperand(idx_raw, 0)
+                else
+                    builder.buildFPToSI(idx_raw, llvm.i32Type(), "arr_idx_i32"),
             };
             const base_ptr = c.LLVMBuildIntToPtr(builder.ref, base_i32, llvm.ptrType(), "arr_base");
-            var gep_indices = [_]llvm.Value{idx_i32};
-            const elem_ptr = c.LLVMBuildGEP2(builder.ref, llvm.i32Type(), base_ptr, &gep_indices, 1, "arr_gep");
-            const loaded = builder.buildLoad(llvm.i32Type(), elem_ptr, "arr_elem");
-            // For f64 tier, convert loaded i32 to f64
-            const result = switch (kind) {
-                .i32 => loaded,
-                .f64 => builder.buildSIToFP(loaded, llvm.doubleType(), "arr_f64"),
+            // i32 tier: i32 elements (4 bytes). f64 tier: f64 elements (8 bytes)
+            const arr_elem_type: llvm.Type = switch (kind) {
+                .i32 => llvm.i32Type(),
+                .f64 => llvm.doubleType(),
             };
-            vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
+            var gep_indices = [_]llvm.Value{idx_i32};
+            const elem_ptr = c.LLVMBuildGEP2(builder.ref, arr_elem_type, base_ptr, &gep_indices, 1, "arr_gep");
+            const loaded = builder.buildLoad(arr_elem_type, elem_ptr, "arr_elem");
+            vstack.append(allocator, loaded) catch return CodegenError.OutOfMemory;
         },
 
         .array_get2 => {
             // arr[idx] keeping arr on stack: pop index, peek base, load, push result
             if (vstack.items.len < 2) return CodegenError.StackUnderflow;
             const idx_raw = numVstackPop(vstack);
-            // Peek at base (don't pop)
-            const base_raw = vstack.items[vstack.items.len - 1];
+            const base_raw = vstack.items[vstack.items.len - 1]; // peek
             const base_i32 = switch (kind) {
                 .i32 => base_raw,
-                .f64 => builder.buildFPToSI(base_raw, llvm.i32Type(), "arr_base2_i32"),
+                .f64 => if (c.LLVMGetInstructionOpcode(base_raw) == c.LLVMSIToFP)
+                    c.LLVMGetOperand(base_raw, 0)
+                else
+                    builder.buildFPToSI(base_raw, llvm.i32Type(), "arr_base2_i32"),
             };
             const idx_i32 = switch (kind) {
                 .i32 => idx_raw,
-                .f64 => builder.buildFPToSI(idx_raw, llvm.i32Type(), "arr_idx2_i32"),
+                .f64 => if (c.LLVMGetInstructionOpcode(idx_raw) == c.LLVMSIToFP)
+                    c.LLVMGetOperand(idx_raw, 0)
+                else
+                    builder.buildFPToSI(idx_raw, llvm.i32Type(), "arr_idx2_i32"),
             };
             const base_ptr = c.LLVMBuildIntToPtr(builder.ref, base_i32, llvm.ptrType(), "arr_base2");
-            var gep_indices = [_]llvm.Value{idx_i32};
-            const elem_ptr = c.LLVMBuildGEP2(builder.ref, llvm.i32Type(), base_ptr, &gep_indices, 1, "arr_gep2");
-            const loaded = builder.buildLoad(llvm.i32Type(), elem_ptr, "arr_elem2");
-            const result = switch (kind) {
-                .i32 => loaded,
-                .f64 => builder.buildSIToFP(loaded, llvm.doubleType(), "arr_f64_2"),
+            const arr_elem_type: llvm.Type = switch (kind) {
+                .i32 => llvm.i32Type(),
+                .f64 => llvm.doubleType(),
             };
-            vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
+            var gep_indices = [_]llvm.Value{idx_i32};
+            const elem_ptr = c.LLVMBuildGEP2(builder.ref, arr_elem_type, base_ptr, &gep_indices, 1, "arr_gep2");
+            const loaded = builder.buildLoad(arr_elem_type, elem_ptr, "arr_elem2");
+            vstack.append(allocator, loaded) catch return CodegenError.OutOfMemory;
         },
 
         .array_put => {
@@ -3043,21 +2769,26 @@ fn emitNumericInstruction(
             const base_raw = numVstackPop(vstack);
             const base_i32 = switch (kind) {
                 .i32 => base_raw,
-                .f64 => builder.buildFPToSI(base_raw, llvm.i32Type(), "arr_basew_i32"),
+                .f64 => if (c.LLVMGetInstructionOpcode(base_raw) == c.LLVMSIToFP)
+                    c.LLVMGetOperand(base_raw, 0)
+                else
+                    builder.buildFPToSI(base_raw, llvm.i32Type(), "arr_basew_i32"),
             };
             const idx_i32 = switch (kind) {
                 .i32 => idx_raw,
-                .f64 => builder.buildFPToSI(idx_raw, llvm.i32Type(), "arr_idxw_i32"),
+                .f64 => if (c.LLVMGetInstructionOpcode(idx_raw) == c.LLVMSIToFP)
+                    c.LLVMGetOperand(idx_raw, 0)
+                else
+                    builder.buildFPToSI(idx_raw, llvm.i32Type(), "arr_idxw_i32"),
             };
             const base_ptr = c.LLVMBuildIntToPtr(builder.ref, base_i32, llvm.ptrType(), "arr_base_w");
-            var gep_indices = [_]llvm.Value{idx_i32};
-            const elem_ptr = c.LLVMBuildGEP2(builder.ref, llvm.i32Type(), base_ptr, &gep_indices, 1, "arr_gep_w");
-            // For f64 tier, convert f64 value to i32 for storage
-            const store_val = switch (kind) {
-                .i32 => val,
-                .f64 => builder.buildFPToSI(val, llvm.i32Type(), "arr_i32_w"),
+            const arr_elem_type: llvm.Type = switch (kind) {
+                .i32 => llvm.i32Type(),
+                .f64 => llvm.doubleType(),
             };
-            _ = builder.buildStore(store_val, elem_ptr);
+            var gep_indices = [_]llvm.Value{idx_i32};
+            const elem_ptr = c.LLVMBuildGEP2(builder.ref, arr_elem_type, base_ptr, &gep_indices, 1, "arr_gep_w");
+            _ = builder.buildStore(val, elem_ptr);
         },
 
         .array_length => {
@@ -3249,7 +2980,8 @@ fn generateThinShardWithTarget(
                             .typeof_is_function, .fclosure8, .fclosure,
                             .@"return", .return_undef,
                             .if_false, .if_false8, .if_true, .if_true8, .goto, .goto8, .goto16,
-                            .throw, .nop, .set_name, .close_loc, .set_loc_uninitialized, .set_home_object,
+                            .throw, .@"catch", .nip_catch, .gosub, .ret,
+                            .nop, .set_name, .close_loc, .set_loc_uninitialized, .set_home_object,
                             .set_proto,
                             // exec_opcode-handled opcodes (safe to delegate to C):
                             // .to_propkey, .to_propkey2 now inline-handled
@@ -3258,9 +2990,14 @@ fn generateThinShardWithTarget(
                             .get_super, .define_array_el, .set_name_computed, .copy_data_properties,
                             .put_var_ref_check,
                             .rest, .regexp, .push_bigint_i32,
-                            // check_ctor, init_ctor, special_object need func_obj/new_target
-                            // which frozen functions don't receive — skip these
+                            // Constructor opcodes: func_obj/new_target read from globals
+                            // set by JS_CallInternal before frozen dispatch.
+                            .check_ctor, .special_object, .check_ctor_return, .init_ctor,
+                            // Private field brand checking
+                            .check_brand, .add_brand,
                             .define_method, .define_method_computed,
+                            // define_class/define_class_computed: handled inline via llvm_rt_define_class
+                            .define_class, .define_class_computed,
                             .put_ref_value,
                             .check_define_var, .define_var, .define_func,
                             // .get_var, .get_var_undef already inline-handled above
@@ -3470,10 +3207,18 @@ const ThinRuntimeDecls = struct {
     fclosure: llvm.Value,
     fclosure_v2: llvm.Value,
 
+    // Class definition
+    define_class: llvm.Value,
+    define_class_computed: llvm.Value,
+
     // Closure sync
     sync_locals_to: llvm.Value,
     sync_locals_from: llvm.Value,
     var_ref_list_detach: llvm.Value,
+
+    // Exception handling
+    exception_find_catch: llvm.Value,
+    nip_catch: llvm.Value,
 
     // Return helpers
     returnFromStack: llvm.Value,
@@ -3524,6 +3269,9 @@ const ThinRuntimeDecls = struct {
     call_method_char_code_at: llvm.Value,
     call_method_array_push: llvm.Value,
     call_method_math_unary: llvm.Value,
+    call_method_math_binary: llvm.Value,
+    call_destr_math_unary: llvm.Value,
+    call_destr_math_binary: llvm.Value,
 
     // Combined tail_call+return
     tail_call_return: llvm.Value,
@@ -3682,12 +3430,23 @@ const ThinRuntimeDecls = struct {
             // fclosure_v2: i32(ctx, stack, sp, cpool, func_idx, var_refs, locals, local_count, argv, argc, locals_jsv, var_ref_list, arg_shadow, arg_count)
             .fclosure_v2 = declareExtern(module, "llvm_rt_fclosure_v2", llvm.functionType(i32t, &.{ ptr, ptr, ptr, ptr, i32t, ptr, ptr, i32t, ptr, i32t, ptr, ptr, ptr, i32t }, false)),
 
+            // define_class: i32(ctx, stack, sp, cpool, class_flags, class_name, var_refs, locals, local_count, argv, argc, locals_jsv, var_ref_list, arg_shadow, arg_count)
+            .define_class = declareExtern(module, "llvm_rt_define_class", llvm.functionType(i32t, &.{ ptr, ptr, ptr, ptr, i32t, ptr, ptr, ptr, i32t, ptr, i32t, ptr, ptr, ptr, i32t }, false)),
+
+            // define_class_computed: i32(ctx, stack, sp, cpool, class_flags, var_refs, locals, local_count, argv, argc, locals_jsv, var_ref_list, arg_shadow, arg_count)
+            .define_class_computed = declareExtern(module, "llvm_rt_define_class_computed", llvm.functionType(i32t, &.{ ptr, ptr, ptr, ptr, i32t, ptr, ptr, i32t, ptr, i32t, ptr, ptr, ptr, i32t }, false)),
+
             // sync_locals_to/from: void(locals, locals_jsv, local_count)
             .sync_locals_to = declareExtern(module, "llvm_rt_sync_locals_to", llvm.functionType(voidt, &.{ ptr, ptr, i32t }, false)),
             .sync_locals_from = declareExtern(module, "llvm_rt_sync_locals_from", llvm.functionType(voidt, &.{ ptr, ptr, i32t }, false)),
 
             // var_ref_list_detach: void(ctx, var_ref_list)
             .var_ref_list_detach = declareExtern(module, "llvm_rt_var_ref_list_detach", llvm.functionType(voidt, &.{ ptr, ptr }, false)),
+
+            // Exception handling: i32(ctx, stack, sp_ptr) — returns catch bytecode offset or -1
+            .exception_find_catch = declareExtern(module, "llvm_rt_exception_find_catch", llvm.functionType(i32t, &.{ ptr, ptr, ptr }, false)),
+            // nip_catch: i32(ctx, stack, sp_ptr) — returns 0 success, 1 error
+            .nip_catch = declareExtern(module, "llvm_rt_nip_catch", llvm.functionType(i32t, &.{ ptr, ptr, ptr }, false)),
 
             .returnFromStack = declareExtern(module, "llvm_rt_returnFromStack", return_helper),
             .returnUndef = declareExtern(module, "llvm_rt_returnUndef", cleanup_helper),
@@ -3732,6 +3491,9 @@ const ThinRuntimeDecls = struct {
             .call_method_char_code_at = declareExtern(module, "llvm_rt_call_method_char_code_at", llvm.functionType(i32t, &.{ ptr, ptr, ptr }, false)),
             .call_method_array_push = declareExtern(module, "llvm_rt_call_method_array_push", llvm.functionType(i32t, &.{ ptr, ptr, ptr }, false)),
             .call_method_math_unary = declareExtern(module, "llvm_rt_call_method_math_unary", llvm.functionType(i32t, &.{ ptr, ptr, ptr, i32t }, false)),
+            .call_method_math_binary = declareExtern(module, "llvm_rt_call_method_math_binary", llvm.functionType(i32t, &.{ ptr, ptr, ptr, i32t }, false)),
+            .call_destr_math_unary = declareExtern(module, "llvm_rt_call_destr_math_unary", llvm.functionType(i32t, &.{ ptr, ptr, ptr, i32t }, false)),
+            .call_destr_math_binary = declareExtern(module, "llvm_rt_call_destr_math_binary", llvm.functionType(i32t, &.{ ptr, ptr, ptr, i32t }, false)),
 
             // exec_opcode: i32(ctx, op, operand, stack, sp, locals, var_count, var_refs, closure_var_count, argv, argc, arg_buf, func_obj, new_target, cpool, operand2, atom_name)
             .exec_opcode = declareExtern(module, "llvm_rt_exec_opcode", llvm.functionType(i32t, &.{ ptr, llvm.i8Type(), i32t, ptr, ptr, ptr, i32t, ptr, i32t, ptr, i32t, ptr, jsv_ty, jsv_ty, ptr, i32t, ptr }, false)),
@@ -3759,7 +3521,7 @@ const VStackEntry = struct {
 };
 
 /// Pending method inline kind — tracks which method pattern was detected at get_field2
-const PendingMethodKind = enum { none, char_code_at, array_push, math_abs, math_sqrt, math_floor, math_ceil, math_round };
+const PendingMethodKind = enum { none, char_code_at, array_push, math_abs, math_sqrt, math_floor, math_ceil, math_round, math_trunc, math_pow, math_min, math_max };
 
 /// Thin codegen context — holds LLVM references for the current function being generated
 const ThinCodegenCtx = struct {
@@ -3815,6 +3577,19 @@ const ThinCodegenCtx = struct {
 
     // Exception cleanup block
     cleanup_bb: llvm.BasicBlock,
+
+    // Exception dispatch block (for functions with try/catch): walks stack for CATCH_OFFSET
+    // and switches to the appropriate catch handler block. null if no catch opcodes.
+    exception_dispatch_bb: ?llvm.BasicBlock = null,
+
+    // Catch handler targets: maps bytecode offset → LLVM basic block
+    // Populated by scanning for catch opcodes before codegen.
+    catch_targets: std.AutoHashMapUnmanaged(u32, llvm.BasicBlock) = .{},
+
+    // Gosub return targets: maps bytecode offset → integer ID for switch
+    // Populated by scanning for gosub opcodes.
+    gosub_return_targets: std.AutoHashMapUnmanaged(u32, u32) = .{},
+    gosub_next_id: u32 = 1,
 
     // Entry block for placing allocas
     entry_bb: llvm.BasicBlock,
@@ -3904,6 +3679,24 @@ const ThinCodegenCtx = struct {
         var val = c.LLVMGetUndef(cv_ty);
         val = c.LLVMBuildInsertValue(b.ref, val, ext, 0, "cv_u");
         val = c.LLVMBuildInsertValue(b.ref, val, llvm.constInt64(0), 1, "cv_tag"); // JS_TAG_INT = 0
+        return val;
+    }
+
+    /// Create a CATCH_OFFSET CV: tag=JS_TAG_CATCH_OFFSET(5), u=bytecode_offset
+    fn makeCatchOffsetCv(self: *ThinCodegenCtx, offset_i32: llvm.Value) llvm.Value {
+        if (self.target.is_wasm32) {
+            // WASM32: NaN-boxed CATCH_OFFSET uses hi=0xFFF90000
+            const ext = self.builder.buildZExt(offset_i32, llvm.i64Type(), "zext");
+            const hi: u64 = @as(u64, 0xFFF90000) << 32;
+            return self.builder.buildOr(ext, llvm.constInt(llvm.i64Type(), hi, false), "catch_cv");
+        }
+        // Native: CV = {u: i64, tag: i64}, JS_TAG_CATCH_OFFSET = 5
+        const b = self.builder;
+        const cv_ty = self.cvTy();
+        const ext = b.buildZExt(offset_i32, llvm.i64Type(), "zext");
+        var val = c.LLVMGetUndef(cv_ty);
+        val = c.LLVMBuildInsertValue(b.ref, val, ext, 0, "catch_u");
+        val = c.LLVMBuildInsertValue(b.ref, val, llvm.constInt64(5), 1, "catch_tag"); // JS_TAG_CATCH_OFFSET = 5
         return val;
     }
 
@@ -4343,7 +4136,7 @@ fn generateThinFunction(
                 .put_arg, .put_arg0, .put_arg1, .put_arg2, .put_arg3,
                 .set_arg, .set_arg0, .set_arg1, .set_arg2, .set_arg3,
                 => has_put_arg = true,
-                .fclosure, .fclosure8 => has_fclosure = true,
+                .fclosure, .fclosure8, .define_class, .define_class_computed => has_fclosure = true,
                 .for_of_start => has_for_of = true,
                 .get_field, .get_field2 => ic_count += 1,
                 else => {},
@@ -4352,7 +4145,7 @@ fn generateThinFunction(
     }
 
     // Create the wrapper function:
-    // JSValue @__frozen_N_name(ptr %ctx, JSValue %this, i32 %argc, ptr %argv, ptr %var_refs, i32 %closure_cnt, ptr %cpool)
+    // JSValue @__frozen_N_name(ptr %ctx, JSValue %this, i32 %argc, ptr %argv, ptr %var_refs, i32 %closure_cnt, ptr %cpool, JSValue %func_obj, JSValue %new_target)
     // Native: JSValue = {i64, i64} (16 bytes), WASM32: JSValue = i64 (8 bytes, NaN-boxed)
     var wrapper_name_buf: [512]u8 = undefined;
     const wrapper_name = std.fmt.bufPrintZ(&wrapper_name_buf, "{s}", .{sf.llvm_func_name}) catch
@@ -4400,7 +4193,6 @@ fn generateThinFunction(
     const var_refs_param = c.LLVMGetParam(wrapper_fn, 4);
     // closure_var_count is param 5, accessed via tctx.closure_var_count_param
     const cpool_param = c.LLVMGetParam(wrapper_fn, 6);
-
     // Stack overflow check: if (check_stack()) return throwRangeError
     {
         const overflow = builder.buildCall(
@@ -4627,6 +4419,30 @@ fn generateThinFunction(
     tctx.vstack.ensureTotalCapacity(allocator, stack_array_size) catch return CodegenError.OutOfMemory;
     defer tctx.vstack.deinit(allocator);
     defer tctx.array_cache.deinit(allocator);
+    defer tctx.catch_targets.deinit(allocator);
+    defer tctx.gosub_return_targets.deinit(allocator);
+
+    // Scan for exception handling opcodes (catch/gosub) to set up dispatch infrastructure
+    {
+        var has_catch = false;
+        for (func.instructions) |instr| {
+            if (instr.opcode == .@"catch") {
+                has_catch = true;
+                // Map catch target bytecode offset to (will map to LLVM block later)
+                if (instr.getJumpTarget()) |target_pc| {
+                    tctx.catch_targets.put(allocator, target_pc, undefined) catch {};
+                }
+            } else if (instr.opcode == .gosub) {
+                // The continuation point is the instruction AFTER gosub (pc + size)
+                // We'll map return_pc → block_id after blocks are created
+                const return_pc = instr.pc + instr.size;
+                tctx.gosub_return_targets.put(allocator, return_pc, 0) catch {};
+            }
+        }
+        if (has_catch) {
+            tctx.exception_dispatch_bb = llvm.appendBasicBlock(wrapper_fn, "exc_dispatch");
+        }
+    }
 
     // At this point, builder is positioned at the end of the "no_overflow" block.
     // We saved our position there after the stack overflow check.
@@ -4717,6 +4533,35 @@ fn generateThinFunction(
             llvm.addSwitchCase(switch_inst, llvm.constInt32(@intCast(i)), llvm_blocks[i]);
         }
 
+        // Map catch target bytecode PCs to their LLVM basic blocks
+        if (tctx.exception_dispatch_bb != null) {
+            var catch_it = tctx.catch_targets.iterator();
+            while (catch_it.next()) |entry| {
+                const target_pc = entry.key_ptr.*;
+                // Find which CFG block this PC maps to
+                for (blocks, 0..) |blk, bi| {
+                    if (target_pc >= blk.start_pc and target_pc < blk.end_pc) {
+                        entry.value_ptr.* = llvm_blocks[bi];
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Map gosub return PCs to their block IDs (for ret opcode dispatch)
+        {
+            var gosub_it = tctx.gosub_return_targets.iterator();
+            while (gosub_it.next()) |entry| {
+                const return_pc = entry.key_ptr.*;
+                for (blocks, 0..) |blk, bi| {
+                    if (return_pc >= blk.start_pc and return_pc < blk.end_pc) {
+                        entry.value_ptr.* = @intCast(bi);
+                        break;
+                    }
+                }
+            }
+        }
+
         // Generate each block's body
         for (blocks, 0..) |block, block_idx| {
             builder.positionAtEnd(llvm_blocks[block_idx]);
@@ -4734,7 +4579,10 @@ fn generateThinFunction(
             for (block.instructions) |instr| {
                 // Skip control flow ops (handled by terminator)
                 switch (instr.opcode) {
-                    .if_false, .if_false8, .if_true, .if_true8, .goto, .goto8, .goto16 => continue,
+                    .if_false, .if_false8, .if_true, .if_true8, .goto, .goto8, .goto16,
+                    // gosub/ret are handled as block terminators
+                    .gosub, .ret,
+                    => continue,
                     else => {},
                 }
 
@@ -4751,6 +4599,11 @@ fn generateThinFunction(
             // Block terminator (vstackFlush handled inside for if_true/if_false optimization)
             emitThinBlockTerminator(&tctx, block, block_id_ptr, dispatch_bb, llvm_blocks);
         }
+
+        // Emit exception dispatch block (if function has catch handlers)
+        if (tctx.exception_dispatch_bb) |exc_bb| {
+            emitExceptionDispatchBlock(&tctx, exc_bb, block_id_ptr, dispatch_bb);
+        }
     }
 
     return tctx.has_unsafe_fallback;
@@ -4760,7 +4613,8 @@ fn isBlockTerminated(block: CFGBasicBlock) bool {
     if (block.instructions.len == 0) return false;
     const last = block.instructions[block.instructions.len - 1].opcode;
     return last == .@"return" or last == .return_undef or last == .throw or
-        last == .tail_call or last == .tail_call_method;
+        last == .tail_call or last == .tail_call_method or
+        last == .gosub or last == .ret;
 }
 
 /// Emit a single thin-codegen instruction as LLVM IR calls to llvm_rt_* functions.
@@ -5309,6 +5163,24 @@ fn emitThinInstruction(
             } else {
                 emitVstackGetVarRef(tctx, idx);
             }
+            // Detect destructured Math builtins: if closure_vars[idx] names a Math method,
+            // set pending_method so the next call1/call2 uses the fast math path
+            if (idx < tctx.func.closure_vars.len) {
+                const cv_name = tctx.func.closure_vars[idx].name;
+                if (frozen_registry.matchMathName(cv_name)) |intrinsic| {
+                    tctx.pending_method = switch (intrinsic) {
+                        .abs => .math_abs,
+                        .sqrt => .math_sqrt,
+                        .floor => .math_floor,
+                        .ceil => .math_ceil,
+                        .round => .math_round,
+                        .trunc => .math_trunc,
+                        .pow => .math_pow,
+                        .min => .math_min,
+                        .max => .math_max,
+                    };
+                }
+            }
         },
         // put_var_ref / set_var_ref: flush + runtime (write ops need old-value free)
         .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3, .put_var_ref,
@@ -5481,10 +5353,62 @@ fn emitThinInstruction(
 
         // ========== Function Calls (with error check) ==========
         .call0 => emitThinCallOp(tctx, rt.op_call, 0),
-        .call1 => emitThinCallOp(tctx, rt.op_call, 1),
-        .call2 => emitThinCallOp(tctx, rt.op_call, 2),
-        .call3 => emitThinCallOp(tctx, rt.op_call, 3),
-        .call => emitThinCallOp(tctx, rt.op_call, instr.operand.u16),
+        .call1, .call2, .call3, .call => {
+            const argc: u16 = switch (instr.opcode) {
+                .call1 => 1,
+                .call2 => 2,
+                .call3 => 3,
+                else => instr.operand.u16,
+            };
+            // Check for destructured Math fast path (set by get_var_ref handler)
+            if (argc == 1 and @intFromEnum(tctx.pending_method) >= @intFromEnum(PendingMethodKind.math_abs) and
+                @intFromEnum(tctx.pending_method) <= @intFromEnum(PendingMethodKind.math_trunc))
+            {
+                const pm = tctx.pending_method;
+                tctx.pending_method = .none;
+                if (!tctx.target.is_wasm32) {
+                    switch (pm) {
+                        .math_abs => emitInlineMathUnaryDestrCall(tctx, .math_abs),
+                        .math_sqrt => emitInlineMathUnaryDestrCall(tctx, .math_sqrt),
+                        .math_floor => emitInlineMathUnaryDestrCall(tctx, .math_floor),
+                        .math_ceil => emitInlineMathUnaryDestrCall(tctx, .math_ceil),
+                        .math_round => emitInlineMathUnaryDestrCall(tctx, .math_round),
+                        .math_trunc => emitInlineMathUnaryDestrCall(tctx, .math_trunc),
+                        else => unreachable,
+                    }
+                } else {
+                    const op_id: i32 = @as(i32, @intCast(@intFromEnum(pm))) - @as(i32, @intCast(@intFromEnum(PendingMethodKind.math_abs)));
+                    vstackFlush(tctx);
+                    const math_sig = llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false);
+                    const err_code = b.buildCall(math_sig, rt.call_destr_math_unary, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, llvm.constInt32(@intCast(op_id)) }, "err");
+                    emitErrorCheck(tctx, err_code);
+                }
+                arrayCacheInvalidateAll(tctx);
+            } else if (argc == 2 and @intFromEnum(tctx.pending_method) >= @intFromEnum(PendingMethodKind.math_pow) and
+                @intFromEnum(tctx.pending_method) <= @intFromEnum(PendingMethodKind.math_max))
+            {
+                const pm = tctx.pending_method;
+                tctx.pending_method = .none;
+                if (!tctx.target.is_wasm32) {
+                    switch (pm) {
+                        .math_pow => emitInlineMathBinaryDestrCall(tctx, .math_pow),
+                        .math_min => emitInlineMathBinaryDestrCall(tctx, .math_min),
+                        .math_max => emitInlineMathBinaryDestrCall(tctx, .math_max),
+                        else => unreachable,
+                    }
+                } else {
+                    const op_id: i32 = @as(i32, @intCast(@intFromEnum(pm))) - @as(i32, @intCast(@intFromEnum(PendingMethodKind.math_pow)));
+                    vstackFlush(tctx);
+                    const math_sig = llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false);
+                    const err_code = b.buildCall(math_sig, rt.call_destr_math_binary, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, llvm.constInt32(@intCast(op_id)) }, "err");
+                    emitErrorCheck(tctx, err_code);
+                }
+                arrayCacheInvalidateAll(tctx);
+            } else {
+                tctx.pending_method = .none;
+                emitThinCallOp(tctx, rt.op_call, argc);
+            }
+        },
         .call_method => {
             const argc = instr.operand.u16;
             const method_sig = llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType() }, false);
@@ -5504,15 +5428,49 @@ fn emitThinInstruction(
                 emitErrorCheck(tctx, err_code);
                 arrayCacheInvalidateAll(tctx);
             } else if (argc == 1 and @intFromEnum(tctx.pending_method) >= @intFromEnum(PendingMethodKind.math_abs) and
-                @intFromEnum(tctx.pending_method) <= @intFromEnum(PendingMethodKind.math_round))
+                @intFromEnum(tctx.pending_method) <= @intFromEnum(PendingMethodKind.math_trunc))
             {
-                // Math.abs/sqrt/floor/ceil/round fast path
-                const op_id: i32 = @as(i32, @intCast(@intFromEnum(tctx.pending_method))) - @as(i32, @intCast(@intFromEnum(PendingMethodKind.math_abs)));
+                // Math.abs/sqrt/floor/ceil/round — inline LLVM intrinsics on native
+                const pm = tctx.pending_method;
                 tctx.pending_method = .none;
-                vstackFlush(tctx);
-                const math_sig = llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false);
-                const err_code = b.buildCall(math_sig, rt.call_method_math_unary, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, llvm.constInt32(@intCast(op_id)) }, "err");
-                emitErrorCheck(tctx, err_code);
+                if (!tctx.target.is_wasm32) {
+                    switch (pm) {
+                        .math_abs => emitInlineMathUnaryCallMethod(tctx, .math_abs),
+                        .math_sqrt => emitInlineMathUnaryCallMethod(tctx, .math_sqrt),
+                        .math_floor => emitInlineMathUnaryCallMethod(tctx, .math_floor),
+                        .math_ceil => emitInlineMathUnaryCallMethod(tctx, .math_ceil),
+                        .math_round => emitInlineMathUnaryCallMethod(tctx, .math_round),
+                        .math_trunc => emitInlineMathUnaryCallMethod(tctx, .math_trunc),
+                        else => unreachable,
+                    }
+                } else {
+                    const op_id: i32 = @as(i32, @intCast(@intFromEnum(pm))) - @as(i32, @intCast(@intFromEnum(PendingMethodKind.math_abs)));
+                    vstackFlush(tctx);
+                    const math_sig = llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false);
+                    const err_code = b.buildCall(math_sig, rt.call_method_math_unary, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, llvm.constInt32(@intCast(op_id)) }, "err");
+                    emitErrorCheck(tctx, err_code);
+                }
+                arrayCacheInvalidateAll(tctx);
+            } else if (argc == 2 and @intFromEnum(tctx.pending_method) >= @intFromEnum(PendingMethodKind.math_pow) and
+                @intFromEnum(tctx.pending_method) <= @intFromEnum(PendingMethodKind.math_max))
+            {
+                // Math.pow/min/max — inline LLVM intrinsics on native
+                const pm = tctx.pending_method;
+                tctx.pending_method = .none;
+                if (!tctx.target.is_wasm32) {
+                    switch (pm) {
+                        .math_pow => emitInlineMathBinaryCallMethod(tctx, .math_pow),
+                        .math_min => emitInlineMathBinaryCallMethod(tctx, .math_min),
+                        .math_max => emitInlineMathBinaryCallMethod(tctx, .math_max),
+                        else => unreachable,
+                    }
+                } else {
+                    const op_id: i32 = @as(i32, @intCast(@intFromEnum(pm))) - @as(i32, @intCast(@intFromEnum(PendingMethodKind.math_pow)));
+                    vstackFlush(tctx);
+                    const math_sig = llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false);
+                    const err_code = b.buildCall(math_sig, rt.call_method_math_binary, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, llvm.constInt32(@intCast(op_id)) }, "err");
+                    emitErrorCheck(tctx, err_code);
+                }
                 arrayCacheInvalidateAll(tctx);
             } else {
                 tctx.pending_method = .none;
@@ -5610,6 +5568,14 @@ fn emitThinInstruction(
                         tctx.pending_method = .math_ceil;
                     } else if (std.mem.eql(u8, span, "round")) {
                         tctx.pending_method = .math_round;
+                    } else if (std.mem.eql(u8, span, "trunc")) {
+                        tctx.pending_method = .math_trunc;
+                    } else if (std.mem.eql(u8, span, "pow")) {
+                        tctx.pending_method = .math_pow;
+                    } else if (std.mem.eql(u8, span, "min")) {
+                        tctx.pending_method = .math_min;
+                    } else if (std.mem.eql(u8, span, "max")) {
+                        tctx.pending_method = .math_max;
                     }
                 }
             }
@@ -5711,14 +5677,35 @@ fn emitThinInstruction(
         },
         .if_false, .if_false8, .if_true, .if_true8, .goto, .goto8, .goto16 => {},
 
-        // ========== Throw — flush vstack, delegate to interpreter, then cleanup ==========
+        // ========== Throw — flush vstack, delegate to interpreter, then exception dispatch ==========
         .throw => {
             vstackFlush(tctx);
             // Execute throw opcode via interpreter (sets pending exception)
             emitFallbackOpcode(tctx, instr);
-            // After error check, the cont_bb is never reached for throw,
-            // but LLVM requires a terminator. Branch to cleanup.
-            _ = b.buildBr(tctx.cleanup_bb);
+            // Branch to exception dispatch (if catch handlers exist) or cleanup
+            _ = b.buildBr(tctx.exception_dispatch_bb orelse tctx.cleanup_bb);
+        },
+
+        // ========== Exception handling: catch / nip_catch ==========
+        .@"catch" => {
+            vstackFlush(tctx);
+            // Push CATCH_OFFSET CV onto the physical stack.
+            // The bytecode offset of the catch handler target is known at compile time.
+            const target_pc = instr.getJumpTarget() orelse return CodegenError.UnsupportedOpcode;
+            const catch_cv = tctx.makeCatchOffsetCv(llvm.constInt32(@intCast(target_pc)));
+            const sp_val = tctx.loadSp();
+            const slot = tctx.stackSlot(sp_val);
+            _ = b.buildStore(catch_cv, slot);
+            tctx.storeSp(tctx.spAdd(sp_val, 1, "sp1"));
+        },
+        .nip_catch => {
+            vstackFlush(tctx);
+            // Call runtime helper to walk stack, remove CATCH_OFFSET, keep top value
+            const err = b.buildCall(
+                llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType() }, false),
+                rt.nip_catch, &.{ ctx_p, stk, sp }, "niperr",
+            );
+            emitErrorCheck(tctx, err);
         },
 
         // ========== for_in / to_propkey — dedicated CV-native handlers (bypass exec_opcode) ==========
@@ -5923,6 +5910,66 @@ fn emitThinInstruction(
             } else return CodegenError.UnsupportedOpcode;
         },
 
+        // ========== Class definition ==========
+        .define_class => {
+            vstackFlush(tctx);
+            if (tctx.locals_jsv_ptr) |ljv| {
+                const atom_u8 = instr.operand.atom_u8;
+                const class_flags = @as(i32, @intCast(atom_u8.value));
+                // Resolve class name atom to string at compile time
+                const class_name_str: llvm.Value = blk: {
+                    const name = getAtomStringStatic(tctx.func, atom_u8.atom);
+                    if (name) |n| {
+                        break :blk c.LLVMBuildGlobalStringPtr(b.ref, n, ".cls_name");
+                    }
+                    // Fallback: empty string (shouldn't happen for define_class)
+                    break :blk c.LLVMBuildGlobalStringPtr(b.ref, "", ".cls_name");
+                };
+                const null_ptr = llvm.constNull(llvm.ptrType());
+                const shadow_ptr = tctx.arg_shadow_ptr orelse null_ptr;
+                const err_code = b.buildCall(
+                    llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false),
+                    rt.define_class,
+                    &.{
+                        ctx_p, stk, sp, tctx.cpool_param,
+                        llvm.constInt32(class_flags),
+                        class_name_str,
+                        tctx.var_refs_param,
+                        locs, llvm.constInt32(@intCast(tctx.local_count)),
+                        tctx.argv_param, tctx.argc_param,
+                        ljv, tctx.var_ref_list_ptr.?,
+                        shadow_ptr, llvm.constInt32(@intCast(tctx.func.arg_count)),
+                    },
+                    "err",
+                );
+                emitErrorCheck(tctx, err_code);
+            } else return CodegenError.UnsupportedOpcode;
+        },
+        .define_class_computed => {
+            vstackFlush(tctx);
+            if (tctx.locals_jsv_ptr) |ljv| {
+                const atom_u8 = instr.operand.atom_u8;
+                const class_flags = @as(i32, @intCast(atom_u8.value));
+                const null_ptr = llvm.constNull(llvm.ptrType());
+                const shadow_ptr = tctx.arg_shadow_ptr orelse null_ptr;
+                const err_code = b.buildCall(
+                    llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.i32Type(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false),
+                    rt.define_class_computed,
+                    &.{
+                        ctx_p, stk, sp, tctx.cpool_param,
+                        llvm.constInt32(class_flags),
+                        tctx.var_refs_param,
+                        locs, llvm.constInt32(@intCast(tctx.local_count)),
+                        tctx.argv_param, tctx.argc_param,
+                        ljv, tctx.var_ref_list_ptr.?,
+                        shadow_ptr, llvm.constInt32(@intCast(tctx.func.arg_count)),
+                    },
+                    "err",
+                );
+                emitErrorCheck(tctx, err_code);
+            } else return CodegenError.UnsupportedOpcode;
+        },
+
         // ========== Unsupported — use fallback ==========
         else => return CodegenError.UnsupportedOpcode,
     }
@@ -5937,9 +5984,45 @@ fn emitErrorCheck(tctx: *ThinCodegenCtx, err_code: llvm.Value) void {
     const current_bb = c.LLVMGetInsertBlock(b.ref);
     const current_fn = c.LLVMGetBasicBlockParent(current_bb);
 
+    // If function has catch handlers, go through exception dispatch instead of direct cleanup
+    const err_target = tctx.exception_dispatch_bb orelse tctx.cleanup_bb;
+
     const continue_bb = llvm.appendBasicBlock(current_fn, "cont");
-    _ = b.buildCondBr(is_err, tctx.cleanup_bb, continue_bb);
+    _ = b.buildCondBr(is_err, err_target, continue_bb);
     b.positionAtEnd(continue_bb);
+}
+
+/// Emit the exception dispatch block body.
+/// Called after all regular blocks are emitted. The dispatch block:
+/// 1. Calls llvm_rt_exception_find_catch to walk the stack for CATCH_OFFSET
+/// 2. If found: switches to the catch handler block (via block_id_ptr + dispatch)
+/// 3. If not found: falls through to cleanup_bb
+fn emitExceptionDispatchBlock(
+    tctx: *ThinCodegenCtx,
+    exc_bb: llvm.BasicBlock,
+    _: llvm.Value, // block_id_ptr (unused — dispatch uses direct switch)
+    _: llvm.BasicBlock, // dispatch_bb (unused — we switch directly to catch blocks)
+) void {
+    const b = tctx.builder;
+    b.positionAtEnd(exc_bb);
+
+    // Call runtime helper: i32 = llvm_rt_exception_find_catch(ctx, stack, sp_ptr)
+    const catch_offset = b.buildCall(
+        llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType() }, false),
+        tctx.rt.exception_find_catch, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr }, "catch_off",
+    );
+
+    // Switch on the returned bytecode offset
+    // Default: no handler → cleanup_bb (propagate exception)
+    const num_cases = tctx.catch_targets.count();
+    const switch_inst = b.buildSwitch(catch_offset, tctx.cleanup_bb, @intCast(num_cases));
+
+    var catch_it = tctx.catch_targets.iterator();
+    while (catch_it.next()) |entry| {
+        const target_pc = entry.key_ptr.*;
+        const target_llvm_bb = entry.value_ptr.*;
+        llvm.addSwitchCase(switch_inst, llvm.constInt32(@intCast(target_pc)), target_llvm_bb);
+    }
 }
 
 /// Emit a call op with error check (call, call_method, call_constructor)
@@ -6057,7 +6140,10 @@ fn emitFallbackOpcode(tctx: *ThinCodegenCtx, instr: Instruction) void {
         .get_super, .define_array_el, .set_name_computed, .copy_data_properties,
         .put_var_ref_check,
         .rest, .regexp, .push_bigint_i32,
-        // check_ctor, init_ctor, special_object need func_obj/new_target — not safe
+        // Constructor opcodes: func_obj/new_target read from globals.
+        .check_ctor, .special_object, .check_ctor_return, .init_ctor,
+        // Private field brand checking
+        .check_brand, .add_brand,
         .define_method, .define_method_computed,
         .put_ref_value,
         .check_define_var, .define_var, .define_func,
@@ -6068,6 +6154,8 @@ fn emitFallbackOpcode(tctx: *ThinCodegenCtx, instr: Instruction) void {
         .iterator_close,
         .array_from,
         .get_field, .get_field2, .put_field, .get_array_el, .put_array_el,
+        // Exception handling (inline-handled, should never reach emitFallbackOpcode)
+        .@"catch", .nip_catch, .gosub, .ret,
         => {}, // Handled by js_frozen_exec_opcode
         else => tctx.has_unsafe_fallback = true,
     }
@@ -6096,16 +6184,18 @@ fn emitFallbackOpcode(tctx: *ThinCodegenCtx, instr: Instruction) void {
         else => 0,
     });
 
-    // Build JS_UNDEFINED for func_obj and new_target
     const jsv_ty = tctx.target.jsvalueType();
-    const undef_jsv = if (tctx.target.is_wasm32)
-        // NaN-boxed: JS_MKVAL(JS_TAG_UNDEFINED, 0) = (3 << 32)
-        llvm.constInt64(@as(u64, 3) << 32)
-    else blk: {
-        var undef_val = c.LLVMGetUndef(jsv_ty);
-        undef_val = c.LLVMBuildInsertValue(b.ref, undef_val, llvm.constInt64(0), 0, "undef0");
-        undef_val = c.LLVMBuildInsertValue(b.ref, undef_val, llvm.constInt64(3), 1, "undef1");
-        break :blk undef_val;
+
+    // Build JS_UNDEFINED for func_obj/new_target exec_opcode params
+    const undef_jsv = blk: {
+        if (tctx.target.is_wasm32) {
+            break :blk llvm.constInt64(@as(u64, 3) << 32);
+        } else {
+            var uv = c.LLVMGetUndef(jsv_ty);
+            uv = c.LLVMBuildInsertValue(b.ref, uv, llvm.constInt64(0), 0, "undef0");
+            uv = c.LLVMBuildInsertValue(b.ref, uv, llvm.constInt64(3), 1, "undef1");
+            break :blk uv;
+        }
     };
 
     // arg_buf: use arg_shadow if available, otherwise null
@@ -6164,8 +6254,10 @@ fn emitFallbackOpcode(tctx: *ThinCodegenCtx, instr: Instruction) void {
             tctx.argv_param,                                        // argv
             tctx.argc_param,                                        // argc
             arg_buf_val,                                            // arg_buf
-            undef_jsv,                                              // func_obj (JS_UNDEFINED)
-            undef_jsv,                                              // new_target (JS_UNDEFINED)
+            // func_obj/new_target: pass JS_UNDEFINED (constructor opcodes
+            // fall back to interpreter, so these are unused placeholders)
+            undef_jsv,                                              // func_obj
+            undef_jsv,                                              // new_target
             tctx.cpool_param,                                       // cpool
             operand2_val,                                           // operand2 (flags for atom_u8)
             atom_name_val,                                          // atom_name (for runtime remapping)
@@ -6205,6 +6297,45 @@ fn emitThinBlockTerminator(
     if (last_op == .@"return" or last_op == .return_undef or last_op == .throw or
         last_op == .tail_call or last_op == .tail_call_method) return;
 
+    // gosub: push block_id of continuation onto stack, branch to finally target
+    if (last_op == .gosub) {
+        vstackFlush(tctx);
+        const last_instr = block.instructions[block.instructions.len - 1];
+
+        // Push the block_id of the continuation (instruction after gosub) as integer CV
+        const return_pc = last_instr.pc + last_instr.size;
+        if (tctx.gosub_return_targets.get(return_pc)) |ret_block_id| {
+            const int_cv = tctx.makeIntCv(llvm.constInt32(@intCast(ret_block_id)));
+            const sp_val = tctx.loadSp();
+            const slot = tctx.stackSlot(sp_val);
+            _ = b.buildStore(int_cv, slot);
+            tctx.storeSp(tctx.spAdd(sp_val, 1, "sp1"));
+        }
+
+        // Branch to finally block — gosub's target is a direct successor
+        if (successors.len >= 1 and successors[0] < llvm_blocks.len) {
+            _ = b.buildBr(llvm_blocks[successors[0]]);
+            return;
+        }
+        // Fallback: should not happen for well-formed bytecode
+        _ = b.buildBr(dispatch_bb);
+        return;
+    }
+
+    // ret: pop block_id from stack, store in block_id_ptr, branch to dispatch
+    if (last_op == .ret) {
+        vstackFlush(tctx);
+        const sp_val = tctx.loadSp();
+        const sp_m1 = tctx.spSub(sp_val, 1, "spm1");
+        tctx.storeSp(sp_m1);
+        const slot = tctx.stackSlot(sp_m1);
+        const ret_cv = tctx.loadCv(slot, "retcv");
+        const ret_id = tctx.getIntCv(ret_cv);
+        _ = b.buildStore(ret_id, block_id_ptr);
+        _ = b.buildBr(dispatch_bb);
+        return;
+    }
+
     // Conditional branches: inline int/bool check, fallback to cv_to_bool runtime
     if (last_op == .if_false or last_op == .if_false8 or last_op == .if_true or last_op == .if_true8) {
         if (successors.len >= 2) {
@@ -6217,9 +6348,6 @@ fn emitThinBlockTerminator(
                 const cond = vstackPop(tctx);
                 // Flush remaining vstack entries to physical stack
                 vstackFlush(tctx);
-
-                _ = block_id_ptr;
-                _ = dispatch_bb;
 
                 // Inline integer truthiness check (hot path for loops)
                 const is_int = tctx.isIntCv(cond.value);
@@ -8004,6 +8132,346 @@ fn emitVstackAddLoc(tctx: *ThinCodegenCtx, idx: u32) void {
         llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false),
         rt.add_loc, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, tctx.locals_ptr, llvm.constInt32(@intCast(idx)) }, "err",
     );
+    emitErrorCheck(tctx, err_code);
+    _ = b.buildBr(merge_bb);
+
+    b.positionAtEnd(merge_bb);
+}
+
+// ============================================================================
+// Inline Math intrinsics (call_method fast path)
+// ============================================================================
+
+/// Emit inline LLVM IR for Math.abs/sqrt/floor/ceil/round/trunc via call_method(1).
+/// Stack layout after vstack flush: [Math_obj, method_fn, arg] at sp-3..sp-1.
+/// Fast path: arg is float or int → extract f64 → LLVM intrinsic → pack as float CV.
+/// Slow path: falls back to llvm_rt_call_method_math_unary.
+/// Native-only (WASM32 callers should use the runtime helper directly).
+fn emitInlineMathUnaryCallMethod(tctx: *ThinCodegenCtx, comptime intrinsic: PendingMethodKind) void {
+    const b = tctx.builder;
+    const rt = tctx.rt;
+    const op_id: i32 = @as(i32, @intCast(@intFromEnum(intrinsic))) - @as(i32, @intCast(@intFromEnum(PendingMethodKind.math_abs)));
+
+    vstackFlush(tctx);
+
+    // Load sp and arg from stack[sp-1]
+    const sp_val = tctx.loadSp();
+    const arg_idx = tctx.spSub(sp_val, 1, "arg_idx");
+    const arg_slot = tctx.stackSlot(arg_idx);
+    const arg_cv = tctx.loadCv(arg_slot, "marg");
+
+    // Check if arg is float (tag == 8) or int (tag == 0)
+    const tag = tctx.getCvTag(arg_cv);
+    const is_float = b.buildICmp(c.LLVMIntEQ, tag, llvm.constInt64(8), "isflt");
+    const is_int = b.buildICmp(c.LLVMIntEQ, tag, llvm.constInt64(0), "isint");
+    const is_numeric = b.buildOr(is_float, is_int, "isnum");
+
+    const current_fn = c.LLVMGetBasicBlockParent(c.LLVMGetInsertBlock(b.ref));
+    const fast_bb = llvm.appendBasicBlock(current_fn, "mu_fast");
+    const slow_bb = llvm.appendBasicBlock(current_fn, "mu_slow");
+    const merge_bb = llvm.appendBasicBlock(current_fn, "mu_merge");
+    _ = b.buildCondBr(is_numeric, fast_bb, slow_bb);
+
+    // === Fast path: extract f64, apply intrinsic, write result ===
+    b.positionAtEnd(fast_bb);
+    // Convert to f64: if float, bitcast u field; if int, sitofp
+    const u_field = tctx.getCvUnion(arg_cv);
+    const f64_from_bits = b.buildBitCast(u_field, llvm.doubleType(), "fbits");
+    const i32_val = b.buildTrunc(u_field, llvm.i32Type(), "ival");
+    const f64_from_int = b.buildSIToFP(i32_val, llvm.doubleType(), "fint");
+    const f64_arg = b.buildSelect(is_float, f64_from_bits, f64_from_int, "f64a");
+
+    // Apply LLVM intrinsic
+    const f64_result = emitMathLlvmIntrinsic(b, tctx.module, intrinsic, f64_arg);
+
+    // Pack result as float CV
+    const result_bits = b.buildBitCast(f64_result, llvm.i64Type(), "rbits");
+    const result_cv = tctx.makeFloatCv(result_bits);
+
+    // Free method_fn (stack[sp-2]) and Math_obj (stack[sp-3]) — both are ref-counted objects
+    const method_idx = tctx.spSub(sp_val, 2, "met_idx");
+    const method_slot = tctx.stackSlot(method_idx);
+    const method_cv = tctx.loadCv(method_slot, "metv");
+    inlineFreeRef(tctx, method_cv);
+
+    const math_idx = tctx.spSub(sp_val, 3, "math_idx");
+    const math_slot = tctx.stackSlot(math_idx);
+    const math_cv = tctx.loadCv(math_slot, "mathv");
+    inlineFreeRef(tctx, math_cv);
+
+    // Write result to stack[sp-3], update sp to sp-2 (net: 3 consumed, 1 produced)
+    _ = b.buildStore(result_cv, math_slot);
+    const new_sp = tctx.spSub(sp_val, 2, "nsp");
+    tctx.storeSp(new_sp);
+    _ = b.buildBr(merge_bb);
+
+    // === Slow path: call runtime helper ===
+    b.positionAtEnd(slow_bb);
+    const math_sig = llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false);
+    const err_code = b.buildCall(math_sig, rt.call_method_math_unary, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, llvm.constInt32(@intCast(op_id)) }, "err");
+    emitErrorCheck(tctx, err_code);
+    _ = b.buildBr(merge_bb);
+
+    b.positionAtEnd(merge_bb);
+}
+
+/// Emit inline LLVM IR for Math.pow/min/max via call_method(2).
+/// Stack layout after vstack flush: [Math_obj, method_fn, arg0, arg1] at sp-4..sp-1.
+/// Fast path: both args numeric → LLVM intrinsic. Slow path: runtime.
+fn emitInlineMathBinaryCallMethod(tctx: *ThinCodegenCtx, comptime intrinsic: PendingMethodKind) void {
+    const b = tctx.builder;
+    const rt = tctx.rt;
+    const op_id: i32 = @as(i32, @intCast(@intFromEnum(intrinsic))) - @as(i32, @intCast(@intFromEnum(PendingMethodKind.math_pow)));
+
+    vstackFlush(tctx);
+
+    // Load sp and both args
+    const sp_val = tctx.loadSp();
+    const arg1_idx = tctx.spSub(sp_val, 1, "a1_idx");
+    const arg1_slot = tctx.stackSlot(arg1_idx);
+    const arg1_cv = tctx.loadCv(arg1_slot, "a1cv");
+
+    const arg0_idx = tctx.spSub(sp_val, 2, "a0_idx");
+    const arg0_slot = tctx.stackSlot(arg0_idx);
+    const arg0_cv = tctx.loadCv(arg0_slot, "a0cv");
+
+    // Check both args are float or int
+    const tag0 = tctx.getCvTag(arg0_cv);
+    const tag1 = tctx.getCvTag(arg1_cv);
+    const is_float0 = b.buildICmp(c.LLVMIntEQ, tag0, llvm.constInt64(8), "isf0");
+    const is_int0 = b.buildICmp(c.LLVMIntEQ, tag0, llvm.constInt64(0), "isi0");
+    const is_num0 = b.buildOr(is_float0, is_int0, "isn0");
+    const is_float1 = b.buildICmp(c.LLVMIntEQ, tag1, llvm.constInt64(8), "isf1");
+    const is_int1 = b.buildICmp(c.LLVMIntEQ, tag1, llvm.constInt64(0), "isi1");
+    const is_num1 = b.buildOr(is_float1, is_int1, "isn1");
+    const both_num = b.buildAnd(is_num0, is_num1, "bnum");
+
+    const current_fn = c.LLVMGetBasicBlockParent(c.LLVMGetInsertBlock(b.ref));
+    const fast_bb = llvm.appendBasicBlock(current_fn, "mb_fast");
+    const slow_bb = llvm.appendBasicBlock(current_fn, "mb_slow");
+    const merge_bb = llvm.appendBasicBlock(current_fn, "mb_merge");
+    _ = b.buildCondBr(both_num, fast_bb, slow_bb);
+
+    // === Fast path ===
+    b.positionAtEnd(fast_bb);
+    // Extract f64 for arg0
+    const cv_u0 = tctx.getCvUnion(arg0_cv);
+    const f64_bits0 = b.buildBitCast(cv_u0, llvm.doubleType(), "fb0");
+    const i32_val0 = b.buildTrunc(cv_u0, llvm.i32Type(), "iv0");
+    const f64_int0 = b.buildSIToFP(i32_val0, llvm.doubleType(), "fi0");
+    const f64_a0 = b.buildSelect(is_float0, f64_bits0, f64_int0, "fa0");
+
+    // Extract f64 for arg1
+    const cv_u1 = tctx.getCvUnion(arg1_cv);
+    const f64_bits1 = b.buildBitCast(cv_u1, llvm.doubleType(), "fb1");
+    const i32_val1 = b.buildTrunc(cv_u1, llvm.i32Type(), "iv1");
+    const f64_int1 = b.buildSIToFP(i32_val1, llvm.doubleType(), "fi1");
+    const f64_a1 = b.buildSelect(is_float1, f64_bits1, f64_int1, "fa1");
+
+    // Apply binary intrinsic
+    const f64_result = emitMathLlvmBinaryIntrinsic(b, tctx.module, intrinsic, f64_a0, f64_a1);
+
+    // Pack result as float CV
+    const result_bits = b.buildBitCast(f64_result, llvm.i64Type(), "rbits");
+    const result_cv = tctx.makeFloatCv(result_bits);
+
+    // Free method_fn (sp-3) and Math_obj (sp-4)
+    const method_idx = tctx.spSub(sp_val, 3, "met_idx");
+    const method_slot = tctx.stackSlot(method_idx);
+    const method_cv = tctx.loadCv(method_slot, "metv");
+    inlineFreeRef(tctx, method_cv);
+
+    const math_idx = tctx.spSub(sp_val, 4, "math_idx");
+    const math_slot = tctx.stackSlot(math_idx);
+    const math_cv = tctx.loadCv(math_slot, "mathv");
+    inlineFreeRef(tctx, math_cv);
+
+    // Write result to stack[sp-4], update sp to sp-3
+    _ = b.buildStore(result_cv, math_slot);
+    const new_sp = tctx.spSub(sp_val, 3, "nsp");
+    tctx.storeSp(new_sp);
+    _ = b.buildBr(merge_bb);
+
+    // === Slow path ===
+    b.positionAtEnd(slow_bb);
+    const math_sig = llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false);
+    const err_code = b.buildCall(math_sig, rt.call_method_math_binary, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, llvm.constInt32(@intCast(op_id)) }, "err");
+    emitErrorCheck(tctx, err_code);
+    _ = b.buildBr(merge_bb);
+
+    b.positionAtEnd(merge_bb);
+}
+
+/// Map PendingMethodKind to LLVM unary intrinsic call
+fn emitMathLlvmIntrinsic(builder: llvm.Builder, module: llvm.Module, comptime kind: PendingMethodKind, arg: llvm.Value) llvm.Value {
+    const f64_ty = llvm.doubleType();
+    const unary_fn_ty = llvm.functionType(f64_ty, &.{f64_ty}, false);
+
+    return switch (kind) {
+        .math_abs => builder.buildCall(unary_fn_ty, getOrDeclareIntrinsic(module, "llvm.fabs.f64", unary_fn_ty), &.{arg}, "abs"),
+        .math_sqrt => builder.buildCall(unary_fn_ty, getOrDeclareIntrinsic(module, "llvm.sqrt.f64", unary_fn_ty), &.{arg}, "sqrt"),
+        .math_floor => builder.buildCall(unary_fn_ty, getOrDeclareIntrinsic(module, "llvm.floor.f64", unary_fn_ty), &.{arg}, "floor"),
+        .math_ceil => builder.buildCall(unary_fn_ty, getOrDeclareIntrinsic(module, "llvm.ceil.f64", unary_fn_ty), &.{arg}, "ceil"),
+        .math_trunc => builder.buildCall(unary_fn_ty, getOrDeclareIntrinsic(module, "llvm.trunc.f64", unary_fn_ty), &.{arg}, "trunc"),
+        .math_round => blk: {
+            // JS Math.round: floor(x + 0.5)
+            const half = llvm.constF64(0.5);
+            const added = builder.buildFAdd(arg, half, "radd");
+            break :blk builder.buildCall(unary_fn_ty, getOrDeclareIntrinsic(module, "llvm.floor.f64", unary_fn_ty), &.{added}, "round");
+        },
+        else => unreachable,
+    };
+}
+
+/// Map PendingMethodKind to LLVM binary intrinsic
+fn emitMathLlvmBinaryIntrinsic(builder: llvm.Builder, module: llvm.Module, comptime kind: PendingMethodKind, a: llvm.Value, b_val: llvm.Value) llvm.Value {
+    return switch (kind) {
+        .math_pow => blk: {
+            const f64_ty = llvm.doubleType();
+            const pow_fn_ty = llvm.functionType(f64_ty, &.{ f64_ty, f64_ty }, false);
+            break :blk builder.buildCall(pow_fn_ty, getOrDeclareIntrinsic(module, "llvm.pow.f64", pow_fn_ty), &.{ a, b_val }, "pow");
+        },
+        .math_min => blk: {
+            const cmp = builder.buildFCmp(c.LLVMRealOLT, a, b_val, "min_cmp");
+            const min_val = builder.buildSelect(cmp, a, b_val, "min_val");
+            const is_nan = builder.buildFCmp(c.LLVMRealUNO, a, b_val, "is_nan");
+            const nan_const = llvm.constF64(std.math.nan(f64));
+            break :blk builder.buildSelect(is_nan, nan_const, min_val, "min");
+        },
+        .math_max => blk: {
+            const cmp = builder.buildFCmp(c.LLVMRealOGT, a, b_val, "max_cmp");
+            const max_val = builder.buildSelect(cmp, a, b_val, "max_val");
+            const is_nan = builder.buildFCmp(c.LLVMRealUNO, a, b_val, "is_nan");
+            const nan_const = llvm.constF64(std.math.nan(f64));
+            break :blk builder.buildSelect(is_nan, nan_const, max_val, "max");
+        },
+        else => unreachable,
+    };
+}
+
+/// Emit inline LLVM IR for destructured Math unary via call(1).
+/// Stack layout after flush: [func_ref, arg] at sp-2..sp-1.
+/// Same as call_method but only 1 ref to free (func_ref), no Math_obj.
+fn emitInlineMathUnaryDestrCall(tctx: *ThinCodegenCtx, comptime intrinsic: PendingMethodKind) void {
+    const b = tctx.builder;
+    const rt = tctx.rt;
+    const op_id: i32 = @as(i32, @intCast(@intFromEnum(intrinsic))) - @as(i32, @intCast(@intFromEnum(PendingMethodKind.math_abs)));
+
+    vstackFlush(tctx);
+
+    const sp_val = tctx.loadSp();
+    const arg_idx = tctx.spSub(sp_val, 1, "arg_idx");
+    const arg_slot = tctx.stackSlot(arg_idx);
+    const arg_cv = tctx.loadCv(arg_slot, "darg");
+
+    const tag = tctx.getCvTag(arg_cv);
+    const is_float = b.buildICmp(c.LLVMIntEQ, tag, llvm.constInt64(8), "isflt");
+    const is_int = b.buildICmp(c.LLVMIntEQ, tag, llvm.constInt64(0), "isint");
+    const is_numeric = b.buildOr(is_float, is_int, "isnum");
+
+    const current_fn = c.LLVMGetBasicBlockParent(c.LLVMGetInsertBlock(b.ref));
+    const fast_bb = llvm.appendBasicBlock(current_fn, "du_fast");
+    const slow_bb = llvm.appendBasicBlock(current_fn, "du_slow");
+    const merge_bb = llvm.appendBasicBlock(current_fn, "du_merge");
+    _ = b.buildCondBr(is_numeric, fast_bb, slow_bb);
+
+    b.positionAtEnd(fast_bb);
+    const u_field = tctx.getCvUnion(arg_cv);
+    const f64_from_bits = b.buildBitCast(u_field, llvm.doubleType(), "fbits");
+    const i32_val = b.buildTrunc(u_field, llvm.i32Type(), "ival");
+    const f64_from_int = b.buildSIToFP(i32_val, llvm.doubleType(), "fint");
+    const f64_arg = b.buildSelect(is_float, f64_from_bits, f64_from_int, "f64a");
+
+    const f64_result = emitMathLlvmIntrinsic(b, tctx.module, intrinsic, f64_arg);
+    const result_bits = b.buildBitCast(f64_result, llvm.i64Type(), "rbits");
+    const result_cv = tctx.makeFloatCv(result_bits);
+
+    // Free func_ref (sp-2)
+    const func_idx = tctx.spSub(sp_val, 2, "fn_idx");
+    const func_slot = tctx.stackSlot(func_idx);
+    const func_cv = tctx.loadCv(func_slot, "fnv");
+    inlineFreeRef(tctx, func_cv);
+
+    // Write result to stack[sp-2], sp = sp-1
+    _ = b.buildStore(result_cv, func_slot);
+    const new_sp = tctx.spSub(sp_val, 1, "nsp");
+    tctx.storeSp(new_sp);
+    _ = b.buildBr(merge_bb);
+
+    b.positionAtEnd(slow_bb);
+    const math_sig = llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false);
+    const err_code = b.buildCall(math_sig, rt.call_destr_math_unary, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, llvm.constInt32(@intCast(op_id)) }, "err");
+    emitErrorCheck(tctx, err_code);
+    _ = b.buildBr(merge_bb);
+
+    b.positionAtEnd(merge_bb);
+}
+
+/// Emit inline LLVM IR for destructured Math binary via call(2).
+/// Stack layout after flush: [func_ref, arg0, arg1] at sp-3..sp-1.
+fn emitInlineMathBinaryDestrCall(tctx: *ThinCodegenCtx, comptime intrinsic: PendingMethodKind) void {
+    const b = tctx.builder;
+    const rt = tctx.rt;
+    const op_id: i32 = @as(i32, @intCast(@intFromEnum(intrinsic))) - @as(i32, @intCast(@intFromEnum(PendingMethodKind.math_pow)));
+
+    vstackFlush(tctx);
+
+    const sp_val = tctx.loadSp();
+    const arg1_idx = tctx.spSub(sp_val, 1, "a1_idx");
+    const arg1_slot = tctx.stackSlot(arg1_idx);
+    const arg1_cv = tctx.loadCv(arg1_slot, "a1cv");
+    const arg0_idx = tctx.spSub(sp_val, 2, "a0_idx");
+    const arg0_slot = tctx.stackSlot(arg0_idx);
+    const arg0_cv = tctx.loadCv(arg0_slot, "a0cv");
+
+    const tag0 = tctx.getCvTag(arg0_cv);
+    const tag1 = tctx.getCvTag(arg1_cv);
+    const is_float0 = b.buildICmp(c.LLVMIntEQ, tag0, llvm.constInt64(8), "isf0");
+    const is_int0 = b.buildICmp(c.LLVMIntEQ, tag0, llvm.constInt64(0), "isi0");
+    const is_num0 = b.buildOr(is_float0, is_int0, "isn0");
+    const is_float1 = b.buildICmp(c.LLVMIntEQ, tag1, llvm.constInt64(8), "isf1");
+    const is_int1 = b.buildICmp(c.LLVMIntEQ, tag1, llvm.constInt64(0), "isi1");
+    const is_num1 = b.buildOr(is_float1, is_int1, "isn1");
+    const both_num = b.buildAnd(is_num0, is_num1, "bnum");
+
+    const current_fn = c.LLVMGetBasicBlockParent(c.LLVMGetInsertBlock(b.ref));
+    const fast_bb = llvm.appendBasicBlock(current_fn, "db_fast");
+    const slow_bb = llvm.appendBasicBlock(current_fn, "db_slow");
+    const merge_bb = llvm.appendBasicBlock(current_fn, "db_merge");
+    _ = b.buildCondBr(both_num, fast_bb, slow_bb);
+
+    b.positionAtEnd(fast_bb);
+    const cv_u0 = tctx.getCvUnion(arg0_cv);
+    const f64_bits0 = b.buildBitCast(cv_u0, llvm.doubleType(), "fb0");
+    const i32_val0 = b.buildTrunc(cv_u0, llvm.i32Type(), "iv0");
+    const f64_int0 = b.buildSIToFP(i32_val0, llvm.doubleType(), "fi0");
+    const f64_a0 = b.buildSelect(is_float0, f64_bits0, f64_int0, "fa0");
+
+    const cv_u1 = tctx.getCvUnion(arg1_cv);
+    const f64_bits1 = b.buildBitCast(cv_u1, llvm.doubleType(), "fb1");
+    const i32_val1 = b.buildTrunc(cv_u1, llvm.i32Type(), "iv1");
+    const f64_int1 = b.buildSIToFP(i32_val1, llvm.doubleType(), "fi1");
+    const f64_a1 = b.buildSelect(is_float1, f64_bits1, f64_int1, "fa1");
+
+    const f64_result = emitMathLlvmBinaryIntrinsic(b, tctx.module, intrinsic, f64_a0, f64_a1);
+    const result_bits = b.buildBitCast(f64_result, llvm.i64Type(), "rbits");
+    const result_cv = tctx.makeFloatCv(result_bits);
+
+    // Free func_ref (sp-3)
+    const func_idx = tctx.spSub(sp_val, 3, "fn_idx");
+    const func_slot = tctx.stackSlot(func_idx);
+    const func_cv = tctx.loadCv(func_slot, "fnv");
+    inlineFreeRef(tctx, func_cv);
+
+    // Write result to stack[sp-3], sp = sp-2
+    _ = b.buildStore(result_cv, func_slot);
+    const new_sp = tctx.spSub(sp_val, 2, "nsp");
+    tctx.storeSp(new_sp);
+    _ = b.buildBr(merge_bb);
+
+    b.positionAtEnd(slow_bb);
+    const math_sig = llvm.functionType(llvm.i32Type(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false);
+    const err_code = b.buildCall(math_sig, rt.call_destr_math_binary, &.{ tctx.ctx_param, tctx.stack_ptr, tctx.sp_ptr, llvm.constInt32(@intCast(op_id)) }, "err");
     emitErrorCheck(tctx, err_code);
     _ = b.buildBr(merge_bb);
 

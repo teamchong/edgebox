@@ -386,37 +386,44 @@ pub fn buildCFG(allocator: Allocator, instructions: []const Instruction) !CFG {
     for (cfg.blocks.items) |*block| {
         const last = block.lastInstruction() orelse continue;
 
-        // Add jump edge
-        if (last.getJumpTarget()) |target| {
-            var target_block_opt = cfg.pc_to_block.get(target);
+        // Add jump edge (skip catch — its target is reached via exception dispatch, not normal flow)
+        if (last.opcode != .@"catch") {
+            if (last.getJumpTarget()) |target| {
+                var target_block_opt = cfg.pc_to_block.get(target);
 
-            // If exact PC not found, find containing block (for jumps into middle of blocks)
-            if (target_block_opt == null) {
-                for (cfg.blocks.items) |*blk| {
-                    if (target >= blk.start_pc and target < blk.end_pc) {
-                        target_block_opt = blk.id;
-                        if (CFG_DEBUG) std.debug.print("[cfg-debug] Block {d}: jump to PC {d} found in block {d} (PC {d}-{d})\n", .{ block.id, target, blk.id, blk.start_pc, blk.end_pc });
-                        break;
+                // If exact PC not found, find containing block (for jumps into middle of blocks)
+                if (target_block_opt == null) {
+                    for (cfg.blocks.items) |*blk| {
+                        if (target >= blk.start_pc and target < blk.end_pc) {
+                            target_block_opt = blk.id;
+                            if (CFG_DEBUG) std.debug.print("[cfg-debug] Block {d}: jump to PC {d} found in block {d} (PC {d}-{d})\n", .{ block.id, target, blk.id, blk.start_pc, blk.end_pc });
+                            break;
+                        }
                     }
                 }
-            }
 
-            if (target_block_opt) |target_block| {
-                // Bounds check before array access to prevent OOB
-                if (target_block < cfg.blocks.items.len) {
-                    try block.successors.append(allocator, target_block);
-                    try cfg.blocks.items[target_block].predecessors.append(allocator, block.id);
+                if (target_block_opt) |target_block| {
+                    // Bounds check before array access to prevent OOB
+                    if (target_block < cfg.blocks.items.len) {
+                        try block.successors.append(allocator, target_block);
+                        try cfg.blocks.items[target_block].predecessors.append(allocator, block.id);
+                    }
+                } else {
+                    if (CFG_DEBUG) std.debug.print("[cfg-debug] Block {d} ({s} at PC {d}): jump target PC {d} not found in any block!\n", .{ block.id, @tagName(last.opcode), last.pc, target });
                 }
-            } else {
-                if (CFG_DEBUG) std.debug.print("[cfg-debug] Block {d} ({s} at PC {d}): jump target PC {d} not found in any block!\n", .{ block.id, @tagName(last.opcode), last.pc, target });
+            } else if (last.opcode == .if_false or last.opcode == .if_false8) {
+                if (CFG_DEBUG) std.debug.print("[cfg-debug] Block {d} ({s}): getJumpTarget returned null!\n", .{ block.id, @tagName(last.opcode) });
             }
-        } else if (last.opcode == .if_false or last.opcode == .if_false8) {
-            if (CFG_DEBUG) std.debug.print("[cfg-debug] Block {d} ({s}): getJumpTarget returned null!\n", .{ block.id, @tagName(last.opcode) });
         }
 
         // Add fall-through edge (if not an unconditional jump or terminator)
         const has_fallthrough = switch (last.opcode) {
-            .goto, .goto8, .goto16, .@"return", .return_undef, .return_async, .throw, .tail_call, .tail_call_method => false,
+            .goto, .goto8, .goto16, .@"return", .return_undef, .return_async, .throw, .tail_call, .tail_call_method,
+            // gosub jumps unconditionally to finally block (return addr pushed on stack)
+            .gosub,
+            // ret pops return addr and jumps to computed target
+            .ret,
+            => false,
             else => true,
         };
 

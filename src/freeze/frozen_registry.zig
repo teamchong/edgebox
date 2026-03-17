@@ -503,8 +503,6 @@ fn hasKillerOpcodes(instructions: []const bytecode_parser.Instruction, is_self_r
             .eval, .with_get_var, .with_put_var, .with_delete_var,
             // Generators (yield not supported, but await IS supported via trampoline)
             .initial_yield, .yield, .yield_star,
-            // Exception handling (requires bytecode PC which frozen code doesn't have)
-            .@"catch", .nip_catch, .gosub, .ret,
             // Variable references (requires get_var_ref which needs JSStackFrame)
             .make_loc_ref, .make_arg_ref, .make_var_ref_ref, .make_var_ref,
             // put_ref_value is dependent on make_*_ref (pushes 2 values)
@@ -2054,6 +2052,82 @@ pub const MathIntrinsic = enum {
     }
 };
 
+/// Match a closure variable name to a known Math intrinsic.
+/// Used for destructured patterns like `const {sqrt, pow} = Math`.
+pub fn matchMathName(name: []const u8) ?MathIntrinsic {
+    if (std.mem.eql(u8, name, "abs")) return .abs;
+    if (std.mem.eql(u8, name, "sqrt")) return .sqrt;
+    if (std.mem.eql(u8, name, "floor")) return .floor;
+    if (std.mem.eql(u8, name, "ceil")) return .ceil;
+    if (std.mem.eql(u8, name, "round")) return .round;
+    if (std.mem.eql(u8, name, "trunc")) return .trunc;
+    if (std.mem.eql(u8, name, "min")) return .min;
+    if (std.mem.eql(u8, name, "max")) return .max;
+    if (std.mem.eql(u8, name, "pow")) return .pow;
+    return null;
+}
+
+/// Detect a destructured Math call at instruction index `i`.
+/// Pattern: get_var_ref{N} where closure_vars[N].name is a known Math method,
+/// followed (after argument pushes) by call1/call2/call3/call.
+/// This handles `const {sqrt, pow, floor} = Math; function f(x) { return sqrt(x); }`
+/// Returns the intrinsic enum or null if not a destructured Math call.
+pub fn detectDestructuredMathRef(func: AnalyzedFunction, instructions: []const bytecode_parser.Instruction, i: usize) ?MathIntrinsic {
+    if (i >= instructions.len) return null;
+    const instr = instructions[i];
+
+    // Must be a get_var_ref opcode
+    const var_ref_idx: u32 = switch (instr.opcode) {
+        .get_var_ref0 => 0,
+        .get_var_ref1 => 1,
+        .get_var_ref2 => 2,
+        .get_var_ref3 => 3,
+        .get_var_ref => switch (instr.operand) {
+            .u16 => |v| v,
+            else => return null,
+        },
+        else => return null,
+    };
+
+    // Look up the closure variable name
+    if (var_ref_idx >= func.closure_vars.len) return null;
+    const cv_name = func.closure_vars[var_ref_idx].name;
+
+    return matchMathName(cv_name);
+}
+
+/// Check if instruction at index `i` is call(N) where N matches the expected arity.
+/// Used for destructured Math calls where the call opcode is `call` (not `call_method`).
+fn isDestructuredMathCall(instructions: []const bytecode_parser.Instruction, i: usize, expected_arity: u16) bool {
+    if (i >= instructions.len) return false;
+    const instr = instructions[i];
+    const argc: u16 = switch (instr.opcode) {
+        .call1 => 1,
+        .call2 => 2,
+        .call3 => 3,
+        .call => switch (instr.operand) {
+            .u16 => |v| v,
+            else => return false,
+        },
+        .tail_call => switch (instr.operand) {
+            .u16 => |v| v,
+            else => return false,
+        },
+        else => return false,
+    };
+    return argc == expected_arity;
+}
+
+/// Check if instruction at index `i` is any call opcode (call1/call2/call3/call/tail_call).
+/// Used in pre-scan to match destructured Math calls without checking specific arity.
+fn isDestructuredMathCallAny(instructions: []const bytecode_parser.Instruction, i: usize) bool {
+    if (i >= instructions.len) return false;
+    return switch (instructions[i].opcode) {
+        .call1, .call2, .call3, .call, .tail_call => true,
+        else => false,
+    };
+}
+
 /// Detect a Math.* method setup starting at instruction index `i`.
 /// Looks for the 2-opcode sequence: get_var("Math") → get_field2("method")
 /// The actual call_method(1) comes LATER (after argument computation).
@@ -2088,7 +2162,7 @@ pub fn detectMathSetup(func: AnalyzedFunction, instructions: []const bytecode_pa
     if (std.mem.eql(u8, method_name, "trunc")) return .trunc;
     if (std.mem.eql(u8, method_name, "min")) return .min;
     if (std.mem.eql(u8, method_name, "max")) return .max;
-    // pow needs exp/log polyfill — not yet supported in standalone WASM
+    if (std.mem.eql(u8, method_name, "pow")) return .pow;
     return null;
 }
 
@@ -2117,8 +2191,8 @@ pub fn isMathCallMethod1(instructions: []const bytecode_parser.Instruction, i: u
 /// and compiles them to WASM f64 intrinsics.
 pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
     const debug = std.posix.getenv("EDGEBOX_WASM_DEBUG") != null;
-    // Same preconditions as isPureInt32Function
-    if (func.arg_count < 1 or func.arg_count > 8) {
+    // Same preconditions as isPureInt32Function (but higher arg limit for WASM)
+    if (func.arg_count < 1 or func.arg_count > 24) {
         if (debug) std.debug.print("[wasm-reject] {s}: arg_count={d}\n", .{ func.name, func.arg_count });
         return null;
     }
@@ -2128,13 +2202,15 @@ pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
     }
 
     // Pre-scan for Math.* intrinsic patterns.
-    // Pattern: get_var("Math") → get_field2("method") → [arg computation] → call_method(1)
-    // The get_var + get_field2 are adjacent, but call_method comes after argument pushes.
+    // Pattern 1: get_var("Math") → get_field2("method") → [arg computation] → call_method(N)
+    // Pattern 2: get_var_ref{N} (destructured Math) → [arg computation] → call{N}
     var has_math_intrinsics = false;
     {
         var pending_math_depth: u32 = 0;
+        var pending_destr_math: u32 = 0; // pending destructured Math calls
         var mi: usize = 0;
         while (mi < func.instructions.len) : (mi += 1) {
+            // Pattern 1: get_var("Math") + get_field2("method")
             if (detectMathSetup(func, func.instructions, mi)) |_| {
                 pending_math_depth += 1;
                 mi += 1; // skip the get_field2
@@ -2143,6 +2219,18 @@ pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
             if (pending_math_depth > 0 and isMathCallMethod1(func.instructions, mi)) {
                 has_math_intrinsics = true;
                 pending_math_depth -= 1;
+                continue;
+            }
+            // Pattern 2: get_var_ref{N} where closure_vars[N] is a Math builtin
+            if (detectDestructuredMathRef(func, func.instructions, mi)) |intrinsic| {
+                pending_destr_math += 1;
+                _ = intrinsic;
+                continue;
+            }
+            // Match the call opcode that completes a destructured Math call
+            if (pending_destr_math > 0 and isDestructuredMathCallAny(func.instructions, mi)) {
+                has_math_intrinsics = true;
+                pending_destr_math -= 1;
             }
         }
     }
@@ -2168,17 +2256,35 @@ pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
 
     // For non-recursive functions, reject recursive-only patterns
     // (self_ref + call_self without the function being self-recursive)
+    // Exception: get_var_ref{N} that refers to a destructured Math builtin is allowed
     if (!func.is_self_recursive) {
-        for (func.instructions) |instr| {
-            const handler = numeric_handlers.getHandler(instr.opcode);
+        var pending_destr: u32 = 0;
+        var si: usize = 0;
+        while (si < func.instructions.len) {
+            // Skip destructured Math ref + its call
+            if (detectDestructuredMathRef(func, func.instructions, si)) |_| {
+                pending_destr += 1;
+                si += 1;
+                continue;
+            }
+            if (pending_destr > 0 and isDestructuredMathCallAny(func.instructions, si)) {
+                pending_destr -= 1;
+                si += 1;
+                continue;
+            }
+            const handler = numeric_handlers.getHandler(func.instructions[si].opcode);
             if (handler.pattern == .self_ref or handler.pattern == .call_self or handler.pattern == .tail_call_self) {
-                if (debug) std.debug.print("[wasm-reject] {s}: non-recursive with call pattern '{s}'\n", .{ func.name, @tagName(instr.opcode) });
+                if (debug) std.debug.print("[wasm-reject] {s}: non-recursive with call pattern '{s}'\n", .{ func.name, @tagName(func.instructions[si].opcode) });
                 return null;
             }
+            si += 1;
         }
     }
 
-    // Validate all cpool references are numeric (int32 or float64)
+    // Validate all cpool references are numeric (int32 or float64).
+    // If any constant is float64, upgrade to f64 tier — the function
+    // operates on float data (e.g. `var x = 1.5`, `var scale = 0.001`).
+    var has_float_const = false;
     for (func.instructions) |instr| {
         if (instr.opcode == .push_const8 or instr.opcode == .push_const) {
             const idx: u32 = switch (instr.operand) {
@@ -2187,24 +2293,27 @@ pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
             };
             if (idx >= func.constants.len) return null;
             switch (func.constants[idx]) {
-                .int32, .float64 => {},
+                .int32 => {},
+                .float64 => has_float_const = true,
                 else => return null, // string/object/complex — can't compile to numeric WASM
             }
         }
     }
 
-    return kind;
+    return if (has_float_const) .f64 else kind;
 }
 
 /// Analyze a function that contains Math.* intrinsic patterns.
-/// Skips Math.* setup sequences (get_var("Math") + get_field2("method"))
-/// and their matching call_method(1), checking all remaining opcodes
-/// with the standard numeric handler.
+/// Skips Math.* setup sequences:
+///   Pattern 1: get_var("Math") + get_field2("method") ... call_method(N)
+///   Pattern 2: get_var_ref{N} (destructured Math) ... call{N}
+/// Checks all remaining opcodes with the standard numeric handler.
 /// Math intrinsics always force f64 tier (they operate on doubles).
 fn analyzeFunctionWithMath(func: AnalyzedFunction, debug: bool) ?numeric_handlers.ValueKind {
     var has_computing_op = false;
     var has_i32_only = false;
     var pending_math_depth: u32 = 0; // Nesting depth for Math.floor(Math.abs(x)) patterns
+    var pending_destr_math: u32 = 0; // Pending destructured Math calls
     var i: usize = 0;
     while (i < func.instructions.len) {
         // Skip Math.* setup (2 opcodes: get_var("Math") + get_field2("method"))
@@ -2215,9 +2324,24 @@ fn analyzeFunctionWithMath(func: AnalyzedFunction, debug: bool) ?numeric_handler
             continue;
         }
 
-        // Skip the call_method(1) or tail_call_method(1) that completes a pending Math intrinsic
+        // Skip the call_method(N) that completes a pending standard Math intrinsic
         if (pending_math_depth > 0 and isMathCallMethod1(func.instructions, i)) {
             pending_math_depth -= 1;
+            i += 1;
+            continue;
+        }
+
+        // Skip destructured Math ref (1 opcode: get_var_ref{N} for known Math builtin)
+        if (detectDestructuredMathRef(func, func.instructions, i)) |_| {
+            has_computing_op = true;
+            pending_destr_math += 1;
+            i += 1; // skip the get_var_ref
+            continue;
+        }
+
+        // Skip the call{N} that completes a pending destructured Math call
+        if (pending_destr_math > 0 and isDestructuredMathCallAny(func.instructions, i)) {
+            pending_destr_math -= 1;
             i += 1;
             continue;
         }
@@ -2248,9 +2372,10 @@ fn analyzeFunctionWithMath(func: AnalyzedFunction, debug: bool) ?numeric_handler
     // part of Math.* patterns (not standalone function references)
     if (!func.is_self_recursive) {
         var pending_math_depth2: u32 = 0;
+        var pending_destr_math2: u32 = 0;
         var si: usize = 0;
         while (si < func.instructions.len) {
-            // Skip Math.* setup (get_var("Math") is self_ref but not a function call)
+            // Skip standard Math.* setup (get_var("Math") is self_ref but not a function call)
             if (detectMathSetup(func, func.instructions, si)) |_| {
                 pending_math_depth2 += 1;
                 si += 2;
@@ -2261,8 +2386,21 @@ fn analyzeFunctionWithMath(func: AnalyzedFunction, debug: bool) ?numeric_handler
                 si += 1;
                 continue;
             }
+            // Skip destructured Math ref (get_var_ref{N} is self_ref but is a Math builtin)
+            if (detectDestructuredMathRef(func, func.instructions, si)) |_| {
+                pending_destr_math2 += 1;
+                si += 1;
+                continue;
+            }
+            // Skip the call that completes a pending destructured Math call
+            if (pending_destr_math2 > 0 and isDestructuredMathCallAny(func.instructions, si)) {
+                pending_destr_math2 -= 1;
+                si += 1;
+                continue;
+            }
             const handler = numeric_handlers.getHandler(func.instructions[si].opcode);
             if (handler.pattern == .self_ref or handler.pattern == .call_self or handler.pattern == .tail_call_self) {
+                if (debug) std.debug.print("[wasm-reject] {s}: non-Math self_ref '{s}' in non-recursive function\n", .{ func.name, @tagName(func.instructions[si].opcode) });
                 return null; // Non-Math self_ref in non-recursive function
             }
             si += 1;
@@ -2312,7 +2450,7 @@ pub fn analyzeNumericTierWithCrossCall(
     func: AnalyzedFunction,
     wasm_func_names: []const []const u8,
 ) ?numeric_handlers.ValueKind {
-    if (func.arg_count < 1 or func.arg_count > 8) return null;
+    if (func.arg_count < 1 or func.arg_count > 24) return null;
     if (func.var_count > 48) return null;
 
     const kind = numeric_handlers.analyzeFunction(func.instructions) orelse return null;

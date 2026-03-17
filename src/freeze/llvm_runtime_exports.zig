@@ -462,6 +462,7 @@ export fn llvm_rt_call_method_math_unary(
                     // JS Math.round: round half towards +Infinity (not banker's rounding)
                     break :blk @floor(f + 0.5);
                 },
+                5 => @trunc(f),
                 else => unreachable,
             };
             // No freeRef needed for int/float args (they're not ref-counted)
@@ -478,6 +479,159 @@ export fn llvm_rt_call_method_math_unary(
 
     // Slow path: normal call_method(1)
     thin.op_call_method(ctx, stack, sp, 1, null, null, 0, null, &.{}) catch return 1;
+    return 0;
+}
+
+/// Math.pow/min/max fast path (binary: 2 args).
+/// Stack layout: [Math obj, method fn, arg0, arg1] → [result]
+/// op: 0=pow, 1=min, 2=max
+/// Falls back to normal call_method(2) for non-numeric args.
+/// Returns 0 on success, non-zero on exception.
+export fn llvm_rt_call_method_math_binary(
+    ctx: *JSContext,
+    stack: [*]CV,
+    sp: *usize,
+    op: i32,
+) callconv(.c) c_int {
+    const s = sp.*;
+    if (s >= 4) {
+        const arg0_cv = stack[s - 2];
+        const arg1_cv = stack[s - 1];
+        // Fast path: both args are int or float → extract f64, apply math op
+        var f0: f64 = undefined;
+        var f1: f64 = undefined;
+        var both_numeric = false;
+        if (arg0_cv.isFloat()) {
+            f0 = arg0_cv.getFloat();
+        } else if (arg0_cv.isInt()) {
+            f0 = @floatFromInt(arg0_cv.getInt());
+        } else {
+            // Slow path
+            thin.op_call_method(ctx, stack, sp, 2, null, null, 0, null, &.{}) catch return 1;
+            return 0;
+        }
+        if (arg1_cv.isFloat()) {
+            f1 = arg1_cv.getFloat();
+            both_numeric = true;
+        } else if (arg1_cv.isInt()) {
+            f1 = @floatFromInt(arg1_cv.getInt());
+            both_numeric = true;
+        }
+        if (both_numeric) {
+            const result: f64 = switch (op) {
+                0 => std.math.pow(f64, f0, f1),
+                1 => @min(f0, f1),
+                2 => @max(f0, f1),
+                else => unreachable,
+            };
+            CV.freeRef(ctx, stack[s - 1]); // arg1 (no-op for int/float)
+            CV.freeRef(ctx, stack[s - 2]); // arg0 (no-op for int/float)
+            CV.freeRef(ctx, stack[s - 3]); // method function
+            CV.freeRef(ctx, stack[s - 4]); // Math object
+            sp.* = s - 4;
+            stack[sp.*] = @bitCast(CV.newFloat(result));
+            sp.* += 1;
+            return 0;
+        }
+    }
+
+    // Slow path: normal call_method(2)
+    thin.op_call_method(ctx, stack, sp, 2, null, null, 0, null, &.{}) catch return 1;
+    return 0;
+}
+
+/// Destructured Math unary fast path: sqrt(x), floor(x), etc. via `call(1)`.
+/// Stack layout: [func_ref, arg] → [result] (2 entries, not 3 like call_method)
+/// op: 0=abs, 1=sqrt, 2=floor, 3=ceil, 4=round, 5=trunc
+/// Falls back to normal call(1) for non-numeric args.
+export fn llvm_rt_call_destr_math_unary(
+    ctx: *JSContext,
+    stack: [*]CV,
+    sp: *usize,
+    op: i32,
+) callconv(.c) c_int {
+    const s = sp.*;
+    if (s >= 2) {
+        const arg_cv = stack[s - 1];
+        var f: f64 = undefined;
+        var is_numeric = false;
+        if (arg_cv.isFloat()) {
+            f = arg_cv.getFloat();
+            is_numeric = true;
+        } else if (arg_cv.isInt()) {
+            f = @floatFromInt(arg_cv.getInt());
+            is_numeric = true;
+        }
+        if (is_numeric) {
+            const result: f64 = switch (op) {
+                0 => @abs(f),
+                1 => @sqrt(f),
+                2 => @floor(f),
+                3 => @ceil(f),
+                4 => @floor(f + 0.5),
+                5 => @trunc(f),
+                else => unreachable,
+            };
+            CV.freeRef(ctx, stack[s - 1]); // arg (no-op for int/float)
+            CV.freeRef(ctx, stack[s - 2]); // func ref
+            sp.* = s - 2;
+            stack[sp.*] = @bitCast(CV.newFloat(result));
+            sp.* += 1;
+            return 0;
+        }
+    }
+    // Slow path: normal call(1)
+    thin.op_call(ctx, stack, sp, 1, null, null, 0, null, &.{}) catch return 1;
+    return 0;
+}
+
+/// Destructured Math binary fast path: pow(a,b), min(a,b), max(a,b) via `call(2)`.
+/// Stack layout: [func_ref, arg0, arg1] → [result] (3 entries, not 4 like call_method)
+/// op: 0=pow, 1=min, 2=max
+/// Falls back to normal call(2) for non-numeric args.
+export fn llvm_rt_call_destr_math_binary(
+    ctx: *JSContext,
+    stack: [*]CV,
+    sp: *usize,
+    op: i32,
+) callconv(.c) c_int {
+    const s = sp.*;
+    if (s >= 3) {
+        const arg0_cv = stack[s - 2];
+        const arg1_cv = stack[s - 1];
+        var f0: f64 = undefined;
+        var f1: f64 = undefined;
+        if (arg0_cv.isFloat()) {
+            f0 = arg0_cv.getFloat();
+        } else if (arg0_cv.isInt()) {
+            f0 = @floatFromInt(arg0_cv.getInt());
+        } else {
+            thin.op_call(ctx, stack, sp, 2, null, null, 0, null, &.{}) catch return 1;
+            return 0;
+        }
+        if (arg1_cv.isFloat()) {
+            f1 = arg1_cv.getFloat();
+        } else if (arg1_cv.isInt()) {
+            f1 = @floatFromInt(arg1_cv.getInt());
+        } else {
+            thin.op_call(ctx, stack, sp, 2, null, null, 0, null, &.{}) catch return 1;
+            return 0;
+        }
+        const result: f64 = switch (op) {
+            0 => std.math.pow(f64, f0, f1),
+            1 => @min(f0, f1),
+            2 => @max(f0, f1),
+            else => unreachable,
+        };
+        CV.freeRef(ctx, stack[s - 1]); // arg1
+        CV.freeRef(ctx, stack[s - 2]); // arg0
+        CV.freeRef(ctx, stack[s - 3]); // func ref
+        sp.* = s - 3;
+        stack[sp.*] = @bitCast(CV.newFloat(result));
+        sp.* += 1;
+        return 0;
+    }
+    thin.op_call(ctx, stack, sp, 2, null, null, 0, null, &.{}) catch return 1;
     return 0;
 }
 
@@ -1747,10 +1901,204 @@ export fn llvm_rt_sync_locals_from(locals: [*]CV, locals_jsv: [*]JSValue, local_
     }
 }
 
+/// define_class opcode: creates class constructor+prototype from cpool bytecode.
+/// Stack: [... parent_class bfunc] → [... ctor proto]
+/// Like fclosure_v2, syncs CV locals ↔ JSValue for closure var_ref creation.
+export fn llvm_rt_define_class(
+    ctx: *JSContext,
+    stack: [*]CV,
+    sp: *usize,
+    _: ?[*]JSValue, // cpool (unused — bfunc comes from stack)
+    class_flags: c_int,
+    class_name: [*:0]const u8,
+    var_refs: ?[*]*JSVarRef,
+    locals: [*]CV,
+    local_count: u32,
+    argv: ?[*]JSValue,
+    argc: c_int,
+    locals_jsv: [*]JSValue,
+    var_ref_list: *ListHead,
+    arg_shadow: ?[*]CV,
+    arg_count: u32,
+) callconv(.c) c_int {
+    const quickjs = zig_runtime.quickjs;
+    const lc: usize = @intCast(local_count);
+
+    // Sync CV locals → JSValue so closure sees current values
+    for (0..lc) |i| {
+        locals_jsv[i] = CV.toJSValuePtr(&locals[i]);
+    }
+
+    // Convert arg_shadow to JSValues for is_arg closure captures
+    const ac: usize = @intCast(arg_count);
+    var args_jsv_buf: [256]JSValue = undefined;
+    const args_ptr: ?[*]JSValue = if (arg_shadow) |shadow| blk: {
+        for (0..ac) |i| {
+            args_jsv_buf[i] = CV.toJSValuePtr(&shadow[i]);
+        }
+        break :blk @ptrCast(&args_jsv_buf);
+    } else if (argv != null and argc > 0) argv else null;
+    const args_count: c_int = if (arg_shadow != null) @intCast(arg_count) else argc;
+
+    // Stack: sp-2 = parent_class, sp-1 = bfunc (constructor bytecode from cpool)
+    const bfunc = CV.toJSValue(stack[sp.* - 1]);
+    const parent_class = CV.toJSValue(stack[sp.* - 2]);
+
+    // Resolve class name atom at runtime
+    const atom = quickjs.JS_NewAtom(ctx, class_name);
+
+    var out_ctor: JSValue = JSValue.UNDEFINED;
+    var out_proto: JSValue = JSValue.UNDEFINED;
+    const ret = quickjs.js_frozen_define_class(
+        ctx,
+        bfunc,
+        parent_class,
+        class_flags,
+        atom,
+        var_refs,
+        var_ref_list,
+        @ptrCast(locals_jsv),
+        @intCast(lc),
+        args_ptr,
+        args_count,
+        &out_ctor,
+        &out_proto,
+    );
+
+    quickjs.JS_FreeAtom(ctx, atom);
+
+    if (ret < 0) return 1;
+
+    // Sync back: closure creation may have modified locals_jsv
+    for (0..lc) |i| {
+        locals[i] = CV.fromJSValue(locals_jsv[i]);
+    }
+
+    // Free old stack values (parent_class and bfunc)
+    CV.freeRef(ctx, stack[sp.* - 2]);
+    CV.freeRef(ctx, stack[sp.* - 1]);
+
+    // Replace stack: [parent_class bfunc] → [ctor proto]
+    stack[sp.* - 2] = CV.fromJSValue(out_ctor);
+    stack[sp.* - 1] = CV.fromJSValue(out_proto);
+    return 0;
+}
+
+/// define_class_computed: like define_class but stack has field_name too.
+/// Stack: [... field_name parent_class bfunc] → [... field_name ctor proto]
+export fn llvm_rt_define_class_computed(
+    ctx: *JSContext,
+    stack: [*]CV,
+    sp: *usize,
+    _: ?[*]JSValue, // cpool (unused — bfunc comes from stack)
+    class_flags: c_int,
+    var_refs: ?[*]*JSVarRef,
+    locals: [*]CV,
+    local_count: u32,
+    argv: ?[*]JSValue,
+    argc: c_int,
+    locals_jsv: [*]JSValue,
+    var_ref_list: *ListHead,
+    arg_shadow: ?[*]CV,
+    arg_count: u32,
+) callconv(.c) c_int {
+    const quickjs = zig_runtime.quickjs;
+    const lc: usize = @intCast(local_count);
+
+    // Sync CV locals → JSValue
+    for (0..lc) |i| {
+        locals_jsv[i] = CV.toJSValuePtr(&locals[i]);
+    }
+
+    const ac: usize = @intCast(arg_count);
+    var args_jsv_buf: [256]JSValue = undefined;
+    const args_ptr: ?[*]JSValue = if (arg_shadow) |shadow| blk: {
+        for (0..ac) |i| {
+            args_jsv_buf[i] = CV.toJSValuePtr(&shadow[i]);
+        }
+        break :blk @ptrCast(&args_jsv_buf);
+    } else if (argv != null and argc > 0) argv else null;
+    const args_count: c_int = if (arg_shadow != null) @intCast(arg_count) else argc;
+
+    // Stack: sp-3 = field_name, sp-2 = parent_class, sp-1 = bfunc
+    const bfunc = CV.toJSValue(stack[sp.* - 1]);
+    const parent_class = CV.toJSValue(stack[sp.* - 2]);
+    const field_name_cv = stack[sp.* - 3];
+    const field_name_jsv = CV.toJSValue(field_name_cv);
+
+    // Use computed name: convert field_name JSValue to atom for class name
+    const atom = quickjs.JS_ValueToAtom(ctx, field_name_jsv);
+    if (atom == 0) return 1; // JS_ATOM_NULL
+
+    var out_ctor: JSValue = JSValue.UNDEFINED;
+    var out_proto: JSValue = JSValue.UNDEFINED;
+    const ret = quickjs.js_frozen_define_class(
+        ctx,
+        bfunc,
+        parent_class,
+        class_flags,
+        atom,
+        var_refs,
+        var_ref_list,
+        @ptrCast(locals_jsv),
+        @intCast(lc),
+        args_ptr,
+        args_count,
+        &out_ctor,
+        &out_proto,
+    );
+
+    quickjs.JS_FreeAtom(ctx, atom);
+
+    if (ret < 0) return 1;
+
+    // Sync back
+    for (0..lc) |i| {
+        locals[i] = CV.fromJSValue(locals_jsv[i]);
+    }
+
+    // Free old parent_class and bfunc (field_name stays)
+    CV.freeRef(ctx, stack[sp.* - 2]);
+    CV.freeRef(ctx, stack[sp.* - 1]);
+
+    // Replace: [field_name parent_class bfunc] → [field_name ctor proto]
+    stack[sp.* - 2] = CV.fromJSValue(out_ctor);
+    stack[sp.* - 1] = CV.fromJSValue(out_proto);
+    return 0;
+}
+
 /// Detach shared var_refs before function return or tail_call.
 export fn llvm_rt_var_ref_list_detach(ctx: *JSContext, var_ref_list: ?*ListHead) callconv(.c) void {
     if (var_ref_list) |vrl| {
         zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, vrl);
     }
+}
+
+// ============================================================================
+// Exception handling: catch / nip_catch / gosub / ret
+// ============================================================================
+
+/// Exception dispatch: walk the physical JSValue stack looking for CATCH_OFFSET.
+/// Called when a runtime call returns JS_EXCEPTION and the function has catch handlers.
+/// Returns the catch handler bytecode offset (>0) or -1 if no handler found.
+/// On native, CV=JSValue so the cast is zero-cost.
+export fn llvm_rt_exception_find_catch(ctx: *JSContext, stack: [*]CV, sp_ptr: *usize) callconv(.c) i32 {
+    // Reinterpret CV stack as JSValue stack (zero-cost on native: CV=JSValue)
+    const jsv_stack: [*]JSValue = @ptrCast(stack);
+    var jsv_sp: [*]JSValue = jsv_stack + sp_ptr.*;
+    const result = zig_runtime.quickjs.js_frozen_exception_find_catch(ctx, jsv_stack, &jsv_sp);
+    // Update sp from the JSValue pointer
+    sp_ptr.* = @divExact(@intFromPtr(jsv_sp) - @intFromPtr(jsv_stack), @sizeOf(JSValue));
+    return result;
+}
+
+/// nip_catch: pop values from stack until CATCH_OFFSET found, replace with top value.
+/// Returns 0 on success, 1 on error.
+export fn llvm_rt_nip_catch(ctx: *JSContext, stack: [*]CV, sp_ptr: *usize) callconv(.c) i32 {
+    const jsv_stack: [*]JSValue = @ptrCast(stack);
+    var jsv_sp: [*]JSValue = jsv_stack + sp_ptr.*;
+    const result = zig_runtime.quickjs.js_frozen_nip_catch(ctx, jsv_stack, &jsv_sp);
+    sp_ptr.* = @divExact(@intFromPtr(jsv_sp) - @intFromPtr(jsv_stack), @sizeOf(JSValue));
+    return result;
 }
 

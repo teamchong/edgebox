@@ -203,5 +203,5 @@ var elapsed = performance.now() - start;
 if (result !== EXPECTED) {
     log("FAIL: gaussian_blur checksum = " + result + ", expected " + EXPECTED);
 } else {
-    log(EXPECTED + " (" + elapsed.toFixed(1) + "ms total, " + (elapsed / RUNS).toFixed(2) + "ms avg)");
+    log("gaussian_blur: " + Math.round(elapsed) + "ms (" + RUNS + " runs, result=" + EXPECTED + ")");
 }
