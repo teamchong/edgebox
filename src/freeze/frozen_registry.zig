@@ -990,26 +990,15 @@ pub fn generateModuleZigShardedWithBackend(
                                         // Propagate array_args from callees to cross-callers
                                         // If this function calls vn(x, xi, y, yi, n), and vn has array_args=0b10001 (x and y),
                                         // then this function's args that map to vn's array args also need copying.
+                                        // Propagate array_args/mutated_args from callees to cross-callers
                                         if (array_args_mask == 0) {
                                             for (sf.func.instructions) |instr| {
-                                                const handler = numeric_handlers.getHandler(instr.opcode);
-                                                if (handler.pattern == .self_ref) {
-                                                    // Resolve callee name (get_var for globals, get_var_ref0 for closures)
-                                                    const callee_name: ?[]const u8 = if (instr.opcode == .get_var or instr.opcode == .get_var_undef) blk: {
-                                                        const atom_val: u32 = switch (instr.operand) { .atom => |a| a, else => break :blk null };
-                                                        break :blk resolveAtomToName(sf.func, atom_val);
-                                                    } else if (instr.opcode == .get_var_ref0) blk: {
-                                                        if (sf.func.closure_vars.len > 0) break :blk sf.func.closure_vars[0].name;
-                                                        break :blk null;
-                                                    } else null;
-                                                    if (callee_name) |cn| {
-                                                        if (array_info_map.get(cn)) |info| {
-                                                            if (info.array_args != 0) {
-                                                                array_args_mask = info.array_args;
-                                                                mutated_args_mask = info.mutated_args;
-                                                            }
-                                                        }
-                                                    }
+                                                if (numeric_handlers.getHandler(instr.opcode).pattern != .self_ref) continue;
+                                                const cn = resolveCalleeName(sf.func, instr) orelse continue;
+                                                const info = array_info_map.get(cn) orelse continue;
+                                                if (info.array_args != 0) {
+                                                    array_args_mask = info.array_args;
+                                                    mutated_args_mask = info.mutated_args;
                                                 }
                                             }
                                         }
@@ -1019,28 +1008,13 @@ pub fn generateModuleZigShardedWithBackend(
                                         const has_loop: u8 = if (numeric_handlers.detectHasLoop(sf.func.instructions)) 1 else 0;
                                         const has_bitwise: u8 = if (numeric_handlers.detectHasBitwise(sf.func.instructions)) 1 else 0;
 
-                                        // Propagate read_array_args from callees (same as array_args propagation)
-                                        if (read_array_args_mask == 0 and array_args_mask != 0) {
-                                            // If array_args were propagated from callee, also propagate read_array_args
-                                            if (array_info_map.get(sf.name)) |_| {} else {
-                                                // Cross-caller: check callee's read_array_args
-                                                for (sf.func.instructions) |instr| {
-                                                    const handler = numeric_handlers.getHandler(instr.opcode);
-                                                    if (handler.pattern == .self_ref) {
-                                                        const callee_name: ?[]const u8 = if (instr.opcode == .get_var or instr.opcode == .get_var_undef) blk: {
-                                                            const atom_val: u32 = switch (instr.operand) { .atom => |a| a, else => break :blk null };
-                                                            break :blk resolveAtomToName(sf.func, atom_val);
-                                                        } else if (instr.opcode == .get_var_ref0) blk: {
-                                                            if (sf.func.closure_vars.len > 0) break :blk sf.func.closure_vars[0].name;
-                                                            break :blk null;
-                                                        } else null;
-                                                        if (callee_name) |cn| {
-                                                            if (array_info_map.get(cn)) |info| {
-                                                                read_array_args_mask = info.array_args; // callee's array_args = read pattern
-                                                            }
-                                                        }
-                                                    }
-                                                }
+                                        // Propagate read_array_args from callees (cross-callers only)
+                                        if (read_array_args_mask == 0 and array_args_mask != 0 and array_info_map.get(sf.name) == null) {
+                                            for (sf.func.instructions) |instr| {
+                                                if (numeric_handlers.getHandler(instr.opcode).pattern != .self_ref) continue;
+                                                const cn = resolveCalleeName(sf.func, instr) orelse continue;
+                                                const info = array_info_map.get(cn) orelse continue;
+                                                read_array_args_mask = info.array_args;
                                             }
                                         }
 
@@ -1986,6 +1960,17 @@ fn resolveAtomToName(func: AnalyzedFunction, atom_idx: u32) ?[]const u8 {
     return null;
 }
 
+/// Resolve callee name from an instruction (get_var → atom, get_var_ref0 → closure var).
+fn resolveCalleeName(func: AnalyzedFunction, instr: bytecode_parser.Instruction) ?[]const u8 {
+    if (instr.opcode == .get_var or instr.opcode == .get_var_undef) {
+        const atom_val: u32 = switch (instr.operand) { .atom => |a| a, else => return null };
+        return resolveAtomToName(func, atom_val);
+    } else if (instr.opcode == .get_var_ref0) {
+        if (func.closure_vars.len > 0) return func.closure_vars[0].name;
+    }
+    return null;
+}
+
 /// Like analyzeNumericTier, but accepts non-recursive functions that call
 /// other known WASM functions (cross-function calls within the WASM module).
 pub fn analyzeNumericTierWithCrossCall(
@@ -2001,22 +1986,7 @@ pub fn analyzeNumericTierWithCrossCall(
         for (func.instructions) |instr| {
             const handler = numeric_handlers.getHandler(instr.opcode);
             if (handler.pattern == .self_ref) {
-                // Resolve the callee name from the opcode:
-                // - get_var/get_var_undef: atom operand → global variable name
-                // - get_var_ref0: closure_vars[0].name → captured function name
-                const callee_name: ?[]const u8 = if (instr.opcode == .get_var or instr.opcode == .get_var_undef) blk: {
-                    const atom_val: u32 = switch (instr.operand) {
-                        .atom => |a| a,
-                        else => break :blk null,
-                    };
-                    break :blk resolveAtomToName(func, atom_val);
-                } else if (instr.opcode == .get_var_ref0) blk: {
-                    // Closure variable reference — look up name from closure metadata
-                    if (func.closure_vars.len > 0) break :blk func.closure_vars[0].name;
-                    break :blk null;
-                } else null;
-
-                if (callee_name) |cn| {
+                if (resolveCalleeName(func, instr)) |cn| {
                     var found = false;
                     for (wasm_func_names) |wn| {
                         if (std.mem.eql(u8, cn, wn)) {

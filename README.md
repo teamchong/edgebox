@@ -61,24 +61,24 @@ V8 inlines WASM calls into JS — zero boundary overhead
 
 ## Benchmarks
 
-**Overall: 2.58x faster than Node.js** across 39 benchmarks (24 wins, 7 ties, 8 losses).
+**Overall: 2.56x faster than Node.js** across 40 benchmarks (26 wins, 5 ties, 5 losses, 4 at parity).
 
 ### Headline Results (AOT+JIT on Node.js v24)
 
 | Benchmark | AOT+JIT | Node.js | Speedup |
 |-----------|:-------:|:-------:|:-------:|
-| loop (zero-copy) | 8 ms | 70 ms | **8.7x faster** |
 | loop (array sum) | 9 ms | 77 ms | **8.5x faster** |
-| arrayStats 100K | 98 ms | 815 ms | **8.3x faster** |
-| fib(40) | 533 ms | 2,599 ms | **4.8x faster** |
-| ackermann(3,10) | 669 ms | 2,995 ms | **4.4x faster** |
-| fib(45) | 2,150 ms | 9,549 ms | **4.4x faster** |
-| hanoi(25) | 50 ms | 202 ms | **4.0x faster** |
-| adler32 10K | 29 ms | 110 ms | **3.7x faster** |
-| magnitudes 100K | 2,095 ms | 7,268 ms | **3.4x faster** |
-| dotProductNorm 100K | 275 ms | 844 ms | **3.0x faster** |
-| euclideanDist 100K | 280 ms | 823 ms | **2.9x faster** |
-| prefixSum 10K | 118 ms | 256 ms | **2.1x faster** |
+| arrayStats 100K | 100 ms | 814 ms | **8.1x faster** |
+| loop (zero-copy) | 8 ms | 56 ms | **7.0x faster** |
+| hanoi(25) | 47 ms | 204 ms | **4.3x faster** |
+| ackermann(3,10) | 769 ms | 3,181 ms | **4.1x faster** |
+| fib(45) | 2,503 ms | 10,394 ms | **4.1x faster** |
+| fib(40) | 653 ms | 2,614 ms | **4.0x faster** |
+| adler32 10K | 30 ms | 106 ms | **3.5x faster** |
+| magnitudes 100K | 2,181 ms | 7,553 ms | **3.4x faster** |
+| dotProductNorm 100K | 289 ms | 866 ms | **2.9x faster** |
+| euclideanDist 100K | 293 ms | 838 ms | **2.8x faster** |
+| prefixSum 10K | 121 ms | 254 ms | **2.0x faster** |
 
 ### Where It Excels vs Where It Doesn't
 
