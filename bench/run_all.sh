@@ -21,6 +21,7 @@ FILES=(
     bench/pako_kernels.js
     bench/mandelbrot.js
     bench/gaussian_blur.js
+    bench/sorting.js
 )
 
 TOTAL_AOT=0
