@@ -443,6 +443,11 @@ const WasmFunc = struct {
     line_num: u32,
     is_anon: bool,
     is_f64: bool,
+    // Struct arg support: which args are JS objects to be flattened into WASM memory
+    struct_args: u8 = 0,
+    // Field names per struct arg (up to 8 args × 16 fields)
+    struct_field_names: [8][16][]const u8 = [_][16][]const u8{[_][]const u8{""} ** 16} ** 8,
+    struct_field_counts: [8]u8 = [_]u8{0} ** 8,
 };
 
 /// Decide whether a WASM-compiled function should get a trampoline or stay as JS.
@@ -488,6 +493,14 @@ fn shouldTrampolineToWasm(mf: WasmFunc, calls_wasm: bool) bool {
     if (mf.mutated_args == 0 and mf.array_args != 0 and
         mf.length_args == 0 and mf.has_loop and mf.instr_count < 200 and
         array_arg_count >= 2 and scalar_arg_count >= 2) return false;
+
+    // Struct arg functions: object fields are copied to flat WASM memory.
+    // Copy cost is O(field_count) per call — cheap but adds up for small functions
+    // called millions of times from JS loops.
+    // Trampoline when the function does enough work to amortize the copy:
+    //   - has internal loop (work scales with data)
+    //   - ≥50 instructions (enough compute to offset boundary crossing)
+    if (mf.struct_args != 0) return mf.has_loop or mf.instr_count >= 50;
 
     // Small scalar functions (<150 instrs): V8 JIT already optimal
     if (mf.array_args == 0 and mf.instr_count < 150) return false;
@@ -1402,7 +1415,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
 
         // Generate frozen module via LLVM IR backend
         zig_gen: {
-            var sharded = freeze.generateModuleZigShardedWithBackend(allocator, &analysis, "frozen", manifest_content, options.freeze_max_functions, options.freeze_profile_path, cache_dir, options.freeze_code_budget) catch |err| {
+            var sharded = freeze.generateModuleZigShardedWithBackend(allocator, &analysis, options.freeze_max_functions, options.freeze_profile_path, cache_dir, options.freeze_code_budget) catch |err| {
                 std.debug.print("[warn] LLVM codegen failed: {}\n", .{err});
                 break :zig_gen;
             };
@@ -1634,6 +1647,30 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     .is_anon = std.mem.startsWith(u8, name, "__anon_"),
                                     .is_f64 = if (jsonStr(obj, "type")) |t| std.mem.eql(u8, t, "f64") else false,
                                 };
+                                // Parse struct_args and struct_fields from manifest
+                                const sa = jsonInt(obj, "struct_args");
+                                if (sa != 0) {
+                                    wasm_funcs[wasm_func_count].struct_args = @truncate(sa);
+                                    if (obj.get("struct_fields")) |sf_val| {
+                                        if (sf_val == .object) {
+                                            var sf_it = sf_val.object.iterator();
+                                            while (sf_it.next()) |sf_entry| {
+                                                // Key is arg index ("0", "1", ...), value is array of field names
+                                                const arg_idx = std.fmt.parseInt(u8, sf_entry.key_ptr.*, 10) catch continue;
+                                                if (arg_idx >= 8) continue;
+                                                if (sf_entry.value_ptr.* == .array) {
+                                                    for (sf_entry.value_ptr.array.items, 0..) |field_val, fi| {
+                                                        if (fi >= 16) break;
+                                                        if (field_val == .string) {
+                                                            wasm_funcs[wasm_func_count].struct_field_names[arg_idx][fi] = field_val.string;
+                                                            wasm_funcs[wasm_func_count].struct_field_counts[arg_idx] = @intCast(fi + 1);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 wasm_func_count += 1;
                             }
                         }
@@ -1682,6 +1719,11 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             if (wfe.is_f64) has_f64_array_funcs = true else has_i32_array_funcs = true;
                             const ro = wfe.array_args & ~wfe.mutated_args;
                             if (ro != 0) any_cacheable_args = true;
+                        }
+                        // Struct args need __m (i32 view) + stack allocator
+                        if (wfe.struct_args != 0) {
+                            has_array_funcs = true;
+                            has_i32_array_funcs = true;
                         }
                     }
                     if (has_array_funcs) {
@@ -1942,8 +1984,48 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     }
                                 }
 
-                                if (mf.array_args == 0) {
-                                    // No array args — simple scalar trampoline
+                                if (mf.struct_args != 0 and mf.array_args == 0) {
+                                    // Struct args — flatten JS object fields into WASM linear memory
+                                    w.writeAll("\n") catch {};
+                                    w.writeAll("  const __sp0 = __wasmStackSave();\n") catch {};
+                                    // Allocate + write fields for each struct arg
+                                    var si: u32 = 0;
+                                    while (si < param_count) : (si += 1) {
+                                        if (mf.struct_args & (@as(u8, 1) << @intCast(si)) != 0) {
+                                            const fc = mf.struct_field_counts[si];
+                                            if (fc == 0) continue;
+                                            // Allocate: fieldCount * 4 bytes (i32 per field)
+                                            w.print("  const __p{d} = __wasmStackAlloc({d});\n", .{ si, @as(u32, fc) * 4 }) catch {};
+                                            // Write each field: __m[(__pN >> 2) + offset] = param.fieldName
+                                            for (mf.struct_field_names[si][0..fc], 0..) |field_name, fi| {
+                                                if (field_name.len == 0) continue;
+                                                if (fi == 0) {
+                                                    w.print("  __m[__p{d} >> 2] = {s}.{s};\n", .{ si, param_names[si], field_name }) catch {};
+                                                } else {
+                                                    w.print("  __m[(__p{d} >> 2) + {d}] = {s}.{s};\n", .{ si, fi, param_names[si], field_name }) catch {};
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Call WASM: struct args become pointers, scalars pass through
+                                    w.print("  const __r = __wasm.exports.{s}(", .{mf.name}) catch {};
+                                    {
+                                        var first_arg = true;
+                                        si = 0;
+                                        while (si < param_count) : (si += 1) {
+                                            if (!first_arg) w.writeAll(", ") catch {};
+                                            if (mf.struct_args & (@as(u8, 1) << @intCast(si)) != 0) {
+                                                w.print("__p{d}", .{si}) catch {};
+                                            } else {
+                                                w.writeAll(param_names[si]) catch {};
+                                            }
+                                            first_arg = false;
+                                        }
+                                    }
+                                    w.writeAll(");\n") catch {};
+                                    w.writeAll("  __wasmStackRestore(__sp0);\n  return __r;\n}") catch {};
+                                } else if (mf.array_args == 0 and mf.struct_args == 0) {
+                                    // No array or struct args — simple scalar trampoline
                                     w.print(" return __wasm.exports.{s}({s}); }}", .{ mf.name, params_str }) catch {};
                                 } else {
                                     // Array args — copy to/from WASM linear memory

@@ -340,8 +340,7 @@ const FREEZE_DEBUG = false;
 /// Quick scan for killer opcodes that prevent freezing
 /// This avoids expensive CFG building for functions that will be skipped anyway
 /// NOTE: Closure READ, WRITE, and CREATION are now supported via var_refs passed from native_dispatch
-fn hasKillerOpcodes(instructions: []const bytecode_parser.Instruction, is_self_recursive: bool) bool {
-    _ = is_self_recursive; // No longer used
+fn hasKillerOpcodes(instructions: []const bytecode_parser.Instruction) bool {
     for (instructions) |instr| {
         switch (instr.opcode) {
             // Invalid/unknown opcodes (byte values 248-255 or actual OP_invalid)
@@ -393,15 +392,11 @@ pub const ShardedOutput = struct {
 pub fn generateModuleZigShardedWithBackend(
     allocator: Allocator,
     analysis: *const ModuleAnalysis,
-    module_name: []const u8,
-    manifest_json: ?[]const u8,
     max_functions: u32,
     profile_path: ?[]const u8,
     output_dir: ?[]const u8,
     code_budget: u32,
 ) !ShardedOutput {
-    _ = module_name;
-    _ = manifest_json;
     // Collect all freezable functions
     const GeneratedFunc = struct {
         func: AnalyzedFunction,
@@ -412,7 +407,7 @@ pub fn generateModuleZigShardedWithBackend(
 
     // Filter: skip functions with unsupported opcodes or unbuildable CFGs
     for (analysis.functions.items, 0..) |func, idx| {
-        if (hasKillerOpcodes(func.instructions, func.is_self_recursive)) continue;
+        if (hasKillerOpcodes(func.instructions)) continue;
         // DEBUG: skip specific parser indices for diagnosis
         // DEBUG: no skip — re-enabled for diagnosis
         var cfg = cfg_builder.buildCFG(allocator, func.instructions) catch continue;
@@ -483,47 +478,26 @@ pub fn generateModuleZigShardedWithBackend(
     const BYTES_PER_INSTRUCTION: u32 = 7;
 
     var effective_max = max_functions;
-    if (effective_max == 0 and code_budget > 0 and profile_path != null) {
-        // Auto-compute function limit from code budget
-        var cumulative_size: u64 = 0;
-        for (generated_all.items, 0..) |gf, i| {
-            const est_size = @as(u64, gf.func.instructions.len) * BYTES_PER_INSTRUCTION;
-            cumulative_size += est_size;
-            if (cumulative_size > code_budget) {
-                effective_max = @intCast(i);
-                std.debug.print("[freeze-pgo] Auto-sized to {d} functions for {d}KB code budget ({d}KB estimated)\n", .{
-                    effective_max,
-                    code_budget / 1024,
-                    (cumulative_size - est_size) / 1024,
-                });
-                break;
-            }
-        }
-        if (effective_max == 0) {
-            // All functions fit within budget
-            std.debug.print("[freeze-pgo] All {d} functions fit within {d}KB code budget ({d}KB estimated)\n", .{
-                generated_all.items.len,
-                code_budget / 1024,
-                cumulative_size / 1024,
-            });
-        }
-    } else if (effective_max == 0 and code_budget == 0 and profile_path != null) {
-        // Auto-detect L2 cache size and use as default budget
-        const l2_budget = detectL2CacheSize();
-        if (l2_budget > 0) {
+    if (effective_max == 0 and profile_path != null) {
+        const budget = if (code_budget > 0) @as(u64, code_budget) else detectL2CacheSize();
+        const label: []const u8 = if (code_budget > 0) "code budget" else "L2 cache";
+        if (budget > 0) {
             var cumulative_size: u64 = 0;
             for (generated_all.items, 0..) |gf, i| {
                 const est_size = @as(u64, gf.func.instructions.len) * BYTES_PER_INSTRUCTION;
                 cumulative_size += est_size;
-                if (cumulative_size > l2_budget) {
+                if (cumulative_size > budget) {
                     effective_max = @intCast(i);
-                    std.debug.print("[freeze-pgo] Auto-sized to {d} functions for L2 cache ({d}KB, {d}KB estimated code)\n", .{
-                        effective_max,
-                        l2_budget / 1024,
-                        (cumulative_size - est_size) / 1024,
+                    std.debug.print("[freeze-pgo] Auto-sized to {d} functions for {s} ({d}KB, {d}KB estimated code)\n", .{
+                        effective_max, label, budget / 1024, (cumulative_size - est_size) / 1024,
                     });
                     break;
                 }
+            }
+            if (effective_max == 0) {
+                std.debug.print("[freeze-pgo] All {d} functions fit within {s} ({d}KB, {d}KB estimated)\n", .{
+                    generated_all.items.len, label, budget / 1024, cumulative_size / 1024,
+                });
             }
         }
     }
@@ -757,6 +731,13 @@ pub fn generateModuleZigShardedWithBackend(
                 for (f64_infos.items) |info| {
                     const gf = generated_all.items[info.gf_idx];
                     const tier = analyzeNumericTier(gf.func) orelse continue;
+                    // Capture struct info if detected (must copy — static cache is overwritten)
+                    var struct_layout_ptr: ?*const numeric_handlers.StructArgInfo = null;
+                    if (getLastStructInfo()) |si| {
+                        const copy = try allocator.create(numeric_handlers.StructArgInfo);
+                        copy.* = si.*;
+                        struct_layout_ptr = copy;
+                    }
                     try wasm_funcs.append(allocator, .{
                         .name = gf.func.name,
                         .func_index = gf.idx,
@@ -766,6 +747,7 @@ pub fn generateModuleZigShardedWithBackend(
                         .func = gf.func,
                         .cfg = &f64_cfgs.items[info.cfg_idx],
                         .value_kind = tier,
+                        .struct_layout = struct_layout_ptr,
                     });
                 }
 
@@ -809,8 +791,7 @@ pub fn generateModuleZigShardedWithBackend(
 
                         if (cross_debug and gf.func.name.len > 0) std.debug.print("[wasm-cross-scan] {s}: checking cross-call (args={d}, vars={d})\n", .{ gf.func.name, gf.func.arg_count, gf.func.var_count });
                         // Check if it qualifies with cross-call context
-                        const tier = analyzeNumericTierWithCrossCall(gf.func, wasm_name_set.items) orelse continue;
-                        _ = tier;
+                        _ = analyzeNumericTierWithCrossCall(gf.func, wasm_name_set.items) orelse continue;
 
                         const cfg_val = cfg_builder.buildCFG(allocator, gf.func.instructions) catch continue;
                         const cfg_idx = cross_cfgs.items.len;
@@ -823,6 +804,11 @@ pub fn generateModuleZigShardedWithBackend(
                         try cross_names.append(allocator, llvm_func_name);
 
                         try cross_infos.append(allocator, .{ .gf_idx = gi, .cfg_idx = cfg_idx, .name_idx = name_idx });
+
+                        // Immediately add to wasm_name_set so subsequent functions in THIS
+                        // iteration can see it. Enables multi-level cross-call chains:
+                        // validateVariant(leaf) → validateVariants → validateItem → validateOrder
+                        try wasm_name_set.append(allocator, gf.func.name);
                     }
 
                     // Build ShardFunctions for cross-call candidates (safe — cross_cfgs won't grow)
@@ -921,9 +907,43 @@ pub fn generateModuleZigShardedWithBackend(
                                             std.fmt.bufPrint(&synth_buf, "__anon_L{d}", .{sf.func.line_num}) catch sf.name
                                         else
                                             sf.name;
-                                        var entry_buf: [512]u8 = undefined;
-                                        const entry = std.fmt.bufPrint(&entry_buf, "{{\"name\":\"{s}\",\"args\":{d},\"type\":\"{s}\",\"instrs\":{d},\"recursive\":{d},\"array_args\":{d},\"mutated_args\":{d},\"read_array_args\":{d},\"length_args\":{d},\"has_loop\":{d},\"has_bitwise\":{d},\"line\":{d}}}", .{ manifest_name, sf.func.arg_count, type_str, sf.func.instructions.len, recursive, array_args_mask, mutated_args_mask, read_array_args_mask, length_args_mask, has_loop, has_bitwise, sf.func.line_num }) catch continue;
+                                        // Detect struct args for manifest
+                                        const struct_args_info = numeric_handlers.detectStructArgs(sf.func.instructions, sf.func.arg_count);
+                                        const struct_args_mask: u8 = if (struct_args_info) |si| si.struct_args else 0;
+
+                                        var entry_buf: [1024]u8 = undefined;
+                                        const entry = std.fmt.bufPrint(&entry_buf, "{{\"name\":\"{s}\",\"args\":{d},\"type\":\"{s}\",\"instrs\":{d},\"recursive\":{d},\"array_args\":{d},\"mutated_args\":{d},\"read_array_args\":{d},\"length_args\":{d},\"has_loop\":{d},\"has_bitwise\":{d},\"line\":{d},\"struct_args\":{d}", .{ manifest_name, sf.func.arg_count, type_str, sf.func.instructions.len, recursive, array_args_mask, mutated_args_mask, read_array_args_mask, length_args_mask, has_loop, has_bitwise, sf.func.line_num, struct_args_mask }) catch continue;
                                         mf.writeAll(entry) catch {};
+
+                                        // Write struct field names for each struct arg
+                                        if (struct_args_info) |si| {
+                                            mf.writeAll(",\"struct_fields\":{") catch {};
+                                            var first_arg = true;
+                                            for (0..8) |ai| {
+                                                if (si.struct_args & (@as(u8, 1) << @intCast(ai)) == 0) continue;
+                                                if (!first_arg) mf.writeAll(",") catch {};
+                                                first_arg = false;
+                                                var arg_buf: [8]u8 = undefined;
+                                                const arg_key = std.fmt.bufPrint(&arg_buf, "\"{d}\":[", .{ai}) catch continue;
+                                                mf.writeAll(arg_key) catch {};
+                                                for (si.field_atoms[ai][0..si.field_counts[ai]], 0..) |atom, fi| {
+                                                    if (fi > 0) mf.writeAll(",") catch {};
+                                                    mf.writeAll("\"") catch {};
+                                                    if (resolveAtomToName(sf.func, atom)) |name| {
+                                                        mf.writeAll(name) catch {};
+                                                    } else {
+                                                        var atom_buf: [32]u8 = undefined;
+                                                        const atom_str = std.fmt.bufPrint(&atom_buf, "atom{d}", .{atom}) catch continue;
+                                                        mf.writeAll(atom_str) catch {};
+                                                    }
+                                                    mf.writeAll("\"") catch {};
+                                                }
+                                                mf.writeAll("]") catch {};
+                                            }
+                                            mf.writeAll("}") catch {};
+                                        }
+
+                                        mf.writeAll("}") catch {};
                                     }
                                     mf.writeAll("]") catch {};
                                 } else |_| {}
@@ -1473,6 +1493,41 @@ pub fn matchMathName(name: []const u8) ?MathIntrinsic {
     return null;
 }
 
+/// State machine for tracking Math.* pattern sequences across instruction walks.
+const MathSkipState = struct {
+    pending_math_depth: u32 = 0,
+    pending_destr_math: u32 = 0,
+};
+
+/// Try to advance past a Math.* pattern at position `i`.
+/// Returns the new position after skipping if a pattern was matched, or null if no match.
+/// `is_setup` is true when matching a pattern start (get_var("Math") or get_var_ref{N}),
+/// false when matching a pattern completion (call_method or call{N}).
+fn skipMathPattern(
+    func: AnalyzedFunction,
+    instructions: []const bytecode_parser.Instruction,
+    i: usize,
+    state: *MathSkipState,
+) ?struct { new_i: usize, is_setup: bool } {
+    if (detectMathSetup(func, instructions, i)) |_| {
+        state.pending_math_depth += 1;
+        return .{ .new_i = i + 2, .is_setup = true };
+    }
+    if (state.pending_math_depth > 0 and isMathCallMethod1(instructions, i)) {
+        state.pending_math_depth -= 1;
+        return .{ .new_i = i + 1, .is_setup = false };
+    }
+    if (detectDestructuredMathRef(func, instructions, i)) |_| {
+        state.pending_destr_math += 1;
+        return .{ .new_i = i + 1, .is_setup = true };
+    }
+    if (state.pending_destr_math > 0 and isDestructuredMathCallAny(instructions, i)) {
+        state.pending_destr_math -= 1;
+        return .{ .new_i = i + 1, .is_setup = false };
+    }
+    return null;
+}
+
 /// Detect a destructured Math call at instruction index `i`.
 /// Pattern: get_var_ref{N} where closure_vars[N].name is a known Math method,
 /// followed (after argument pushes) by call1/call2/call3/call.
@@ -1575,6 +1630,20 @@ pub fn isMathCallMethod1(instructions: []const bytecode_parser.Instruction, i: u
 ///
 /// Also detects Math.* intrinsic patterns (Math.abs, Math.sqrt, etc.)
 /// and compiles them to WASM f64 intrinsics.
+/// Thread-local cache for struct arg info detected during analysis.
+/// Set by analyzeNumericTier when struct args are detected, read by codegen.
+var struct_info_cache: numeric_handlers.StructArgInfo = undefined;
+var has_struct_info: bool = false;
+
+/// Get the most recently detected struct arg info (call after analyzeNumericTier)
+pub fn getLastStructInfo() ?*const numeric_handlers.StructArgInfo {
+    if (has_struct_info) {
+        has_struct_info = false;
+        return &struct_info_cache;
+    }
+    return null;
+}
+
 pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
     const debug = std.posix.getenv("EDGEBOX_WASM_DEBUG") != null;
     // Same preconditions as isPureInt32Function (but higher arg limit for WASM)
@@ -1587,36 +1656,17 @@ pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
         return null;
     }
 
-    // Pre-scan for Math.* intrinsic patterns.
-    // Pattern 1: get_var("Math") → get_field2("method") → [arg computation] → call_method(N)
-    // Pattern 2: get_var_ref{N} (destructured Math) → [arg computation] → call{N}
+    // Pre-scan for Math.* intrinsic patterns (Math.floor(x), destructured sqrt(x), etc.)
     var has_math_intrinsics = false;
     {
-        var pending_math_depth: u32 = 0;
-        var pending_destr_math: u32 = 0; // pending destructured Math calls
+        var math_state = MathSkipState{};
         var mi: usize = 0;
-        while (mi < func.instructions.len) : (mi += 1) {
-            // Pattern 1: get_var("Math") + get_field2("method")
-            if (detectMathSetup(func, func.instructions, mi)) |_| {
-                pending_math_depth += 1;
-                mi += 1; // skip the get_field2
-                continue;
-            }
-            if (pending_math_depth > 0 and isMathCallMethod1(func.instructions, mi)) {
-                has_math_intrinsics = true;
-                pending_math_depth -= 1;
-                continue;
-            }
-            // Pattern 2: get_var_ref{N} where closure_vars[N] is a Math builtin
-            if (detectDestructuredMathRef(func, func.instructions, mi)) |intrinsic| {
-                pending_destr_math += 1;
-                _ = intrinsic;
-                continue;
-            }
-            // Match the call opcode that completes a destructured Math call
-            if (pending_destr_math > 0 and isDestructuredMathCallAny(func.instructions, mi)) {
-                has_math_intrinsics = true;
-                pending_destr_math -= 1;
+        while (mi < func.instructions.len) {
+            if (skipMathPattern(func, func.instructions, mi, &math_state)) |result| {
+                if (result.is_setup) has_math_intrinsics = true;
+                mi = result.new_i;
+            } else {
+                mi += 1;
             }
         }
     }
@@ -1627,17 +1677,56 @@ pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
     }
 
     // Standard analysis (no Math patterns)
-    const kind = numeric_handlers.analyzeFunction(func.instructions) orelse {
-        if (debug) {
-            for (func.instructions) |instr| {
-                const handler = numeric_handlers.getHandler(instr.opcode);
-                if (handler.pattern == .unsupported) {
-                    std.debug.print("[wasm-reject] {s}: unsupported opcode '{s}'\n", .{ func.name, @tagName(instr.opcode) });
-                    break;
-                }
+    const kind = numeric_handlers.analyzeFunction(func.instructions) orelse blk: {
+        // Standard analysis failed — check if it's because of get_field (struct access)
+        var has_field_get = false;
+        for (func.instructions) |instr| {
+            const handler = numeric_handlers.getHandler(instr.opcode);
+            if (handler.pattern == .field_get) { has_field_get = true; continue; }
+            if (handler.pattern == .unsupported) {
+                if (debug) std.debug.print("[wasm-reject] {s}: unsupported opcode '{s}'\n", .{ func.name, @tagName(instr.opcode) });
+                return null;
             }
         }
-        return null;
+        if (!has_field_get) return null;
+
+        // Try struct-aware analysis: detect which args are struct-typed
+        const struct_args = numeric_handlers.detectStructArgs(func.instructions, func.arg_count) orelse {
+            if (debug) std.debug.print("[wasm-reject] {s}: get_field on non-arg (not struct-eligible)\n", .{func.name});
+            return null;
+        };
+
+        // Re-analyze with get_field allowed
+        const struct_result = numeric_handlers.analyzeFunctionWithStructs(func.instructions) orelse {
+            if (debug) std.debug.print("[wasm-reject] {s}: struct analysis failed\n", .{func.name});
+            return null;
+        };
+
+        // Store struct info for later use by codegen and trampoline generation
+        // (stored in thread-local for the current compilation pass)
+        struct_info_cache = struct_args;
+        has_struct_info = true;
+
+        if (debug) {
+            std.debug.print("[wasm-struct] {s}: struct args=0x{x}, fields:", .{ func.name, struct_args.struct_args });
+            for (0..8) |ai| {
+                if (struct_args.struct_args & (@as(u8, 1) << @intCast(ai)) != 0) {
+                    std.debug.print(" arg{d}=[", .{ai});
+                    for (struct_args.field_atoms[ai][0..struct_args.field_counts[ai]], 0..) |atom, fi| {
+                        if (fi > 0) std.debug.print(",", .{});
+                        if (resolveAtomToName(func, atom)) |name| {
+                            std.debug.print("{s}", .{name});
+                        } else {
+                            std.debug.print("atom{d}", .{atom});
+                        }
+                    }
+                    std.debug.print("]", .{});
+                }
+            }
+            std.debug.print("\n", .{});
+        }
+
+        break :blk struct_result.kind;
     };
 
     // For non-recursive functions, reject recursive-only patterns
@@ -1697,37 +1786,12 @@ pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
 /// Math intrinsics always force f64 tier (they operate on doubles).
 fn analyzeFunctionWithMath(func: AnalyzedFunction, debug: bool) ?numeric_handlers.ValueKind {
     var has_computing_op = false;
-    var pending_math_depth: u32 = 0; // Nesting depth for Math.floor(Math.abs(x)) patterns
-    var pending_destr_math: u32 = 0; // Pending destructured Math calls
+    var math_state = MathSkipState{};
     var i: usize = 0;
     while (i < func.instructions.len) {
-        // Skip Math.* setup (2 opcodes: get_var("Math") + get_field2("method"))
-        if (detectMathSetup(func, func.instructions, i)) |_| {
-            has_computing_op = true;
-            pending_math_depth += 1;
-            i += 2; // skip both get_var and get_field2
-            continue;
-        }
-
-        // Skip the call_method(N) that completes a pending standard Math intrinsic
-        if (pending_math_depth > 0 and isMathCallMethod1(func.instructions, i)) {
-            pending_math_depth -= 1;
-            i += 1;
-            continue;
-        }
-
-        // Skip destructured Math ref (1 opcode: get_var_ref{N} for known Math builtin)
-        if (detectDestructuredMathRef(func, func.instructions, i)) |_| {
-            has_computing_op = true;
-            pending_destr_math += 1;
-            i += 1; // skip the get_var_ref
-            continue;
-        }
-
-        // Skip the call{N} that completes a pending destructured Math call
-        if (pending_destr_math > 0 and isDestructuredMathCallAny(func.instructions, i)) {
-            pending_destr_math -= 1;
-            i += 1;
+        if (skipMathPattern(func, func.instructions, i, &math_state)) |result| {
+            if (result.is_setup) has_computing_op = true;
+            i = result.new_i;
             continue;
         }
 
@@ -1754,37 +1818,17 @@ fn analyzeFunctionWithMath(func: AnalyzedFunction, debug: bool) ?numeric_handler
     // For non-recursive functions, check that self_ref opcodes are ONLY
     // part of Math.* patterns (not standalone function references)
     if (!func.is_self_recursive) {
-        var pending_math_depth2: u32 = 0;
-        var pending_destr_math2: u32 = 0;
+        var math_state2 = MathSkipState{};
         var si: usize = 0;
         while (si < func.instructions.len) {
-            // Skip standard Math.* setup (get_var("Math") is self_ref but not a function call)
-            if (detectMathSetup(func, func.instructions, si)) |_| {
-                pending_math_depth2 += 1;
-                si += 2;
-                continue;
-            }
-            if (pending_math_depth2 > 0 and isMathCallMethod1(func.instructions, si)) {
-                pending_math_depth2 -= 1;
-                si += 1;
-                continue;
-            }
-            // Skip destructured Math ref (get_var_ref{N} is self_ref but is a Math builtin)
-            if (detectDestructuredMathRef(func, func.instructions, si)) |_| {
-                pending_destr_math2 += 1;
-                si += 1;
-                continue;
-            }
-            // Skip the call that completes a pending destructured Math call
-            if (pending_destr_math2 > 0 and isDestructuredMathCallAny(func.instructions, si)) {
-                pending_destr_math2 -= 1;
-                si += 1;
+            if (skipMathPattern(func, func.instructions, si, &math_state2)) |result| {
+                si = result.new_i;
                 continue;
             }
             const handler = numeric_handlers.getHandler(func.instructions[si].opcode);
             if (handler.pattern == .self_ref or handler.pattern == .call_self or handler.pattern == .tail_call_self) {
                 if (debug) std.debug.print("[wasm-reject] {s}: non-Math self_ref '{s}' in non-recursive function\n", .{ func.name, @tagName(func.instructions[si].opcode) });
-                return null; // Non-Math self_ref in non-recursive function
+                return null;
             }
             si += 1;
         }
@@ -1834,6 +1878,15 @@ fn resolveCalleeName(func: AnalyzedFunction, instr: bytecode_parser.Instruction)
         return resolveAtomToName(func, atom_val);
     } else if (instr.opcode == .get_var_ref0) {
         if (func.closure_vars.len > 0) return func.closure_vars[0].name;
+    } else if (instr.opcode == .get_var_ref1) {
+        if (func.closure_vars.len > 1) return func.closure_vars[1].name;
+    } else if (instr.opcode == .get_var_ref2) {
+        if (func.closure_vars.len > 2) return func.closure_vars[2].name;
+    } else if (instr.opcode == .get_var_ref3) {
+        if (func.closure_vars.len > 3) return func.closure_vars[3].name;
+    } else if (instr.opcode == .get_var_ref) {
+        const idx: u32 = switch (instr.operand) { .u16 => |v| v, .u8 => |v| v, else => return null };
+        if (idx < func.closure_vars.len) return func.closure_vars[idx].name;
     }
     return null;
 }
@@ -1850,9 +1903,21 @@ pub fn analyzeNumericTierWithCrossCall(
     const kind = numeric_handlers.analyzeFunction(func.instructions) orelse return null;
 
     if (!func.is_self_recursive) {
-        for (func.instructions) |instr| {
+        for (func.instructions, 0..) |instr, ii| {
             const handler = numeric_handlers.getHandler(instr.opcode);
             if (handler.pattern == .self_ref) {
+                // Look ahead: is this a function call (→ call_self) or data access (→ get_array_el)?
+                // get_var_ref0 is used for BOTH closure function calls AND closure array reads.
+                // Only reject if it's actually a function call to a non-WASM function.
+                var is_call = false;
+                for (func.instructions[ii + 1 ..]) |next_instr| {
+                    const nh = numeric_handlers.getHandler(next_instr.opcode);
+                    if (nh.pattern == .call_self) { is_call = true; break; }
+                    if (next_instr.opcode == .get_array_el or next_instr.opcode == .get_array_el2) break;
+                    if (nh.pattern == .self_ref) break; // another ref before call — this one wasn't called
+                }
+                if (!is_call) continue; // data access (e.g., lookup table), not a function call
+
                 if (resolveCalleeName(func, instr)) |cn| {
                     var found = false;
                     for (wasm_func_names) |wn| {

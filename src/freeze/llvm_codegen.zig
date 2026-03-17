@@ -158,10 +158,6 @@ fn inlineLoadSp(b: llvm.Builder, sp_ptr: llvm.Value) llvm.Value {
     return b.buildLoad(llvm.i64Type(), sp_ptr, "sp");
 }
 
-fn inlineLoadSpTarget(b: llvm.Builder, sp_ptr: llvm.Value, target: TargetInfo) llvm.Value {
-    return b.buildLoad(target.usizeType(), sp_ptr, "sp");
-}
-
 /// Store the stack pointer value: *sp_ptr = sp
 fn inlineStoreSp(b: llvm.Builder, sp_ptr: llvm.Value, sp_val: llvm.Value) void {
     _ = b.buildStore(sp_val, sp_ptr);
@@ -170,46 +166,6 @@ fn inlineStoreSp(b: llvm.Builder, sp_ptr: llvm.Value, sp_val: llvm.Value) void {
 /// Get pointer to stack[index] where index is an i64 LLVM value
 fn inlineStackSlot(b: llvm.Builder, stk: llvm.Value, index: llvm.Value) llvm.Value {
     return b.buildInBoundsGEP(llvm.i64Type(), stk, &.{index}, "slot");
-}
-
-/// Get pointer to locals[idx] where idx is a u32 constant
-fn inlineLocalSlot(b: llvm.Builder, locs: llvm.Value, idx: u32) llvm.Value {
-    return b.buildInBoundsGEP(llvm.i64Type(), locs, &.{llvm.constInt(llvm.i64Type(), idx, false)}, "lslot");
-}
-
-/// Push a constant CV (u64) onto the stack: stack[sp] = cv_bits; sp++
-fn inlinePushCV(b: llvm.Builder, stk: llvm.Value, sp_ptr: llvm.Value, cv_bits: u64) void {
-    const sp = inlineLoadSp(b, sp_ptr);
-    const slot = inlineStackSlot(b, stk, sp);
-    _ = b.buildStore(llvm.constInt(llvm.i64Type(), cv_bits, false), slot);
-    const new_sp = b.buildAdd(sp, llvm.constInt64(1), "sp1");
-    inlineStoreSp(b, sp_ptr, new_sp);
-}
-
-/// Push a dynamic i64 value onto the stack: stack[sp] = val; sp++
-fn inlinePushValue(b: llvm.Builder, stk: llvm.Value, sp_ptr: llvm.Value, val: llvm.Value) void {
-    const sp = inlineLoadSp(b, sp_ptr);
-    const slot = inlineStackSlot(b, stk, sp);
-    _ = b.buildStore(val, slot);
-    const new_sp = b.buildAdd(sp, llvm.constInt64(1), "sp1");
-    inlineStoreSp(b, sp_ptr, new_sp);
-}
-
-/// Check if a CV value is an integer: (cv & TAG_MASK) == QNAN_INT
-fn inlineIsInt(b: llvm.Builder, val: llvm.Value) llvm.Value {
-    const tag = b.buildAnd(val, llvm.constInt(llvm.i64Type(), CV_TAG_MASK, false), "tag");
-    return b.buildICmp(c.LLVMIntEQ, tag, llvm.constInt(llvm.i64Type(), CV_QNAN_INT, false), "isint");
-}
-
-/// Extract i32 from a CV integer: trunc(cv) to i32
-fn inlineGetInt(b: llvm.Builder, val: llvm.Value) llvm.Value {
-    return b.buildTrunc(val, llvm.i32Type(), "ival");
-}
-
-/// Create a CV integer from an i32: QNAN_INT | zext(val)
-fn inlineNewInt(b: llvm.Builder, i32_val: llvm.Value) llvm.Value {
-    const ext = b.buildZExt(i32_val, llvm.i64Type(), "zext");
-    return b.buildOr(ext, llvm.constInt(llvm.i64Type(), CV_QNAN_INT, false), "newcv");
 }
 
 /// Inline dupRef: if isRefType(cv) then call rt_cv_dup_ref, else return cv unchanged.
@@ -473,14 +429,14 @@ pub fn generateStandaloneWasm(
         // Generate body using generic numeric codegen (handles i32, f64, array access, and array length)
         const gen_ok = switch (sf.value_kind) {
             .i32 => blk: {
-                generateNumericBody(.i32, allocator, builder, standalone_fn, func, sf.cfg, native.module, length_args) catch |err| {
+                generateNumericBody(.i32, allocator, builder, standalone_fn, func, sf.cfg, native.module, length_args, sf.struct_layout) catch |err| {
                     std.debug.print("[standalone-wasm] {s}: codegen failed: {}\n", .{ sf.name, err });
                     break :blk false;
                 };
                 break :blk true;
             },
             .f64 => blk: {
-                generateNumericBody(.f64, allocator, builder, standalone_fn, func, sf.cfg, native.module, length_args) catch |err| {
+                generateNumericBody(.f64, allocator, builder, standalone_fn, func, sf.cfg, native.module, length_args, sf.struct_layout) catch |err| {
                     std.debug.print("[standalone-wasm] {s}: codegen failed: {}\n", .{ sf.name, err });
                     break :blk false;
                 };
@@ -598,6 +554,8 @@ pub const ShardFunction = struct {
     cfg: *const CFG,
     /// Numeric tier: i32 (pure integer) or f64 (float-capable)
     value_kind: ValueKind = .i32,
+    /// Struct arg layout info (null = no struct args, all args are scalar/array)
+    struct_layout: ?*const numeric_handlers.StructArgInfo = null,
 };
 
 const GeneratedFuncInfo = struct {
@@ -1389,6 +1347,10 @@ fn emitInt32Instruction(
 // Comptime Numeric Body Generator (f64 tier)
 // ============================================================================
 
+// Thread-local struct layout for field_get codegen (workaround for Zig 0.15
+// parameter tracking limitation in complex switch arms)
+var struct_layout_global: ?*const numeric_handlers.StructArgInfo = null;
+
 /// Generate function body for any numeric ValueKind using comptime dispatch.
 /// The i32 tier uses generateInt32Body (legacy, well-tested).
 /// The f64 tier uses this function with comptime kind = .f64.
@@ -1401,7 +1363,11 @@ fn generateNumericBody(
     cfg: *const CFG,
     module: llvm.Module,
     length_args: u8,
+    _struct_layout: ?*const numeric_handlers.StructArgInfo,
 ) CodegenError!void {
+    // Store struct layout for use in field_get handler (Zig 0.15 can't trace
+    // parameter usage through complex switch arms)
+    struct_layout_global = _struct_layout;
     const blocks = cfg.blocks.items;
     if (blocks.len == 0) return;
 
@@ -1769,7 +1735,7 @@ fn numericStackEffect(instr: Instruction) i32 {
         .put_arg, .put_loc, .put_loc_check, .stack_drop, .add_loc => -1,
         .set_arg, .set_loc, .nop, .set_loc_uninitialized, .inc_loc, .dec_loc => 0,
         .binary_arith, .binary_cmp, .bitwise_binary, .array_get => -1, // pop 2, push 1
-        .unary, .lnot, .inc_dec, .always_false, .array_length => 0, // pop 1, push 1
+        .unary, .lnot, .inc_dec, .always_false, .array_length, .field_get => 0, // pop 1, push 1
         .post_inc_dec => 1, // pop 1, push 2
         .stack_dup => 1,
         .stack_dup2 => 2,
@@ -2755,6 +2721,59 @@ fn emitNumericInstruction(
             const elem_ptr = c.LLVMBuildGEP2(builder.ref, arr_elem_type, base_ptr, &gep_indices, 1, "arr_gep");
             const loaded = builder.buildLoad(arr_elem_type, elem_ptr, "arr_elem");
             vstack.append(allocator, loaded) catch return CodegenError.OutOfMemory;
+        },
+
+        .field_get => {
+            // obj.prop: pop struct pointer, load i32 at fixed field offset
+            if (vstack.items.len < 1) return CodegenError.StackUnderflow;
+            const base_raw = numVstackPop(vstack);
+            const base_i32 = switch (kind) {
+                .i32 => base_raw,
+                .f64 => if (c.LLVMGetInstructionOpcode(base_raw) == c.LLVMSIToFP)
+                    c.LLVMGetOperand(base_raw, 0)
+                else
+                    builder.buildFPToSI(base_raw, llvm.i32Type(), "struct_base_i32"),
+            };
+            // Look up field offset from struct layout
+            const atom: u32 = switch (instr.operand) {
+                .atom => |a| a,
+                else => return CodegenError.UnsupportedOpcode,
+            };
+            var field_offset: u32 = 0;
+            if (struct_layout_global) |si| {
+                // Identify which arg produced this struct pointer by tracing
+                // the LLVM value back through load/sitofp to the param alloca.
+                var source_alloca = base_i32;
+                if (c.LLVMGetInstructionOpcode(source_alloca) == c.LLVMLoad)
+                    source_alloca = c.LLVMGetOperand(source_alloca, 0);
+                var found_arg: u3 = 0;
+                for (0..@min(arg_count, 8)) |ai| {
+                    if (si.struct_args & (@as(u8, 1) << @intCast(ai)) != 0 and
+                        params.*[@intCast(ai)] == source_alloca)
+                    {
+                        found_arg = @intCast(ai);
+                        break;
+                    }
+                }
+                // Find atom in field list → offset
+                for (si.field_atoms[found_arg][0..si.field_counts[found_arg]], 0..) |fa, oi| {
+                    if (fa == atom) {
+                        field_offset = @intCast(oi);
+                        break;
+                    }
+                }
+            }
+            const base_ptr = c.LLVMBuildIntToPtr(builder.ref, base_i32, llvm.ptrType(), "struct_ptr");
+            const offset_val = llvm.constInt32(@intCast(field_offset));
+            var gep_indices = [_]llvm.Value{offset_val};
+            const field_ptr = c.LLVMBuildGEP2(builder.ref, llvm.i32Type(), base_ptr, &gep_indices, 1, "field_gep");
+            const loaded = builder.buildLoad(llvm.i32Type(), field_ptr, "field_val");
+            // In f64 tier, convert loaded i32 to f64
+            const result = switch (kind) {
+                .i32 => loaded,
+                .f64 => builder.buildSIToFP(loaded, llvm.doubleType(), "field_f64"),
+            };
+            vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
         },
 
         .array_get2 => {
@@ -8824,14 +8843,6 @@ fn callVoid3(b: llvm.Builder, func: llvm.Value, a: llvm.Value, bv: llvm.Value, c
     _ = b.buildCall(
         llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.ptrType() }, false),
         func, &.{ a, bv, cv }, "",
-    );
-}
-
-/// Call void(ptr, ptr, i32) — e.g., push_i32(stack, sp, val)
-fn callVoid3i(b: llvm.Builder, func: llvm.Value, a: llvm.Value, bv: llvm.Value, ival: llvm.Value) void {
-    _ = b.buildCall(
-        llvm.functionType(llvm.voidType(), &.{ llvm.ptrType(), llvm.ptrType(), llvm.i32Type() }, false),
-        func, &.{ a, bv, ival }, "",
     );
 }
 

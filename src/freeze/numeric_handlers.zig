@@ -105,6 +105,9 @@ pub const NumericPattern = enum {
     /// Always-false check (pops value, pushes 0). Used for is_undefined/is_null
     /// in numeric context where values are never undefined or null.
     always_false,
+    /// Object field read: obj.prop (pops object, pushes i32 field value)
+    /// Only valid when the arg is a known struct shape (detected by shape analysis)
+    field_get,
     /// Unsupported in numeric mode
     unsupported,
 };
@@ -307,6 +310,9 @@ pub fn getHandler(opcode: Opcode) NumericHandler {
         .put_array_el => .{ .pattern = .array_put },
         .get_length => .{ .pattern = .array_length },
 
+        // ── Object field access (struct mode only) ─────────────
+        .get_field => .{ .pattern = .field_get },
+
         // ── Everything else ─────────────────────────────────────
         else => .{ .pattern = .unsupported },
     };
@@ -332,14 +338,33 @@ pub fn analyzeFunction(instructions: anytype) ?ValueKind {
 }
 
 /// Full analysis returning both numeric tier and array usage info.
+/// By default, field_get (get_field) is rejected — use analyzeFunctionWithStructs
+/// for functions with known struct args.
 pub fn analyzeFunctionFull(instructions: anytype) ?AnalysisResult {
+    return analyzeFunctionFullImpl(instructions, false);
+}
+
+/// Variant that allows field_get (get_field) on struct-typed arguments.
+/// Called after struct arg detection determines which args have known shapes.
+pub fn analyzeFunctionWithStructs(instructions: anytype) ?AnalysisResult {
+    return analyzeFunctionFullImpl(instructions, true);
+}
+
+fn analyzeFunctionFullImpl(instructions: anytype, allow_field_get: bool) ?AnalysisResult {
     var has_computing_op = false;
     var needs_float = false;
     var has_i32_only = false;
     var uses_arrays = false;
+    var uses_structs = false;
 
     for (instructions) |instr| {
         const handler = getHandler(instr.opcode);
+        if (handler.pattern == .field_get) {
+            if (!allow_field_get) return null;
+            has_computing_op = true;
+            uses_structs = true;
+            continue;
+        }
         if (handler.pattern == .unsupported) return null;
 
         if (handler.introduces_float) needs_float = true;
@@ -381,6 +406,7 @@ pub fn isComputingPattern(pattern: NumericPattern) bool {
         .push_bool, .call_self, .tail_call_self,
         .add_loc, .inc_loc, .dec_loc,
         .array_get, .array_get2, .array_put, .array_length,
+        .field_get,
         => true,
         else => false,
     };
@@ -563,6 +589,11 @@ pub fn detectArrayArgs(instructions: anytype, arg_count: u32) u8 {
                 // Pop 1, push 1 (result is not an arg)
                 if (sp >= 1) { stack[sp - 1] = -1; }
             },
+            .field_get => {
+                // Pop object, push field value. Object might be an arg (struct arg detection).
+                // Don't set array_args bit — struct args are tracked separately.
+                if (sp >= 1) { stack[sp - 1] = -1; }
+            },
             .nop, .goto_br, .set_loc_uninitialized, .tail_call_self => {},
             .unsupported => {
                 // Math.* opcodes (get_field2, call_method, tail_call_method) fall through
@@ -672,7 +703,7 @@ pub fn detectMutatedArgs(instructions: anytype, arg_count: u32) u8 {
                 // Pop array base, push length (not an arg). No mutation.
                 if (sp >= 1) { stack[sp - 1] = -1; }
             },
-            .always_false => {
+            .always_false, .field_get => {
                 if (sp >= 1) { stack[sp - 1] = -1; }
             },
             .nop, .goto_br, .set_loc_uninitialized, .tail_call_self => {},
@@ -793,7 +824,7 @@ pub fn detectReadArrayArgs(instructions: anytype, arg_count: u32) u8 {
                 // Length access does NOT count as element read — just update stack
                 if (sp >= 1) { stack[sp - 1] = -1; }
             },
-            .always_false => {
+            .always_false, .field_get => {
                 if (sp >= 1) { stack[sp - 1] = -1; }
             },
             .nop, .goto_br, .set_loc_uninitialized, .tail_call_self => {},
@@ -852,7 +883,7 @@ pub fn detectLengthArgs(instructions: anytype, arg_count: u32) u8 {
             .binary_arith, .binary_cmp, .bitwise_binary => {
                 if (sp >= 2) { sp -= 1; stack[sp - 1] = -1; }
             },
-            .unary, .lnot, .inc_dec, .always_false => {
+            .unary, .lnot, .inc_dec, .always_false, .field_get => {
                 if (sp >= 1) { stack[sp - 1] = -1; }
             },
             .post_inc_dec => {
@@ -932,5 +963,172 @@ pub fn detectHasBitwise(instructions: anytype) bool {
         if (handler.requires_i32) return true;
     }
     return false;
+}
+
+/// Max fields per struct arg (bail out for wide objects — copy overhead eats the gain)
+pub const MAX_STRUCT_FIELDS = 16;
+
+/// Struct arg info: which args are struct-typed and what field atoms they access
+pub const StructArgInfo = struct {
+    /// Bitmask: bit N set = arg N is a struct-typed object
+    struct_args: u8,
+    /// Per-arg field atoms (up to MAX_STRUCT_FIELDS per arg, up to 8 args)
+    /// Stored as atom indices. field_counts[i] = number of fields for arg i.
+    field_atoms: [8][MAX_STRUCT_FIELDS]u32,
+    field_counts: [8]u8,
+
+    pub fn fieldCount(self: *const StructArgInfo, arg_idx: u3) u8 {
+        return self.field_counts[arg_idx];
+    }
+};
+
+/// Detect which function arguments are struct-typed objects (accessed via get_field).
+/// Uses stack simulation to trace get_arg{N} → get_field(atom) patterns.
+/// Returns null if no struct args found, or if any get_field is on a non-arg value
+/// (e.g., on a local variable or computed value — not safe to convert).
+pub fn detectStructArgs(instructions: anytype, arg_count: u32) ?StructArgInfo {
+    var stack: [128]i8 = undefined;
+    var sp: usize = 0;
+    var info = StructArgInfo{
+        .struct_args = 0,
+        .field_atoms = undefined,
+        .field_counts = [_]u8{0} ** 8,
+    };
+    var has_field_get = false;
+    var has_unsafe_field_get = false;
+
+    for (instructions) |instr| {
+        const handler = getHandler(instr.opcode);
+        switch (handler.pattern) {
+            .get_arg => {
+                const idx: u8 = handler.index orelse switch (instr.operand) {
+                    .arg => |a| @intCast(a),
+                    .u8 => |a| a,
+                    else => 255,
+                };
+                if (sp < stack.len) {
+                    stack[sp] = if (idx < arg_count) @intCast(idx) else -1;
+                    sp += 1;
+                }
+            },
+            .field_get => {
+                has_field_get = true;
+                if (sp >= 1) {
+                    const obj_arg = stack[sp - 1];
+                    if (obj_arg >= 0 and obj_arg < 8) {
+                        // This get_field is on a known arg — record the atom
+                        const ai: u3 = @intCast(obj_arg);
+                        const atom: u32 = switch (instr.operand) {
+                            .atom => |a| a,
+                            else => {
+                                has_unsafe_field_get = true;
+                                stack[sp - 1] = -1;
+                                continue;
+                            },
+                        };
+                        // Add atom if not already tracked for this arg
+                        const fc = info.field_counts[ai];
+                        if (fc < MAX_STRUCT_FIELDS) {
+                            var found = false;
+                            for (info.field_atoms[ai][0..fc]) |existing| {
+                                if (existing == atom) { found = true; break; }
+                            }
+                            if (!found) {
+                                info.field_atoms[ai][fc] = atom;
+                                info.field_counts[ai] = fc + 1;
+                            }
+                        } else {
+                            // Too many fields — bail out for this arg
+                            has_unsafe_field_get = true;
+                        }
+                        info.struct_args |= @as(u8, 1) << ai;
+                    } else {
+                        // get_field on a non-arg value (local, computed) — not safe
+                        has_unsafe_field_get = true;
+                    }
+                    stack[sp - 1] = -1; // result is not an arg
+                }
+            },
+            // Generic stack effects (same as detectArrayArgs)
+            .array_get => {
+                if (sp >= 2) { sp -= 2; if (sp < stack.len) { stack[sp] = -1; sp += 1; } }
+            },
+            .array_get2 => {
+                if (sp >= 2) { sp -= 1; if (sp < stack.len) { stack[sp] = -1; sp += 1; } }
+            },
+            .array_put => {
+                if (sp >= 3) sp -= 3;
+            },
+            .push_const, .push_cpool, .push_bool => {
+                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+            },
+            .binary_arith, .binary_cmp, .bitwise_binary => {
+                if (sp >= 2) { sp -= 1; stack[sp - 1] = -1; }
+            },
+            .unary, .lnot, .inc_dec, .always_false => {
+                if (sp >= 1) { stack[sp - 1] = -1; }
+            },
+            .post_inc_dec => {
+                if (sp >= 1) { stack[sp - 1] = -1; if (sp < stack.len) { stack[sp] = -1; sp += 1; } }
+            },
+            .get_loc, .get_loc_check => {
+                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+            },
+            .get_loc_pair => {
+                if (sp + 1 < stack.len) { stack[sp] = -1; stack[sp + 1] = -1; sp += 2; }
+            },
+            .put_loc, .put_loc_check, .put_arg => {
+                if (sp >= 1) sp -= 1;
+            },
+            .set_loc, .set_arg => {},
+            .stack_dup => {
+                if (sp >= 1 and sp < stack.len) { stack[sp] = stack[sp - 1]; sp += 1; }
+            },
+            .stack_dup2 => {
+                if (sp >= 2 and sp + 1 < stack.len) { stack[sp] = stack[sp - 2]; stack[sp + 1] = stack[sp - 1]; sp += 2; }
+            },
+            .stack_drop => {
+                if (sp >= 1) sp -= 1;
+            },
+            .stack_swap => {
+                if (sp >= 2) {
+                    const tmp = stack[sp - 1];
+                    stack[sp - 1] = stack[sp - 2];
+                    stack[sp - 2] = tmp;
+                }
+            },
+            .self_ref => {
+                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+            },
+            .call_self => {
+                const argc: u32 = switch (instr.opcode) {
+                    .call1 => 1, .call2 => 2, .call3 => 3, .call => instr.operand.u16, else => 1,
+                };
+                if (sp >= argc) sp -= argc;
+                if (sp >= 1) sp -= 1;
+                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+            },
+            .ret, .if_false, .if_true => {
+                if (sp >= 1) sp -= 1;
+            },
+            .add_loc => {
+                if (sp >= 1) sp -= 1;
+            },
+            .inc_loc, .dec_loc => {},
+            .array_length => {
+                if (sp >= 1) { stack[sp - 1] = -1; }
+            },
+            .nop, .goto_br, .set_loc_uninitialized, .tail_call_self => {},
+            .unsupported => {
+                applyUnsupportedStackEffect(instr, &stack, &sp);
+            },
+        }
+    }
+
+    // Must have at least one field_get on an arg, and NO unsafe field access
+    if (!has_field_get or has_unsafe_field_get) return null;
+    if (info.struct_args == 0) return null;
+
+    return info;
 }
 
