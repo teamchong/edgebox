@@ -2196,6 +2196,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     // Zero-copy fast path: if ALL array args are backed by WASM memory
                                     // (allocated via __wasmArray), skip copy entirely.
                                     // arr.buffer === __wbuf means the TypedArray is a view into WASM linear memory.
+                                    // Zero-copy condition: all array args backed by WASM memory
                                     w.writeAll("  if (") catch {};
                                     {
                                         var first_zc = true;
@@ -2203,36 +2204,28 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         while (zi < param_count) : (zi += 1) {
                                             if (mf.array_args & (@as(u8, 1) << @intCast(zi)) != 0) {
                                                 if (!first_zc) w.writeAll(" && ") catch {};
-                                                w.writeAll(param_names[zi]) catch {};
-                                                w.writeAll(".buffer === __wbuf") catch {};
+                                                w.print("{s}.buffer === __wbuf", .{param_names[zi]}) catch {};
                                                 first_zc = false;
                                             }
                                         }
                                     }
-                                    w.writeAll(") return __wasm.exports.") catch {};
-                                    w.writeAll(mf.name) catch {};
-                                    w.writeAll("(") catch {};
+                                    w.print(") return __wasm.exports.{s}(", .{mf.name}) catch {};
                                     {
                                         var first_arg = true;
                                         var zi: u32 = 0;
                                         while (zi < param_count) : (zi += 1) {
                                             if (!first_arg) w.writeAll(", ") catch {};
                                             if (mf.array_args & (@as(u8, 1) << @intCast(zi)) != 0) {
-                                                // Pass byte offset directly from the TypedArray view
-                                                w.writeAll(param_names[zi]) catch {};
-                                                w.writeAll(".byteOffset") catch {};
+                                                w.print("{s}.byteOffset", .{param_names[zi]}) catch {};
                                             } else {
                                                 w.writeAll(param_names[zi]) catch {};
                                             }
                                             first_arg = false;
                                         }
-                                        // Append .length for array args that use get_length
                                         zi = 0;
                                         while (zi < param_count) : (zi += 1) {
                                             if (mf.length_args & (@as(u8, 1) << @intCast(zi)) != 0) {
-                                                w.writeAll(", ") catch {};
-                                                w.writeAll(param_names[zi]) catch {};
-                                                w.writeAll(".length") catch {};
+                                                w.print(", {s}.length", .{param_names[zi]}) catch {};
                                             }
                                         }
                                     }
@@ -2251,13 +2244,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             var idx_buf: [8]u8 = undefined;
                                             const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{i}) catch "0";
                                             // Stack-allocate: __pN = __wasmStackAlloc(arr.length * bytes_per_elem)
-                                            w.writeAll("  const __p") catch {};
-                                            w.writeAll(idx_str) catch {};
-                                            w.writeAll(" = __wasmStackAlloc(") catch {};
-                                            w.writeAll(param_names[i]) catch {};
-                                            w.writeAll(".length") catch {};
-                                            w.writeAll(alloc_shift) catch {};
-                                            w.writeAll(");\n") catch {};
+                                            w.print("  const __p{s} = __wasmStackAlloc({s}.length{s});\n", .{ idx_str, param_names[i], alloc_shift }) catch {};
 
                                             if (read_only_args & (@as(u8, 1) << @intCast(i)) != 0) {
                                                 // Read-only: cache by reference identity. Skip copy when
@@ -2273,36 +2260,12 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                                 // Small arrays (< 128 = 512 bytes) always re-copy — too cheap to
                                                 // risk stale data from same-ref mutation (e.g. crypto_verify_32).
                                                 // Large arrays use identity cache for performance.
-                                                w.writeAll("  if (__last_fn !== ") catch {};
-                                                w.writeAll(mfi_str) catch {};
-                                                w.writeAll(" || ") catch {};
-                                                w.writeAll(pn) catch {};
-                                                w.writeAll(".length < 128 || ") catch {};
-                                                w.writeAll(pn) catch {};
-                                                w.writeAll(" !== __c") catch {};
-                                                w.writeAll(cid) catch {};
-                                                w.writeAll(") { ") catch {};
-                                                w.writeAll(mem_view) catch {};
-                                                w.writeAll(".set(") catch {};
-                                                w.writeAll(pn) catch {};
-                                                w.writeAll(", __p") catch {};
-                                                w.writeAll(idx_str) catch {};
-                                                w.writeAll(elem_shift) catch {};
-                                                w.writeAll("); __c") catch {};
-                                                w.writeAll(cid) catch {};
-                                                w.writeAll(" = ") catch {};
-                                                w.writeAll(pn) catch {};
-                                                w.writeAll("; }\n") catch {};
+                                                w.print("  if (__last_fn !== {s} || {s}.length < 128 || {s} !== __c{s}) {{ {s}.set({s}, __p{s}{s}); __c{s} = {s}; }}\n", .{
+                                                    mfi_str, pn, pn, cid, mem_view, pn, idx_str, elem_shift, cid, pn,
+                                                }) catch {};
                                             } else if (mf.read_array_args & (@as(u8, 1) << @intCast(i)) != 0) {
                                                 // Mutated + read: must copy in (function reads then writes)
-                                                w.writeAll("  ") catch {};
-                                                w.writeAll(mem_view) catch {};
-                                                w.writeAll(".set(") catch {};
-                                                w.writeAll(param_names[i]) catch {};
-                                                w.writeAll(", __p") catch {};
-                                                w.writeAll(idx_str) catch {};
-                                                w.writeAll(elem_shift) catch {};
-                                                w.writeAll(");\n") catch {};
+                                                w.print("  {s}.set({s}, __p{s}{s});\n", .{ mem_view, param_names[i], idx_str, elem_shift }) catch {};
                                             } else {
                                                 // Write-only: skip copy-in (data will be overwritten)
                                             }
@@ -2311,22 +2274,15 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     }
                                     // Track which function last wrote to WASM memory (cross-function cache safety)
                                     if (any_cacheable_args) {
-                                        w.writeAll("  __last_fn = ") catch {};
-                                        w.writeAll(mfi_str) catch {};
-                                        w.writeAll(";\n") catch {};
+                                        w.print("  __last_fn = {s};\n", .{mfi_str}) catch {};
                                     }
                                     // Call WASM — __pN is already a byte offset from stack allocator
-                                    w.writeAll("  const __r = __wasm.exports.") catch {};
-                                    w.writeAll(mf.name) catch {};
-                                    w.writeAll("(") catch {};
+                                    w.print("  const __r = __wasm.exports.{s}(", .{mf.name}) catch {};
                                     i = 0;
                                     while (i < param_count) : (i += 1) {
                                         if (i > 0) w.writeAll(", ") catch {};
                                         if (mf.array_args & (@as(u8, 1) << @intCast(i)) != 0) {
-                                            var idx_buf2: [8]u8 = undefined;
-                                            const idx_str2 = std.fmt.bufPrint(&idx_buf2, "{d}", .{i}) catch "0";
-                                            w.writeAll("__p") catch {};
-                                            w.writeAll(idx_str2) catch {};
+                                            w.print("__p{d}", .{i}) catch {};
                                         } else {
                                             w.writeAll(param_names[i]) catch {};
                                         }
@@ -2335,9 +2291,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     i = 0;
                                     while (i < param_count) : (i += 1) {
                                         if (mf.length_args & (@as(u8, 1) << @intCast(i)) != 0) {
-                                            w.writeAll(", ") catch {};
-                                            w.writeAll(param_names[i]) catch {};
-                                            w.writeAll(".length") catch {};
+                                            w.print(", {s}.length", .{param_names[i]}) catch {};
                                         }
                                     }
                                     w.writeAll(");\n") catch {};
@@ -2345,36 +2299,14 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     i = 0;
                                     while (i < param_count) : (i += 1) {
                                         if (mf.mutated_args & (@as(u8, 1) << @intCast(i)) != 0) {
-                                            var idx_buf3: [8]u8 = undefined;
-                                            const idx_str3 = std.fmt.bufPrint(&idx_buf3, "{d}", .{i}) catch "0";
                                             const pn = param_names[i];
-                                            // TypedArray fast path: .set(subarray)
-                                            w.writeAll("  if (") catch {};
-                                            w.writeAll(pn) catch {};
-                                            w.writeAll(".set) ") catch {};
-                                            w.writeAll(pn) catch {};
-                                            w.writeAll(".set(") catch {};
-                                            w.writeAll(mem_view) catch {};
-                                            w.writeAll(".subarray(__p") catch {};
-                                            w.writeAll(idx_str3) catch {};
-                                            w.writeAll(elem_shift) catch {};
-                                            w.writeAll(", (__p") catch {};
-                                            w.writeAll(idx_str3) catch {};
-                                            w.writeAll(elem_shift) catch {};
-                                            w.writeAll(") + ") catch {};
-                                            w.writeAll(pn) catch {};
-                                            w.writeAll(".length));\n") catch {};
-                                            // Plain Array fallback
-                                            w.writeAll("  else for (let __i = 0; __i < ") catch {};
-                                            w.writeAll(pn) catch {};
-                                            w.writeAll(".length; __i++) ") catch {};
-                                            w.writeAll(pn) catch {};
-                                            w.writeAll("[__i] = ") catch {};
-                                            w.writeAll(mem_view) catch {};
-                                            w.writeAll("[(__p") catch {};
-                                            w.writeAll(idx_str3) catch {};
-                                            w.writeAll(elem_shift) catch {};
-                                            w.writeAll(") + __i];\n") catch {};
+                                            // TypedArray fast path + plain Array fallback
+                                            w.print("  if ({s}.set) {s}.set({s}.subarray(__p{d}{s}, (__p{d}{s}) + {s}.length));\n", .{
+                                                pn, pn, mem_view, i, elem_shift, i, elem_shift, pn,
+                                            }) catch {};
+                                            w.print("  else for (let __i = 0; __i < {s}.length; __i++) {s}[__i] = {s}[(__p{d}{s}) + __i];\n", .{
+                                                pn, pn, mem_view, i, elem_shift,
+                                            }) catch {};
                                         }
                                     }
                                     w.writeAll("  __wasmStackRestore(__sp0);\n  return __r;\n}") catch {};
