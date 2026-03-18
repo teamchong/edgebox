@@ -116,24 +116,23 @@ for (var j = 0; j < nodes.length; j++) {
 
 EdgeBox compiles the TypeScript compiler (`_tsc.js`, 130K+ lines) with 446 SOA alloc sites detected and 8 numeric WASM kernels. No code changes to TSC — just `edgebox _tsc.js`.
 
-**4-way comparison: SEA binary vs Worker vs Node.js vs Bun**
+**3-way comparison: EdgeBox vs Node.js vs Bun**
 
-| Project | Files | SEA Binary | Worker | Node.js | Bun |
-|---------|:-----:|:----------:|:------:|:-------:|:---:|
-| rxjs | 207 | **0.50s** | 0.58s | 0.77s | 1.00s |
-| playwright | 358 | **2.00s** | 2.06s | 3.04s | 4.15s |
+| Project | Files | EdgeBox | Node.js | Bun |
+|---------|:-----:|:-------:|:-------:|:---:|
+| rxjs | 207 | **0.58s** | 0.77s | 1.00s |
+| playwright | 358 | **2.06s** | 3.04s | 4.15s |
 
 | Runner | vs Node.js | vs Bun | How |
 |--------|:----------:|:------:|-----|
-| **SEA Binary** | **1.5x faster** | **2.1x faster** | Single executable (Node.js SEA + V8 code cache) |
-| **Worker** | **1.5x faster** | **2.0x faster** | `node _tsc-worker.mjs` (V8 inlines WASM) |
+| **EdgeBox** | **1.5x faster** | **2.0x faster** | `node _tsc-worker.mjs` (V8 inlines WASM) |
 | Node.js | baseline | 1.4x faster | `node tsc.js` |
 | Bun | 0.7x (slower) | baseline | `bun tsc.js` (JSC doesn't inline WASM) |
 
 ```bash
 # Generate worker + pack into single binary
 edgebox _tsc.js
-./scripts/pack.sh zig-out/bin/_tsc.js/   # → _tsc-sea (122MB single executable)
+./scripts/pack-workerd.sh zig-out/bin/_tsc.js/   # → standalone workerd binary (116MB)
 ```
 
 Tested with `tsc --noEmit` on Node.js v24 and Bun v1.2. EdgeBox benefits come from SOA transforms (446 factory functions → contiguous arrays) and 8 WASM numeric kernels that V8 TurboFan inlines.
@@ -163,8 +162,14 @@ zig build cli
 #   zig-out/bin/my-app.js/my-app-worker.mjs        — JS module (with WASM trampolines)
 #   zig-out/bin/my-app.js/my-app-standalone.wasm    — Standalone WASM (AOT numeric kernels)
 
-# Run on Node.js
+# Run on Node.js (V8 inlines WASM — zero overhead)
 node zig-out/bin/my-app.js/my-app-worker.mjs
+
+# Run on workerd (Cloudflare Workers runtime)
+npx workerd serve zig-out/bin/my-app.js/my-app-config.capnp
+
+# Pack into single binary (workerd + V8 embedded)
+./scripts/pack-workerd.sh zig-out/bin/my-app.js/
 
 # Run benchmarks
 bash bench/run_all.sh
