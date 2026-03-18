@@ -1981,11 +1981,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     var w_buf: [65536]u8 = undefined;
                     var w_state = wf.writer(&w_buf);
                     const w = &w_state.interface;
-                    defer {
-                        w.flush() catch |err| {
-                            std.debug.print("[build] WARNING: Worker flush failed: {}\n", .{err});
-                        };
-                    }
+                    // Flush periodically to avoid data loss
+                    var flush_counter: u32 = 0;
                     w.print(
                         \\// EdgeBox AOT+JIT (auto-generated)
                         \\const {{ readFileSync }} = require('fs');
@@ -3362,8 +3359,15 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 // No match — copy one character
                                 w.writeAll(cc[src_pos .. src_pos + 1]) catch {};
                                 src_pos += 1;
+                                // Periodic flush every ~50KB to avoid buffer overflow
+                                flush_counter += 1;
+                                if (flush_counter >= 50000) {
+                                    w.flush() catch {};
+                                    flush_counter = 0;
+                                }
                             }
                         }
+                        w.flush() catch {};
                         std.debug.print("[soa] Read-site: {d} functions matched, {d} field reads rewritten\n", .{ rs_func_count, rs_rewrite_count });
                     } else {
                         w.writeAll("// ERROR: Original source not available\n") catch {};
