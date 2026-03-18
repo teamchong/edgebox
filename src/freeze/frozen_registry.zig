@@ -396,6 +396,7 @@ pub fn generateModuleZigShardedWithBackend(
     profile_path: ?[]const u8,
     output_dir: ?[]const u8,
     code_budget: u32,
+    wasm_only: bool,
 ) !ShardedOutput {
     // Collect all freezable functions
     const GeneratedFunc = struct {
@@ -478,7 +479,17 @@ pub fn generateModuleZigShardedWithBackend(
     const BYTES_PER_INSTRUCTION: u32 = 7;
 
     var effective_max = max_functions;
-    if (effective_max == 0 and profile_path != null) {
+    // Sort by instruction count (largest first) when no PGO profile is provided.
+    // This ensures that the L2 cache budget is filled with the most impactful functions.
+    if (profile_path == null) {
+        std.mem.sort(GeneratedFunc, generated_all.items, {}, struct {
+            fn lessThan(_: void, a: GeneratedFunc, b: GeneratedFunc) bool {
+                return a.func.instructions.len > b.func.instructions.len; // descending
+            }
+        }.lessThan);
+    }
+
+    if (effective_max == 0) {
         const budget = if (code_budget > 0) @as(u64, code_budget) else detectL2CacheSize();
         const label: []const u8 = if (code_budget > 0) "code budget" else "L2 cache";
         if (budget > 0) {
@@ -960,6 +971,9 @@ pub fn generateModuleZigShardedWithBackend(
             }
 
         // ===== Phase 2: Thin codegen for ALL remaining functions =====
+        // Skip when wasm_only — worker path only needs standalone WASM (numeric kernels).
+        // Thin shards are for native binary and WASM-static paths only.
+        if (!wasm_only) {
         // Collect non-int32 functions for LLVM thin codegen
         var thin_llvm_funcs = std.ArrayListUnmanaged(llvm_codegen.ThinShardFunction){};
         defer thin_llvm_funcs.deinit(allocator);
@@ -1093,6 +1107,7 @@ pub fn generateModuleZigShardedWithBackend(
             }
         }
     }
+    } // end if (!wasm_only)
 
     std.debug.print("[freeze] LLVM backend: {d} functions ({d} int32 + {d} thin) in {d} shard .o files\n", .{
         generated_all.items.len,
@@ -1100,6 +1115,109 @@ pub fn generateModuleZigShardedWithBackend(
         llvm_shard_count - int32_llvm_shard_count,
         llvm_shard_count,
     });
+
+    // Detect allocation sites: functions that create object literals with fixed shapes.
+    // These are candidates for SOA transform — rewrite to allocate in WASM linear memory.
+    if (output_dir) |cd| {
+        var alloc_manifest_path_buf: [4096]u8 = undefined;
+        const alloc_manifest_path = std.fmt.bufPrint(&alloc_manifest_path_buf, "{s}/alloc_manifest.json", .{cd}) catch null;
+        if (alloc_manifest_path) |amp| {
+            if (std.fs.cwd().createFile(amp, .{})) |amf| {
+                defer amf.close();
+                amf.writeAll("[") catch {};
+                var alloc_count: usize = 0;
+                for (analysis.functions.items) |func| {
+                    const alloc_info = numeric_handlers.detectAllocSites(func.instructions) orelse continue;
+                    if (alloc_count > 0) amf.writeAll(",") catch {};
+                    // Use synthetic name for anonymous functions
+                    var synth_buf: [32]u8 = undefined;
+                    const alloc_name = if (func.name.len == 0)
+                        std.fmt.bufPrint(&synth_buf, "__anon_L{d}", .{func.line_num}) catch func.name
+                    else
+                        func.name;
+                    var entry_buf: [1024]u8 = undefined;
+                    const entry = std.fmt.bufPrint(&entry_buf, "{{\"name\":\"{s}\",\"line\":{d},\"args\":{d},\"alloc_fields\":[", .{
+                        alloc_name, func.line_num, func.arg_count,
+                    }) catch continue;
+                    amf.writeAll(entry) catch {};
+                    for (alloc_info.field_atoms[0..alloc_info.field_count], 0..) |atom, fi| {
+                        if (fi > 0) amf.writeAll(",") catch {};
+                        amf.writeAll("\"") catch {};
+                        if (resolveAtomToName(func, atom)) |name| {
+                            amf.writeAll(name) catch {};
+                        } else {
+                            var atom_buf: [32]u8 = undefined;
+                            const atom_str = std.fmt.bufPrint(&atom_buf, "atom{d}", .{atom}) catch continue;
+                            amf.writeAll(atom_str) catch {};
+                        }
+                        amf.writeAll("\"") catch {};
+                    }
+                    amf.writeAll("]}") catch {};
+                    alloc_count += 1;
+                }
+                amf.writeAll("]") catch {};
+                if (alloc_count > 0) {
+                    std.debug.print("[freeze] Alloc sites: {d} factory functions with fixed shapes\n", .{alloc_count});
+                }
+            } else |_| {}
+        }
+
+        // Also emit struct read sites — functions that read obj.field on their args.
+        // This is the SAME detectStructArgs analysis, but emitted for ALL functions,
+        // not just the ones that pass numeric tier filtering.
+        var read_manifest_path_buf: [4096]u8 = undefined;
+        const read_manifest_path = std.fmt.bufPrint(&read_manifest_path_buf, "{s}/read_manifest.json", .{cd}) catch null;
+        if (read_manifest_path) |rmp| {
+            if (std.fs.cwd().createFile(rmp, .{})) |rmf| {
+                defer rmf.close();
+                rmf.writeAll("[") catch {};
+                var read_count: usize = 0;
+                for (analysis.functions.items) |func| {
+                    const si = numeric_handlers.detectStructArgs(func.instructions, func.arg_count) orelse continue;
+                    if (read_count > 0) rmf.writeAll(",") catch {};
+                    var synth_buf2: [32]u8 = undefined;
+                    const read_name = if (func.name.len == 0)
+                        std.fmt.bufPrint(&synth_buf2, "__anon_L{d}", .{func.line_num}) catch func.name
+                    else
+                        func.name;
+                    var entry_buf2: [512]u8 = undefined;
+                    const combined = si.struct_args | si.array_of_struct_args;
+                    const entry2 = std.fmt.bufPrint(&entry_buf2, "{{\"name\":\"{s}\",\"line\":{d},\"struct_args\":{d},\"read_fields\":{{", .{
+                        read_name, func.line_num, combined,
+                    }) catch continue;
+                    rmf.writeAll(entry2) catch {};
+                    var first_arg2 = true;
+                    for (0..@min(func.arg_count, 8)) |ai| {
+                        if (combined & (@as(u8, 1) << @intCast(ai)) == 0) continue;
+                        if (!first_arg2) rmf.writeAll(",") catch {};
+                        first_arg2 = false;
+                        var arg_buf2: [8]u8 = undefined;
+                        const arg_key2 = std.fmt.bufPrint(&arg_buf2, "\"{d}\":[", .{ai}) catch continue;
+                        rmf.writeAll(arg_key2) catch {};
+                        for (si.field_atoms[ai][0..si.field_counts[ai]], 0..) |atom, fi| {
+                            if (fi > 0) rmf.writeAll(",") catch {};
+                            rmf.writeAll("\"") catch {};
+                            if (resolveAtomToName(func, atom)) |name| {
+                                rmf.writeAll(name) catch {};
+                            } else {
+                                var atom_buf2: [32]u8 = undefined;
+                                const atom_str2 = std.fmt.bufPrint(&atom_buf2, "atom{d}", .{atom}) catch continue;
+                                rmf.writeAll(atom_str2) catch {};
+                            }
+                            rmf.writeAll("\"") catch {};
+                        }
+                        rmf.writeAll("]") catch {};
+                    }
+                    rmf.writeAll("}}") catch {};
+                    read_count += 1;
+                }
+                rmf.writeAll("]") catch {};
+                if (read_count > 0) {
+                    std.debug.print("[freeze] Read sites: {d} functions read struct fields from args\n", .{read_count});
+                }
+            } else |_| {}
+        }
+    }
 
     // Generate main frozen_module.zig with extern declarations for LLVM shard init functions
     var main_output = std.ArrayListUnmanaged(u8){};

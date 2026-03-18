@@ -1153,3 +1153,55 @@ pub fn detectStructArgs(instructions: anytype, arg_count: u32) ?StructArgInfo {
     return info;
 }
 
+/// Allocation site info: a function creates objects with a known shape.
+/// Detected from `object → define_field(atom)` sequences in bytecodes.
+pub const AllocSiteInfo = struct {
+    /// Field atoms in definition order (matches constructor argument order)
+    field_atoms: [MAX_STRUCT_FIELDS]u32,
+    field_count: u8,
+};
+
+/// Detect object literal allocation sites in a function's bytecodes.
+/// Looks for: `object → (value) → define_field(atom)` repeated sequences.
+/// Returns the shape (field names in order) or null if no clean pattern found.
+///
+/// Only matches functions that create a SINGLE object literal with a fixed shape.
+/// Multiple object literals or dynamic shapes return null.
+pub fn detectAllocSites(instructions: anytype) ?AllocSiteInfo {
+    var info = AllocSiteInfo{
+        .field_atoms = undefined,
+        .field_count = 0,
+    };
+    var in_object = false;
+    var object_count: u32 = 0;
+
+    for (instructions) |instr| {
+        if (instr.opcode == .object) {
+            object_count += 1;
+            if (object_count > 1) return null; // multiple object literals — bail
+            in_object = true;
+            continue;
+        }
+        if (in_object and instr.opcode == .define_field) {
+            const atom: u32 = switch (instr.operand) {
+                .atom => |a| a,
+                else => return null, // dynamic field — bail
+            };
+            if (info.field_count >= MAX_STRUCT_FIELDS) return null; // too many fields
+            info.field_atoms[info.field_count] = atom;
+            info.field_count += 1;
+            continue;
+        }
+        // `return` after define_field sequence = factory function
+        if (in_object and (instr.opcode == .@"return" or instr.opcode == .return_undef)) {
+            // Completed the object literal — stop
+            break;
+        }
+        // Other opcodes between object and define_field are fine
+        // (they compute values to store, e.g., get_arg, binary ops)
+    }
+
+    if (info.field_count == 0) return null;
+    return info;
+}
+

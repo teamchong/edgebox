@@ -453,6 +453,17 @@ const WasmFunc = struct {
     struct_field_counts: [8]u8 = [_]u8{0} ** 8,
 };
 
+/// SOA allocation site: a factory function that creates objects with a fixed shape.
+/// Detected from bytecodes (object → define_field pattern).
+/// Used to rewrite object creation to SOA layout in WASM linear memory.
+const AllocSite = struct {
+    name: []const u8,
+    line_num: u32,
+    arg_count: u32,
+    field_names: [16][]const u8,
+    field_count: u8,
+};
+
 /// Decide whether a WASM-compiled function should get a trampoline or stay as JS.
 /// Returns true if the function should be trampolined to WASM.
 fn shouldTrampolineToWasm(mf: WasmFunc, calls_wasm: bool) bool {
@@ -1619,7 +1630,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
 
         // Generate frozen module via LLVM IR backend
         zig_gen: {
-            var sharded = freeze.generateModuleZigShardedWithBackend(allocator, &analysis, options.freeze_max_functions, options.freeze_profile_path, cache_dir, options.freeze_code_budget) catch |err| {
+            var sharded = freeze.generateModuleZigShardedWithBackend(allocator, &analysis, options.freeze_max_functions, options.freeze_profile_path, cache_dir, options.freeze_code_budget, options.wasm_only) catch |err| {
                 std.debug.print("[warn] LLVM codegen failed: {}\n", .{err});
                 break :zig_gen;
             };
@@ -1673,37 +1684,35 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         }
     }
 
-    // Step 6d: Generate raw bytecode for unified @embedFile flow
-    // Use hooked bundle if freeze succeeded, otherwise use original bundle
-    const runtime_bundle_path = if (freeze_success) bundle_hooked_path else bundle_js_path;
-    std.debug.print("[build] Compiling JS to bytecode: {s} (freeze_success={})\n", .{ runtime_bundle_path, freeze_success });
     // Ensure output directory exists
     std.fs.cwd().makePath(output_dir) catch {};
 
-    // Generate raw bytecode (unified flow - both WASM and native use @embedFile)
+    // Step 6d: Generate raw bytecode + build args (only needed for native/WASM-static binary)
+    // Worker-only path skips this — it uses standalone.wasm + source transform, not @embedFile bytecode
+    const runtime_bundle_path = if (freeze_success) bundle_hooked_path else bundle_js_path;
     var bundle_bin_path_buf: [4096]u8 = undefined;
     const bundle_bin_path = std.fmt.bufPrint(&bundle_bin_path_buf, "{s}/bundle.bin", .{cache_dir}) catch "zig-out/cache/bundle.bin";
-    std.debug.print("[build] Generating raw bytecode for native...\n", .{});
-    const exit_code_bin = try qjsc_wrapper.compileJsToBytecode(allocator, &.{
-        "qjsc",
-        "-b", // Raw bytecode output (no C wrapper, just bytes)
-        "-s", "-s", // Strip source code AND debug info (index-based dispatch doesn't need line numbers)
-        "-o", bundle_bin_path,
-        runtime_bundle_path,
-    });
-    if (exit_code_bin != 0) {
-        std.debug.print("[warn] Raw bytecode generation failed (native may not work)\n", .{});
-    } else {
-        if (std.fs.cwd().statFile(bundle_bin_path)) |stat| {
-            const size_mb = @as(f64, @floatFromInt(stat.size)) / 1024.0 / 1024.0;
-            std.debug.print("[build] Raw bytecode: {s} ({d:.1}MB)\n", .{ bundle_bin_path, size_mb });
-        } else |_| {}
+
+    if (!options.wasm_only) {
+        std.debug.print("[build] Compiling JS to bytecode: {s} (freeze_success={})\n", .{ runtime_bundle_path, freeze_success });
+        const exit_code_bin = try qjsc_wrapper.compileJsToBytecode(allocator, &.{
+            "qjsc",
+            "-b", // Raw bytecode output (no C wrapper, just bytes)
+            "-s", "-s", // Strip source code AND debug info (index-based dispatch doesn't need line numbers)
+            "-o", bundle_bin_path,
+            runtime_bundle_path,
+        });
+        if (exit_code_bin != 0) {
+            std.debug.print("[warn] Raw bytecode generation failed (native may not work)\n", .{});
+        } else {
+            if (std.fs.cwd().statFile(bundle_bin_path)) |stat| {
+                const size_mb = @as(f64, @floatFromInt(stat.size)) / 1024.0 / 1024.0;
+                std.debug.print("[build] Raw bytecode: {s} ({d:.1}MB)\n", .{ bundle_bin_path, size_mb });
+            } else |_| {}
+        }
     }
 
-    // No C file patching needed - bytecode embedded via @embedFile
-    // Both native and wasm-static use the same unified flow
-
-    // Generate output filenames based on input base name and output directory
+    // Generate output filenames and build args (used by Steps 7-10 for native/WASM-static)
     var wasm_path_buf: [4096]u8 = undefined;
     var aot_path_buf: [4096]u8 = undefined;
     var stripped_path_buf: [4096]u8 = undefined;
@@ -1783,6 +1792,24 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         }
     }
 
+    // If no numeric WASM was produced, emit a minimal WASM (just exported memory)
+    // so the worker pipeline always works — SOA pools need a memory buffer.
+    if (!has_standalone_wasm) {
+        const minimal_wasm = [_]u8{
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // \0asm v1
+            0x05, 0x03, 0x01, 0x00, 0x02, // memory: 1 mem, min 2 pages
+            0x07, 0x0a, 0x01, 0x06, 0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, 0x02, 0x00, // export "memory"
+        };
+        const sw = std.fmt.bufPrint(&standalone_wasm_path_buf, "{s}/{s}-standalone.wasm", .{ output_dir, output_base }) catch null;
+        if (sw) |swp| {
+            if (std.fs.cwd().createFile(swp, .{})) |f| {
+                defer f.close();
+                f.writeAll(&minimal_wasm) catch {};
+                has_standalone_wasm = true;
+            } else |_| {}
+        }
+    }
+
     // Step 6f: Generate workerd worker files (worker.mjs + config.capnp)
     // Uses the clean bundle (pre-polyfill) + standalone WASM
     var has_worker_files = false;
@@ -1802,6 +1829,15 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             }
             defer if (wasm_manifest) |wm| allocator.free(wm);
 
+            // Read alloc manifest — factory functions that create objects with fixed shapes
+            var alloc_manifest_buf: [4096]u8 = undefined;
+            const alloc_manifest_path = std.fmt.bufPrint(&alloc_manifest_buf, "{s}/alloc_manifest.json", .{cache_dir}) catch null;
+            var alloc_manifest: ?[]const u8 = null;
+            if (alloc_manifest_path) |amp| {
+                alloc_manifest = std.fs.cwd().readFileAlloc(allocator, amp, 4 * 1024 * 1024) catch null;
+            }
+            defer if (alloc_manifest) |am| allocator.free(am);
+
             // Read clean bundle
             var clean_content: ?[]const u8 = null;
             if (clean_bundle_path) |cbp| {
@@ -1819,9 +1855,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                 if (std.fs.cwd().createFile(wp, .{})) |wf| {
                     defer wf.close();
 
-                    // Collect WASM function metadata from manifest
-                    var wasm_funcs: [64]WasmFunc = undefined;
-                    var wasm_func_count: usize = 0;
+                    // Collect WASM function metadata from manifest (dynamic, no limit)
+                    var wasm_func_list: std.ArrayListUnmanaged(WasmFunc) = .{};
+                    defer wasm_func_list.deinit(allocator);
                     // Parse manifest JSON (same std.json used throughout the codebase)
                     var json_parsed: ?std.json.Parsed(std.json.Value) = if (wasm_manifest) |mc|
                         std.json.parseFromSlice(std.json.Value, allocator, mc, .{}) catch null
@@ -1832,11 +1868,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         if (p.value == .array) {
                             for (p.value.array.items) |item| {
                                 if (item != .object) continue;
-                                if (wasm_func_count >= 64) break;
                                 const obj = item.object;
                                 const name = jsonStr(obj, "name") orelse continue;
                                 const aa = jsonInt(obj, "array_args");
-                                wasm_funcs[wasm_func_count] = .{
+                                var entry: WasmFunc = .{
                                     .name = name,
                                     .arg_count = @max(1, jsonInt(obj, "args")),
                                     .instr_count = jsonInt(obj, "instrs"),
@@ -1854,22 +1889,21 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 // Parse struct_args, array_of_struct_args, and struct_fields from manifest
                                 const sa = jsonInt(obj, "struct_args");
                                 const aos = jsonInt(obj, "array_of_struct_args");
-                                if (sa != 0) wasm_funcs[wasm_func_count].struct_args = @truncate(sa);
-                                if (aos != 0) wasm_funcs[wasm_func_count].array_of_struct_args = @truncate(aos);
+                                if (sa != 0) entry.struct_args = @truncate(sa);
+                                if (aos != 0) entry.array_of_struct_args = @truncate(aos);
                                 if (sa != 0 or aos != 0) {
                                     if (obj.get("struct_fields")) |sf_val| {
                                         if (sf_val == .object) {
                                             var sf_it = sf_val.object.iterator();
                                             while (sf_it.next()) |sf_entry| {
-                                                // Key is arg index ("0", "1", ...), value is array of field names
                                                 const arg_idx = std.fmt.parseInt(u8, sf_entry.key_ptr.*, 10) catch continue;
                                                 if (arg_idx >= 8) continue;
                                                 if (sf_entry.value_ptr.* == .array) {
                                                     for (sf_entry.value_ptr.array.items, 0..) |field_val, fi| {
                                                         if (fi >= 16) break;
                                                         if (field_val == .string) {
-                                                            wasm_funcs[wasm_func_count].struct_field_names[arg_idx][fi] = field_val.string;
-                                                            wasm_funcs[wasm_func_count].struct_field_counts[arg_idx] = @intCast(fi + 1);
+                                                            entry.struct_field_names[arg_idx][fi] = field_val.string;
+                                                            entry.struct_field_counts[arg_idx] = @intCast(fi + 1);
                                                         }
                                                     }
                                                 }
@@ -1877,13 +1911,13 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         }
                                     }
                                 }
-                                wasm_func_count += 1;
+                                wasm_func_list.append(allocator, entry) catch continue;
                             }
                         }
                     }
 
                     // Preamble: load WASM module (compatible with Node.js + workerd)
-                    var w_buf: [4096]u8 = undefined;
+                    var w_buf: [65536]u8 = undefined;
                     var w_state = wf.writer(&w_buf);
                     const w = &w_state.interface;
                     defer w.flush() catch {};
@@ -1919,7 +1953,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     var has_i32_array_funcs = false;
                     var has_f64_array_funcs = false;
                     var any_cacheable_args = false;
-                    for (wasm_funcs[0..wasm_func_count]) |wfe| {
+                    for (wasm_func_list.items) |wfe| {
                         if (wfe.array_args != 0) {
                             has_array_funcs = true;
                             if (wfe.is_f64) has_f64_array_funcs = true else has_i32_array_funcs = true;
@@ -1948,7 +1982,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         // Per-arg identity cache for repeated calls with same array ref
                         if (any_cacheable_args) {
                             w.writeAll("let __last_fn = -1;\n") catch {};
-                            for (wasm_funcs[0..wasm_func_count], 0..) |wfe, wfi| {
+                            for (wasm_func_list.items, 0..) |wfe, wfi| {
                                 const read_only = wfe.array_args & ~wfe.mutated_args;
                                 if (read_only == 0) continue;
                                 var ai: u32 = 0;
@@ -1960,12 +1994,91 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         }
                     }
 
+                    // === SOA Transform: rewrite factory functions to allocate in WASM linear memory ===
+                    // Parse alloc manifest and generate SOA pool declarations
+                    var alloc_sites: std.ArrayListUnmanaged(AllocSite) = .{};
+                    defer alloc_sites.deinit(allocator);
+                    if (alloc_manifest) |am_content| {
+                        var am_parsed = std.json.parseFromSlice(std.json.Value, allocator, am_content, .{}) catch null;
+                        defer if (am_parsed) |*p| p.deinit();
+                        if (am_parsed) |p| {
+                            if (p.value == .array) {
+                                for (p.value.array.items) |item| {
+                                    if (item != .object) continue;
+                                    const obj = item.object;
+                                    const name = jsonStr(obj, "name") orelse continue;
+                                    // Skip anonymous/polyfill functions — only transform named factories
+                                    if (std.mem.startsWith(u8, name, "__anon_")) continue;
+                                    const fields_val = obj.get("alloc_fields") orelse continue;
+                                    if (fields_val != .array) continue;
+                                    if (fields_val.array.items.len == 0 or fields_val.array.items.len > 16) continue;
+                                    // Dupe name — JSON strings are freed when am_parsed goes out of scope
+                                    const duped_name = allocator.dupe(u8, name) catch continue;
+                                    var site = AllocSite{
+                                        .name = duped_name,
+                                        .line_num = jsonInt(obj, "line"),
+                                        .arg_count = jsonInt(obj, "args"),
+                                        .field_names = [_][]const u8{""} ** 16,
+                                        .field_count = 0,
+                                    };
+                                    for (fields_val.array.items, 0..) |fv, fi| {
+                                        if (fi >= 16) break;
+                                        if (fv == .string) {
+                                            site.field_names[fi] = allocator.dupe(u8, fv.string) catch continue;
+                                            site.field_count = @intCast(fi + 1);
+                                        }
+                                    }
+                                    if (site.field_count > 0) {
+                                        alloc_sites.append(allocator, site) catch continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Generate SOA pool declarations for each alloc site shape
+                    if (alloc_sites.items.len > 0) {
+                        // Ensure WASM memory views exist (may not have been created if no WASM functions)
+                        if (!has_array_funcs) {
+                            w.writeAll("const __wbuf = __wasm ? __wasm.exports.memory.buffer : null;\n") catch {};
+                            w.writeAll("const __m = __wasm ? new Int32Array(__wbuf) : null;\n") catch {};
+                            w.writeAll(
+                                \\let __sp = __wbuf.byteLength;
+                                \\function __wasmStackSave() { return __sp; }
+                                \\function __wasmStackRestore(p) { __sp = p; }
+                                \\function __wasmStackAlloc(n) { __sp = (__sp - n) & ~7; return __sp; }
+                                \\
+                            ) catch {};
+                        }
+                        w.writeAll("// SOA pools: factory objects allocated in WASM linear memory (contiguous, cache-friendly)\n") catch {};
+                        // Auto-size capacity: 75% of WASM memory / (total_fields * 4 bytes per i32)
+                        var total_soa_fields: usize = 0;
+                        for (alloc_sites.items) |site| total_soa_fields += site.field_count;
+                        if (total_soa_fields == 0) total_soa_fields = 1;
+                        w.print("const __SOA_CAP = Math.floor(__wbuf.byteLength * 0.75 / ({d} * 4));\n", .{total_soa_fields}) catch {};
+                        for (alloc_sites.items, 0..) |site, si| {
+                            // Allocate one Int32Array per field — matches WASM i32 layout for zero-copy
+                            for (site.field_names[0..site.field_count]) |fname| {
+                                w.print("const __soa_{d}_{s} = new Int32Array(__wbuf, __wasmStackAlloc(__SOA_CAP * 4), __SOA_CAP);\n", .{ si, fname }) catch {};
+                            }
+                            w.print("let __soa_{d}_next = 0;\n", .{si}) catch {};
+                            // Shared class: all handles have same hidden class → V8 inlines getters
+                            w.print("class __SOA_{d} {{\n", .{si}) catch {};
+                            w.writeAll("  constructor(idx) { this.__idx = idx; }\n") catch {};
+                            for (site.field_names[0..site.field_count]) |fname| {
+                                w.print("  get {s}() {{ return __soa_{d}_{s}[this.__idx]; }}\n", .{ fname, si, fname }) catch {};
+                                w.print("  set {s}(v) {{ __soa_{d}_{s}[this.__idx] = v; }}\n", .{ fname, si, fname }) catch {};
+                            }
+                            w.writeAll("}\n") catch {};
+                        }
+                    }
+
                     // Batch struct helpers: for each struct function with _batch variant,
                     // generate a JS function that copies array fields into WASM pool and
                     // calls the batched WASM function in a single invocation.
                     // Identity cache: if same array ref on repeated calls, skip the copy
                     // (pool persists in WASM stack memory across calls).
-                    for (wasm_funcs[0..wasm_func_count]) |wfe| {
+                    for (wasm_func_list.items) |wfe| {
                         if (wfe.struct_args == 0) continue;
                         // Find first struct arg and its fields
                         var sai: u32 = 0;
@@ -1992,6 +2105,53 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             }
                         }
                         w.writeAll(") {\n") catch {};
+                        // SOA fast path: if elements are SOA handles, data is already in WASM memory
+                        if (alloc_sites.items.len > 0) {
+                            // Match batch function's struct fields against SOA sites
+                            for (alloc_sites.items, 0..) |site, si| {
+                                // Check if the first struct field matches an SOA field
+                                const first_field = wfe.struct_field_names[sai][0];
+                                if (first_field.len == 0) continue;
+                                var soa_match = false;
+                                for (site.field_names[0..site.field_count]) |sf| {
+                                    if (std.mem.eql(u8, sf, first_field)) {
+                                        soa_match = true;
+                                        break;
+                                    }
+                                }
+                                if (!soa_match) continue;
+
+                                w.print("  if (arr.length > 0 && (arr[0] instanceof __SOA_{d} || arr.__soa === {d})) {{\n", .{ si, si }) catch {};
+                                if (stride == 1) {
+                                    // Zero-copy: pass SOA array pointer directly
+                                    w.print("    return __wasm.exports.{s}_batch(__soa_{d}_{s}.byteOffset, arr.length", .{ wfe.name, si, first_field }) catch {};
+                                } else {
+                                    // Multi-field: read from contiguous SOA arrays (cache-friendly) into interleaved pool
+                                    w.writeAll("    const __n = arr.length;\n") catch {};
+                                    w.print("    const __p = __wasmStackAlloc(__n * {d});\n", .{stride * 4}) catch {};
+                                    w.writeAll("    const __b = __p >> 2;\n") catch {};
+                                    w.writeAll("    for (let __i = 0; __i < __n; __i++) {\n") catch {};
+                                    for (wfe.struct_field_names[sai][0..field_count], 0..) |fname, fi| {
+                                        if (fname.len == 0) continue;
+                                        // Raw index: arr[i] is SOA index, use directly; handle: use .__idx
+                                        w.print("      __m[__b + __i * {d} + {d}] = __soa_{d}_{s}[typeof arr[__i] === 'number' ? arr[__i] : arr[__i].__idx];\n", .{ stride, fi, si, fname }) catch {};
+                                    }
+                                    w.writeAll("    }\n") catch {};
+                                    w.print("    return __wasm.exports.{s}_batch(__p, __n", .{wfe.name}) catch {};
+                                }
+                                // Append scalar params
+                                {
+                                    var pi2: u32 = 0;
+                                    while (pi2 < wfe.arg_count) : (pi2 += 1) {
+                                        if (wfe.struct_args & (@as(u8, 1) << @intCast(pi2)) == 0) {
+                                            w.print(", __s{d}", .{pi2}) catch {};
+                                        }
+                                    }
+                                }
+                                w.writeAll(");\n  }\n") catch {};
+                                break; // use first matching SOA site
+                            }
+                        }
                         // Identity cache fast path: same array ref → zero-copy
                         w.print("  if (arr === __bp_{s}_arr) return __wasm.exports.{s}_batch(__bp_{s}_pool, arr.length", .{ wfe.name, wfe.name, wfe.name }) catch {};
                         {
@@ -2084,7 +2244,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         const ArrowReplace = struct { brace_pos: u32, func_idx: u16 };
                         var arrow_replacements: [64]ArrowReplace = undefined;
                         var arrow_count: usize = 0;
-                        for (wasm_funcs[0..wasm_func_count], 0..) |wf_entry, wfi| {
+                        for (wasm_func_list.items, 0..) |wf_entry, wfi| {
                             if (!wf_entry.is_anon) continue;
                             const adjusted_line = if (wf_entry.line_num > preamble_lines) wf_entry.line_num - preamble_lines else wf_entry.line_num;
                             if (adjusted_line == 0 or adjusted_line >= line_count) continue;
@@ -2134,8 +2294,128 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             }
                         }
 
+                        // === Local array provenance tracking ===
+                        // Pre-scan for `VAR.push(FACTORY(` patterns to find which arrays
+                        // are filled exclusively from one SOA factory. Then at read sites,
+                        // transform `VAR[expr].field` → `__soa_N_field[VAR[expr].__idx]`
+                        // (or `__soa_N_field[expr]` when index alignment is provable).
+                        const ProvEntry = struct { var_name: []const u8, site_idx: usize, decl_end: usize, raw_index: bool };
+                        var provenance_buf: [64]ProvEntry = undefined;
+                        var prov_count: usize = 0;
+                        if (alloc_sites.items.len > 0) {
+                            const push_pat = ".push(";
+                            var sp: usize = 0;
+                            while (sp + push_pat.len < cc.len) : (sp += 1) {
+                                if (!std.mem.startsWith(u8, cc[sp..], push_pat)) continue;
+                                // Look back for variable name
+                                const ve = sp;
+                                var vs = ve;
+                                while (vs > 0 and isIdentChar(cc[vs - 1])) vs -= 1;
+                                if (vs == ve) continue;
+                                const vn = cc[vs..ve];
+                                // Look forward for factory name after '('
+                                const fs = sp + push_pat.len;
+                                var fe = fs;
+                                while (fe < cc.len and isIdentChar(cc[fe])) fe += 1;
+                                if (fe == fs or fe >= cc.len or cc[fe] != '(') continue;
+                                const fn_name = cc[fs..fe];
+                                // Match against alloc sites
+                                for (alloc_sites.items, 0..) |site, si| {
+                                    if (std.mem.eql(u8, site.name, fn_name)) {
+                                        // Deduplicate
+                                        var dup = false;
+                                        for (provenance_buf[0..prov_count]) |p| {
+                                            if (std.mem.eql(u8, p.var_name, vn)) { dup = true; break; }
+                                        }
+                                        if (!dup and prov_count < provenance_buf.len) {
+                                            provenance_buf[prov_count] = .{ .var_name = vn, .site_idx = si, .decl_end = 0, .raw_index = false };
+                                            prov_count += 1;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        // Find `VAR = []` declarations for each provenance entry (index alignment)
+                        {
+                            var pi: usize = 0;
+                            while (pi < prov_count) : (pi += 1) {
+                                const vn = provenance_buf[pi].var_name;
+                                var dp: usize = 0;
+                                while (dp + vn.len + 3 < cc.len) : (dp += 1) {
+                                    if (dp > 0 and isIdentChar(cc[dp - 1])) continue;
+                                    if (!std.mem.startsWith(u8, cc[dp..], vn)) continue;
+                                    var ep = dp + vn.len;
+                                    while (ep < cc.len and cc[ep] == ' ') ep += 1;
+                                    if (ep >= cc.len or cc[ep] != '=') continue;
+                                    ep += 1;
+                                    while (ep < cc.len and cc[ep] == ' ') ep += 1;
+                                    if (ep + 1 < cc.len and cc[ep] == '[' and cc[ep + 1] == ']') {
+                                        provenance_buf[pi].decl_end = ep + 2;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        // Check raw index eligibility: every VAR[expr] must be followed by .field
+                        {
+                            var pi: usize = 0;
+                            while (pi < prov_count) : (pi += 1) {
+                                if (provenance_buf[pi].decl_end == 0) continue;
+                                provenance_buf[pi].raw_index = true; // assume eligible
+                                const vn = provenance_buf[pi].var_name;
+                                const site = alloc_sites.items[provenance_buf[pi].site_idx];
+                                var sp2: usize = 0;
+                                while (sp2 + vn.len + 1 < cc.len) : (sp2 += 1) {
+                                    if (sp2 > 0 and isIdentChar(cc[sp2 - 1])) continue;
+                                    if (!std.mem.startsWith(u8, cc[sp2..], vn)) continue;
+                                    const after = sp2 + vn.len;
+                                    if (after >= cc.len or cc[after] != '[') continue;
+                                    // Found VAR[ — find matching ]
+                                    var depth2: u32 = 1;
+                                    var k2 = after + 1;
+                                    while (k2 < cc.len and depth2 > 0) : (k2 += 1) {
+                                        if (cc[k2] == '[') depth2 += 1;
+                                        if (cc[k2] == ']') depth2 -= 1;
+                                    }
+                                    if (k2 >= cc.len or cc[k2] != '.') {
+                                        provenance_buf[pi].raw_index = false;
+                                        break;
+                                    }
+                                    const fstart2 = k2 + 1;
+                                    var fend2 = fstart2;
+                                    while (fend2 < cc.len and isIdentChar(cc[fend2])) fend2 += 1;
+                                    if (fend2 == fstart2) {
+                                        provenance_buf[pi].raw_index = false;
+                                        break;
+                                    }
+                                    const fname2 = cc[fstart2..fend2];
+                                    var is_soa = false;
+                                    for (site.field_names[0..site.field_count]) |sf| {
+                                        if (std.mem.eql(u8, sf, fname2)) { is_soa = true; break; }
+                                    }
+                                    if (!is_soa) {
+                                        provenance_buf[pi].raw_index = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        const provenance = provenance_buf[0..prov_count];
+
                         var src_pos: usize = 0;
-                        while (src_pos < cc.len) {
+                        char_loop: while (src_pos < cc.len) {
+                            // === SOA base capture ===
+                            // At `VAR = []` declaration, emit base offset for index alignment
+                            for (provenance) |prov| {
+                                if (prov.decl_end > 0 and src_pos == prov.decl_end) {
+                                    w.print(";const __{s}_soa_base = __soa_{d}_next", .{ prov.var_name, prov.site_idx }) catch {};
+                                    // Raw index: tag array so trampolines detect SOA provenance
+                                    if (prov.raw_index) {
+                                        w.print(";{s}.__soa={d}", .{ prov.var_name, prov.site_idx }) catch {};
+                                    }
+                                }
+                            }
                             // === Batch struct detection ===
                             // Pattern: for (V = 0; V < ARR.length; V++) { ACC = (ACC + FN(ARR[V], ...) | 0; }
                             // where FN is a batch-eligible struct function.
@@ -2143,7 +2423,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             if (src_pos + 4 < cc.len and std.mem.startsWith(u8, cc[src_pos..], "for ") or
                                 (src_pos + 4 < cc.len and std.mem.startsWith(u8, cc[src_pos..], "for(")))
                             {
-                                if (detectBatchLoop(cc, src_pos, wasm_funcs[0..wasm_func_count])) |batch| {
+                                if (detectBatchLoop(cc, src_pos, wasm_func_list.items)) |batch| {
                                     // Write everything before the loop
                                     // The loop is already in the output stream at src_pos.
                                     // Write the batch replacement and skip past the original loop.
@@ -2168,12 +2448,12 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 (std.mem.startsWith(u8, cc[src_pos..], "for ") or
                                 std.mem.startsWith(u8, cc[src_pos..], "for(")))
                             {
-                                if (detectPushLoop(cc, src_pos, wasm_funcs[0..wasm_func_count])) |push| {
+                                if (detectPushLoop(cc, src_pos, wasm_func_list.items)) |push| {
                                     // Write the original push loop unchanged
                                     w.writeAll(cc[src_pos..push.loop_end]) catch {};
                                     // Append pool materialization for each matched struct function
                                     w.writeAll("\n") catch {};
-                                    for (wasm_funcs[0..wasm_func_count]) |wfe| {
+                                    for (wasm_func_list.items) |wfe| {
                                         if (wfe.struct_args == 0) continue;
                                         // Match fields
                                         var match_sai: u32 = 0;
@@ -2217,12 +2497,71 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 }
                             }
 
+                            // === SOA Transform: match factory functions and rewrite body ===
+                            if (alloc_sites.items.len > 0 and std.mem.startsWith(u8, cc[src_pos..], "function ")) {
+                                for (alloc_sites.items, 0..) |site, si| {
+                                    const after_kw = src_pos + 9;
+                                    if (after_kw + site.name.len + 1 > cc.len) continue;
+                                    if (!std.mem.startsWith(u8, cc[after_kw..], site.name)) continue;
+                                    const after_name = after_kw + site.name.len;
+                                    if (after_name >= cc.len or cc[after_name] != '(') continue;
+                                    if (src_pos > 0 and isIdentChar(cc[src_pos - 1])) continue;
+
+                                    // Found an alloc site. Find the opening brace and skip the original body.
+                                    var scan = after_name;
+                                    while (scan < cc.len and cc[scan] != '{') scan += 1;
+                                    if (scan >= cc.len) continue;
+
+                                    // Write function declaration with original params
+                                    w.writeAll(cc[src_pos .. scan + 1]) catch {};
+                                    w.writeAll("\n") catch {};
+
+                                    // Generate SOA allocation body
+                                    w.print("  const __idx = __soa_{d}_next++;\n", .{si}) catch {};
+                                    // Store each field from the original args
+                                    // The define_field order in bytecode matches the object literal field order.
+                                    // Map params to fields: { field0: param0, field1: param1, ... }
+                                    // Parse param names from the source
+                                    var param_start = after_name + 1; // after '('
+                                    for (site.field_names[0..site.field_count]) |fname| {
+                                        // Find param name (skip whitespace)
+                                        while (param_start < scan and (cc[param_start] == ' ' or cc[param_start] == '\n')) param_start += 1;
+                                        var param_end = param_start;
+                                        while (param_end < scan and cc[param_end] != ',' and cc[param_end] != ')') param_end += 1;
+                                        // Trim trailing whitespace
+                                        var pe = param_end;
+                                        while (pe > param_start and (cc[pe - 1] == ' ' or cc[pe - 1] == '\n')) pe -= 1;
+                                        if (pe > param_start) {
+                                            w.print("  __soa_{d}_{s}[__idx] = {s};\n", .{ si, fname, cc[param_start..pe] }) catch {};
+                                        }
+                                        param_start = if (param_end < scan and cc[param_end] == ',') param_end + 1 else param_end;
+                                    }
+                                    // Check if all provenance entries for this site use raw index
+                                    var all_raw = provenance.len > 0;
+                                    for (provenance) |prov| {
+                                        if (prov.site_idx == si and !prov.raw_index) { all_raw = false; break; }
+                                    }
+                                    if (all_raw) {
+                                        // Raw index return — no V8 HeapObject, zero GC pressure
+                                        w.print("  return __idx;\n}}\n", .{}) catch {};
+                                    } else {
+                                        // Handle object — shared hidden class for V8 inline caching
+                                        w.print("  return new __SOA_{d}(__idx);\n}}\n", .{si}) catch {};
+                                    }
+
+                                    // Skip the original function body
+                                    const body_end = skipJsFunctionBody(cc, scan);
+                                    src_pos = body_end;
+                                    continue :char_loop;
+                                }
+                            }
+
                             // Try to match `function NAME(` for each WASM function
                             var matched_func: ?WasmFunc = null;
                             var matched_func_idx: usize = 0;
                             var match_end: usize = 0;
                             var is_arrow_match = false;
-                            for (wasm_funcs[0..wasm_func_count], 0..) |wf_entry, wfi| {
+                            for (wasm_func_list.items, 0..) |wf_entry, wfi| {
                                 if (wf_entry.is_anon) continue; // handled separately
                                 // Build search pattern: "function NAME("
                                 if (src_pos + 9 + wf_entry.name.len + 1 > cc.len) continue;
@@ -2243,7 +2582,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             if (matched_func == null) {
                                 for (arrow_replacements[0..arrow_count]) |ar| {
                                     if (ar.brace_pos == @as(u32, @intCast(src_pos))) {
-                                        matched_func = wasm_funcs[ar.func_idx];
+                                        matched_func = wasm_func_list.items[ar.func_idx];
                                         matched_func_idx = ar.func_idx;
                                         is_arrow_match = true;
                                         // For arrows, match_end points to just before '(' in the params
@@ -2263,7 +2602,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             // Matches: class methods `gammaCorrect(pixels) {`
                             //          object methods `magnitude(positions, out) {`
                             if (matched_func == null) {
-                                for (wasm_funcs[0..wasm_func_count], 0..) |wf_entry, wfi| {
+                                for (wasm_func_list.items, 0..) |wf_entry, wfi| {
                                     if (wf_entry.is_anon) continue;
                                     if (src_pos + wf_entry.name.len + 1 > cc.len) continue;
                                     // Must not be preceded by an ident char (avoid matching function calls)
@@ -2297,7 +2636,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             if (matched_func) |mf| {
                                 // Decide: trampoline to WASM or keep as JS?
                                 const calls_wasm = if (!mf.is_recursive)
-                                    bodyCallsWasmFunc(cc, match_end, mf.name, wasm_funcs[0..wasm_func_count])
+                                    bodyCallsWasmFunc(cc, match_end, mf.name, wasm_func_list.items)
                                 else
                                     false;
                                 if (!shouldTrampolineToWasm(mf, calls_wasm)) {
@@ -2437,6 +2776,44 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 } else {
                                     // Array args — copy to/from WASM linear memory
                                     w.writeAll("\n") catch {};
+
+                                    // SOA fast path for array-arg functions:
+                                    // If elements are SOA handles, data is already in WASM memory.
+                                    // Find matching SOA field by looking at batch functions with struct_fields.
+                                    if (alloc_sites.items.len > 0 and mf.struct_args == 0) {
+                                        // Find a batch function with a single struct field matching an SOA site
+                                        var soa_matched = false;
+                                        for (wasm_func_list.items) |bf| {
+                                            if (bf.struct_args == 0) continue;
+                                            // Find first struct arg
+                                            var bai: u32 = 0;
+                                            while (bai < 8) : (bai += 1) {
+                                                if (bf.struct_args & (@as(u8, 1) << @intCast(bai)) != 0) break;
+                                            }
+                                            if (bai >= 8) continue;
+                                            if (bf.struct_field_counts[bai] != 1) continue; // only single-field for zero-copy
+                                            const bfield = bf.struct_field_names[bai][0];
+                                            if (bfield.len == 0) continue;
+                                            // Match against SOA sites
+                                            for (alloc_sites.items, 0..) |site, si| {
+                                                for (site.field_names[0..site.field_count]) |sf| {
+                                                    if (std.mem.eql(u8, sf, bfield)) {
+                                                        // Use batch function (flat access) not original (gather/indirect).
+                                                        // readKind_batch reads flat i32 values = SOA layout.
+                                                        // sumKinds reads pointers-to-structs = AOS with indirection.
+                                                        w.print("  if ({s}.length > 0 && ({s}[0] instanceof __SOA_{d} || {s}.__soa === {d})) return __wasm.exports.{s}_batch(__soa_{d}_{s}.byteOffset, {s}.length);\n", .{
+                                                            param_names[0], param_names[0], si, param_names[0], si, bf.name, si, bfield, param_names[0],
+                                                        }) catch {};
+                                                        soa_matched = true;
+                                                        break;
+                                                    }
+                                                }
+                                                if (soa_matched) break;
+                                            }
+                                            if (soa_matched) break;
+                                        }
+                                    }
+
                                     // i32 tier: Int32Array (4 bytes/elem), byte offset = idx << 2
                                     // f64 tier: Float64Array (8 bytes/elem), byte offset = idx << 3
                                     // Float64Array lets copy-back handle type conversion (e.g.
@@ -2567,6 +2944,102 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 // src_pos = scan (past the closing brace we already consumed)
                                 src_pos = scan;
                             } else {
+                                // === SOA read-site transform ===
+                                // Match `VAR[expr].field` where VAR is in provenance map
+                                // Transform to `__soa_N_field[VAR[expr].__idx]`
+                                var prov_matched = false;
+                                if (provenance.len > 0 and isIdentChar(cc[src_pos]) and
+                                    (src_pos == 0 or !isIdentChar(cc[src_pos - 1])))
+                                {
+                                    for (provenance) |prov| {
+                                        if (src_pos + prov.var_name.len + 1 >= cc.len) continue;
+                                        if (!std.mem.startsWith(u8, cc[src_pos..], prov.var_name)) continue;
+                                        const after_var = src_pos + prov.var_name.len;
+                                        if (cc[after_var] != '[') continue;
+                                        // Ensure word boundary (not part of longer identifier)
+                                        if (after_var < cc.len and isIdentChar(cc[after_var])) {
+                                            // cc[after_var] == '[' which is not ident, so this is fine
+                                        }
+                                        // Find matching ']' (handle nested brackets)
+                                        var depth: u32 = 1;
+                                        var k = after_var + 1;
+                                        while (k < cc.len and depth > 0) : (k += 1) {
+                                            if (cc[k] == '[') depth += 1;
+                                            if (cc[k] == ']') depth -= 1;
+                                        }
+                                        // k is now past the ']'
+                                        if (k >= cc.len or cc[k] != '.') continue;
+                                        // Read field name after '.'
+                                        const fstart = k + 1;
+                                        var fend = fstart;
+                                        while (fend < cc.len and isIdentChar(cc[fend])) fend += 1;
+                                        if (fend == fstart) continue;
+                                        const fname = cc[fstart..fend];
+                                        // Skip .length, .push, .indexOf etc — only match SOA fields
+                                        const site = alloc_sites.items[prov.site_idx];
+                                        var field_match = false;
+                                        for (site.field_names[0..site.field_count]) |sf| {
+                                            if (std.mem.eql(u8, sf, fname)) { field_match = true; break; }
+                                        }
+                                        if (!field_match) continue;
+                                        const idx_expr = cc[after_var + 1 .. k - 1]; // content between [ ]
+                                        // Try to recursively transform idx_expr if it contains VAR[inner].field
+                                        var inner_transformed = false;
+                                        if (prov.decl_end > 0) {
+                                            for (provenance) |ip| {
+                                                if (ip.decl_end == 0) continue;
+                                                if (!std.mem.startsWith(u8, idx_expr, ip.var_name)) continue;
+                                                const ia = ip.var_name.len;
+                                                if (ia >= idx_expr.len or idx_expr[ia] != '[') continue;
+                                                // Find matching ] in idx_expr
+                                                var d3: u32 = 1;
+                                                var k3 = ia + 1;
+                                                while (k3 < idx_expr.len and d3 > 0) : (k3 += 1) {
+                                                    if (idx_expr[k3] == '[') d3 += 1;
+                                                    if (idx_expr[k3] == ']') d3 -= 1;
+                                                }
+                                                if (k3 >= idx_expr.len or idx_expr[k3] != '.') continue;
+                                                const ifs = k3 + 1;
+                                                var ife = ifs;
+                                                while (ife < idx_expr.len and isIdentChar(idx_expr[ife])) ife += 1;
+                                                if (ife == ifs) continue;
+                                                const ifn = idx_expr[ifs..ife];
+                                                // Verify it's an SOA field
+                                                const isite = alloc_sites.items[ip.site_idx];
+                                                var if_match = false;
+                                                for (isite.field_names[0..isite.field_count]) |sf| {
+                                                    if (std.mem.eql(u8, sf, ifn)) { if_match = true; break; }
+                                                }
+                                                if (!if_match) continue;
+                                                const inner_idx = idx_expr[ia + 1 .. k3 - 1];
+                                                // Emit: __soa_N_field[__VAR_base + (__soa_M_innerfield[__IVAR_base + (inner_idx)])]
+                                                w.print("__soa_{d}_{s}[__{s}_soa_base + (__soa_{d}_{s}[__{s}_soa_base + ({s})])]", .{
+                                                    prov.site_idx, fname, prov.var_name,
+                                                    ip.site_idx, ifn, ip.var_name, inner_idx,
+                                                }) catch {};
+                                                inner_transformed = true;
+                                                break;
+                                            }
+                                        }
+                                        if (!inner_transformed) {
+                                            if (prov.decl_end > 0) {
+                                                // Index-aligned: VAR[expr].field → __soa_N_field[__VAR_soa_base + (expr)]
+                                                w.print("__soa_{d}_{s}[__{s}_soa_base + ({s})]", .{
+                                                    prov.site_idx, fname, prov.var_name, idx_expr,
+                                                }) catch {};
+                                            } else {
+                                                // Handle-based: VAR[expr].field → __soa_N_field[VAR[expr].__idx]
+                                                w.print("__soa_{d}_{s}[{s}[{s}].__idx]", .{
+                                                    prov.site_idx, fname, prov.var_name, idx_expr,
+                                                }) catch {};
+                                            }
+                                        }
+                                        src_pos = fend;
+                                        prov_matched = true;
+                                        break;
+                                    }
+                                }
+                                if (prov_matched) continue :char_loop;
                                 // No match — copy one character
                                 w.writeAll(cc[src_pos .. src_pos + 1]) catch {};
                                 src_pos += 1;

@@ -53,6 +53,8 @@ V8 inlines WASM calls into JS — zero boundary overhead
 
 **Key innovations:**
 - **Automatic detection**: Analyzes QuickJS bytecodes to identify pure numeric functions (no manual annotation needed)
+- **Auto Struct Layout (SOA)**: Detects factory functions that create objects with fixed shapes, rewrites them to allocate fields into contiguous `Int32Array` pools backed by WASM linear memory — enables CPU cache prefetch and SIMD auto-vectorization
+- **Provenance tracking**: Traces which arrays are filled from SOA factories, eliminates handle objects entirely at read sites — `nodes[j].kind` becomes a direct typed array access with zero JS object overhead
 - **Smart trampolines**: Recursive/cross-calling functions → WASM (deep stacks stay native); pure scalar → keep as JS (V8 already optimal)
 - **Zero-copy WASM memory**: `__wasmArray()` allocates TypedArrays directly in WASM linear memory — trampolines detect `arr.buffer === __wbuf` and skip copy entirely
 - **Array copy caching**: Read-only array arguments cached by reference identity, eliminating redundant copies in tight loops
@@ -80,6 +82,31 @@ V8 inlines WASM calls into JS — zero boundary overhead
 | euclideanDist 100K | 293 ms | 838 ms | **2.8x faster** |
 | prefixSum 10K | 121 ms | 254 ms | **2.0x faster** |
 
+### Auto Struct Layout (SOA) Results
+
+| Benchmark | AOT+JIT | Node.js | Speedup |
+|-----------|:-------:|:-------:|:-------:|
+| struct field sum (200K objects) | 10 ms | 21 ms | **2.1x faster** |
+| multi-field filter (3 fields/iter) | 19 ms | 27 ms | **1.4x faster** |
+| parent chain walk (graph traversal) | 13 ms | 28 ms | **2.2x faster** |
+
+SOA transforms factory-allocated objects into contiguous typed arrays in WASM linear memory. No code changes needed — EdgeBox detects the pattern automatically:
+
+```javascript
+// Your code (unchanged)
+function makeNode(kind, flags, id) {
+  return { kind: kind, flags: flags, id: id };
+}
+var nodes = [];
+for (var i = 0; i < 200000; i++) {
+  nodes.push(makeNode(i % 16, i * 7 & 255, i));
+}
+// This loop runs 2.1x faster — fields are in contiguous WASM memory
+for (var j = 0; j < nodes.length; j++) {
+  sum += nodes[j].kind;
+}
+```
+
 ### Where It Excels vs Where It Doesn't
 
 | Code Pattern | Speedup | Why |
@@ -87,6 +114,7 @@ V8 inlines WASM calls into JS — zero boundary overhead
 | Array iteration loops | **7-9x** | WASM eliminates bounds checks, V8 inlines the trampoline |
 | Recursive functions (fib, ackermann) | **4-5x** | Entire call stack stays in WASM, zero JS overhead |
 | Numeric kernels (hash, CRC, crypto) | **2-4x** | WASM eliminates type checks, array caching skips copies |
+| Struct field iteration (SOA) | **2x** | Fields in contiguous WASM memory, provenance eliminates handle objects |
 | Float64 compute (dot product, distance) | **3x** | LLVM optimizes f64 loops better than V8's speculative JIT |
 | Pure integer bitwise (rotr, popcount) | ~same | V8 JIT already compiles these to native integer ops |
 | Object-heavy code | No benefit | V8 JIT already optimal for property access and closures |
@@ -179,7 +207,32 @@ function adler32(adler, buf, len, pos) {
 
 V8 TurboFan sees the `__wasm.exports.adler32(...)` call and inlines the WASM code directly — the trampoline's copy-or-skip logic and the WASM compute kernel compile into a single native code stream. The stack allocator (`__wasmStackSave`/`__wasmStackRestore`) scopes temporary copies to each trampoline call — nested calls and multiple scopes work correctly with LIFO lifetime management.
 
-### 4. Smart Trampoline Decisions
+### 4. Auto Struct Layout (SOA Transform)
+
+EdgeBox detects factory functions that create objects with fixed shapes (e.g., `return { kind, flags, id }`) and rewrites them to store fields in contiguous `Int32Array` pools backed by WASM linear memory:
+
+```javascript
+// Original                              // Transformed (auto-generated)
+function makeNode(kind, flags, id) {     function makeNode(kind, flags, id) {
+  return { kind, flags, id };              const __idx = __soa_0_next++;
+}                                          __soa_0_kind[__idx] = kind;
+                                           __soa_0_flags[__idx] = flags;
+                                           __soa_0_id[__idx] = id;
+                                           return __idx;  // raw integer, zero GC
+                                         }
+```
+
+**Provenance tracking** then transforms read sites — `nodes[j].kind` becomes `__soa_0_kind[base + j]`, a direct TypedArray load:
+
+| Optimization Layer | What It Does |
+|-------------------|--------------|
+| SOA allocation | Fields stored in contiguous `Int32Array` (WASM linear memory) |
+| Provenance tracking | Detects arrays filled from SOA factories via `.push()` |
+| Index alignment | `nodes[j].kind` → `__soa_0_kind[base + j]` (eliminates handle objects) |
+| Raw index return | Factory returns integer, not object — zero V8 heap allocation |
+| Recursive transform | `nodes[nodes[j].parentId].kind` → chained typed array lookups |
+
+### 5. Smart Trampoline Decisions
 
 | Function Pattern | Decision | Rationale |
 |-----------------|----------|-----------|
