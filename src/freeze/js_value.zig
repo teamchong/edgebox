@@ -3093,12 +3093,6 @@ pub fn promiseReject(ctx: *JSContext, reason: JSValue) JSValue {
     return quickjs.JS_Call(ctx, reject_fn, promise_ctor, 1, &args);
 }
 
-/// Wrap a value in Promise.resolve() - alias for toPromise
-/// Used by async functions to ensure return value is always a Promise
-pub fn promiseResolve(ctx: *JSContext, val: JSValue) JSValue {
-    return toPromise(ctx, val);
-}
-
 // ============================================================================
 // Frozen Async State - saved execution state for await resumption
 // ============================================================================

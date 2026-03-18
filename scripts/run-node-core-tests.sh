@@ -91,7 +91,7 @@ run_test() {
         local compile_output
         local compile_exit=0
         local compile_start=$(get_time_ms)
-        compile_output=$(./zig-out/bin/edgeboxc build "$test_app_dir" 2>&1) || compile_exit=$?
+        compile_output=$(./zig-out/bin/edgebox build "$test_app_dir" 2>&1) || compile_exit=$?
         local compile_end=$(get_time_ms)
         compile_time_ms=$((compile_end - compile_start))
         TOTAL_COMPILE_TIME=$((TOTAL_COMPILE_TIME + compile_time_ms))
@@ -105,7 +105,7 @@ run_test() {
         fi
 
         # Find the compiled native binary
-        # edgeboxc outputs to zig-out/bin/tmp/<full-path-of-app-dir>/<dirname> (no extension)
+        # edgebox outputs to zig-out/bin/tmp/<full-path-of-app-dir>/<dirname> (no extension)
         local native_bin="./zig-out/bin/tmp/edgebox-node-tests/$test_name/$test_name"
         if [ ! -f "$native_bin" ]; then
             # Fallback pattern without subdirectory

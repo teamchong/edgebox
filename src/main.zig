@@ -287,7 +287,7 @@ pub const Runtime = struct {
     }
 
     /// AOT compile JavaScript to native
-    /// Note: AOT compilation is now handled by edgeboxc CLI tool
+    /// Note: AOT compilation is now handled by edgebox CLI tool
     pub fn aotCompile(self: *Self, source_path: []const u8, output_path: []const u8) !void {
         _ = self;
         _ = source_path;

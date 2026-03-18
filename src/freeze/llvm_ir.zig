@@ -303,10 +303,6 @@ pub const Builder = struct {
         return c.LLVMBuildIntToPtr(self.ref, val, dest_ty, name);
     }
 
-    pub fn buildPtrToInt(self: Builder, val: Value, dest_ty: Type, name: [*:0]const u8) Value {
-        return c.LLVMBuildPtrToInt(self.ref, val, dest_ty, name);
-    }
-
     pub fn buildBitCast(self: Builder, val: Value, dest_ty: Type, name: [*:0]const u8) Value {
         return c.LLVMBuildBitCast(self.ref, val, dest_ty, name);
     }
@@ -399,10 +395,6 @@ pub fn constNull(ty: Type) Value {
     return c.LLVMConstNull(ty);
 }
 
-pub fn constString(str: [*:0]const u8, len: u32, null_terminate: bool) Value {
-    return c.LLVMConstString(str, len, if (null_terminate) 0 else 1);
-}
-
 // ============================================================================
 // BasicBlock helpers
 // ============================================================================
@@ -423,20 +415,8 @@ pub fn setGlobalConstant(val: Value, is_const: bool) void {
     c.LLVMSetGlobalConstant(val, if (is_const) 1 else 0);
 }
 
-pub fn setInitializer(global: Value, init: Value) void {
-    c.LLVMSetInitializer(global, init);
-}
-
 pub fn setFunctionCallConv(func: Value, cc: c.LLVMCallConv) void {
     c.LLVMSetFunctionCallConv(func, cc);
-}
-
-pub fn addFunctionAttr(func: Value, attr_kind: [*:0]const u8, ctx: Context) void {
-    const kind = c.LLVMGetEnumAttributeKindForName(attr_kind, std.mem.len(attr_kind));
-    if (kind != 0) {
-        const attr = c.LLVMCreateEnumAttribute(ctx.ref, kind, 0);
-        c.LLVMAddAttributeAtIndex(func, c.LLVMAttributeFunctionIndex, attr);
-    }
 }
 
 pub fn addSwitchCase(switch_val: Value, on_val: Value, dest: BasicBlock) void {

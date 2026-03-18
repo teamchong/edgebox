@@ -3,7 +3,7 @@
 /// Unified configuration structures used by all EdgeBox tools:
 /// - edgebox (runtime)
 /// - edgeboxd (daemon)
-/// - edgeboxc (compiler)
+/// - edgebox (compiler)
 const std = @import("std");
 const path_utils = @import("path.zig");
 
@@ -122,7 +122,7 @@ pub const DaemonConfig = struct {
 };
 
 /// Unified EdgeBox Configuration
-/// All tools (edgebox, edgeboxd, edgeboxc) use subsets of this
+/// All tools (edgebox, edgeboxd) use subsets of this
 pub const Config = struct {
     // === Identity ===
     name: ?[]const u8 = null,

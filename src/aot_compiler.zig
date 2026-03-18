@@ -7,7 +7,7 @@ const c = @cImport({
 });
 
 /// Compile a WASM file to AOT format using WAMR's embedded AOT compiler
-/// No external CLI needed - LLVM is linked into edgeboxc
+/// No external CLI needed - LLVM is linked into edgebox
 pub fn compileWasmToAot(
     allocator: std.mem.Allocator,
     wasm_path: []const u8,

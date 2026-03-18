@@ -753,7 +753,7 @@ fn printUsage() void {
         \\The daemon caches modules - first run loads, subsequent runs are instant.
         \\
         \\To compile JS to WASM:
-        \\  edgeboxc build <app_dir>
+        \\  edgebox build <app_dir>
         \\
     , .{});
 }

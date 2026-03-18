@@ -554,6 +554,77 @@ fn skipJsFunctionBody(cc: []const u8, brace_pos: usize) usize {
     return scan;
 }
 
+/// Result of detecting a push-loop pattern (array population).
+const PushLoopMatch = struct {
+    loop_end: usize,
+    arr_name: []const u8, // array being populated
+    body: []const u8, // push body content for field matching
+
+    /// Check if a field name appears as a key in the push object literal.
+    fn has_field(self: PushLoopMatch, name: []const u8) bool {
+        // Search for "fieldname:" or "fieldname :" in the body
+        var pos: usize = 0;
+        while (pos + name.len < self.body.len) {
+            if (std.mem.startsWith(u8, self.body[pos..], name)) {
+                const after = pos + name.len;
+                if (after < self.body.len) {
+                    var ap = after;
+                    while (ap < self.body.len and self.body[ap] == ' ') ap += 1;
+                    if (ap < self.body.len and self.body[ap] == ':') return true;
+                }
+            }
+            pos += 1;
+        }
+        return false;
+    }
+};
+
+/// Detect for-loop patterns that populate an array via push({...}).
+/// Pattern: for (...) { ARR.push({ field1: EXPR, field2: EXPR }); }
+fn detectPushLoop(cc: []const u8, for_pos: usize, wasm_funcs: []const WasmFunc) ?PushLoopMatch {
+    _ = wasm_funcs;
+    // Skip to the loop body brace
+    var p = for_pos + 3;
+    while (p < cc.len and cc[p] == ' ') p += 1;
+    if (p >= cc.len or cc[p] != '(') return null;
+    // Skip the for(...) header
+    var depth: u32 = 1;
+    p += 1;
+    while (p < cc.len and depth > 0) : (p += 1) {
+        if (cc[p] == '(') depth += 1;
+        if (cc[p] == ')') depth -= 1;
+    }
+    // Find loop body brace
+    while (p < cc.len and (cc[p] == ' ' or cc[p] == '\n' or cc[p] == '\r')) p += 1;
+    if (p >= cc.len or cc[p] != '{') return null;
+    const body_start = p + 1;
+    const loop_end = skipJsFunctionBody(cc, p);
+    const body = cc[body_start..@min(loop_end - 1, cc.len)];
+
+    // Find ARR.push({ in the body
+    const push_marker = ".push(";
+    const push_pos = std.mem.indexOf(u8, body, push_marker) orelse return null;
+    // Extract array name (identifier before .push)
+    var arr_end = push_pos;
+    while (arr_end > 0 and (body[arr_end - 1] == ' ' or body[arr_end - 1] == '\n')) arr_end -= 1;
+    var arr_start = arr_end;
+    while (arr_start > 0 and isIdentChar(body[arr_start - 1])) arr_start -= 1;
+    const arr_name = body[arr_start..arr_end];
+    if (arr_name.len == 0) return null;
+
+    // Verify it's pushing an object literal
+    const after_push = push_pos + push_marker.len;
+    var ap = after_push;
+    while (ap < body.len and (body[ap] == ' ' or body[ap] == '\n')) ap += 1;
+    if (ap >= body.len or body[ap] != '{') return null;
+
+    return PushLoopMatch{
+        .loop_end = loop_end,
+        .arr_name = arr_name,
+        .body = body,
+    };
+}
+
 /// Result of detecting a batch-eligible for-loop.
 const BatchLoopMatch = struct {
     loop_end: usize, // position after the closing `}`
@@ -1882,6 +1953,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     // Batch struct helpers: for each struct function with _batch variant,
                     // generate a JS function that copies array fields into WASM pool and
                     // calls the batched WASM function in a single invocation.
+                    // Identity cache: if same array ref on repeated calls, skip the copy
+                    // (pool persists in WASM stack memory across calls).
                     for (wasm_funcs[0..wasm_func_count]) |wfe| {
                         if (wfe.struct_args == 0) continue;
                         // Find first struct arg and its fields
@@ -1896,40 +1969,36 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         if (field_count == 0) continue;
                         const stride = @as(u32, field_count);
 
-                        // Generate: function __batch_FUNC(arr, ...scalars) {
-                        //   const sp = __wasmStackSave();
-                        //   const n = arr.length;
-                        //   const pool = __wasmStackAlloc(n * stride * 4);
-                        //   const base = pool >> 2;
-                        //   for (let i = 0; i < n; i++) {
-                        //     __m[base + i * stride + 0] = arr[i].field0;
-                        //     __m[base + i * stride + 1] = arr[i].field1;
-                        //     ...
-                        //   }
-                        //   const r = __wasm.exports.FUNC_batch(pool, n, ...scalars);
-                        //   __wasmStackRestore(sp);
-                        //   return r;
-                        // }
+                        // Per-function identity cache variables
+                        w.print("let __bp_{s}_arr = null, __bp_{s}_pool = 0, __bp_{s}_sp = 0;\n", .{ wfe.name, wfe.name, wfe.name }) catch {};
                         w.print("function __batch_{s}(arr", .{wfe.name}) catch {};
                         // Scalar params (non-struct args)
-                        var scalar_names: [8][]const u8 = undefined;
-                        var scalar_count_2: u32 = 0;
                         {
                             var pi: u32 = 0;
                             while (pi < wfe.arg_count) : (pi += 1) {
                                 if (wfe.struct_args & (@as(u8, 1) << @intCast(pi)) == 0) {
-                                    var sname_buf: [8]u8 = undefined;
-                                    const sname = std.fmt.bufPrint(&sname_buf, "__s{d}", .{pi}) catch "__s";
-                                    w.print(", {s}", .{sname}) catch {};
-                                    scalar_names[scalar_count_2] = sname;
-                                    scalar_count_2 += 1;
+                                    w.print(", __s{d}", .{pi}) catch {};
                                 }
                             }
                         }
                         w.writeAll(") {\n") catch {};
-                        w.writeAll("  const __sp0 = __wasmStackSave();\n  const __n = arr.length;\n") catch {};
-                        w.print("  const __pool = __wasmStackAlloc(__n * {d});\n", .{stride * 4}) catch {};
-                        w.writeAll("  const __base = __pool >> 2;\n") catch {};
+                        // Identity cache fast path: same array ref → zero-copy
+                        w.print("  if (arr === __bp_{s}_arr) return __wasm.exports.{s}_batch(__bp_{s}_pool, arr.length", .{ wfe.name, wfe.name, wfe.name }) catch {};
+                        {
+                            var pi: u32 = 0;
+                            while (pi < wfe.arg_count) : (pi += 1) {
+                                if (wfe.struct_args & (@as(u8, 1) << @intCast(pi)) == 0) {
+                                    w.print(", __s{d}", .{pi}) catch {};
+                                }
+                            }
+                        }
+                        w.writeAll(");\n") catch {};
+                        // Cache miss: free old pool, allocate new, copy fields
+                        w.print("  if (__bp_{s}_arr !== null) __wasmStackRestore(__bp_{s}_sp);\n", .{ wfe.name, wfe.name }) catch {};
+                        w.print("  __bp_{s}_sp = __wasmStackSave();\n", .{wfe.name}) catch {};
+                        w.writeAll("  const __n = arr.length;\n") catch {};
+                        w.print("  __bp_{s}_pool = __wasmStackAlloc(__n * {d});\n", .{ wfe.name, stride * 4 }) catch {};
+                        w.print("  const __base = __bp_{s}_pool >> 2;\n", .{wfe.name}) catch {};
                         // Copy loop
                         w.writeAll("  for (let __i = 0; __i < __n; __i++) {\n") catch {};
                         for (wfe.struct_field_names[sai][0..field_count], 0..) |fname, fi| {
@@ -1941,8 +2010,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             }
                         }
                         w.writeAll("  }\n") catch {};
+                        w.print("  __bp_{s}_arr = arr;\n", .{wfe.name}) catch {};
                         // Call batch WASM
-                        w.print("  const __r = __wasm.exports.{s}_batch(__pool, __n", .{wfe.name}) catch {};
+                        w.print("  return __wasm.exports.{s}_batch(__bp_{s}_pool, __n", .{ wfe.name, wfe.name }) catch {};
                         {
                             var pi: u32 = 0;
                             while (pi < wfe.arg_count) : (pi += 1) {
@@ -1951,8 +2021,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 }
                             }
                         }
-                        w.writeAll(");\n") catch {};
-                        w.writeAll("  __wasmStackRestore(__sp0);\n  return __r;\n}\n") catch {};
+                        w.writeAll(");\n}\n") catch {};
                     }
 
                     w.writeAll("\n") catch {};
@@ -2077,6 +2146,63 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     }
                                     w.writeAll(")) | 0;\n") catch {};
                                     src_pos = batch.loop_end;
+                                    continue;
+                                }
+                            }
+
+                            // === Push-loop pool materialization ===
+                            // Detect: for (...) { ARR.push({ fields... }); }
+                            // Append after loop: materialize WASM pool from JS array
+                            // so subsequent __batch_* calls hit the identity cache.
+                            if (src_pos + 4 < cc.len and
+                                (std.mem.startsWith(u8, cc[src_pos..], "for ") or
+                                std.mem.startsWith(u8, cc[src_pos..], "for(")))
+                            {
+                                if (detectPushLoop(cc, src_pos, wasm_funcs[0..wasm_func_count])) |push| {
+                                    // Write the original push loop unchanged
+                                    w.writeAll(cc[src_pos..push.loop_end]) catch {};
+                                    // Append pool materialization for each matched struct function
+                                    w.writeAll("\n") catch {};
+                                    for (wasm_funcs[0..wasm_func_count]) |wfe| {
+                                        if (wfe.struct_args == 0) continue;
+                                        // Match fields
+                                        var match_sai: u32 = 0;
+                                        var match_fc: u8 = 0;
+                                        while (match_sai < 8) : (match_sai += 1) {
+                                            if (wfe.struct_args & (@as(u8, 1) << @intCast(match_sai)) != 0) {
+                                                match_fc = wfe.struct_field_counts[match_sai];
+                                                break;
+                                            }
+                                        }
+                                        if (match_fc == 0) continue;
+                                        // Check if ANY of this func's fields appear in the push body
+                                        var fields_match = false;
+                                        for (wfe.struct_field_names[match_sai][0..match_fc]) |fname| {
+                                            if (fname.len > 0 and push.has_field(fname)) {
+                                                fields_match = true;
+                                                break;
+                                            }
+                                        }
+                                        if (!fields_match) continue;
+                                        const s = @as(u32, match_fc);
+                                        // Emit pool materialization
+                                        w.print("__bp_{s}_sp = __wasmStackSave(); ", .{wfe.name}) catch {};
+                                        w.print("__bp_{s}_pool = __wasmStackAlloc({s}.length * {d}); ", .{ wfe.name, push.arr_name, s * 4 }) catch {};
+                                        w.writeAll("{\n") catch {};
+                                        w.print("  const __b = __bp_{s}_pool >> 2;\n", .{wfe.name}) catch {};
+                                        w.print("  for (let __i = 0; __i < {s}.length; __i++) {{\n", .{push.arr_name}) catch {};
+                                        for (wfe.struct_field_names[match_sai][0..match_fc], 0..) |fname, fi| {
+                                            if (fname.len == 0) continue;
+                                            if (s == 1) {
+                                                w.print("    __m[__b + __i] = {s}[__i].{s};\n", .{ push.arr_name, fname }) catch {};
+                                            } else {
+                                                w.print("    __m[__b + __i * {d} + {d}] = {s}[__i].{s};\n", .{ s, fi, push.arr_name, fname }) catch {};
+                                            }
+                                        }
+                                        w.writeAll("  }\n}\n") catch {};
+                                        w.print("__bp_{s}_arr = {s};\n", .{ wfe.name, push.arr_name }) catch {};
+                                    }
+                                    src_pos = push.loop_end;
                                     continue;
                                 }
                             }

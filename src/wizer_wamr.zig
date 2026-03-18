@@ -1150,7 +1150,7 @@ fn readLEB128i64(data: []const u8, pos: *usize) !i64 {
 /// Run wizer snapshot from command line args
 pub fn runSnapshot(allocator: Allocator, args: []const [:0]const u8) !void {
     if (args.len < 2) {
-        std.debug.print("Usage: edgeboxc snapshot <input.wasm> <output.wasm> [--init-func=name]\n", .{});
+        std.debug.print("Usage: edgebox snapshot <input.wasm> <output.wasm> [--init-func=name]\n", .{});
         return error.InvalidArgs;
     }
 

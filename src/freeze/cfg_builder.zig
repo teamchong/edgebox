@@ -593,50 +593,6 @@ fn computeStackDepths(cfg: *CFG) StackDepthError!void {
     }
 }
 
-/// Get blocks in reverse post-order (good for forward dataflow)
-pub fn reversePostOrder(cfg: *const CFG, allocator: Allocator) ![]u32 {
-    var order = std.ArrayListUnmanaged(u32){};
-    var visited = std.AutoHashMapUnmanaged(u32, void){};
-    defer visited.deinit(allocator);
-
-    // DFS from entry
-    const StackItem = struct { id: u32, children_visited: bool };
-    var stack = std.ArrayListUnmanaged(StackItem){};
-    defer stack.deinit(allocator);
-
-    try stack.append(allocator, .{ .id = cfg.entry_block, .children_visited = false });
-
-    while (stack.items.len > 0) {
-        var item = &stack.items[stack.items.len - 1];
-        const block_id = item.id;
-
-        if (visited.contains(block_id)) {
-            _ = stack.pop();
-            continue;
-        }
-
-        if (!item.children_visited) {
-            item.children_visited = true;
-            try visited.put(allocator, block_id, {});
-
-            // Push successors
-            const block = cfg.getBlock(block_id) orelse continue;
-            for (block.successors.items) |succ| {
-                if (!visited.contains(succ)) {
-                    try stack.append(allocator, .{ .id = succ, .children_visited = false });
-                }
-            }
-        } else {
-            _ = stack.pop();
-            try order.append(allocator, block_id);
-        }
-    }
-
-    // Reverse for reverse post-order
-    std.mem.reverse(u32, order.items);
-    return order.toOwnedSlice(allocator);
-}
-
 /// Analyze block contamination for partial freezing
 /// A block is contaminated if:
 /// 1. It contains a never_freeze opcode (direct contamination), OR

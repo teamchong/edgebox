@@ -2,7 +2,7 @@
 // Removes dependency on wasm-opt CLI binary
 //
 // Usage:
-//   edgeboxc optimize input.wasm output.wasm [-Oz|-Os|-O1|-O2|-O3|-O4]
+//   edgebox optimize input.wasm output.wasm [-Oz|-Os|-O1|-O2|-O3|-O4]
 
 const std = @import("std");
 
@@ -101,10 +101,10 @@ pub fn optimize(allocator: std.mem.Allocator, input: []const u8, level: OptLevel
     };
 }
 
-/// Run wasm-opt from CLI (edgeboxc optimize)
+/// Run wasm-opt from CLI (edgebox optimize)
 pub fn runOptimize(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 2) {
-        std.debug.print("Usage: edgeboxc optimize <input.wasm> <output.wasm> [-Oz|-Os|-O1|-O2|-O3|-O4]\n", .{});
+        std.debug.print("Usage: edgebox optimize <input.wasm> <output.wasm> [-Oz|-Os|-O1|-O2|-O3|-O4]\n", .{});
         std.process.exit(1);
     }
 

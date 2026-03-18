@@ -1,5 +1,5 @@
 // Frozen dispatch for CLI builds
-// The CLI (edgeboxc) compiles code but doesn't execute frozen functions
+// The CLI (edgebox) compiles code but doesn't execute frozen functions
 // This provides a no-op implementation - the real dispatch is in native_dispatch.zig
 
 #include <stddef.h>

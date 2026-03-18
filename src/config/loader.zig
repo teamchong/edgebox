@@ -32,7 +32,7 @@ pub const ConfigSections = enum {
     all,
     runtime_only, // For edgebox
     daemon_only, // For edgeboxd
-    build_only, // For edgeboxc
+    build_only, // For edgebox (compiler mode)
 };
 
 /// Load configuration with precedence handling

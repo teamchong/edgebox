@@ -22,6 +22,10 @@ FILES=(
     bench/mandelbrot.js
     bench/gaussian_blur.js
     bench/sorting.js
+    bench/recursive.js
+    bench/vlq_decode.js
+    bench/protobuf_varint.js
+    bench/schema_validate.js
 )
 
 TOTAL_AOT=0

@@ -317,5 +317,5 @@ console.log(`[bundle] Written: ${outputFile} (${(stats.size / 1024 / 1024).toFix
 console.log('[bundle] Done!');
 console.log('');
 console.log('Next steps:');
-console.log(`  1. Compile: ./zig-out/bin/edgeboxc --minimal ${outputFile}`);
+console.log(`  1. Compile: ./zig-out/bin/edgebox --minimal ${outputFile}`);
 console.log(`  2. Run:     ./zig-out/bin/${path.basename(outputFile, '.js')}/${path.basename(outputFile, '.js')}`);

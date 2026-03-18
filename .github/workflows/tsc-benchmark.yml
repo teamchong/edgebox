@@ -51,7 +51,7 @@ jobs:
 
       - name: Compile tsc with EdgeBox AOT
         run: |
-          ./zig-out/bin/edgeboxc --binary-only --allocator=arena benchmark/node_modules/typescript/lib/tsc.js
+          ./zig-out/bin/edgebox --binary-only --allocator=arena benchmark/node_modules/typescript/lib/tsc.js
 
       - name: Install tsgo (TypeScript Native Preview)
         continue-on-error: true
