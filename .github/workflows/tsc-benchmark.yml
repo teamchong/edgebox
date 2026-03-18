@@ -35,26 +35,17 @@ jobs:
 
       - name: Setup EdgeBox
         uses: ./.github/actions/setup-edgebox
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Install benchmark dependencies
         run: |
           cd benchmark
           npm install
 
-      - name: Build EdgeBox compiler
-        run: zig build cli -Doptimize=ReleaseFast
-
-      - name: Compile tsc with EdgeBox AOT
+      - name: Compile tsc with EdgeBox (worker path)
         run: |
-          ./zig-out/bin/edgebox --binary-only --allocator=arena benchmark/node_modules/typescript/lib/tsc.js
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+          ./zig-out/bin/edgebox benchmark/node_modules/typescript/lib/_tsc.js
 
       - name: Install tsgo (TypeScript Native Preview)
         continue-on-error: true

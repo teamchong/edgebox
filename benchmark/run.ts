@@ -187,11 +187,11 @@ function buildEdgeboxTsc(): string | null {
   // Use relative path from PROJECT_ROOT to avoid path.join issues with absolute paths
   const tscSourceRel = relative(PROJECT_ROOT, tscSourceAbs);
   const outputDir = join(PROJECT_ROOT, "zig-out/bin", tscSourceRel);
-  const compiled = join(outputDir, "_tsc");
+  const workerMjs = join(outputDir, "_tsc-worker.mjs");
 
   // Check if already compiled
-  if (existsSync(compiled)) {
-    return compiled;
+  if (existsSync(workerMjs)) {
+    return workerMjs;
   }
 
   // Build edgebox if needed
@@ -205,10 +205,10 @@ function buildEdgeboxTsc(): string | null {
     }
   }
 
-  // Compile tsc with EdgeBox
-  console.log("Compiling tsc with EdgeBox AOT...");
+  // Compile tsc with EdgeBox (worker path: .mjs + .wasm)
+  console.log("Compiling tsc with EdgeBox AOT (worker path)...");
   try {
-    execSync(`"${edgeboxPath}" --binary-only --allocator=arena "${tscSourceRel}"`, {
+    execSync(`"${edgeboxPath}" "${tscSourceRel}"`, {
       cwd: PROJECT_ROOT,
       stdio: "pipe",  // Suppress build output
       timeout: 600000,
@@ -218,7 +218,7 @@ function buildEdgeboxTsc(): string | null {
     return null;
   }
 
-  return existsSync(compiled) ? compiled : null;
+  return existsSync(workerMjs) ? workerMjs : null;
 }
 
 // ============================================================================
@@ -462,14 +462,14 @@ function benchmarkProject(
     nodeTimes.push(nodeResult.time);
   }
 
-  // Benchmark EdgeBox tsc
+  // Benchmark EdgeBox tsc (worker .mjs via Node.js — V8 inlines WASM)
   const edgeboxTimes: number[] = [];
   let edgeboxResult: RunResult = { time: 0, success: false, outputFiles: 0, outputSize: 0 };
 
   for (let i = 0; i < runs; i++) {
     const args = [...tscArgs];
     args[1] = edgeboxOutDir;
-    edgeboxResult = runTsc(edgeboxTsc, args, edgeboxOutDir, debug);
+    edgeboxResult = runTsc("node", [edgeboxTsc, ...args], edgeboxOutDir, debug);
     if (!edgeboxResult.success) {
       console.log(`    EdgeBox: Failed - ${edgeboxResult.error}`);
       return null;
