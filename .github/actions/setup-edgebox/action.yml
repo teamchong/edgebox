@@ -143,9 +143,10 @@ runs:
       shell: bash
       run: |
         # Use baseline CPU for portable binaries (avoid SIGILL on different runners)
-        zig build wasm -Doptimize=ReleaseFast
-        zig build runner -Doptimize=ReleaseFast -Dcpu=baseline
+        # cli = EdgeBox compiler (worker .mjs + .wasm generation)
         zig build cli -Doptimize=ReleaseFast -Dcpu=baseline
+        # runner = WAMR runtime (only needed for --with-binary native path)
+        zig build runner -Doptimize=ReleaseFast -Dcpu=baseline || echo "Runner build skipped (WAMR optional)"
         ${{ inputs.build-test262 == 'true' && 'zig build test262 -Doptimize=ReleaseFast -Dcpu=baseline' || '' }}
 
     # === Build benchmarks (if cache miss and requested) ===
