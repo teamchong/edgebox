@@ -2017,7 +2017,7 @@ fn resolveCalleeName(func: AnalyzedFunction, instr: bytecode_parser.Instruction)
     } else if (instr.opcode == .get_var_ref3) {
         if (func.closure_vars.len > 3) return func.closure_vars[3].name;
     } else if (instr.opcode == .get_var_ref) {
-        const idx: u32 = switch (instr.operand) { .u16 => |v| v, .u8 => |v| v, else => return null };
+        const idx: u32 = switch (instr.operand) { .var_ref => |v| v, .u16 => |v| v, .u8 => |v| v, else => return null };
         if (idx < func.closure_vars.len) return func.closure_vars[idx].name;
     }
     return null;

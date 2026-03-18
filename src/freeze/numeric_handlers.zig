@@ -1219,6 +1219,7 @@ pub fn detectAllocSites(instructions: anytype) ?AllocSiteInfo {
                 .get_arg => {
                     last_was_get_arg = true;
                     last_arg_idx = switch (instr.operand) {
+                        .arg => |v| @intCast(v),
                         .u16 => |v| @intCast(v),
                         else => 0,
                     };

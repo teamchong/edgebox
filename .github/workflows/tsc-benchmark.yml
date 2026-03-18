@@ -141,8 +141,6 @@ jobs:
 
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "✓ = Diagnostic counts match Node.js tsc" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Note**: SOA transform may affect type checker behavior. Diagnostic count mismatches indicate the type checker runs differently (faster startup but fewer errors detected)." >> $GITHUB_STEP_SUMMARY
           else
             echo "_Results not available_" >> $GITHUB_STEP_SUMMARY
           fi
@@ -154,11 +152,11 @@ jobs:
               const results = require('./benchmark/results.json');
               const mismatches = results.filter(r => !r.outputMatch);
               if (mismatches.length > 0) {
-                console.log('⚠️  Diagnostic count mismatches (SOA transform limitation):');
+                console.log('Diagnostic count mismatches:');
                 for (const r of mismatches) {
                   console.log('  ' + r.project + ': Node=' + r.nodeDiagnostics + ' EdgeBox=' + r.edgeboxDiagnostics);
                 }
-                // Don't fail CI — this is a known limitation tracked for investigation
+                process.exit(1);
               } else {
                 console.log('All diagnostics match Node.js tsc');
               }

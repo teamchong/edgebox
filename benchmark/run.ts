@@ -771,12 +771,11 @@ async function main() {
   // Output validation summary
   const mismatches = results.filter(r => !r.outputMatch);
   if (mismatches.length > 0) {
-    console.log("\n⚠️  Diagnostic count mismatches (SOA transform may affect type checker):");
+    console.log("\nDiagnostic count mismatches:");
     for (const r of mismatches) {
       console.log(`   ${r.project}: ${r.outputDiff}`);
     }
-    // Don't exit(1) — diagnostic mismatch is a known limitation of the SOA transform.
-    // The benchmark still measures real execution time (startup + parse + bind).
+    process.exit(1);
   } else if (results.length > 0) {
     console.log("\n✓ All diagnostics match Node.js tsc");
   }
