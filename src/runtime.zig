@@ -2545,6 +2545,63 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         var rs_rewrite_count: u32 = 0;
                         var current_line: u32 = 1;
 
+                        // Pre-pass: build exact rewrite positions
+                        const RewriteInfo = struct { dot_pos: u32, end_pos: u32, field: []const u8 };
+                        var pre_pass_rewrites = std.AutoHashMap(u32, RewriteInfo).init(allocator);
+                        defer pre_pass_rewrites.deinit();
+                        {
+                            var pp_line: u32 = 1;
+                            var pp_pos: usize = 0;
+                            while (pp_pos < cc.len) : (pp_pos += 1) {
+                                if (cc[pp_pos] == '\n') { pp_line += 1; continue; }
+                                // Check if this line has patches and we're at a dot
+                                if (cc[pp_pos] != '.' or !patch_lines.contains(pp_line)) continue;
+                                if (pp_pos == 0 or (!isIdentChar(cc[pp_pos - 1]) and cc[pp_pos - 1] != ')' and cc[pp_pos - 1] != ']')) continue;
+                                // Read field after dot
+                                const fs = pp_pos + 1;
+                                var fe = fs;
+                                while (fe < cc.len and isIdentChar(cc[fe])) fe += 1;
+                                if (fe == fs) continue;
+                                const field = cc[fs..fe];
+                                var fh: u64 = 0;
+                                for (field) |c| fh = fh *% 31 + c;
+                                if (!patch_set.contains(pp_line *% 1000003 + fh)) continue;
+                                // Skip assignments and method calls
+                                var eq = fe;
+                                while (eq < cc.len and cc[eq] == ' ') eq += 1;
+                                if (eq < cc.len and cc[eq] == '(') continue; // method call
+                                if (eq < cc.len and cc[eq] == '=' and (eq + 1 >= cc.len or cc[eq + 1] != '=')) continue;
+                                if (eq + 1 < cc.len and cc[eq + 1] == '=' and (cc[eq] == '+' or cc[eq] == '-' or cc[eq] == '|' or cc[eq] == '&')) continue;
+                                if (eq + 1 < cc.len and ((cc[eq] == '+' and cc[eq + 1] == '+') or (cc[eq] == '-' and cc[eq + 1] == '-'))) continue;
+                                // Scan backwards to find expression start
+                                var expr_start = pp_pos;
+                                while (expr_start > 0) {
+                                    const prev = cc[expr_start - 1];
+                                    if (isIdentChar(prev) or prev == '.') {
+                                        expr_start -= 1;
+                                    } else if (prev == ')' or prev == ']') {
+                                        // Skip matched parens/brackets backwards
+                                        var depth_c: u32 = 1;
+                                        const close = prev;
+                                        const open: u8 = if (close == ')') '(' else '[';
+                                        expr_start -= 1;
+                                        while (expr_start > 0 and depth_c > 0) {
+                                            expr_start -= 1;
+                                            if (cc[expr_start] == close) depth_c += 1;
+                                            if (cc[expr_start] == open) depth_c -= 1;
+                                        }
+                                    } else break;
+                                }
+                                // Store: at expr_start, insert __rd( ... )
+                                pre_pass_rewrites.put(@intCast(expr_start), .{
+                                    .dot_pos = @intCast(pp_pos),
+                                    .end_pos = @intCast(fe),
+                                    .field = field,
+                                }) catch {};
+                            }
+                            std.debug.print("[soa] Pre-pass: {d} rewrite positions identified\n", .{pre_pass_rewrites.count()});
+                        }
+
                         var src_pos: usize = 0;
                         char_loop: while (src_pos < cc.len) {
 
@@ -2552,39 +2609,20 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             // Track line number and apply patches from bytecode analysis
                             if (cc[src_pos] == '\n') current_line += 1;
 
-                            // Check if current line has patches and we're at an IDENT.FIELD
-                            if (patch_lines.contains(current_line) and isIdentChar(cc[src_pos]) and
-                                (src_pos == 0 or !isIdentChar(cc[src_pos - 1])))
-                            {
-                                var id_end = src_pos;
-                                while (id_end < cc.len and isIdentChar(cc[id_end])) id_end += 1;
-                                if (id_end < cc.len and cc[id_end] == '.') {
-                                    const f_start = id_end + 1;
-                                    var f_end = f_start;
-                                    while (f_end < cc.len and isIdentChar(cc[f_end])) f_end += 1;
-                                    if (f_end > f_start) {
-                                        const field = cc[f_start..f_end];
-                                        // Check if (line, field) is in the patch set
-                                        var fh: u64 = 0;
-                                        for (field) |c| fh = fh *% 31 + c;
-                                        const key = current_line *% 1000003 + fh;
-                                        if (patch_set.contains(key)) {
-                                            const ident = cc[src_pos..id_end];
-                                            // Skip assignments and increments
-                                            var eq_check = f_end;
-                                            while (eq_check < cc.len and cc[eq_check] == ' ') eq_check += 1;
-                                            const is_assign = eq_check < cc.len and cc[eq_check] == '=' and (eq_check + 1 >= cc.len or cc[eq_check + 1] != '=');
-                                            const is_compound = eq_check + 1 < cc.len and cc[eq_check + 1] == '=' and (cc[eq_check] == '+' or cc[eq_check] == '-' or cc[eq_check] == '|' or cc[eq_check] == '&');
-                                            const is_inc = eq_check + 1 < cc.len and ((cc[eq_check] == '+' and cc[eq_check + 1] == '+') or (cc[eq_check] == '-' and cc[eq_check + 1] == '-'));
-                                            if (!is_assign and !is_compound and !is_inc) {
-                                                w.print("__rd({s},\"{s}\",__col_{s})", .{ ident, field, field }) catch {};
-                                                src_pos = f_end;
-                                                rs_rewrite_count += 1;
-                                                continue :char_loop;
-                                            }
-                                        }
-                                    }
-                                }
+                            if (cc[src_pos] == '\n') current_line += 1;
+
+                            // Pre-pass: check if src_pos is at an expression start that
+                            // will need __rd() wrapping. The pre_pass_rewrites map tells us.
+                            if (pre_pass_rewrites.get(@intCast(src_pos))) |rewrite_info| {
+                                // Insert __rd( before the expression
+                                w.writeAll("__rd(") catch {};
+                                // Write the expression up to and including the dot
+                                w.writeAll(cc[src_pos..rewrite_info.dot_pos]) catch {};
+                                // Write the __rd closing with field name
+                                w.print(",\"{s}\",__col_{s})", .{ rewrite_info.field, rewrite_info.field }) catch {};
+                                src_pos = rewrite_info.end_pos;
+                                rs_rewrite_count += 1;
+                                continue :char_loop;
                             }
                             // === SOA base capture ===
                             // At `VAR = []` declaration, emit base offset for index alignment
