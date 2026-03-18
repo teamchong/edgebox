@@ -116,12 +116,27 @@ for (var j = 0; j < nodes.length; j++) {
 
 EdgeBox compiles the TypeScript compiler (`_tsc.js`, 130K+ lines) with 446 SOA alloc sites detected and 8 numeric WASM kernels. No code changes to TSC — just `edgebox _tsc.js`.
 
-| Project | Files | EdgeBox | Node.js | Bun | vs Node | vs Bun |
-|---------|:-----:|:-------:|:-------:|:---:|:-------:|:------:|
-| rxjs | 100 | 0.60s | 0.90s | 1.27s | **1.5x faster** | **2.1x faster** |
-| playwright | 358 | 2.14s | 4.05s | 5.05s | **1.9x faster** | **2.4x faster** |
+**4-way comparison: SEA binary vs Worker vs Node.js vs Bun**
 
-Tested with `tsc --noEmit` on Node.js v24 and Bun v1.2. EdgeBox benefits come from SOA transforms (factory objects → contiguous arrays) and WASM numeric kernels that V8 TurboFan inlines.
+| Project | Files | SEA Binary | Worker | Node.js | Bun |
+|---------|:-----:|:----------:|:------:|:-------:|:---:|
+| rxjs | 207 | **0.50s** | 0.58s | 0.77s | 1.00s |
+| playwright | 358 | **2.00s** | 2.06s | 3.04s | 4.15s |
+
+| Runner | vs Node.js | vs Bun | How |
+|--------|:----------:|:------:|-----|
+| **SEA Binary** | **1.5x faster** | **2.1x faster** | Single executable (Node.js SEA + V8 code cache) |
+| **Worker** | **1.5x faster** | **2.0x faster** | `node _tsc-worker.mjs` (V8 inlines WASM) |
+| Node.js | baseline | 1.4x faster | `node tsc.js` |
+| Bun | 0.7x (slower) | baseline | `bun tsc.js` (JSC doesn't inline WASM) |
+
+```bash
+# Generate worker + pack into single binary
+edgebox _tsc.js
+./scripts/pack.sh zig-out/bin/_tsc.js/   # → _tsc-sea (122MB single executable)
+```
+
+Tested with `tsc --noEmit` on Node.js v24 and Bun v1.2. EdgeBox benefits come from SOA transforms (446 factory functions → contiguous arrays) and 8 WASM numeric kernels that V8 TurboFan inlines.
 
 ### Where It Excels vs Where It Doesn't
 
