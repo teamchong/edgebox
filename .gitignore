@@ -193,5 +193,26 @@ src/wizer_init.zig
 build.zig.backup
 build.zig.*
 
-# Benchmark baselines (generated)
+# Benchmark baselines and results (generated)
 benchmark/BASELINE.md
+bench_results*.txt
+edgebox-results.txt
+es2024_results.txt
+
+# Profiling data
+perf.data
+perf.data.*
+
+# Generated diagrams
+diagram
+diagram.*
+*.svg
+
+# Refactoring scripts (one-time use)
+scripts/refactoring/
+
+# metal0 test artifacts
+.metal0/
+
+# Claude session files
+.claude/*.txt
