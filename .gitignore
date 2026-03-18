@@ -214,5 +214,5 @@ scripts/refactoring/
 # metal0 test artifacts
 .metal0/
 
-# Claude session files
-.claude/*.txt
+# Claude session/config files
+.claude/
