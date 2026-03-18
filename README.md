@@ -89,6 +89,11 @@ V8 inlines WASM calls into JS — zero boundary overhead
 | struct field sum (200K objects) | 10 ms | 21 ms | **2.1x faster** |
 | multi-field filter (3 fields/iter) | 19 ms | 27 ms | **1.4x faster** |
 | parent chain walk (graph traversal) | 13 ms | 28 ms | **2.2x faster** |
+| alloc 2M objects | 52 ms | 132 ms | **2.5x faster** |
+| iterate 4M objects 10x | 38 ms | 107 ms | **2.8x faster** |
+| iterate 5M (GC pressure) | 38 ms | 56–244 ms | **1.5–6.4x faster** |
+
+SOA advantage grows with scale: at 4M+ objects, V8 heap exceeds L3 cache and GC pauses add unpredictable latency spikes. EdgeBox SOA allocates zero V8 heap objects (raw index return), so performance is predictable regardless of heap size.
 
 SOA transforms factory-allocated objects into contiguous typed arrays in WASM linear memory. No code changes needed — EdgeBox detects the pattern automatically:
 
@@ -114,7 +119,7 @@ for (var j = 0; j < nodes.length; j++) {
 | Array iteration loops | **7-9x** | WASM eliminates bounds checks, V8 inlines the trampoline |
 | Recursive functions (fib, ackermann) | **4-5x** | Entire call stack stays in WASM, zero JS overhead |
 | Numeric kernels (hash, CRC, crypto) | **2-4x** | WASM eliminates type checks, array caching skips copies |
-| Struct field iteration (SOA) | **2x** | Fields in contiguous WASM memory, provenance eliminates handle objects |
+| Struct field iteration (SOA) | **2-3x** | Fields in contiguous WASM memory, zero GC pressure at scale |
 | Float64 compute (dot product, distance) | **3x** | LLVM optimizes f64 loops better than V8's speculative JIT |
 | Pure integer bitwise (rotr, popcount) | ~same | V8 JIT already compiles these to native integer ops |
 | Object-heavy code | No benefit | V8 JIT already optimal for property access and closures |

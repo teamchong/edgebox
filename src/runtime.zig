@@ -1937,11 +1937,11 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         \\  const __dir = dirname(fileURLToPath(import.meta.url));
                         \\  const buf = readFileSync(join(__dir, '{s}'));
                         \\  __wasm = new WebAssembly.Instance(new WebAssembly.Module(buf), {{ env: {{ pow: Math.pow }} }});
-                        \\  __wasm.exports.memory.grow(254);
+                        \\  __wasm.exports.memory.grow(1534);
                         \\}} else {{
                         \\  const {{ default: __wasmModule }} = await import('{s}');
                         \\  __wasm = new WebAssembly.Instance(__wasmModule, {{ env: {{ pow: Math.pow }} }});
-                        \\  __wasm.exports.memory.grow(254);
+                        \\  __wasm.exports.memory.grow(1534);
                         \\}}
                         \\
                     , .{ wasm_filename, wasm_filename }) catch {};
