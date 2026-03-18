@@ -1948,7 +1948,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     const mem_grow_pages: u32 = if (has_array_funcs) 256 else 16;
 
                     // Preamble: load WASM module (compatible with Node.js + workerd)
-                    var w_buf: [65536]u8 = undefined;
+                    var w_buf: [262144]u8 = undefined; // 256KB buffer for large workers
                     var w_state = wf.writer(&w_buf);
                     const w = &w_state.interface;
                     defer w.flush() catch {};
@@ -2053,6 +2053,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     const rs_map_count = rs_map.count();
                     std.debug.print("[soa] Loaded {d} read sites, {d} unique names\n", .{ read_sites.items.len, rs_map_count });
 
+                    // Column existence set (populated during column declaration)
+                    var col_set = std.StringHashMap(void).init(allocator);
+                    defer col_set.deinit();
+
                     // === SOA Transform: rewrite factory functions to allocate in WASM linear memory ===
                     // Parse alloc manifest and generate SOA pool declarations
                     var alloc_sites: std.ArrayListUnmanaged(AllocSite) = .{};
@@ -2132,6 +2136,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         // across ALL alloc sites. Single __idx counter shared by all factories.
                         // This enables read-site rewrite: node.kind → __col_kind[node.__idx]
                         w.writeAll("let __col_idx = 0;\n") catch {};
+                    w.writeAll("function __rd(o,f,c){return o.__idx!==undefined?c[o.__idx]:o[f];}\n") catch {};
                         {
                             // Collect unique field names
                             var unique_fields: [256][]const u8 = undefined;
@@ -2157,9 +2162,11 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             }
                             for (unique_fields[0..unique_count]) |fname| {
                                 w.print("const __col_{s} = [];\n", .{fname}) catch {};
+                                col_set.put(fname, {}) catch {};
                             }
                             std.debug.print("[soa] {d} global columns for {d} alloc sites\n", .{ unique_count, alloc_sites.items.len });
                         }
+                        // col_set populated in column declaration loop above
                     }
 
                     // Batch struct helpers: for each struct function with _batch variant,
@@ -2501,8 +2508,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
 
                         // Read-site rewrite state: track current function's struct params
                         var rs_active = false; // true when inside a read-site function
-                        var rs_depth: u32 = 0; // brace depth tracking
-                        var rs_start_depth: u32 = 0; // depth at function entry
+                        var rs_end_pos: usize = 0; // position where current read-site function ends
                         var rs_param_names: [8][]const u8 = .{""} ** 8;
                         var rs_struct_mask: u8 = 0;
                         var rs_fields: [8][16][]const u8 = undefined;
@@ -2513,14 +2519,6 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
 
                         var src_pos: usize = 0;
                         char_loop: while (src_pos < cc.len) {
-                            // Track brace depth for read-site function boundary
-                            if (cc[src_pos] == '{') rs_depth += 1;
-                            if (cc[src_pos] == '}') {
-                                if (rs_depth > 0) rs_depth -= 1;
-                                if (rs_active and rs_depth < rs_start_depth) {
-                                    rs_active = false; // exited the function
-                                }
-                            }
 
                             // Detect function entry: `function NAME(` where NAME is in read_sites
                             if (!rs_active and rs_map_count > 0 and
@@ -2552,12 +2550,22 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             rs_struct_mask = rs.*.struct_args;
                                             rs_fields = rs.*.arg_fields;
                                             rs_field_counts = rs.*.arg_field_counts;
-                                            rs_start_depth = rs_depth + 1; // +1 for the upcoming {
-                                            rs_active = true;
-                                            rs_func_count += 1;
+                                            // Find the function body '{' and its matching '}'
+                                            var brace_pos = name_end;
+                                            while (brace_pos < cc.len and cc[brace_pos] != '{') brace_pos += 1;
+                                            if (brace_pos < cc.len) {
+                                                rs_end_pos = skipJsFunctionBody(cc, brace_pos);
+                                                rs_active = true;
+                                                rs_func_count += 1;
+                                            }
                                         }
                                     }
                                 }
+
+                            // Check if we've exited the read-site function
+                            if (rs_active and src_pos >= rs_end_pos) {
+                                rs_active = false;
+                            }
 
                             // Read-site rewrite: PARAM.FIELD → __col_FIELD[PARAM.__idx]
                             if (rs_active and isIdentChar(cc[src_pos]) and
@@ -2577,13 +2585,18 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         for (0..8) |ai| {
                                             if (rs_struct_mask & (@as(u8, 1) << @intCast(ai)) == 0) continue;
                                             if (!std.mem.eql(u8, rs_param_names[ai], ident)) continue;
-                                            // Check if field is in this arg's field list
+                                            // Check if field is in this arg's field list AND column exists
                                             for (rs_fields[ai][0..rs_field_counts[ai]]) |rf| {
-                                                if (std.mem.eql(u8, rf, field)) {
-                                                    // Don't rewrite if followed by = (assignment)
-                                                    if (f_end < cc.len and (cc[f_end] == '=' and (f_end + 1 >= cc.len or cc[f_end + 1] != '='))) break;
-                                                    // Rewrite: PARAM.FIELD → __col_FIELD[PARAM.__idx]
-                                                    w.print("__col_{s}[{s}.__idx]", .{ field, ident }) catch {};
+                                                if (std.mem.eql(u8, rf, field) and col_set.contains(field)) {
+                                                    // Don't rewrite if followed by = (assignment) or += |= etc
+                                                    var eq_check = f_end;
+                                                    while (eq_check < cc.len and cc[eq_check] == ' ') eq_check += 1;
+                                                    if (eq_check < cc.len and cc[eq_check] == '=' and (eq_check + 1 >= cc.len or cc[eq_check + 1] != '=')) break;
+                                                    if (eq_check < cc.len and eq_check + 1 < cc.len and cc[eq_check + 1] == '=' and (cc[eq_check] == '+' or cc[eq_check] == '-' or cc[eq_check] == '|' or cc[eq_check] == '&')) break;
+                                                    // Don't rewrite if followed by ++ or -- (postfix inc/dec)
+                                                    if (eq_check + 1 < cc.len and ((cc[eq_check] == '+' and cc[eq_check + 1] == '+') or (cc[eq_check] == '-' and cc[eq_check + 1] == '-'))) break;
+                                                    // Rewrite: PARAM.FIELD → __rd(PARAM, "FIELD", __col_FIELD)
+                                                    w.print("__rd({s},\"{s}\",__col_{s})", .{ ident, field, field }) catch {};
                                                     src_pos = f_end;
                                                     rewritten = true;
                                                     break;
