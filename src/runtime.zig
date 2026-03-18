@@ -2044,7 +2044,14 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             }
                         }
                     }
-                    std.debug.print("[soa] Loaded {d} read sites from manifest\n", .{read_sites.items.len});
+                    // Build hashmap for O(1) function name lookup
+                    var rs_map = std.StringHashMap(*const ReadSite).init(allocator);
+                    defer rs_map.deinit();
+                    for (read_sites.items) |*rs| {
+                        rs_map.put(rs.name, rs) catch continue;
+                    }
+                    const rs_map_count = rs_map.count();
+                    std.debug.print("[soa] Loaded {d} read sites, {d} unique names\n", .{ read_sites.items.len, rs_map_count });
 
                     // === SOA Transform: rewrite factory functions to allocate in WASM linear memory ===
                     // Parse alloc manifest and generate SOA pool declarations
@@ -2501,6 +2508,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         var rs_fields: [8][16][]const u8 = undefined;
                         var rs_field_counts: [8]u8 = .{0} ** 8;
                         @memset(&rs_fields, .{""} ** 16);
+                        var rs_func_count: u32 = 0;
+                        var rs_rewrite_count: u32 = 0;
 
                         var src_pos: usize = 0;
                         char_loop: while (src_pos < cc.len) {
@@ -2514,7 +2523,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             }
 
                             // Detect function entry: `function NAME(` where NAME is in read_sites
-                            if (!rs_active and read_sites.items.len > 0 and
+                            if (!rs_active and rs_map_count > 0 and
                                 src_pos + 9 < cc.len and std.mem.startsWith(u8, cc[src_pos..], "function "))
                             {
                                 const name_start = src_pos + 9;
@@ -2522,8 +2531,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 while (name_end < cc.len and isIdentChar(cc[name_end])) name_end += 1;
                                 if (name_end > name_start and name_end < cc.len and cc[name_end] == '(') {
                                     const fname = cc[name_start..name_end];
-                                    for (read_sites.items) |rs| {
-                                        if (std.mem.eql(u8, rs.name, fname)) {
+                                    if (rs_map.get(fname)) |rs| {
                                             // Parse param names from source
                                             var ppos = name_end + 1;
                                             var pi: u8 = 0;
@@ -2541,16 +2549,15 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                                     while (ppos < cc.len and cc[ppos] != ',' and cc[ppos] != ')') ppos += 1;
                                                 }
                                             }
-                                            rs_struct_mask = rs.struct_args;
-                                            rs_fields = rs.arg_fields;
-                                            rs_field_counts = rs.arg_field_counts;
-                                            rs_start_depth = rs_depth;
+                                            rs_struct_mask = rs.*.struct_args;
+                                            rs_fields = rs.*.arg_fields;
+                                            rs_field_counts = rs.*.arg_field_counts;
+                                            rs_start_depth = rs_depth + 1; // +1 for the upcoming {
                                             rs_active = true;
-                                            break;
+                                            rs_func_count += 1;
                                         }
                                     }
                                 }
-                            }
 
                             // Read-site rewrite: PARAM.FIELD → __col_FIELD[PARAM.__idx]
                             if (rs_active and isIdentChar(cc[src_pos]) and
@@ -2584,7 +2591,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             }
                                             break;
                                         }
-                                        if (rewritten) continue :char_loop;
+                                        if (rewritten) { rs_rewrite_count += 1; continue :char_loop; }
                                     }
                                 }
                             }
@@ -3310,6 +3317,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 src_pos += 1;
                             }
                         }
+                        std.debug.print("[soa] Read-site: {d} functions matched, {d} field reads rewritten\n", .{ rs_func_count, rs_rewrite_count });
                     } else {
                         w.writeAll("// ERROR: Original source not available\n") catch {};
                     }
