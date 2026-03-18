@@ -112,6 +112,17 @@ for (var j = 0; j < nodes.length; j++) {
 }
 ```
 
+### Real-World: TypeScript Compiler (TSC)
+
+EdgeBox compiles the TypeScript compiler (`_tsc.js`, 130K+ lines) with 446 SOA alloc sites detected and 8 numeric WASM kernels. No code changes to TSC — just `edgebox _tsc.js`.
+
+| Project | Files | EdgeBox | Node.js | Bun | vs Node | vs Bun |
+|---------|:-----:|:-------:|:-------:|:---:|:-------:|:------:|
+| rxjs | 100 | 0.60s | 0.90s | 1.27s | **1.5x faster** | **2.1x faster** |
+| playwright | 358 | 2.14s | 4.05s | 5.05s | **1.9x faster** | **2.4x faster** |
+
+Tested with `tsc --noEmit` on Node.js v24 and Bun v1.2. EdgeBox benefits come from SOA transforms (factory objects → contiguous arrays) and WASM numeric kernels that V8 TurboFan inlines.
+
 ### Where It Excels vs Where It Doesn't
 
 | Code Pattern | Speedup | Why |

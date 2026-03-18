@@ -1136,8 +1136,9 @@ pub fn generateModuleZigShardedWithBackend(
                     else
                         func.name;
                     var entry_buf: [1024]u8 = undefined;
-                    const entry = std.fmt.bufPrint(&entry_buf, "{{\"name\":\"{s}\",\"line\":{d},\"args\":{d},\"alloc_fields\":[", .{
+                    const entry = std.fmt.bufPrint(&entry_buf, "{{\"name\":\"{s}\",\"line\":{d},\"args\":{d},\"pass_through\":{s},\"alloc_fields\":[", .{
                         alloc_name, func.line_num, func.arg_count,
+                        if (alloc_info.pass_through) "true" else "false",
                     }) catch continue;
                     amf.writeAll(entry) catch {};
                     for (alloc_info.field_atoms[0..alloc_info.field_count], 0..) |atom, fi| {
@@ -1151,6 +1152,13 @@ pub fn generateModuleZigShardedWithBackend(
                             amf.writeAll(atom_str) catch {};
                         }
                         amf.writeAll("\"") catch {};
+                    }
+                    amf.writeAll("],\"arg_indices\":[") catch {};
+                    for (alloc_info.arg_indices[0..alloc_info.field_count], 0..) |ai, fi| {
+                        if (fi > 0) amf.writeAll(",") catch {};
+                        var ai_buf: [8]u8 = undefined;
+                        const ai_str = std.fmt.bufPrint(&ai_buf, "{d}", .{ai}) catch continue;
+                        amf.writeAll(ai_str) catch {};
                     }
                     amf.writeAll("]}") catch {};
                     alloc_count += 1;

@@ -462,6 +462,8 @@ const AllocSite = struct {
     arg_count: u32,
     field_names: [16][]const u8,
     field_count: u8,
+    /// Which get_arg index maps to each field (for correct param mapping)
+    arg_indices: [16]u8 = .{0} ** 16,
 };
 
 /// Decide whether a WASM-compiled function should get a trampoline or stay as JS.
@@ -2028,9 +2030,24 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             site.field_count = @intCast(fi + 1);
                                         }
                                     }
-                                    if (site.field_count > 0) {
-                                        alloc_sites.append(allocator, site) catch continue;
+                                    // Only load pass-through factories (every field value is a direct get_arg).
+                                    // Computed/closure factories may store strings/objects — Int32Array would corrupt them.
+                                    const pt = obj.get("pass_through") orelse continue;
+                                    const is_pt = if (pt == .bool) pt.bool else false;
+                                    if (!is_pt or site.field_count == 0) continue;
+                                    // Load arg_indices for correct field→param mapping
+                                    if (obj.get("arg_indices")) |ai_val| {
+                                        if (ai_val == .array) {
+                                            for (ai_val.array.items, 0..) |av, ai| {
+                                                if (ai >= 16) break;
+                                                site.arg_indices[ai] = switch (av) {
+                                                    .integer => |v| @intCast(@as(u32, @bitCast(@as(i32, @intCast(v))))),
+                                                    else => @intCast(ai),
+                                                };
+                                            }
+                                        }
                                     }
+                                    alloc_sites.append(allocator, site) catch continue;
                                 }
                             }
                         }
@@ -2050,18 +2067,23 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 \\
                             ) catch {};
                         }
-                        w.writeAll("// SOA pools: factory objects allocated in WASM linear memory (contiguous, cache-friendly)\n") catch {};
-                        // Auto-size capacity: 75% of WASM memory / (total_fields * 4 bytes per i32)
-                        var total_soa_fields: usize = 0;
-                        for (alloc_sites.items) |site| total_soa_fields += site.field_count;
-                        if (total_soa_fields == 0) total_soa_fields = 1;
-                        w.print("const __SOA_CAP = Math.floor(__wbuf.byteLength * 0.75 / ({d} * 4));\n", .{total_soa_fields}) catch {};
+                        w.writeAll("// SOA pools: contiguous per-field arrays (V8 optimizes Smi-only to typed backing)\n") catch {};
                         for (alloc_sites.items, 0..) |site, si| {
-                            // Allocate one Int32Array per field — matches WASM i32 layout for zero-copy
+                            // Skip sites with non-identifier field names (e.g. "SHA-1", "2.5.4.3")
+                            var valid_fields = true;
                             for (site.field_names[0..site.field_count]) |fname| {
-                                w.print("const __soa_{d}_{s} = new Int32Array(__wbuf, __wasmStackAlloc(__SOA_CAP * 4), __SOA_CAP);\n", .{ si, fname }) catch {};
+                                if (fname.len == 0) { valid_fields = false; break; }
+                                for (fname) |c| {
+                                    if (!isIdentChar(c)) { valid_fields = false; break; }
+                                }
+                                if (!valid_fields) break;
                             }
-                            w.print("let __soa_{d}_next = 0;\n", .{si}) catch {};
+                            if (!valid_fields) continue;
+                            // One Array per field — V8 auto-promotes to typed backing for Smi-only fields
+                            for (site.field_names[0..site.field_count]) |fname| {
+                                w.print("const __soa_{d}_{s} = [];\n", .{ si, fname }) catch {};
+                            }
+                            w.print("let __soa_{d}__ctr = 0;\n", .{si}) catch {};
                             // Shared class: all handles have same hidden class → V8 inlines getters
                             w.print("class __SOA_{d} {{\n", .{si}) catch {};
                             w.writeAll("  constructor(idx) { this.__idx = idx; }\n") catch {};
@@ -2348,9 +2370,16 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     var ep = dp + vn.len;
                                     while (ep < cc.len and cc[ep] == ' ') ep += 1;
                                     if (ep >= cc.len or cc[ep] != '=') continue;
+                                    // Skip if '=' is part of '==' or '=>'
+                                    if (ep + 1 < cc.len and (cc[ep + 1] == '=' or cc[ep + 1] == '>')) continue;
                                     ep += 1;
                                     while (ep < cc.len and cc[ep] == ' ') ep += 1;
                                     if (ep + 1 < cc.len and cc[ep] == '[' and cc[ep + 1] == ']') {
+                                        // Verify statement context: check for '(' or '??' before VAR
+                                        // Skip if inside an expression like `x ?? (VAR = [])`
+                                        var ctx = dp;
+                                        while (ctx > 0 and cc[ctx - 1] == ' ') ctx -= 1;
+                                        if (ctx > 0 and cc[ctx - 1] == '(') continue;
                                         provenance_buf[pi].decl_end = ep + 2;
                                         break;
                                     }
@@ -2409,7 +2438,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             // At `VAR = []` declaration, emit base offset for index alignment
                             for (provenance) |prov| {
                                 if (prov.decl_end > 0 and src_pos == prov.decl_end) {
-                                    w.print(";const __{s}_soa_base = __soa_{d}_next", .{ prov.var_name, prov.site_idx }) catch {};
+                                    w.print(";const __{s}_soa_base = __soa_{d}__ctr", .{ prov.var_name, prov.site_idx }) catch {};
                                     // Raw index: tag array so trampolines detect SOA provenance
                                     if (prov.raw_index) {
                                         w.print(";{s}.__soa={d}", .{ prov.var_name, prov.site_idx }) catch {};
@@ -2500,6 +2529,16 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             // === SOA Transform: match factory functions and rewrite body ===
                             if (alloc_sites.items.len > 0 and std.mem.startsWith(u8, cc[src_pos..], "function ")) {
                                 for (alloc_sites.items, 0..) |site, si| {
+                                    // Skip sites with non-identifier field names
+                                    var valid_site = true;
+                                    for (site.field_names[0..site.field_count]) |fname| {
+                                        if (fname.len == 0) { valid_site = false; break; }
+                                        for (fname) |c| {
+                                            if (!isIdentChar(c)) { valid_site = false; break; }
+                                        }
+                                        if (!valid_site) break;
+                                    }
+                                    if (!valid_site) continue;
                                     const after_kw = src_pos + 9;
                                     if (after_kw + site.name.len + 1 > cc.len) continue;
                                     if (!std.mem.startsWith(u8, cc[after_kw..], site.name)) continue;
@@ -2507,39 +2546,102 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     if (after_name >= cc.len or cc[after_name] != '(') continue;
                                     if (src_pos > 0 and isIdentChar(cc[src_pos - 1])) continue;
 
-                                    // Found an alloc site. Find the opening brace and skip the original body.
+                                    // Found an alloc site. Skip params (track parens) then find body '{'.
                                     var scan = after_name;
+                                    if (scan < cc.len and cc[scan] == '(') {
+                                        var paren_depth: u32 = 1;
+                                        scan += 1;
+                                        while (scan < cc.len and paren_depth > 0) : (scan += 1) {
+                                            if (cc[scan] == '(') paren_depth += 1 else if (cc[scan] == ')') paren_depth -= 1;
+                                        }
+                                    }
                                     while (scan < cc.len and cc[scan] != '{') scan += 1;
                                     if (scan >= cc.len) continue;
 
-                                    // Write function declaration with original params
+                                    const first_param = after_name + 1;
+                                    const is_destructured = first_param < cc.len and cc[first_param] == '{';
+
+                                    // === Validate params BEFORE emitting anything ===
+                                    var param_names: [16][]const u8 = .{""} ** 16;
+
+                                    if (is_destructured) {
+                                        // Destructured: verify all alloc fields appear as bindings
+                                        var close_paren = first_param;
+                                        var pd: u32 = 0;
+                                        while (close_paren < cc.len) : (close_paren += 1) {
+                                            if (cc[close_paren] == '(') pd += 1 else if (cc[close_paren] == ')') {
+                                                if (pd == 0) break;
+                                                pd -= 1;
+                                            }
+                                        }
+                                        const param_text = cc[first_param..@min(close_paren, cc.len)];
+                                        var all_found = true;
+                                        for (site.field_names[0..site.field_count]) |fname| {
+                                            if (fname.len == 0) { all_found = false; break; }
+                                            var found = false;
+                                            var sp: usize = 0;
+                                            while (sp + fname.len <= param_text.len) : (sp += 1) {
+                                                if (std.mem.eql(u8, param_text[sp .. sp + fname.len], fname)) {
+                                                    const before_ok = sp == 0 or !isIdentChar(param_text[sp - 1]);
+                                                    const after_ok = sp + fname.len >= param_text.len or !isIdentChar(param_text[sp + fname.len]);
+                                                    if (before_ok and after_ok) { found = true; break; }
+                                                }
+                                            }
+                                            if (!found) { all_found = false; break; }
+                                        }
+                                        if (!all_found) continue;
+                                        // Use field names directly as binding names
+                                        for (site.field_names[0..site.field_count], 0..) |fname, fi| {
+                                            param_names[fi] = fname;
+                                        }
+                                    } else {
+                                        // Positional: extract all param names, then use arg_indices to map
+                                        var all_params: [16][]const u8 = .{""} ** 16;
+                                        var total_params: usize = 0;
+                                        var ps = after_name + 1;
+                                        var params_valid = true;
+                                        // Extract up to 16 params
+                                        while (total_params < 16 and ps < scan) {
+                                            while (ps < scan and (cc[ps] == ' ' or cc[ps] == '\n')) ps += 1;
+                                            if (ps >= scan or cc[ps] == ')') break;
+                                            var pe2 = ps;
+                                            while (pe2 < scan and cc[pe2] != ',' and cc[pe2] != ')') pe2 += 1;
+                                            var pe3 = pe2;
+                                            while (pe3 > ps and (cc[pe3 - 1] == ' ' or cc[pe3 - 1] == '\n')) pe3 -= 1;
+                                            if (pe3 <= ps) { params_valid = false; break; }
+                                            const ptext = cc[ps..pe3];
+                                            for (ptext) |c| {
+                                                if (!isIdentChar(c)) { params_valid = false; break; }
+                                            }
+                                            if (!params_valid) break;
+                                            all_params[total_params] = ptext;
+                                            total_params += 1;
+                                            ps = if (pe2 < scan and cc[pe2] == ',') pe2 + 1 else pe2;
+                                        }
+                                        if (!params_valid) continue;
+                                        // Map fields via arg_indices
+                                        for (site.arg_indices[0..site.field_count], 0..) |ai, fi| {
+                                            if (ai >= total_params) { params_valid = false; break; }
+                                            param_names[fi] = all_params[ai];
+                                        }
+                                        if (!params_valid) continue;
+                                    }
+
+                                    // === All validation passed — now emit ===
                                     w.writeAll(cc[src_pos .. scan + 1]) catch {};
                                     w.writeAll("\n") catch {};
-
-                                    // Generate SOA allocation body
-                                    w.print("  const __idx = __soa_{d}_next++;\n", .{si}) catch {};
-                                    // Store each field from the original args
-                                    // The define_field order in bytecode matches the object literal field order.
-                                    // Map params to fields: { field0: param0, field1: param1, ... }
-                                    // Parse param names from the source
-                                    var param_start = after_name + 1; // after '('
-                                    for (site.field_names[0..site.field_count]) |fname| {
-                                        // Find param name (skip whitespace)
-                                        while (param_start < scan and (cc[param_start] == ' ' or cc[param_start] == '\n')) param_start += 1;
-                                        var param_end = param_start;
-                                        while (param_end < scan and cc[param_end] != ',' and cc[param_end] != ')') param_end += 1;
-                                        // Trim trailing whitespace
-                                        var pe = param_end;
-                                        while (pe > param_start and (cc[pe - 1] == ' ' or cc[pe - 1] == '\n')) pe -= 1;
-                                        if (pe > param_start) {
-                                            w.print("  __soa_{d}_{s}[__idx] = {s};\n", .{ si, fname, cc[param_start..pe] }) catch {};
-                                        }
-                                        param_start = if (param_end < scan and cc[param_end] == ',') param_end + 1 else param_end;
+                                    w.print("  const __idx = __soa_{d}__ctr++;\n", .{si}) catch {};
+                                    for (site.field_names[0..site.field_count], 0..) |fname, fi| {
+                                        w.print("  __soa_{d}_{s}[__idx] = {s};\n", .{ si, fname, param_names[fi] }) catch {};
                                     }
-                                    // Check if all provenance entries for this site use raw index
-                                    var all_raw = provenance.len > 0;
+                                    // Raw index only when ALL provenance entries for this site are raw.
+                                    // No provenance entries → object used standalone → must return handle.
+                                    var all_raw = false;
                                     for (provenance) |prov| {
-                                        if (prov.site_idx == si and !prov.raw_index) { all_raw = false; break; }
+                                        if (prov.site_idx == si) {
+                                            if (!all_raw) all_raw = true; // first entry: tentatively raw
+                                            if (!prov.raw_index) { all_raw = false; break; }
+                                        }
                                     }
                                     if (all_raw) {
                                         // Raw index return — no V8 HeapObject, zero GC pressure

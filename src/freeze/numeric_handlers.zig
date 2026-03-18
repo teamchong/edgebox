@@ -1159,6 +1159,12 @@ pub const AllocSiteInfo = struct {
     /// Field atoms in definition order (matches constructor argument order)
     field_atoms: [MAX_STRUCT_FIELDS]u32,
     field_count: u8,
+    /// True when every field value comes directly from get_arg (pure pass-through).
+    /// Only pass-through factories are safe for SOA (Int32Array can't store strings/objects).
+    pass_through: bool = false,
+    /// For pass-through: which get_arg index maps to each field.
+    /// Allows correct mapping when field order ≠ param order.
+    arg_indices: [MAX_STRUCT_FIELDS]u8 = .{0} ** MAX_STRUCT_FIELDS,
 };
 
 /// Detect object literal allocation sites in a function's bytecodes.
@@ -1174,12 +1180,16 @@ pub fn detectAllocSites(instructions: anytype) ?AllocSiteInfo {
     };
     var in_object = false;
     var object_count: u32 = 0;
+    var last_was_get_arg = false;
+    var last_arg_idx: u8 = 0;
+    var all_get_arg = true;
 
     for (instructions) |instr| {
         if (instr.opcode == .object) {
             object_count += 1;
             if (object_count > 1) return null; // multiple object literals — bail
             in_object = true;
+            last_was_get_arg = false;
             continue;
         }
         if (in_object and instr.opcode == .define_field) {
@@ -1189,19 +1199,37 @@ pub fn detectAllocSites(instructions: anytype) ?AllocSiteInfo {
             };
             if (info.field_count >= MAX_STRUCT_FIELDS) return null; // too many fields
             info.field_atoms[info.field_count] = atom;
+            if (!last_was_get_arg) all_get_arg = false;
+            info.arg_indices[info.field_count] = if (last_was_get_arg) last_arg_idx else 0;
             info.field_count += 1;
+            last_was_get_arg = false;
             continue;
         }
         // `return` after define_field sequence = factory function
         if (in_object and (instr.opcode == .@"return" or instr.opcode == .return_undef)) {
-            // Completed the object literal — stop
             break;
         }
-        // Other opcodes between object and define_field are fine
-        // (they compute values to store, e.g., get_arg, binary ops)
+        // Track get_arg and its index
+        if (in_object) {
+            switch (instr.opcode) {
+                .get_arg0 => { last_was_get_arg = true; last_arg_idx = 0; },
+                .get_arg1 => { last_was_get_arg = true; last_arg_idx = 1; },
+                .get_arg2 => { last_was_get_arg = true; last_arg_idx = 2; },
+                .get_arg3 => { last_was_get_arg = true; last_arg_idx = 3; },
+                .get_arg => {
+                    last_was_get_arg = true;
+                    last_arg_idx = switch (instr.operand) {
+                        .u16 => |v| @intCast(v),
+                        else => 0,
+                    };
+                },
+                else => { last_was_get_arg = false; },
+            }
+        }
     }
 
     if (info.field_count == 0) return null;
+    info.pass_through = all_get_arg and info.field_count > 0;
     return info;
 }
 
