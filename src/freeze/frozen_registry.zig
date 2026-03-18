@@ -113,8 +113,9 @@ pub const AnalyzedFunction = struct {
     /// Line number from debug info (for name@line_num dispatch key)
     line_num: u32 = 0,
     /// Parser index for index-based dispatch (position in parser.functions)
-    /// Matches the JS_ReadFunctionTag counter during bytecode deserialization
     parser_index: u32 = 0,
+    /// PC-to-line debug data for mapping instruction PCs to source lines
+    pc2line: []const u8 = &.{},
 };
 
 /// Result of analyzing a module for freezable functions
@@ -272,6 +273,7 @@ pub fn analyzeModule(
             .atom_strings = atom_strings_copy,
             .closure_vars = closure_vars_copy,
             .line_num = func_info.line_num,
+            .pc2line = func_info.pc2line,
             .parser_index = if (parser_idx < parser.phase1_count) @intCast(parser_idx) else 0xFFFFFFFF,
         });
 
@@ -1184,6 +1186,115 @@ pub fn generateModuleZigShardedWithBackend(
                 if (read_count > 0) {
                     std.debug.print("[freeze] Read sites: {d} functions read struct fields from args\n", .{read_count});
                 }
+            } else |_| {}
+        }
+
+        // Generate patch manifest — exact source locations for property access rewrites.
+        // Uses pc2line from bytecode debug info to map get_field PCs to source lines.
+        var patch_manifest_path_buf: [4096]u8 = undefined;
+        const patch_manifest_path = std.fmt.bufPrint(&patch_manifest_path_buf, "{s}/patch_manifest.json", .{cd}) catch null;
+        if (patch_manifest_path) |pmp| {
+            if (std.fs.cwd().createFile(pmp, .{})) |pmf| {
+                defer pmf.close();
+                pmf.writeAll("[") catch {};
+                var patch_count: usize = 0;
+                for (analysis.functions.items) |func| {
+                    const si = numeric_handlers.detectStructArgs(func.instructions, func.arg_count) orelse continue;
+                    const combined = si.struct_args | si.array_of_struct_args;
+                    // Use already-parsed instructions from AnalyzedFunction
+                    const instructions = func.instructions;
+                    // Simple stack sim to track which stack slot holds which arg
+                    var stack_buf: [64]i8 = .{-1} ** 64;
+                    var sp: usize = 0;
+                    var pc: u32 = 0;
+                    for (instructions) |instr| {
+                        const handler = numeric_handlers.getHandler(instr.opcode);
+                        switch (handler.pattern) {
+                            .get_arg => {
+                                const idx: u8 = handler.index orelse switch (instr.operand) {
+                                    .arg => |a| @intCast(a),
+                                    else => 255,
+                                };
+                                if (sp < stack_buf.len) {
+                                    stack_buf[sp] = if (idx < func.arg_count) @intCast(idx) else -1;
+                                    sp += 1;
+                                }
+                            },
+                            .get_loc, .get_loc_check => {
+                                if (sp < stack_buf.len) { stack_buf[sp] = -1; sp += 1; }
+                            },
+                            .put_loc, .put_loc_check => {
+                                if (sp >= 1) sp -= 1;
+                            },
+                            .field_get => {
+                                if (sp >= 1) {
+                                    const obj_arg = stack_buf[sp - 1];
+                                    if (obj_arg >= 0 and obj_arg < 8 and
+                                        combined & (@as(u8, 1) << @intCast(obj_arg)) != 0)
+                                    {
+                                        const atom: u32 = switch (instr.operand) {
+                                            .atom => |a| a,
+                                            else => {
+                                                stack_buf[sp - 1] = -1;
+                                                pc += instr.size;
+                                                continue;
+                                            },
+                                        };
+                                        // Get field name
+                                        if (resolveAtomToName(func, atom)) |field_name| {
+                                            // Get source line from pc2line
+                                            const line = module_parser.getLineForPC(func.pc2line, func.line_num, pc);
+                                            if (patch_count > 0) pmf.writeAll(",") catch {};
+                                            // Emit patch entry
+                                            var pbuf: [256]u8 = undefined;
+                                            const pentry = std.fmt.bufPrint(&pbuf, "\n{{\"func\":\"{s}\",\"line\":{d},\"field\":\"{s}\",\"arg\":{d}}}", .{
+                                                func.name, line, field_name, obj_arg,
+                                            }) catch continue;
+                                            pmf.writeAll(pentry) catch {};
+                                            patch_count += 1;
+                                        }
+                                    }
+                                    stack_buf[sp - 1] = -1;
+                                }
+                            },
+                            else => {
+                                // Simplified: just push unknown for non-tracked patterns
+                                const h = numeric_handlers.getHandler(instr.opcode);
+                                switch (h.pattern) {
+                                    .push_const, .push_cpool, .push_bool => {
+                                        if (sp < stack_buf.len) { stack_buf[sp] = -1; sp += 1; }
+                                    },
+                                    .binary_arith, .binary_cmp, .bitwise_binary => {
+                                        if (sp >= 2) { sp -= 1; stack_buf[sp - 1] = -1; }
+                                    },
+                                    .unary, .lnot => {
+                                        if (sp >= 1) stack_buf[sp - 1] = -1;
+                                    },
+                                    .stack_drop => { if (sp >= 1) sp -= 1; },
+                                    .stack_dup => {
+                                        if (sp >= 1 and sp < stack_buf.len) { stack_buf[sp] = stack_buf[sp - 1]; sp += 1; }
+                                    },
+                                    .ret, .goto_br, .if_true, .if_false => {},
+                                    .call_self, .tail_call_self => {
+                                        // Pop args + push result
+                                        const argc: u32 = switch (instr.opcode) {
+                                            .call0 => 0, .call1 => 1, .call2 => 2, .call3 => 3,
+                                            else => if (instr.operand == .u16) instr.operand.u16 else 1,
+                                        };
+                                        if (sp >= argc) sp -= argc;
+                                        if (sp < stack_buf.len) { stack_buf[sp] = -1; sp += 1; }
+                                    },
+                                    else => {
+                                        if (sp < stack_buf.len) { stack_buf[sp] = -1; sp += 1; }
+                                    },
+                                }
+                            },
+                        }
+                        pc += instr.size;
+                    }
+                }
+                pmf.writeAll("]") catch {};
+                std.debug.print("[freeze] Patch manifest: {d} field read patches\n", .{patch_count});
             } else |_| {}
         }
     }

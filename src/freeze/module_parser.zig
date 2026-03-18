@@ -915,3 +915,68 @@ test "parse C array bytecode" {
     try std.testing.expectEqual(@as(u8, 0xff), result[2]);
     try std.testing.expectEqual(@as(u8, 0x00), result[3]);
 }
+
+// ============================================================================
+// PC-to-line decoder (QuickJS debug info format)
+// ============================================================================
+
+const PC2LINE_BASE: i32 = -1;
+const PC2LINE_RANGE: u32 = 5;
+const PC2LINE_OP_FIRST: u32 = 1;
+
+/// Decode the pc2line table and return the line number for a given PC offset.
+/// The table is delta-encoded: each byte encodes (diff_pc, diff_line) pairs.
+pub fn getLineForPC(pc2line: []const u8, base_line: u32, target_pc: u32) u32 {
+    var line: i32 = @intCast(base_line);
+    var pc: u32 = 0;
+    var pos: usize = 0;
+
+    while (pos < pc2line.len) {
+        const b = pc2line[pos];
+        pos += 1;
+
+        if (b == 0) {
+            // Extended encoding: raw diff_pc (u32) + diff_line (i32) as LEB128
+            var diff_pc: u32 = 0;
+            var shift: u5 = 0;
+            while (pos < pc2line.len) {
+                const byte = pc2line[pos];
+                pos += 1;
+                diff_pc |= @as(u32, byte & 0x7f) << shift;
+                if (byte & 0x80 == 0) break;
+                shift +|= 7;
+            }
+            var diff_line: i32 = 0;
+            var lshift: u5 = 0;
+            while (pos < pc2line.len) {
+                const byte = pc2line[pos];
+                pos += 1;
+                diff_line |= @as(i32, byte & 0x7f) << lshift;
+                if (byte & 0x80 == 0) {
+                    // Sign extend
+                    if (lshift < 31 and byte & 0x40 != 0) {
+                        diff_line |= @as(i32, -1) << (lshift + 7);
+                    }
+                    break;
+                }
+                lshift +|= 7;
+            }
+            pc += diff_pc;
+            line += diff_line;
+        } else {
+            // Compact encoding
+            const val = @as(u32, b) - PC2LINE_OP_FIRST;
+            const diff_pc = val / PC2LINE_RANGE;
+            const diff_line_u = val % PC2LINE_RANGE;
+            const diff_line: i32 = @as(i32, @intCast(diff_line_u)) + PC2LINE_BASE;
+            pc += diff_pc;
+            line += diff_line;
+        }
+
+        if (pc > target_pc) {
+            return @intCast(line);
+        }
+    }
+
+    return @intCast(line);
+}
