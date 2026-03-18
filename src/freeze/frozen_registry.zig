@@ -12,7 +12,6 @@
 //! replacing the interpreted bytecode with machine code.
 
 const std = @import("std");
-const hashmap_helper = @import("../utils/hashmap_helper.zig");
 const jsvalue = @import("zig_jsvalue.zig");
 pub const module_parser = @import("module_parser.zig");
 const bytecode_parser = @import("bytecode_parser.zig");
@@ -103,12 +102,8 @@ pub const AnalyzedFunction = struct {
     stack_size: u32 = 256,
     /// Whether function calls itself recursively
     is_self_recursive: bool,
-    /// Index of self-reference in closure vars (-1 if none)
-    self_ref_var_idx: i16 = -1,
     /// Whether function can be frozen
     can_freeze: bool,
-    /// Reason if cannot freeze
-    freeze_block_reason: ?[]const u8,
     /// Constants from bytecode (owned copy)
     constants: []const module_parser.ConstValue,
     /// Atom strings from module (shared reference to ModuleAnalysis.atom_strings)
@@ -117,12 +112,6 @@ pub const AnalyzedFunction = struct {
     closure_vars: []const module_parser.ClosureVarInfo = &.{},
     /// Line number from debug info (for name@line_num dispatch key)
     line_num: u32 = 0,
-    /// Explicit "use strict" directive (for proper 'this' handling)
-    has_use_strict: bool = false,
-    /// Function kind: 0=normal, 1=generator, 2=async, 3=async generator
-    func_kind: u2 = 0,
-    /// Local indices captured by child closures (for targeted reverse sync in relooper)
-    captured_local_indices: []const u16 = &.{},
     /// Parser index for index-based dispatch (position in parser.functions)
     /// Matches the JS_ReadFunctionTag counter during bytecode deserialization
     parser_index: u32 = 0,
@@ -206,12 +195,9 @@ pub fn analyzeModule(
     for (parser.functions.items, 0..) |func_info, parser_idx| {
         // Parse instructions - skip functions that fail to parse
         var bc_parser = bytecode_parser.BytecodeParser.init(func_info.bytecode);
-        const instructions = bc_parser.parseAll(allocator) catch |err| {
+        const instructions = bc_parser.parseAll(allocator) catch {
             // Some functions may have malformed bytecode (e.g., from scanning)
             // Skip them gracefully instead of failing the entire freeze
-            if (false) { // Set to true for debugging
-                std.debug.print("[freeze] Skipping function with parse error: {}\n", .{err});
-            }
             continue;
         };
 
@@ -245,11 +231,9 @@ pub fn analyzeModule(
         // Example: function fib(n) { return fib(n-1) + fib(n-2); }
         // -> closureVars: [{"name": "fib", "var_idx": 0, "is_const": false}]
         var is_self_recursive = false;
-        var self_ref_var_idx: i16 = -1;
-        for (func_info.closure_vars, 0..) |cv, idx| {
+        for (func_info.closure_vars) |cv| {
             if (std.mem.eql(u8, cv.name, parser_name)) {
                 is_self_recursive = true;
-                self_ref_var_idx = @intCast(idx);
                 break;
             }
         }
@@ -275,32 +259,6 @@ pub fn analyzeModule(
             };
         }
 
-        // Compute which local indices are captured by child closures
-        // This enables targeted reverse sync (only captured locals, not all) in the relooper.
-        var captured_set = std.AutoHashMapUnmanaged(u16, void){};
-        defer captured_set.deinit(allocator);
-        for (func_info.constants) |c| {
-            switch (c) {
-                .child_func => |child| {
-                    if (child.func_idx < parser.functions.items.len) {
-                        const child_func = parser.functions.items[child.func_idx];
-                        for (child_func.closure_vars) |cv| {
-                            if (cv.is_local and cv.var_idx < func_info.var_count) {
-                                captured_set.put(allocator, @intCast(cv.var_idx), {}) catch {};
-                            }
-                        }
-                    }
-                },
-                else => {},
-            }
-        }
-        var captured_list = std.ArrayListUnmanaged(u16){};
-        var cap_it = captured_set.keyIterator();
-        while (cap_it.next()) |key| {
-            captured_list.append(allocator, key.*) catch {};
-        }
-        const captured_local_indices_slice = captured_list.toOwnedSlice(allocator) catch &.{};
-
         try result.functions.append(allocator, .{
             .name = name,
             .bytecode = func_info.bytecode,
@@ -309,16 +267,11 @@ pub fn analyzeModule(
             .var_count = func_info.var_count,
             .stack_size = func_info.stack_size,
             .is_self_recursive = is_self_recursive,
-            .self_ref_var_idx = self_ref_var_idx,
             .can_freeze = can_freeze_final,
-            .freeze_block_reason = freeze_check.reason,
             .constants = constants_copy,
-            .atom_strings = atom_strings_copy, // Share reference
+            .atom_strings = atom_strings_copy,
             .closure_vars = closure_vars_copy,
-            .line_num = func_info.line_num, // For name@line_num dispatch key
-            .has_use_strict = func_info.has_use_strict, // For proper 'this' handling
-            .func_kind = func_info.func_kind, // 0=normal, 1=generator, 2=async, 3=async_generator
-            .captured_local_indices = captured_local_indices_slice,
+            .line_num = func_info.line_num,
             .parser_index = if (parser_idx < parser.phase1_count) @intCast(parser_idx) else 0xFFFFFFFF,
         });
 

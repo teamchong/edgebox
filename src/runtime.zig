@@ -10,7 +10,6 @@ const freeze = @import("freeze/frozen_registry.zig");
 const wasm_opt = @import("wasm_opt.zig");
 
 const VERSION = "0.1.0";
-const SOCKET_PATH = "/tmp/edgebox.sock";
 
 // ============================================================================
 // EdgeBox Configuration
@@ -459,7 +458,6 @@ const WasmFunc = struct {
 const AllocSite = struct {
     name: []const u8,
     line_num: u32,
-    arg_count: u32,
     field_names: [16][]const u8,
     field_count: u8,
     /// Which get_arg index maps to each field (for correct param mapping)
@@ -2015,7 +2013,6 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     var site = AllocSite{
                                         .name = duped_name,
                                         .line_num = jsonInt(obj, "line"),
-                                        .arg_count = jsonInt(obj, "args"),
                                         .field_names = [_][]const u8{""} ** 16,
                                         .field_count = 0,
                                     };
