@@ -149,7 +149,9 @@ pub const FunctionInfo = struct {
     bytecode: []const u8, // Slice of actual bytecode
     constants: []const ConstValue, // Constant pool values
     closure_vars: []const ClosureVarInfo, // Closure variable info (names, indices)
-    line_num: u32, // Line number from debug info (for name@line_num dispatch key)
+    line_num: u32, // Line number from debug info
+    col_num: u32 = 0, // Column number from debug info
+    pc2line: []const u8 = &.{}, // PC-to-line delta encoding for instruction positions
 
     // Flags
     has_prototype: bool,
@@ -493,11 +495,16 @@ pub const ModuleParser = struct {
 
         // Parse debug info if present (extract line_num for dispatch key)
         var line_num: u32 = 0;
+        var col_num: u32 = 0;
+        var pc2line_data: []const u8 = &.{};
         if (has_debug) {
             _ = self.readAtom(); // filename
-            line_num = self.readLeb128() orelse 0; // line_num - STORE for dispatch key
-            _ = self.readLeb128(); // col_num
+            line_num = self.readLeb128() orelse 0;
+            col_num = self.readLeb128() orelse 0;
             const pc2line_len = self.readLeb128() orelse return error.UnexpectedEof;
+            if (self.pos + pc2line_len <= self.data.len) {
+                pc2line_data = self.data[self.pos .. self.pos + pc2line_len];
+            }
             if (!self.skip(pc2line_len)) return error.UnexpectedEof;
             const source_len = self.readLeb128() orelse return error.UnexpectedEof;
             if (!self.skip(source_len)) return error.UnexpectedEof;
@@ -517,6 +524,8 @@ pub const ModuleParser = struct {
             .constants = constants.items,
             .closure_vars = closure_vars.items,
             .line_num = line_num,
+            .col_num = col_num,
+            .pc2line = pc2line_data,
             .has_prototype = has_prototype,
             .has_simple_parameter_list = has_simple_parameter_list,
             .is_derived_class_constructor = is_derived_class_constructor,
