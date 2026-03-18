@@ -2627,7 +2627,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         if (all_raw) {
                                             w.print("  return __idx;\n}}\n", .{}) catch {};
                                         } else {
-                                            w.writeAll("  return {") catch {};
+                                            // Return plain object WITH __idx for SOA column reads
+                                            w.writeAll("  return {__idx, ") catch {};
                                             for (site.field_names[0..site.field_count], 0..) |fname, fi| {
                                                 if (fi > 0) w.writeAll(", ") catch {};
                                                 w.print("{s}: {s}", .{ fname, param_names[fi] }) catch {};
@@ -2635,7 +2636,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             w.writeAll("};\n}\n") catch {};
                                         }
                                     } else {
-                                        // No readers — skip column writes, return plain object
+                                        // No readers — return plain object, no column writes
                                         w.writeAll("  return {") catch {};
                                         for (site.field_names[0..site.field_count], 0..) |fname, fi| {
                                             if (fi > 0) w.writeAll(", ") catch {};
@@ -3127,9 +3128,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                                     prov.site_idx, fname, prov.var_name, idx_expr,
                                                 }) catch {};
                                             } else {
-                                                // No index alignment — leave as plain object access (V8 inline cache)
-                                                w.print("{s}[{s}].{s}", .{
-                                                    prov.var_name, idx_expr, fname,
+                                                // SOA column read via __idx: VAR[expr].field → __soa_N_field[VAR[expr].__idx]
+                                                w.print("__soa_{d}_{s}[{s}[{s}].__idx]", .{
+                                                    prov.site_idx, fname, prov.var_name, idx_expr,
                                                 }) catch {};
                                             }
                                         }
