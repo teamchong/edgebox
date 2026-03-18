@@ -1224,13 +1224,20 @@ pub fn detectAllocSites(instructions: anytype) ?AllocSiteInfo {
                         else => 0,
                     };
                 },
+                // Call after object means object is consumed by another function — not a simple factory
+                .call0, .call1, .call2, .call3, .call, .call_method,
+                .tail_call, .tail_call_method, .call_constructor => return null,
                 else => { last_was_get_arg = false; },
             }
         }
     }
 
-    if (info.field_count == 0) return null;
-    info.pass_through = all_get_arg and info.field_count > 0;
+    // Require at least 3 fields — V8 already optimizes 1-2 field objects via
+    // monomorphic hidden classes, making SOA getter/setter overhead a net loss.
+    // SOA is also provenance-gated at source transform time (only factories with
+    // `arr.push(factory(...))` get transformed). This threshold catches the rest.
+    if (info.field_count < 3) return null;
+    info.pass_through = all_get_arg;
     return info;
 }
 

@@ -2053,6 +2053,39 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         }
                     }
 
+                    // Provenance gate: only SOA-transform factories that have arrays filled
+                    // via `.push(factory(`. Factories without provenance add getter/setter
+                    // overhead with no cache-locality benefit (harmful for graph traversal workloads).
+                    // Require >=3 push sites to ensure the array is built at scale and likely iterated.
+                    if (alloc_sites.items.len > 0 and clean_content != null) {
+                        const ccc = clean_content.?;
+                        const push_pat = ".push(";
+                        var prov_count_per_site = [_]u16{0} ** 256; // max 256 alloc sites
+                        var sp2: usize = 0;
+                        while (sp2 + push_pat.len < ccc.len) : (sp2 += 1) {
+                            if (!std.mem.startsWith(u8, ccc[sp2..], push_pat)) continue;
+                            const fs2 = sp2 + push_pat.len;
+                            var fe2 = fs2;
+                            while (fe2 < ccc.len and isIdentChar(ccc[fe2])) fe2 += 1;
+                            if (fe2 == fs2 or fe2 >= ccc.len or ccc[fe2] != '(') continue;
+                            const fn_name2 = ccc[fs2..fe2];
+                            for (alloc_sites.items, 0..) |site, si| {
+                                if (si < 256 and std.mem.eql(u8, site.name, fn_name2)) {
+                                    prov_count_per_site[si] +|= 1;
+                                    break;
+                                }
+                            }
+                        }
+                        // Remove sites without sufficient provenance (iterate backwards)
+                        var ri: usize = alloc_sites.items.len;
+                        while (ri > 0) {
+                            ri -= 1;
+                            if (ri < 256 and prov_count_per_site[ri] < 3) {
+                                _ = alloc_sites.orderedRemove(ri);
+                            }
+                        }
+                    }
+
                     // Generate SOA pool declarations for each alloc site shape
                     if (alloc_sites.items.len > 0) {
                         // Ensure WASM memory views exist (may not have been created if no WASM functions)

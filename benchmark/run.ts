@@ -498,7 +498,7 @@ function benchmarkProject(
   const edgeboxMin = Math.min(...edgeboxTimes);
   const edgeboxMax = Math.max(...edgeboxTimes);
 
-  const speedup = nodeMean / edgeboxMean;
+  const speedup = nodeMin / edgeboxMin;
 
   // Bun stats (optional)
   let bunMean: number | undefined;
@@ -526,13 +526,13 @@ function benchmarkProject(
     tsgoSpeedup = nodeMean / tsgoMean;
   }
 
-  console.log(`    Node.js:  ${nodeMean.toFixed(0)}ms (${nodeResult.diagnostics} errors)`);
+  console.log(`    Node.js:  ${nodeMin.toFixed(0)}ms (${nodeResult.diagnostics} errors)`);
   if (bunMean !== undefined) {
-    console.log(`    Bun:      ${bunMean.toFixed(0)}ms - ${bunSpeedup!.toFixed(2)}x vs EdgeBox`);
+    console.log(`    Bun:      ${bunMin!.toFixed(0)}ms - ${(bunMin! / edgeboxMin).toFixed(2)}x vs EdgeBox`);
   }
-  console.log(`    EdgeBox:  ${edgeboxMean.toFixed(0)}ms (${edgeboxResult.diagnostics} errors) - ${speedup.toFixed(2)}x vs Node`);
-  if (tsgoMean !== undefined) {
-    console.log(`    tsgo:     ${tsgoMean.toFixed(0)}ms - ${tsgoSpeedup!.toFixed(2)}x vs Node`);
+  console.log(`    EdgeBox:  ${edgeboxMin.toFixed(0)}ms (${edgeboxResult.diagnostics} errors) - ${speedup.toFixed(2)}x vs Node`);
+  if (tsgoMin !== undefined) {
+    console.log(`    tsgo:     ${tsgoMin.toFixed(0)}ms - ${(nodeMin / tsgoMin).toFixed(2)}x vs Node`);
   }
   console.log(`    Match:    ${comparison.match ? "✓ Same diagnostics" : `✗ ${comparison.diff}`}`);
 
@@ -714,24 +714,24 @@ async function main() {
 
   for (const r of results) {
     const lines = r.lines.toLocaleString().padStart(9);
-    const node = r.nodeMean.toFixed(0).padStart(12);
-    const edgebox = r.edgeboxMean.toFixed(0).padStart(12);
+    const node = r.nodeMin.toFixed(0).padStart(12);
+    const edgebox = r.edgeboxMin.toFixed(0).padStart(12);
     const speedup = `${r.speedup.toFixed(2)}x`.padStart(7);
     const match = r.outputMatch ? "  ✓  " : "  ✗  ";
 
     let row = `| ${r.project.padEnd(10)} | ${lines} | ${node} |`;
     if (hasBun) {
-      const bun = r.bunMean !== undefined ? r.bunMean.toFixed(0).padStart(12) : "-".padStart(12);
+      const bun = r.bunMin !== undefined ? r.bunMin.toFixed(0).padStart(12) : "-".padStart(12);
       row += ` ${bun} |`;
     }
     row += ` ${edgebox} | ${speedup} |`;
     if (hasBun) {
-      const bunSpd = r.bunSpeedup !== undefined ? `${r.bunSpeedup.toFixed(2)}x`.padStart(7) : "-".padStart(7);
+      const bunSpd = r.bunMin !== undefined && r.edgeboxMin > 0 ? `${(r.bunMin / r.edgeboxMin).toFixed(2)}x`.padStart(7) : "-".padStart(7);
       row += ` ${bunSpd} |`;
     }
     if (hasTsgo) {
-      const tsgo = r.tsgoMean !== undefined ? r.tsgoMean.toFixed(0).padStart(9) : "-".padStart(9);
-      const tsgoSpd = r.tsgoSpeedup !== undefined ? `${r.tsgoSpeedup.toFixed(2)}x`.padStart(12) : "-".padStart(12);
+      const tsgo = r.tsgoMin !== undefined ? r.tsgoMin.toFixed(0).padStart(9) : "-".padStart(9);
+      const tsgoSpd = r.tsgoMin !== undefined && r.nodeMin > 0 ? `${(r.nodeMin / r.tsgoMin).toFixed(2)}x`.padStart(12) : "-".padStart(12);
       row += ` ${tsgo} | ${tsgoSpd} |`;
     }
     row += ` ${match} |`;
