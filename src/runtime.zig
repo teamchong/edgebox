@@ -2062,7 +2062,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 if (!valid_fields) break;
                             }
                             if (!valid_fields) continue;
-                            // One Array per field — V8 auto-promotes to typed backing for Smi-only fields
+                            // SOA columns — plain JS arrays (V8 auto-promotes Smi-only to typed backing)
                             for (site.field_names[0..site.field_count]) |fname| {
                                 w.print("const __soa_{d}_{s} = [];\n", .{ si, fname }) catch {};
                             }
