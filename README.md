@@ -107,18 +107,6 @@ for (var j = 0; j < nodes.length; j++) {
 }
 ```
 
-### Real-World: TypeScript Compiler (TSC)
-
-EdgeBox compiles the TypeScript compiler (`_tsc.js`, 130K+ lines) with 8 numeric WASM kernels. No code changes to TSC — just `edgebox _tsc.js`.
-
-```bash
-# Compile + pack
-edgebox _tsc.js
-edgebox pack zig-out/bin/_tsc.js/    # → standalone workerd binary (121MB)
-```
-
-Diagnostic output matches Node.js `tsc` exactly across all test projects (CI-verified).
-
 ### Where It Excels vs Where It Doesn't
 
 | Code Pattern | Speedup | Why |

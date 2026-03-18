@@ -1912,6 +1912,28 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         }
                     }
 
+                    // Pre-scan WASM function list for memory sizing
+                    var has_array_funcs = false;
+                    var has_i32_array_funcs = false;
+                    var has_f64_array_funcs = false;
+                    var any_cacheable_args = false;
+                    for (wasm_func_list.items) |wfe| {
+                        if (wfe.array_args != 0) {
+                            has_array_funcs = true;
+                            if (wfe.is_f64) has_f64_array_funcs = true else has_i32_array_funcs = true;
+                            const ro = wfe.array_args & ~wfe.mutated_args;
+                            if (ro != 0) any_cacheable_args = true;
+                        }
+                        if (wfe.struct_args != 0 or wfe.array_of_struct_args != 0) {
+                            has_array_funcs = true;
+                            has_i32_array_funcs = true;
+                        }
+                    }
+
+                    // Size WASM memory: minimal for scalar-only, larger for array workloads
+                    // 16 pages (1MB) for scalar-only, 256 pages (16MB) for array args
+                    const mem_grow_pages: u32 = if (has_array_funcs) 256 else 16;
+
                     // Preamble: load WASM module (compatible with Node.js + workerd)
                     var w_buf: [65536]u8 = undefined;
                     var w_state = wf.writer(&w_buf);
@@ -1933,35 +1955,14 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         \\  const __dir = dirname(fileURLToPath(import.meta.url));
                         \\  const buf = readFileSync(join(__dir, '{s}'));
                         \\  __wasm = new WebAssembly.Instance(new WebAssembly.Module(buf), {{ env: {{ pow: Math.pow }} }});
-                        \\  __wasm.exports.memory.grow(1534);
+                        \\  __wasm.exports.memory.grow({d});
                         \\}} else {{
                         \\  const {{ default: __wasmModule }} = await import('{s}');
                         \\  __wasm = new WebAssembly.Instance(__wasmModule, {{ env: {{ pow: Math.pow }} }});
-                        \\  __wasm.exports.memory.grow(1534);
+                        \\  __wasm.exports.memory.grow({d});
                         \\}}
                         \\
-                    , .{ wasm_filename, wasm_filename }) catch {};
-
-                    // Hoist TypedArray views to module level (avoids per-call allocation).
-                    // i32 tier: Int32Array (4 bytes/element), f64 tier: Float64Array (8 bytes/element)
-                    // Flags lifted to outer scope so trampoline body can reference them.
-                    var has_array_funcs = false;
-                    var has_i32_array_funcs = false;
-                    var has_f64_array_funcs = false;
-                    var any_cacheable_args = false;
-                    for (wasm_func_list.items) |wfe| {
-                        if (wfe.array_args != 0) {
-                            has_array_funcs = true;
-                            if (wfe.is_f64) has_f64_array_funcs = true else has_i32_array_funcs = true;
-                            const ro = wfe.array_args & ~wfe.mutated_args;
-                            if (ro != 0) any_cacheable_args = true;
-                        }
-                        // Struct/AOS args need __m (i32 view) + stack allocator
-                        if (wfe.struct_args != 0 or wfe.array_of_struct_args != 0) {
-                            has_array_funcs = true;
-                            has_i32_array_funcs = true;
-                        }
-                    }
+                    , .{ wasm_filename, mem_grow_pages, wasm_filename, mem_grow_pages }) catch {};
                     if (has_array_funcs) {
                         // Memory views + stack allocator for WASM linear memory
                         w.writeAll("const __wbuf = __wasm ? __wasm.exports.memory.buffer : null;\n") catch {};
@@ -2042,39 +2043,6 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     }
                                     alloc_sites.append(allocator, site) catch continue;
                                 }
-                            }
-                        }
-                    }
-
-                    // Provenance gate: only SOA-transform factories that have arrays filled
-                    // via `.push(factory(`. Factories without provenance add getter/setter
-                    // overhead with no cache-locality benefit (harmful for graph traversal workloads).
-                    // Require >=3 push sites to ensure the array is built at scale and likely iterated.
-                    if (alloc_sites.items.len > 0 and clean_content != null) {
-                        const ccc = clean_content.?;
-                        const push_pat = ".push(";
-                        var prov_count_per_site = [_]u16{0} ** 256; // max 256 alloc sites
-                        var sp2: usize = 0;
-                        while (sp2 + push_pat.len < ccc.len) : (sp2 += 1) {
-                            if (!std.mem.startsWith(u8, ccc[sp2..], push_pat)) continue;
-                            const fs2 = sp2 + push_pat.len;
-                            var fe2 = fs2;
-                            while (fe2 < ccc.len and isIdentChar(ccc[fe2])) fe2 += 1;
-                            if (fe2 == fs2 or fe2 >= ccc.len or ccc[fe2] != '(') continue;
-                            const fn_name2 = ccc[fs2..fe2];
-                            for (alloc_sites.items, 0..) |site, si| {
-                                if (si < 256 and std.mem.eql(u8, site.name, fn_name2)) {
-                                    prov_count_per_site[si] +|= 1;
-                                    break;
-                                }
-                            }
-                        }
-                        // Remove sites without sufficient provenance (iterate backwards)
-                        var ri: usize = alloc_sites.items.len;
-                        while (ri > 0) {
-                            ri -= 1;
-                            if (ri < 256 and prov_count_per_site[ri] < 3) {
-                                _ = alloc_sites.orderedRemove(ri);
                             }
                         }
                     }
