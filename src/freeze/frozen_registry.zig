@@ -668,25 +668,13 @@ pub fn generateModuleZigShardedWithBackend(
                 // Scan ALL functions for WASM eligibility (not L2-limited).
                 // WASM functions run in V8's code cache, not the frozen interpreter.
                 // The L2 budget only constrains the thin LLVM codegen (native binary path).
-                const saved_len = generated_all.items.len;
-                if (generated_all_full_len > 0) generated_all.items.len = generated_all_full_len;
-                defer generated_all.items.len = saved_len;
-
                 var extra_i32_count: usize = 0;
-                // Env var EDGEBOX_WASM_LIMIT limits WASM function count (for bisecting bugs)
-                const wasm_limit: usize = if (std.posix.getenv("EDGEBOX_WASM_LIMIT")) |lim|
-                    std.fmt.parseInt(usize, lim, 10) catch 999999
-                else
-                    999999;
-                var wasm_accepted: usize = 0;
                 for (generated_all.items, 0..) |gf, gi| {
-                    if (wasm_accepted >= wasm_limit) break;
                     // Skip functions already in int32 shard
                     if (isPureInt32Function(gf.func)) continue;
 
                     // Check if it qualifies for any numeric tier
                     const tier = analyzeNumericTier(gf.func) orelse continue;
-                    wasm_accepted += 1;
 
                     const cfg_val = cfg_builder.buildCFG(allocator, gf.func.instructions) catch continue;
                     const cfg_idx = f64_cfgs.items.len;
