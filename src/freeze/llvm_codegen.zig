@@ -945,9 +945,9 @@ fn emitInt32Instruction(
 
         .put_arg_i32 => {
             const idx: u32 = handler.index orelse switch (instr.operand) {
+                .arg => |a| a,
                 .u8 => |a| a,
-                .u16 => |a| a,
-                else => 0,
+                else => return CodegenError.UnsupportedOpcode,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
             if (idx >= arg_count) return CodegenError.UnsupportedOpcode;
@@ -957,9 +957,9 @@ fn emitInt32Instruction(
 
         .get_loc_i32 => {
             const idx: u32 = handler.index orelse switch (instr.operand) {
+                .loc => |a| a,
                 .u8 => |a| a,
-                .u16 => |a| a,
-                else => 0,
+                else => return CodegenError.UnsupportedOpcode,
             };
             if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             const loc_ptr = locals.*[idx];
@@ -969,9 +969,9 @@ fn emitInt32Instruction(
 
         .put_loc_i32 => {
             const idx: u32 = handler.index orelse switch (instr.operand) {
+                .loc => |a| a,
                 .u8 => |a| a,
-                .u16 => |a| a,
-                else => 0,
+                else => return CodegenError.UnsupportedOpcode,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
             if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
@@ -981,9 +981,9 @@ fn emitInt32Instruction(
 
         .set_loc_i32 => {
             const idx: u32 = handler.index orelse switch (instr.operand) {
+                .loc => |a| a,
                 .u8 => |a| a,
-                .u16 => |a| a,
-                else => 0,
+                else => return CodegenError.UnsupportedOpcode,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
             if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
@@ -1086,9 +1086,9 @@ fn emitInt32Instruction(
         .get_loc_check_i32 => {
             // Same as get_loc — in int32 context, locals are always initialized
             const idx: u32 = switch (instr.operand) {
+                .loc => |a| a,
                 .u8 => |a| a,
-                .u16 => |a| a,
-                else => 0,
+                else => return CodegenError.UnsupportedOpcode,
             };
             if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             const loc_ptr = locals.*[idx];
@@ -1099,9 +1099,9 @@ fn emitInt32Instruction(
         .put_loc_check_i32 => {
             // Same as put_loc — const check irrelevant in int32 context
             const idx: u32 = switch (instr.operand) {
+                .loc => |a| a,
                 .u8 => |a| a,
-                .u16 => |a| a,
-                else => 0,
+                else => return CodegenError.UnsupportedOpcode,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
             if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
@@ -1112,9 +1112,9 @@ fn emitInt32Instruction(
         .set_loc_uninitialized_i32 => {
             // In int32 context, "uninitialized" = 0
             const idx: u32 = switch (instr.operand) {
+                .loc => |a| a,
                 .u8 => |a| a,
-                .u16 => |a| a,
-                else => 0,
+                else => return CodegenError.UnsupportedOpcode,
             };
             if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             _ = builder.buildStore(llvm.constInt32(0), locals.*[idx]);
@@ -1133,9 +1133,9 @@ fn emitInt32Instruction(
         .set_arg_i32 => {
             // set_arg: store to arg slot, keep value on stack
             const idx: u32 = if (handler.index) |i| i else switch (instr.operand) {
+                .arg => |a| a,
                 .u8 => |a| a,
-                .u16 => |a| a,
-                else => 0,
+                else => return CodegenError.UnsupportedOpcode,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
             if (idx >= arg_count) return CodegenError.UnsupportedOpcode;
@@ -1148,8 +1148,7 @@ fn emitInt32Instruction(
             const idx: u32 = switch (instr.operand) {
                 .loc => |a| a,
                 .u8 => |a| a,
-                .u16 => |a| a,
-                else => 0,
+                else => return CodegenError.UnsupportedOpcode,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
             if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
@@ -1165,8 +1164,7 @@ fn emitInt32Instruction(
             const idx: u32 = switch (instr.operand) {
                 .loc => |a| a,
                 .u8 => |a| a,
-                .u16 => |a| a,
-                else => 0,
+                else => return CodegenError.UnsupportedOpcode,
             };
             if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             const loc_ptr = locals.*[idx];
@@ -1180,8 +1178,7 @@ fn emitInt32Instruction(
             const idx: u32 = switch (instr.operand) {
                 .loc => |a| a,
                 .u8 => |a| a,
-                .u16 => |a| a,
-                else => 0,
+                else => return CodegenError.UnsupportedOpcode,
             };
             if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             const loc_ptr = locals.*[idx];
@@ -1504,7 +1501,6 @@ fn generateNumericBody(
                     const cidx: u32 = switch (cinstr.operand) {
                         .loc => |a| a,
                         .u8 => |a| a,
-                        .u16 => |a| a,
                         else => continue,
                     };
                     if (cidx < 64) counter_mask |= @as(u64, 1) << @intCast(cidx);
@@ -2056,8 +2052,7 @@ fn emitNumericInstruction(
             const idx: u32 = handler.index orelse switch (instr.operand) {
                 .arg => |a| a,
                 .u8 => |a| a,
-                .u16 => |a| a,
-                else => 0,
+                else => return CodegenError.UnsupportedOpcode,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
             if (idx >= arg_count) return CodegenError.UnsupportedOpcode;
@@ -2069,8 +2064,7 @@ fn emitNumericInstruction(
             const idx: u32 = if (handler.index) |i| i else switch (instr.operand) {
                 .arg => |a| a,
                 .u8 => |a| a,
-                .u16 => |a| a,
-                else => 0,
+                else => return CodegenError.UnsupportedOpcode,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
             if (idx >= arg_count) return CodegenError.UnsupportedOpcode;
@@ -2082,8 +2076,7 @@ fn emitNumericInstruction(
             const idx: u32 = handler.index orelse switch (instr.operand) {
                 .loc => |a| a,
                 .u8 => |a| a,
-                .u16 => |a| a,
-                else => 0,
+                else => return CodegenError.UnsupportedOpcode,
             };
             if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             // f64 tier: for loop counter locals, load i32 shadow and sitofp.
@@ -2113,8 +2106,7 @@ fn emitNumericInstruction(
             const idx: u32 = handler.index orelse switch (instr.operand) {
                 .loc => |a| a,
                 .u8 => |a| a,
-                .u16 => |a| a,
-                else => 0,
+                else => return CodegenError.UnsupportedOpcode,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
             if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
@@ -2135,8 +2127,7 @@ fn emitNumericInstruction(
             const idx: u32 = handler.index orelse switch (instr.operand) {
                 .loc => |a| a,
                 .u8 => |a| a,
-                .u16 => |a| a,
-                else => 0,
+                else => return CodegenError.UnsupportedOpcode,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
             if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
@@ -2156,8 +2147,7 @@ fn emitNumericInstruction(
             const idx: u32 = switch (instr.operand) {
                 .loc => |a| a,
                 .u8 => |a| a,
-                .u16 => |a| a,
-                else => 0,
+                else => return CodegenError.UnsupportedOpcode,
             };
             if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             _ = builder.buildStore(zero_val, locals.*[idx]);
@@ -2378,8 +2368,7 @@ fn emitNumericInstruction(
             const idx: u32 = switch (instr.operand) {
                 .loc => |a| a,
                 .u8 => |a| a,
-                .u16 => |a| a,
-                else => 0,
+                else => return CodegenError.UnsupportedOpcode,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
             if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
@@ -2409,8 +2398,7 @@ fn emitNumericInstruction(
             const idx: u32 = switch (instr.operand) {
                 .loc => |a| a,
                 .u8 => |a| a,
-                .u16 => |a| a,
-                else => 0,
+                else => return CodegenError.UnsupportedOpcode,
             };
             if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             const loc_ptr = locals.*[idx];
@@ -2440,8 +2428,7 @@ fn emitNumericInstruction(
             const idx: u32 = switch (instr.operand) {
                 .loc => |a| a,
                 .u8 => |a| a,
-                .u16 => |a| a,
-                else => 0,
+                else => return CodegenError.UnsupportedOpcode,
             };
             if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             const loc_ptr = locals.*[idx];

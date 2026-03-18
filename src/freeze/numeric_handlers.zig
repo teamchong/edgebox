@@ -1255,12 +1255,13 @@ pub fn detectAllocSites(instructions: anytype) ?AllocSiteInfo {
                 .get_arg2 => { last_was_get_arg = true; last_arg_idx = 2; },
                 .get_arg3 => { last_was_get_arg = true; last_arg_idx = 3; },
                 .get_arg => {
-                    last_was_get_arg = true;
-                    last_arg_idx = switch (instr.operand) {
-                        .arg => |v| @intCast(v),
-                        .u16 => |v| @intCast(v),
-                        else => 0,
-                    };
+                    switch (instr.operand) {
+                        .arg => |v| {
+                            last_was_get_arg = true;
+                            last_arg_idx = @intCast(v);
+                        },
+                        else => { last_was_get_arg = false; },
+                    }
                 },
                 // Call after object means object is consumed by another function — not a simple factory
                 .call0, .call1, .call2, .call3, .call, .call_method,
