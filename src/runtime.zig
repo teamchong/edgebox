@@ -2770,10 +2770,14 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         // Skip whitespace
                                         while (ppos < params_str.len and (params_str[ppos] == ' ' or params_str[ppos] == '\t')) ppos += 1;
                                         const pstart = ppos;
-                                        while (ppos < params_str.len and params_str[ppos] != ',' and params_str[ppos] != ' ') ppos += 1;
+                                        while (ppos < params_str.len and params_str[ppos] != ',' and params_str[ppos] != ' ' and params_str[ppos] != '=') ppos += 1;
                                         if (ppos > pstart) {
                                             param_names[param_count] = params_str[pstart..ppos];
                                             param_count += 1;
+                                        }
+                                        // Skip default value: = expression until comma
+                                        if (ppos < params_str.len and params_str[ppos] == '=') {
+                                            while (ppos < params_str.len and params_str[ppos] != ',') ppos += 1;
                                         }
                                         // Skip comma
                                         if (ppos < params_str.len and params_str[ppos] == ',') ppos += 1;

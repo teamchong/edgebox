@@ -673,12 +673,20 @@ pub fn generateModuleZigShardedWithBackend(
                 defer generated_all.items.len = saved_len;
 
                 var extra_i32_count: usize = 0;
+                // Env var EDGEBOX_WASM_LIMIT limits WASM function count (for bisecting bugs)
+                const wasm_limit: usize = if (std.posix.getenv("EDGEBOX_WASM_LIMIT")) |lim|
+                    std.fmt.parseInt(usize, lim, 10) catch 999999
+                else
+                    999999;
+                var wasm_accepted: usize = 0;
                 for (generated_all.items, 0..) |gf, gi| {
+                    if (wasm_accepted >= wasm_limit) break;
                     // Skip functions already in int32 shard
                     if (isPureInt32Function(gf.func)) continue;
 
                     // Check if it qualifies for any numeric tier
                     const tier = analyzeNumericTier(gf.func) orelse continue;
+                    wasm_accepted += 1;
 
                     const cfg_val = cfg_builder.buildCFG(allocator, gf.func.instructions) catch continue;
                     const cfg_idx = f64_cfgs.items.len;
