@@ -2617,25 +2617,37 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     // === All validation passed — now emit ===
                                     w.writeAll(cc[src_pos .. scan + 1]) catch {};
                                     w.writeAll("\n") catch {};
-                                    w.print("  const __idx = __soa_{d}__ctr++;\n", .{si}) catch {};
-                                    for (site.field_names[0..site.field_count], 0..) |fname, fi| {
-                                        w.print("  __soa_{d}_{s}[__idx] = {s};\n", .{ si, fname, param_names[fi] }) catch {};
-                                    }
-                                    // Raw index only when ALL provenance entries for this site are raw.
-                                    // No provenance entries → object used standalone → must return handle.
+
+                                    // Check if this site has provenance (arrays push from this factory).
+                                    // Only write shadow columns when someone will read them.
+                                    var has_prov = false;
                                     var all_raw = false;
                                     for (provenance) |prov| {
                                         if (prov.site_idx == si) {
-                                            if (!all_raw) all_raw = true; // first entry: tentatively raw
+                                            has_prov = true;
+                                            if (!all_raw) all_raw = true;
                                             if (!prov.raw_index) { all_raw = false; break; }
                                         }
                                     }
-                                    if (all_raw) {
-                                        // Raw index return — no V8 HeapObject, zero GC pressure
-                                        w.print("  return __idx;\n}}\n", .{}) catch {};
+
+                                    if (has_prov) {
+                                        // Site has array readers — write columns + return index or handle
+                                        w.print("  const __idx = __soa_{d}__ctr++;\n", .{si}) catch {};
+                                        for (site.field_names[0..site.field_count], 0..) |fname, fi| {
+                                            w.print("  __soa_{d}_{s}[__idx] = {s};\n", .{ si, fname, param_names[fi] }) catch {};
+                                        }
+                                        if (all_raw) {
+                                            w.print("  return __idx;\n}}\n", .{}) catch {};
+                                        } else {
+                                            w.writeAll("  return {") catch {};
+                                            for (site.field_names[0..site.field_count], 0..) |fname, fi| {
+                                                if (fi > 0) w.writeAll(", ") catch {};
+                                                w.print("{s}: {s}", .{ fname, param_names[fi] }) catch {};
+                                            }
+                                            w.writeAll("};\n}\n") catch {};
+                                        }
                                     } else {
-                                        // Plain object return — V8 fast hidden class for random reads.
-                                        // SOA columns populated in shadow for iteration use.
+                                        // No readers — skip column writes, return plain object
                                         w.writeAll("  return {") catch {};
                                         for (site.field_names[0..site.field_count], 0..) |fname, fi| {
                                             if (fi > 0) w.writeAll(", ") catch {};
