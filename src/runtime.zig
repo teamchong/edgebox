@@ -462,6 +462,8 @@ const AllocSite = struct {
     field_count: u8,
     /// Which get_arg index maps to each field (for correct param mapping)
     arg_indices: [16]u8 = .{0} ** 16,
+    /// True for constructor pattern (this.X = Y), false for factory (return {X: Y})
+    is_constructor: bool = false,
 };
 
 /// Decide whether a WASM-compiled function should get a trampoline or stay as JS.
@@ -1951,6 +1953,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         \\__wasm.exports.memory.grow({d});
                         \\
                     , .{ wasm_filename, mem_grow_pages }) catch {};
+
                     if (has_array_funcs) {
                         // Memory views + stack allocator for WASM linear memory
                         w.writeAll("const __wbuf = __wasm ? __wasm.exports.memory.buffer : null;\n") catch {};
@@ -2028,6 +2031,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                                 };
                                             }
                                         }
+                                    }
+                                    // Check if constructor pattern
+                                    if (obj.get("is_constructor")) |ic_val| {
+                                        site.is_constructor = if (ic_val == .bool) ic_val.bool else false;
                                     }
                                     alloc_sites.append(allocator, site) catch continue;
                                 }
@@ -2603,47 +2610,33 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     }
 
                                     // === All validation passed — now emit ===
+                                    if (site.is_constructor) {
+                                        // Constructor: inject __idx + column writes after {, keep body
+                                        w.writeAll(cc[src_pos .. scan + 1]) catch {};
+                                        w.print("\n  this.__idx = __soa_{d}__ctr++;\n", .{si}) catch {};
+                                        // Write param values to SOA columns (same data as this.X = param)
+                                        for (site.field_names[0..site.field_count], 0..) |fname, fi| {
+                                            w.print("  __soa_{d}_{s}[this.__idx] = {s};\n", .{ si, fname, param_names[fi] }) catch {};
+                                        }
+                                        src_pos = scan + 1; // continue — let original body run too
+                                        continue :char_loop;
+                                    }
+
+                                    // Factory: replace body with column writes + return
                                     w.writeAll(cc[src_pos .. scan + 1]) catch {};
                                     w.writeAll("\n") catch {};
 
-                                    // Check if this site has provenance (arrays push from this factory).
-                                    // Only write shadow columns when someone will read them.
-                                    var has_prov = false;
-                                    var all_raw = false;
-                                    for (provenance) |prov| {
-                                        if (prov.site_idx == si) {
-                                            has_prov = true;
-                                            if (!all_raw) all_raw = true;
-                                            if (!prov.raw_index) { all_raw = false; break; }
-                                        }
+                                    w.print("  const __idx = __soa_{d}__ctr++;\n", .{si}) catch {};
+                                    for (site.field_names[0..site.field_count], 0..) |fname, fi| {
+                                        w.print("  __soa_{d}_{s}[__idx] = {s};\n", .{ si, fname, param_names[fi] }) catch {};
                                     }
-
-                                    if (has_prov) {
-                                        // Site has array readers — write columns + return index or handle
-                                        w.print("  const __idx = __soa_{d}__ctr++;\n", .{si}) catch {};
-                                        for (site.field_names[0..site.field_count], 0..) |fname, fi| {
-                                            w.print("  __soa_{d}_{s}[__idx] = {s};\n", .{ si, fname, param_names[fi] }) catch {};
-                                        }
-                                        if (all_raw) {
-                                            w.print("  return __idx;\n}}\n", .{}) catch {};
-                                        } else {
-                                            // Return plain object WITH __idx for SOA column reads
-                                            w.writeAll("  return {__idx, ") catch {};
-                                            for (site.field_names[0..site.field_count], 0..) |fname, fi| {
-                                                if (fi > 0) w.writeAll(", ") catch {};
-                                                w.print("{s}: {s}", .{ fname, param_names[fi] }) catch {};
-                                            }
-                                            w.writeAll("};\n}\n") catch {};
-                                        }
-                                    } else {
-                                        // No readers — return plain object, no column writes
-                                        w.writeAll("  return {") catch {};
-                                        for (site.field_names[0..site.field_count], 0..) |fname, fi| {
-                                            if (fi > 0) w.writeAll(", ") catch {};
-                                            w.print("{s}: {s}", .{ fname, param_names[fi] }) catch {};
-                                        }
-                                        w.writeAll("};\n}\n") catch {};
+                                    // Return plain object WITH __idx for SOA column reads
+                                    w.writeAll("  return {__idx, ") catch {};
+                                    for (site.field_names[0..site.field_count], 0..) |fname, fi| {
+                                        if (fi > 0) w.writeAll(", ") catch {};
+                                        w.print("{s}: {s}", .{ fname, param_names[fi] }) catch {};
                                     }
+                                    w.writeAll("};\n}\n") catch {};
 
                                     // Skip the original function body
                                     const body_end = skipJsFunctionBody(cc, scan);

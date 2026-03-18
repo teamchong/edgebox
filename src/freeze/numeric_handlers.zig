@@ -1198,11 +1198,11 @@ pub const AllocSiteInfo = struct {
     field_atoms: [MAX_STRUCT_FIELDS]u32,
     field_count: u8,
     /// True when every field value comes directly from get_arg (pure pass-through).
-    /// Only pass-through factories are safe for SOA (Int32Array can't store strings/objects).
     pass_through: bool = false,
     /// For pass-through: which get_arg index maps to each field.
-    /// Allows correct mapping when field order ≠ param order.
     arg_indices: [MAX_STRUCT_FIELDS]u8 = .{0} ** MAX_STRUCT_FIELDS,
+    /// True for constructor pattern (this.X = Y), false for factory (return {X: Y})
+    is_constructor: bool = false,
 };
 
 /// Detect object literal allocation sites in a function's bytecodes.
@@ -1270,10 +1270,53 @@ pub fn detectAllocSites(instructions: anytype) ?AllocSiteInfo {
         }
     }
 
-    // Require at least 3 fields — V8 already optimizes 1-2 field objects via
-    // monomorphic hidden classes, making SOA getter/setter overhead a net loss.
-    // SOA is also provenance-gated at source transform time (only factories with
-    // `arr.push(factory(...))` get transformed). This threshold catches the rest.
+    // If no object literal found, try constructor pattern: this.X = Y (put_field)
+    if (info.field_count == 0) {
+        var ctor_last_was_get_arg = false;
+        var ctor_last_arg_idx: u8 = 0;
+        var ctor_all_get_arg = true;
+        for (instructions) |instr| {
+            if (instr.opcode == .put_field) {
+                const atom: u32 = switch (instr.operand) {
+                    .atom => |a| a,
+                    else => continue,
+                };
+                // Deduplicate: skip if atom already recorded
+                var dup = false;
+                for (info.field_atoms[0..info.field_count]) |existing| {
+                    if (existing == atom) { dup = true; break; }
+                }
+                if (dup) { ctor_last_was_get_arg = false; continue; }
+                if (info.field_count >= MAX_STRUCT_FIELDS) return null;
+                info.field_atoms[info.field_count] = atom;
+                if (!ctor_last_was_get_arg) ctor_all_get_arg = false;
+                info.arg_indices[info.field_count] = if (ctor_last_was_get_arg) ctor_last_arg_idx else 0;
+                info.field_count += 1;
+                ctor_last_was_get_arg = false;
+                continue;
+            }
+            switch (instr.opcode) {
+                .get_arg0 => { ctor_last_was_get_arg = true; ctor_last_arg_idx = 0; },
+                .get_arg1 => { ctor_last_was_get_arg = true; ctor_last_arg_idx = 1; },
+                .get_arg2 => { ctor_last_was_get_arg = true; ctor_last_arg_idx = 2; },
+                .get_arg3 => { ctor_last_was_get_arg = true; ctor_last_arg_idx = 3; },
+                .get_arg => {
+                    switch (instr.operand) {
+                        .arg => |v| {
+                            ctor_last_was_get_arg = true;
+                            ctor_last_arg_idx = @intCast(v);
+                        },
+                        else => { ctor_last_was_get_arg = false; },
+                    }
+                },
+                .push_this => { ctor_last_was_get_arg = false; },
+                else => { ctor_last_was_get_arg = false; },
+            }
+        }
+        all_get_arg = ctor_all_get_arg;
+        info.is_constructor = true;
+    }
+
     if (info.field_count < 3) return null;
     info.pass_through = all_get_arg;
     return info;

@@ -1119,7 +1119,9 @@ pub fn generateModuleZigShardedWithBackend(
                         const ai_str = std.fmt.bufPrint(&ai_buf, "{d}", .{ai}) catch continue;
                         amf.writeAll(ai_str) catch {};
                     }
-                    amf.writeAll("]}") catch {};
+                    amf.writeAll("],\"is_constructor\":") catch {};
+                    amf.writeAll(if (alloc_info.is_constructor) "true" else "false") catch {};
+                    amf.writeAll("}") catch {};
                     alloc_count += 1;
                 }
                 amf.writeAll("]") catch {};
