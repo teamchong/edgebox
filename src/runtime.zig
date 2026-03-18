@@ -648,6 +648,7 @@ fn detectPushLoop(cc: []const u8, for_pos: usize, wasm_funcs: []const WasmFunc) 
 const BatchLoopMatch = struct {
     loop_end: usize, // position after the closing `}`
     func_name: []const u8, // name of the struct function to batch
+    func_idx: usize, // wasm function index (for unique variable names)
     arr_name: []const u8, // array variable name
     acc_name: []const u8, // accumulator variable name
     scalar_args: []const u8, // scalar args after the array element (e.g. ", 3, 0x20")
@@ -709,7 +710,7 @@ fn detectBatchLoop(cc: []const u8, for_pos: usize, wasm_funcs: []const WasmFunc)
 
     // Search body for: ACC = (ACC + FN(ARR[V], ...) | 0;
     // or: ACC = ACC + FN(ARR[V], ...) | 0;
-    for (wasm_funcs) |wfe| {
+    for (wasm_funcs, 0..) |wfe, wfi| {
         if (wfe.struct_args == 0) continue;
         // Find FN(ARR[V] in body
         const fn_call = std.mem.indexOf(u8, body, wfe.name) orelse continue;
@@ -758,6 +759,7 @@ fn detectBatchLoop(cc: []const u8, for_pos: usize, wasm_funcs: []const WasmFunc)
                     return BatchLoopMatch{
                         .loop_end = loop_end,
                         .func_name = wfe.name,
+                        .func_idx = wfi,
                         .arr_name = arr_name,
                         .acc_name = acc_name,
                         .scalar_args = scalar_args,
@@ -2073,7 +2075,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     // calls the batched WASM function in a single invocation.
                     // Identity cache: if same array ref on repeated calls, skip the copy
                     // (pool persists in WASM stack memory across calls).
-                    for (wasm_func_list.items) |wfe| {
+                    for (wasm_func_list.items, 0..) |wfe, wfi| {
                         if (wfe.struct_args == 0) continue;
                         // Find first struct arg and its fields
                         var sai: u32 = 0;
@@ -2088,8 +2090,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         const stride = @as(u32, field_count);
 
                         // Per-function identity cache variables
-                        w.print("let __bp_{s}_arr = null, __bp_{s}_pool = 0, __bp_{s}_sp = 0;\n", .{ wfe.name, wfe.name, wfe.name }) catch {};
-                        w.print("function __batch_{s}(arr", .{wfe.name}) catch {};
+                        w.print("let __bp_{d}_arr = null, __bp_{d}_pool = 0, __bp_{d}_sp = 0;\n", .{ wfi, wfi, wfi }) catch {};
+                        w.print("function __batch_{d}(arr", .{wfi}) catch {};
                         // Scalar params (non-struct args)
                         {
                             var pi: u32 = 0;
@@ -2148,7 +2150,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             }
                         }
                         // Identity cache fast path: same array ref → zero-copy
-                        w.print("  if (arr === __bp_{s}_arr) return __wasm.exports.{s}_batch(__bp_{s}_pool, arr.length", .{ wfe.name, wfe.name, wfe.name }) catch {};
+                        w.print("  if (arr === __bp_{d}_arr) return __wasm.exports.{s}_batch(__bp_{d}_pool, arr.length", .{ wfi, wfe.name, wfi }) catch {};
                         {
                             var pi: u32 = 0;
                             while (pi < wfe.arg_count) : (pi += 1) {
@@ -2159,11 +2161,11 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         }
                         w.writeAll(");\n") catch {};
                         // Cache miss: free old pool, allocate new, copy fields
-                        w.print("  if (__bp_{s}_arr !== null) __wasmStackRestore(__bp_{s}_sp);\n", .{ wfe.name, wfe.name }) catch {};
-                        w.print("  __bp_{s}_sp = __wasmStackSave();\n", .{wfe.name}) catch {};
+                        w.print("  if (__bp_{d}_arr !== null) __wasmStackRestore(__bp_{d}_sp);\n", .{ wfi, wfi }) catch {};
+                        w.print("  __bp_{d}_sp = __wasmStackSave();\n", .{wfi}) catch {};
                         w.writeAll("  const __n = arr.length;\n") catch {};
-                        w.print("  __bp_{s}_pool = __wasmStackAlloc(__n * {d});\n", .{ wfe.name, stride * 4 }) catch {};
-                        w.print("  const __base = __bp_{s}_pool >> 2;\n", .{wfe.name}) catch {};
+                        w.print("  __bp_{d}_pool = __wasmStackAlloc(__n * {d});\n", .{ wfi, stride * 4 }) catch {};
+                        w.print("  const __base = __bp_{d}_pool >> 2;\n", .{wfi}) catch {};
                         // Copy loop
                         w.writeAll("  for (let __i = 0; __i < __n; __i++) {\n") catch {};
                         for (wfe.struct_field_names[sai][0..field_count], 0..) |fname, fi| {
@@ -2175,9 +2177,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             }
                         }
                         w.writeAll("  }\n") catch {};
-                        w.print("  __bp_{s}_arr = arr;\n", .{wfe.name}) catch {};
+                        w.print("  __bp_{d}_arr = arr;\n", .{wfi}) catch {};
                         // Call batch WASM
-                        w.print("  return __wasm.exports.{s}_batch(__bp_{s}_pool, __n", .{ wfe.name, wfe.name }) catch {};
+                        w.print("  return __wasm.exports.{s}_batch(__bp_{d}_pool, __n", .{ wfe.name, wfi }) catch {};
                         {
                             var pi: u32 = 0;
                             while (pi < wfe.arg_count) : (pi += 1) {
@@ -2429,8 +2431,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     // Write everything before the loop
                                     // The loop is already in the output stream at src_pos.
                                     // Write the batch replacement and skip past the original loop.
-                                    w.print("{s} = ({s} + __batch_{s}({s}", .{
-                                        batch.acc_name, batch.acc_name, batch.func_name, batch.arr_name,
+                                    w.print("{s} = ({s} + __batch_{d}({s}", .{
+                                        batch.acc_name, batch.acc_name, batch.func_idx, batch.arr_name,
                                     }) catch {};
                                     // Write scalar args
                                     if (batch.scalar_args.len > 0) {
@@ -2455,7 +2457,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     w.writeAll(cc[src_pos..push.loop_end]) catch {};
                                     // Append pool materialization for each matched struct function
                                     w.writeAll("\n") catch {};
-                                    for (wasm_func_list.items) |wfe| {
+                                    for (wasm_func_list.items, 0..) |wfe, wfi| {
                                         if (wfe.struct_args == 0) continue;
                                         // Match fields
                                         var match_sai: u32 = 0;
@@ -2478,10 +2480,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         if (!fields_match) continue;
                                         const s = @as(u32, match_fc);
                                         // Emit pool materialization
-                                        w.print("__bp_{s}_sp = __wasmStackSave(); ", .{wfe.name}) catch {};
-                                        w.print("__bp_{s}_pool = __wasmStackAlloc({s}.length * {d}); ", .{ wfe.name, push.arr_name, s * 4 }) catch {};
+                                        w.print("__bp_{d}_sp = __wasmStackSave(); ", .{wfi}) catch {};
+                                        w.print("__bp_{d}_pool = __wasmStackAlloc({s}.length * {d}); ", .{ wfi, push.arr_name, s * 4 }) catch {};
                                         w.writeAll("{\n") catch {};
-                                        w.print("  const __b = __bp_{s}_pool >> 2;\n", .{wfe.name}) catch {};
+                                        w.print("  const __b = __bp_{d}_pool >> 2;\n", .{wfi}) catch {};
                                         w.print("  for (let __i = 0; __i < {s}.length; __i++) {{\n", .{push.arr_name}) catch {};
                                         for (wfe.struct_field_names[match_sai][0..match_fc], 0..) |fname, fi| {
                                             if (fname.len == 0) continue;
@@ -2492,7 +2494,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             }
                                         }
                                         w.writeAll("  }\n}\n") catch {};
-                                        w.print("__bp_{s}_arr = {s};\n", .{ wfe.name, push.arr_name }) catch {};
+                                        w.print("__bp_{d}_arr = {s};\n", .{ wfi, push.arr_name }) catch {};
                                     }
                                     src_pos = push.loop_end;
                                     continue;
