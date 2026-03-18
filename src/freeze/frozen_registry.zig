@@ -665,6 +665,11 @@ pub fn generateModuleZigShardedWithBackend(
                 var f64_infos = std.ArrayListUnmanaged(F64Info){};
                 defer f64_infos.deinit(allocator);
 
+                // Scan ALL functions for WASM eligibility (not L2-limited)
+                const saved_len = generated_all.items.len;
+                if (generated_all_full_len > 0) generated_all.items.len = generated_all_full_len;
+                defer generated_all.items.len = saved_len;
+
                 var extra_i32_count: usize = 0;
                 for (generated_all.items, 0..) |gf, gi| {
                     // Skip functions already in int32 shard
@@ -790,6 +795,15 @@ pub fn generateModuleZigShardedWithBackend(
 
                     if (cross_infos.items.len > 0) {
                         std.debug.print("[freeze] Cross-call: {d} functions added to WASM (call other numeric functions)\n", .{cross_infos.items.len});
+                    }
+                }
+
+                // Apply WASM function limit for bisecting codegen bugs
+                if (std.posix.getenv("EDGEBOX_WASM_LIMIT")) |lim| {
+                    const max_funcs = std.fmt.parseInt(usize, lim, 10) catch wasm_funcs.items.len;
+                    if (max_funcs < wasm_funcs.items.len) {
+                        std.debug.print("[wasm-limit] Truncating {d} → {d} WASM functions\n", .{ wasm_funcs.items.len, max_funcs });
+                        wasm_funcs.items.len = max_funcs;
                     }
                 }
 
@@ -1810,6 +1824,28 @@ pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
 
         break :blk struct_result.kind;
     };
+
+    // Reject functions that capture closure variables (callbacks WASM can't call).
+    if (func.closure_vars.len > 1) {
+        if (debug) std.debug.print("[wasm-reject] {s}: {d} closure vars (likely calls JS callbacks)\n", .{ func.name, func.closure_vars.len });
+        return null;
+    }
+
+    // Reject struct-arg functions with >1 field per struct arg.
+    // Single-field structs (just .kind) are safe: the field is always numeric.
+    // Multi-field structs may include object references (.left, .expression, .parent)
+    // that can't be represented as i32 in WASM linear memory.
+    if (has_struct_info) {
+        if (getLastStructInfo()) |si| {
+            const combined = si.struct_args | si.array_of_struct_args;
+            for (0..@min(func.arg_count, 8)) |ai| {
+                if (combined & (@as(u8, 1) << @intCast(ai)) != 0 and si.field_counts[ai] > 1) {
+                    if (debug) std.debug.print("[wasm-reject] {s}: struct with {d} fields (may include object refs)\n", .{ func.name, si.field_counts[ai] });
+                    return null;
+                }
+            }
+        }
+    }
 
     // For non-recursive functions, reject recursive-only patterns
     // (self_ref + call_self without the function being self-recursive)
