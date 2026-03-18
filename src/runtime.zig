@@ -1948,7 +1948,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     const mem_grow_pages: u32 = if (has_array_funcs) 256 else 16;
 
                     // Preamble: load WASM module (compatible with Node.js + workerd)
-                    var w_buf: [262144]u8 = undefined; // 256KB buffer for large workers
+                    var w_buf: [65536]u8 = undefined;
                     var w_state = wf.writer(&w_buf);
                     const w = &w_state.interface;
                     defer w.flush() catch {};
