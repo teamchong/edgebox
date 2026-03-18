@@ -53,6 +53,9 @@ jobs:
         run: |
           ./zig-out/bin/edgebox --binary-only --allocator=arena benchmark/node_modules/typescript/lib/tsc.js
 
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
       - name: Install tsgo (TypeScript Native Preview)
         continue-on-error: true
         run: |
@@ -64,13 +67,13 @@ jobs:
         if: ${{ github.event.inputs.full_suite != 'true' }}
         run: |
           cd benchmark
-          npx tsx run.ts --no-vscode --runs 3 --include-tsgo
+          npx tsx run.ts --no-vscode --runs 3 --include-bun --include-tsgo
 
       - name: Run TSC Benchmark (Full)
         if: ${{ github.event.inputs.full_suite == 'true' }}
         run: |
           cd benchmark
-          npx tsx run.ts --runs 3 --include-tsgo
+          npx tsx run.ts --runs 3 --include-bun --include-tsgo
 
       - name: Upload Results
         uses: actions/upload-artifact@v4
@@ -89,60 +92,56 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           if [ -f benchmark/results.json ]; then
-            # Parse JSON and generate table with optional tsgo column
+            # Parse JSON and generate table with optional Bun/tsgo columns
             node -e "
               const results = require('./benchmark/results.json');
+              const hasBun = results.some(r => r.bunMean !== undefined);
               const hasTsgo = results.some(r => r.tsgoMean !== undefined);
 
-              if (hasTsgo) {
-                console.log('| Project | Lines | Node.js (ms) | EdgeBox (ms) | Speedup | tsgo (ms) | tsgo Speedup | Match |');
-                console.log('|---------|-------|--------------|--------------|---------|-----------|--------------|-------|');
-              } else {
-                console.log('| Project | Lines | Node.js (ms) | EdgeBox (ms) | Speedup | Match |');
-                console.log('|---------|-------|--------------|--------------|---------|-------|');
-              }
+              let hdr = '| Project | Lines | Node.js (ms) |';
+              let sep = '|---------|-------|--------------|';
+              if (hasBun) { hdr += ' Bun (ms) |'; sep += '----------|'; }
+              hdr += ' EdgeBox (ms) | vs Node |';
+              sep += '--------------|---------|';
+              if (hasBun) { hdr += ' vs Bun |'; sep += '--------|'; }
+              if (hasTsgo) { hdr += ' tsgo (ms) | tsgo Speedup |'; sep += '-----------|--------------|'; }
+              hdr += ' Match |';
+              sep += '-------|';
+              console.log(hdr);
+              console.log(sep);
 
-              let totalLines = 0;
-              let totalSpeedup = 0;
-              let totalTsgoSpeedup = 0;
-              let tsgoCount = 0;
-              let allMatch = true;
+              let totalLines = 0, totalSpeedup = 0, allMatch = true;
+              let totalBunSpeedup = 0, bunCount = 0;
+              let totalTsgoSpeedup = 0, tsgoCount = 0;
 
               for (const r of results) {
-                const lines = r.lines.toLocaleString();
-                const node = r.nodeMean.toFixed(0);
-                const edgebox = r.edgeboxMean.toFixed(0);
-                const speedup = r.speedup.toFixed(2);
-                const match = r.outputMatch ? '✓' : '✗';
-
-                if (hasTsgo) {
-                  const tsgo = r.tsgoMean !== undefined ? r.tsgoMean.toFixed(0) : '-';
-                  const tsgoSpd = r.tsgoSpeedup !== undefined ? r.tsgoSpeedup.toFixed(2) + 'x' : '-';
-                  console.log('| ' + r.project + ' | ' + lines + ' | ' + node + ' | ' + edgebox + ' | ' + speedup + 'x | ' + tsgo + ' | ' + tsgoSpd + ' | ' + match + ' |');
-                  if (r.tsgoSpeedup !== undefined) {
-                    totalTsgoSpeedup += r.tsgoSpeedup;
-                    tsgoCount++;
-                  }
-                } else {
-                  console.log('| ' + r.project + ' | ' + lines + ' | ' + node + ' | ' + edgebox + ' | ' + speedup + 'x | ' + match + ' |');
+                let row = '| ' + r.project + ' | ' + r.lines.toLocaleString() + ' | ' + r.nodeMean.toFixed(0) + ' |';
+                if (hasBun) row += ' ' + (r.bunMean !== undefined ? r.bunMean.toFixed(0) : '-') + ' |';
+                row += ' ' + r.edgeboxMean.toFixed(0) + ' | ' + r.speedup.toFixed(2) + 'x |';
+                if (hasBun) {
+                  row += ' ' + (r.bunSpeedup !== undefined ? r.bunSpeedup.toFixed(2) + 'x' : '-') + ' |';
+                  if (r.bunSpeedup !== undefined) { totalBunSpeedup += r.bunSpeedup; bunCount++; }
                 }
-
+                if (hasTsgo) {
+                  row += ' ' + (r.tsgoMean !== undefined ? r.tsgoMean.toFixed(0) : '-') + ' | ' + (r.tsgoSpeedup !== undefined ? r.tsgoSpeedup.toFixed(2) + 'x' : '-') + ' |';
+                  if (r.tsgoSpeedup !== undefined) { totalTsgoSpeedup += r.tsgoSpeedup; tsgoCount++; }
+                }
+                row += ' ' + (r.outputMatch ? '✓' : '✗') + ' |';
+                console.log(row);
                 totalLines += r.lines;
                 totalSpeedup += r.speedup;
                 if (!r.outputMatch) allMatch = false;
               }
 
+              console.log(sep);
               const avgSpeedup = (totalSpeedup / results.length).toFixed(2);
-              const avgTsgoSpeedup = tsgoCount > 0 ? (totalTsgoSpeedup / tsgoCount).toFixed(2) + 'x avg' : '-';
-              const totalMatch = allMatch ? '✓' : '✗';
-
-              if (hasTsgo) {
-                console.log('|---------|-------|--------------|--------------|---------|-----------|--------------|-------|');
-                console.log('| **TOTAL** | ' + totalLines.toLocaleString() + ' | | | ' + avgSpeedup + 'x avg | | ' + avgTsgoSpeedup + ' | ' + totalMatch + ' |');
-              } else {
-                console.log('|---------|-------|--------------|--------------|---------|-------|');
-                console.log('| **TOTAL** | ' + totalLines.toLocaleString() + ' | | | ' + avgSpeedup + 'x avg | ' + totalMatch + ' |');
-              }
+              let summary = '| **TOTAL** | ' + totalLines.toLocaleString() + ' | |';
+              if (hasBun) summary += ' |';
+              summary += ' | ' + avgSpeedup + 'x avg |';
+              if (hasBun) summary += ' ' + (bunCount > 0 ? (totalBunSpeedup/bunCount).toFixed(2) + 'x avg' : '-') + ' |';
+              if (hasTsgo) summary += ' | ' + (tsgoCount > 0 ? (totalTsgoSpeedup/tsgoCount).toFixed(2) + 'x avg' : '-') + ' |';
+              summary += ' ' + (allMatch ? '✓' : '✗') + ' |';
+              console.log(summary);
             " >> $GITHUB_STEP_SUMMARY
 
             echo "" >> $GITHUB_STEP_SUMMARY
@@ -179,48 +178,47 @@ jobs:
 
             try {
               const results = JSON.parse(fs.readFileSync('benchmark/results.json', 'utf8'));
+              const hasBun = results.some(r => r.bunMean !== undefined);
               const hasTsgo = results.some(r => r.tsgoMean !== undefined);
 
-              if (hasTsgo) {
-                body += '| Project | Lines | Node.js | EdgeBox | Speedup | tsgo | tsgo Speedup | Match |\n';
-                body += '|---------|-------|---------|---------|---------|------|--------------|-------|\n';
-              } else {
-                body += '| Project | Lines | Node.js | EdgeBox | Speedup | Match |\n';
-                body += '|---------|-------|---------|---------|---------|-------|\n';
-              }
+              let hdr = '| Project | Lines | Node.js |';
+              let sep = '|---------|-------|---------|';
+              if (hasBun) { hdr += ' Bun |'; sep += '-----|'; }
+              hdr += ' EdgeBox | vs Node |';
+              sep += '---------|---------|';
+              if (hasBun) { hdr += ' vs Bun |'; sep += '--------|'; }
+              if (hasTsgo) { hdr += ' tsgo | tsgo Speedup |'; sep += '------|--------------|'; }
+              hdr += ' Match |\n';
+              sep += '-------|\n';
+              body += hdr + sep;
 
-              let totalSpeedup = 0;
-              let totalTsgoSpeedup = 0;
-              let tsgoCount = 0;
-              let allMatch = true;
+              let totalSpeedup = 0, allMatch = true;
+              let totalBunSpeedup = 0, bunCount = 0;
+              let totalTsgoSpeedup = 0, tsgoCount = 0;
 
               for (const r of results) {
-                const speedup = r.speedup.toFixed(2);
                 const match = r.outputMatch ? ':white_check_mark:' : ':x:';
-
-                if (hasTsgo) {
-                  const tsgo = r.tsgoMean !== undefined ? `${r.tsgoMean.toFixed(0)}ms` : '-';
-                  const tsgoSpd = r.tsgoSpeedup !== undefined ? `${r.tsgoSpeedup.toFixed(2)}x` : '-';
-                  body += `| ${r.project} | ${r.lines.toLocaleString()} | ${r.nodeMean.toFixed(0)}ms | ${r.edgeboxMean.toFixed(0)}ms | ${speedup}x | ${tsgo} | ${tsgoSpd} | ${match} |\n`;
-                  if (r.tsgoSpeedup !== undefined) {
-                    totalTsgoSpeedup += r.tsgoSpeedup;
-                    tsgoCount++;
-                  }
-                } else {
-                  body += `| ${r.project} | ${r.lines.toLocaleString()} | ${r.nodeMean.toFixed(0)}ms | ${r.edgeboxMean.toFixed(0)}ms | ${speedup}x | ${match} |\n`;
+                let row = `| ${r.project} | ${r.lines.toLocaleString()} | ${r.nodeMean.toFixed(0)}ms |`;
+                if (hasBun) {
+                  row += ` ${r.bunMean !== undefined ? r.bunMean.toFixed(0) + 'ms' : '-'} |`;
+                  if (r.bunSpeedup !== undefined) { totalBunSpeedup += r.bunSpeedup; bunCount++; }
                 }
-
+                row += ` ${r.edgeboxMean.toFixed(0)}ms | ${r.speedup.toFixed(2)}x |`;
+                if (hasBun) row += ` ${r.bunSpeedup !== undefined ? r.bunSpeedup.toFixed(2) + 'x' : '-'} |`;
+                if (hasTsgo) {
+                  row += ` ${r.tsgoMean !== undefined ? r.tsgoMean.toFixed(0) + 'ms' : '-'} | ${r.tsgoSpeedup !== undefined ? r.tsgoSpeedup.toFixed(2) + 'x' : '-'} |`;
+                  if (r.tsgoSpeedup !== undefined) { totalTsgoSpeedup += r.tsgoSpeedup; tsgoCount++; }
+                }
+                row += ` ${match} |\n`;
+                body += row;
                 totalSpeedup += r.speedup;
                 if (!r.outputMatch) allMatch = false;
               }
 
               const avgSpeedup = (totalSpeedup / results.length).toFixed(2);
-              const avgTsgoSpeedup = tsgoCount > 0 ? (totalTsgoSpeedup / tsgoCount).toFixed(2) : null;
-
-              let summary = `**EdgeBox speedup: ${avgSpeedup}x**`;
-              if (avgTsgoSpeedup) {
-                summary += ` | **tsgo speedup: ${avgTsgoSpeedup}x**`;
-              }
+              let summary = `**EdgeBox vs Node: ${avgSpeedup}x**`;
+              if (bunCount > 0) summary += ` | **vs Bun: ${(totalBunSpeedup/bunCount).toFixed(2)}x**`;
+              if (tsgoCount > 0) summary += ` | **tsgo: ${(totalTsgoSpeedup/tsgoCount).toFixed(2)}x**`;
               summary += allMatch ? ' :white_check_mark: All outputs match' : ' :x: Some outputs differ';
               body += `\n${summary}\n`;
 

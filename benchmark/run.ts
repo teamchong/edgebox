@@ -63,6 +63,7 @@ interface Options {
   help: boolean;
   debug: boolean;
   includeTsgo: boolean;
+  includeBun: boolean;
 }
 
 function parseArgs(): Options {
@@ -74,6 +75,7 @@ function parseArgs(): Options {
     help: false,
     debug: false,
     includeTsgo: false,
+    includeBun: false,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -101,6 +103,9 @@ function parseArgs(): Options {
       case "--include-tsgo":
         options.includeTsgo = true;
         break;
+      case "--include-bun":
+        options.includeBun = true;
+        break;
     }
   }
 
@@ -120,6 +125,7 @@ Options:
   --runs, -r N      Number of runs per project (default: 3)
   --debug, -d       Enable debug output (stdout/stderr from runs)
   --include-tsgo    Include tsgo in comparison (requires tsgo installed)
+  --include-bun     Include Bun in comparison (requires bun installed)
   --help, -h        Show this help message
 
 Examples:
@@ -127,6 +133,7 @@ Examples:
   npx tsx run.ts --quick       # Quick test with 2 small projects
   npx tsx run.ts --runs 5      # More runs for stable measurements
   npx tsx run.ts --include-tsgo  # Include tsgo comparison
+  npx tsx run.ts --include-bun   # Include Bun comparison
 `);
 }
 
@@ -390,6 +397,11 @@ interface BenchmarkResult {
   tsgoMin?: number;
   tsgoMax?: number;
   tsgoSpeedup?: number;
+  // bun data (optional)
+  bunMean?: number;
+  bunMin?: number;
+  bunMax?: number;
+  bunSpeedup?: number;
 }
 
 interface BenchmarkOptions {
@@ -397,6 +409,8 @@ interface BenchmarkOptions {
   debug: boolean;
   includeTsgo: boolean;
   tsgoPath?: string;
+  includeBun: boolean;
+  bunPath?: string;
 }
 
 function benchmarkProject(
@@ -406,7 +420,7 @@ function benchmarkProject(
   edgeboxTsc: string,
   options: BenchmarkOptions
 ): BenchmarkResult | null {
-  const { runs, debug, includeTsgo, tsgoPath } = options;
+  const { runs, debug, includeTsgo, tsgoPath, includeBun, bunPath } = options;
   const srcDir = join(projectDir, project.path);
   const tsFiles = findTsFiles(srcDir);
 
@@ -463,6 +477,24 @@ function benchmarkProject(
     edgeboxTimes.push(edgeboxResult.time);
   }
 
+  // Benchmark Bun tsc (optional)
+  const bunOutDir = join(OUT_DIR, `${project.name}_bun`);
+  let bunTimes: number[] = [];
+
+  if (includeBun && bunPath) {
+    for (let i = 0; i < runs; i++) {
+      const args = [...tscArgs];
+      args[1] = bunOutDir;
+      const bunResult = runTsc(bunPath, [nodeTsc, ...args], bunOutDir, debug);
+      if (!bunResult.success) {
+        console.log(`    Bun: Failed - ${bunResult.error}`);
+        bunTimes = [];
+        break;
+      }
+      bunTimes.push(bunResult.time);
+    }
+  }
+
   // Benchmark tsgo (optional)
   let tsgoTimes: number[] = [];
   let tsgoResult: RunResult | undefined;
@@ -495,6 +527,19 @@ function benchmarkProject(
 
   const speedup = nodeMean / edgeboxMean;
 
+  // Bun stats (optional)
+  let bunMean: number | undefined;
+  let bunMin: number | undefined;
+  let bunMax: number | undefined;
+  let bunSpeedup: number | undefined;
+
+  if (bunTimes.length > 0) {
+    bunMean = bunTimes.reduce((a, b) => a + b, 0) / bunTimes.length;
+    bunMin = Math.min(...bunTimes);
+    bunMax = Math.max(...bunTimes);
+    bunSpeedup = bunMean / edgeboxMean;
+  }
+
   // tsgo stats (optional)
   let tsgoMean: number | undefined;
   let tsgoMin: number | undefined;
@@ -509,15 +554,21 @@ function benchmarkProject(
   }
 
   console.log(`    Node.js:  ${nodeMean.toFixed(0)}ms (${nodeResult.outputFiles} files)`);
-  console.log(`    EdgeBox:  ${edgeboxMean.toFixed(0)}ms (${edgeboxResult.outputFiles} files) - ${speedup.toFixed(2)}x`);
+  if (bunMean !== undefined) {
+    console.log(`    Bun:      ${bunMean.toFixed(0)}ms - ${bunSpeedup!.toFixed(2)}x vs EdgeBox`);
+  }
+  console.log(`    EdgeBox:  ${edgeboxMean.toFixed(0)}ms (${edgeboxResult.outputFiles} files) - ${speedup.toFixed(2)}x vs Node`);
   if (tsgoMean !== undefined) {
-    console.log(`    tsgo:     ${tsgoMean.toFixed(0)}ms - ${tsgoSpeedup!.toFixed(2)}x`);
+    console.log(`    tsgo:     ${tsgoMean.toFixed(0)}ms - ${tsgoSpeedup!.toFixed(2)}x vs Node`);
   }
   console.log(`    Output:   ${comparison.match ? "✓ Match" : `✗ ${comparison.diff}`}`);
 
   // Cleanup
   rmSync(nodeOutDir, { recursive: true, force: true });
   rmSync(edgeboxOutDir, { recursive: true, force: true });
+  if (existsSync(bunOutDir)) {
+    rmSync(bunOutDir, { recursive: true, force: true });
+  }
   if (existsSync(tsgoOutDir)) {
     rmSync(tsgoOutDir, { recursive: true, force: true });
   }
@@ -535,6 +586,10 @@ function benchmarkProject(
     speedup,
     outputMatch: comparison.match,
     outputDiff: comparison.diff,
+    bunMean,
+    bunMin,
+    bunMax,
+    bunSpeedup,
     tsgoMean,
     tsgoMin,
     tsgoMax,
@@ -592,6 +647,18 @@ async function main() {
   }
   console.log(`EdgeBox tsc: ${edgeboxTsc}`);
 
+  // Find Bun if requested
+  let bunPath: string | undefined;
+  if (options.includeBun) {
+    try {
+      bunPath = execSync("which bun", { encoding: "utf-8" }).trim();
+      console.log(`Bun: ${bunPath}`);
+    } catch {
+      console.log("Bun: Not found (skipping Bun comparison)");
+      bunPath = undefined;
+    }
+  }
+
   // Find tsgo if requested
   let tsgoPath: string | undefined;
   if (options.includeTsgo) {
@@ -627,6 +694,8 @@ async function main() {
     debug: options.debug,
     includeTsgo: options.includeTsgo,
     tsgoPath,
+    includeBun: options.includeBun,
+    bunPath,
   };
 
   const results: BenchmarkResult[] = [];
@@ -645,7 +714,8 @@ async function main() {
     console.log();
   }
 
-  // Check if any results have tsgo data
+  // Check if any results have optional data
+  const hasBun = results.some(r => r.bunMean !== undefined);
   const hasTsgo = results.some(r => r.tsgoMean !== undefined);
 
   // Print results table
@@ -653,13 +723,19 @@ async function main() {
   console.log("║                                          RESULTS                                                   ║");
   console.log("╚════════════════════════════════════════════════════════════════════════════════════════════════════╝\n");
 
-  if (hasTsgo) {
-    console.log("| Project    | Lines     | Node.js (ms) | EdgeBox (ms) | Speedup | tsgo (ms) | tsgo Speedup | Match |");
-    console.log("|------------|-----------|--------------|--------------|---------|-----------|--------------|-------|");
-  } else {
-    console.log("| Project    | Lines     | Node.js (ms) | EdgeBox (ms) | Speedup | Match |");
-    console.log("|------------|-----------|--------------|--------------|---------|-------|");
-  }
+  // Build header dynamically
+  let header = "| Project    | Lines     | Node.js (ms) |";
+  let separator = "|------------|-----------|--------------|";
+  if (hasBun) { header += " Bun (ms)     |"; separator += "--------------|"; }
+  header += " EdgeBox (ms) | vs Node |";
+  separator += "--------------|---------|";
+  if (hasBun) { header += " vs Bun  |"; separator += "---------|"; }
+  if (hasTsgo) { header += " tsgo (ms) | tsgo Speedup |"; separator += "-----------|--------------|"; }
+  header += " Match |";
+  separator += "-------|";
+
+  console.log(header);
+  console.log(separator);
 
   for (const r of results) {
     const lines = r.lines.toLocaleString().padStart(9);
@@ -668,13 +744,23 @@ async function main() {
     const speedup = `${r.speedup.toFixed(2)}x`.padStart(7);
     const match = r.outputMatch ? "  ✓  " : "  ✗  ";
 
+    let row = `| ${r.project.padEnd(10)} | ${lines} | ${node} |`;
+    if (hasBun) {
+      const bun = r.bunMean !== undefined ? r.bunMean.toFixed(0).padStart(12) : "-".padStart(12);
+      row += ` ${bun} |`;
+    }
+    row += ` ${edgebox} | ${speedup} |`;
+    if (hasBun) {
+      const bunSpd = r.bunSpeedup !== undefined ? `${r.bunSpeedup.toFixed(2)}x`.padStart(7) : "-".padStart(7);
+      row += ` ${bunSpd} |`;
+    }
     if (hasTsgo) {
       const tsgo = r.tsgoMean !== undefined ? r.tsgoMean.toFixed(0).padStart(9) : "-".padStart(9);
       const tsgoSpd = r.tsgoSpeedup !== undefined ? `${r.tsgoSpeedup.toFixed(2)}x`.padStart(12) : "-".padStart(12);
-      console.log(`| ${r.project.padEnd(10)} | ${lines} | ${node} | ${edgebox} | ${speedup} | ${tsgo} | ${tsgoSpd} | ${match} |`);
-    } else {
-      console.log(`| ${r.project.padEnd(10)} | ${lines} | ${node} | ${edgebox} | ${speedup} | ${match} |`);
+      row += ` ${tsgo} | ${tsgoSpd} |`;
     }
+    row += ` ${match} |`;
+    console.log(row);
   }
 
   // Summary
@@ -683,17 +769,24 @@ async function main() {
     const avgSpeedup = results.reduce((sum, r) => sum + r.speedup, 0) / results.length;
     const allMatch = results.every(r => r.outputMatch);
 
-    if (hasTsgo) {
-      const tsgoResults = results.filter(r => r.tsgoSpeedup !== undefined);
-      const avgTsgoSpeedup = tsgoResults.length > 0
-        ? tsgoResults.reduce((sum, r) => sum + r.tsgoSpeedup!, 0) / tsgoResults.length
-        : 0;
-      console.log(`|------------|-----------|--------------|--------------|---------|-----------|--------------|-------|`);
-      console.log(`| TOTAL      | ${totalLines.toLocaleString().padStart(9)} |              |              | ${avgSpeedup.toFixed(2)}x avg |           | ${avgTsgoSpeedup > 0 ? avgTsgoSpeedup.toFixed(2) + 'x avg' : '-'.padStart(12)} |${allMatch ? "  ✓  " : "  ✗  "} |`);
-    } else {
-      console.log(`|------------|-----------|--------------|--------------|---------|-------|`);
-      console.log(`| TOTAL      | ${totalLines.toLocaleString().padStart(9)} |              |              | ${avgSpeedup.toFixed(2)}x avg |${allMatch ? "  ✓  " : "  ✗  "} |`);
-    }
+    const bunResults = results.filter(r => r.bunSpeedup !== undefined);
+    const avgBunSpeedup = bunResults.length > 0
+      ? bunResults.reduce((sum, r) => sum + r.bunSpeedup!, 0) / bunResults.length
+      : 0;
+
+    const tsgoResults = results.filter(r => r.tsgoSpeedup !== undefined);
+    const avgTsgoSpeedup = tsgoResults.length > 0
+      ? tsgoResults.reduce((sum, r) => sum + r.tsgoSpeedup!, 0) / tsgoResults.length
+      : 0;
+
+    console.log(separator);
+    let summary = `| TOTAL      | ${totalLines.toLocaleString().padStart(9)} |              |`;
+    if (hasBun) summary += `              |`;
+    summary += `              | ${avgSpeedup.toFixed(2)}x avg |`;
+    if (hasBun) summary += ` ${avgBunSpeedup > 0 ? avgBunSpeedup.toFixed(2) + 'x avg' : '-'.padStart(7)} |`;
+    if (hasTsgo) summary += `           | ${avgTsgoSpeedup > 0 ? avgTsgoSpeedup.toFixed(2) + 'x avg' : '-'.padStart(12)} |`;
+    summary += `${allMatch ? "  ✓  " : "  ✗  "} |`;
+    console.log(summary);
   }
 
   // Save results
