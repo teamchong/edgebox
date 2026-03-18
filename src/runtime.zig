@@ -567,6 +567,36 @@ fn skipJsFunctionBody(cc: []const u8, brace_pos: usize) usize {
                 }
                 continue;
             }
+            // Regex literal: / preceded by operator/keyword, not identifier/number
+            if (scan > 0) {
+                var rp = scan - 1;
+                while (rp > 0 and (cc[rp] == ' ' or cc[rp] == '\t')) rp -= 1;
+                const prev = cc[rp];
+                const is_regex = prev == '=' or prev == '(' or prev == ',' or
+                    prev == '[' or prev == '!' or prev == '&' or prev == '|' or
+                    prev == ':' or prev == ';' or prev == '{' or prev == '}' or
+                    prev == '?' or prev == '+' or prev == '-' or prev == '~' or
+                    prev == '^' or prev == '<' or prev == '>' or prev == '\n' or
+                    prev == '%' or prev == '*';
+                if (is_regex) {
+                    scan += 1;
+                    while (scan < cc.len and cc[scan] != '/') {
+                        if (cc[scan] == '\\') scan += 1; // skip escaped chars
+                        if (cc[scan] == '[') { // character class — skip to ]
+                            scan += 1;
+                            while (scan < cc.len and cc[scan] != ']') {
+                                if (cc[scan] == '\\') scan += 1;
+                                scan += 1;
+                            }
+                        }
+                        scan += 1;
+                    }
+                    if (scan < cc.len) scan += 1; // skip closing /
+                    // Skip regex flags
+                    while (scan < cc.len and (cc[scan] >= 'a' and cc[scan] <= 'z')) scan += 1;
+                    continue;
+                }
+            }
         }
         if (ch == '{') depth += 1;
         if (ch == '}') depth -= 1;
@@ -1951,7 +1981,11 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     var w_buf: [65536]u8 = undefined;
                     var w_state = wf.writer(&w_buf);
                     const w = &w_state.interface;
-                    defer w.flush() catch {};
+                    defer {
+                        w.flush() catch |err| {
+                            std.debug.print("[build] WARNING: Worker flush failed: {}\n", .{err});
+                        };
+                    }
                     w.print(
                         \\// EdgeBox AOT+JIT (auto-generated)
                         \\const {{ readFileSync }} = require('fs');
