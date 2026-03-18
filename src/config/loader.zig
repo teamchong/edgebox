@@ -268,7 +268,6 @@ fn parseRuntimeConfig(runtime: *types.RuntimeConfig, obj: std.json.ObjectMap) vo
     if (obj.get("cpu_limit_seconds")) |v| {
         if (v == .integer) runtime.cpu_limit_seconds = @intCast(@max(0, v.integer));
     }
-    // Note: gas_metering removed - use cpu_limit_seconds or exec_timeout_ms instead
     if (obj.get("allocator")) |v| {
         if (v == .string) {
             runtime.use_bump_allocator = std.mem.eql(u8, v.string, "bump");
