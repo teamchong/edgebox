@@ -288,6 +288,7 @@ interface RunResult {
   success: boolean;
   outputFiles: number;
   outputSize: number;
+  diagnostics: number; // count of "error TS" lines in stdout
   error?: string;
 }
 
@@ -306,6 +307,10 @@ function runTsc(cmd: string, args: string[], outDir: string, debug: boolean = fa
   });
   const elapsed = performance.now() - start;
 
+  // Count type errors from stdout (tsc prints "error TS" diagnostics to stdout)
+  const stdout = result.stdout?.toString() || "";
+  const diagnostics = (stdout.match(/error TS\d+/g) || []).length;
+
   // Check for errors
   if (result.status !== 0 && result.status !== 2) {
     // status 2 is type errors, which is OK
@@ -316,6 +321,7 @@ function runTsc(cmd: string, args: string[], outDir: string, debug: boolean = fa
         success: false,
         outputFiles: 0,
         outputSize: 0,
+        diagnostics: 0,
         error: stderr.slice(0, 200),
       };
     }
@@ -323,12 +329,11 @@ function runTsc(cmd: string, args: string[], outDir: string, debug: boolean = fa
 
   // Debug output (only when --debug flag is set)
   if (debug) {
-    const stdout = result.stdout?.toString() || "";
     const stderr = result.stderr?.toString() || "";
     if (stderr.length > 0 || stdout.length > 0) {
       console.log(`    DEBUG stdout (${stdout.length}): ${stdout.slice(0, 500)}`);
       console.log(`    DEBUG stderr (${stderr.length}): ${stderr.slice(0, 500)}`);
-      console.log(`    DEBUG status: ${result.status}`);
+      console.log(`    DEBUG status: ${result.status}, diagnostics: ${diagnostics}`);
     }
   }
 
@@ -346,38 +351,10 @@ function runTsc(cmd: string, args: string[], outDir: string, debug: boolean = fa
     success: true,
     outputFiles: jsFiles.length,
     outputSize,
+    diagnostics,
   };
 }
 
-function compareOutputs(dir1: string, dir2: string): { match: boolean; diff?: string } {
-  const files1 = findJsFiles(dir1);
-  const files2 = findJsFiles(dir2);
-
-  if (files1.length !== files2.length) {
-    return {
-      match: false,
-      diff: `File count mismatch: ${files1.length} vs ${files2.length}`,
-    };
-  }
-
-  for (const file of files1) {
-    const path1 = join(dir1, file);
-    const path2 = join(dir2, file);
-
-    if (!existsSync(path2)) {
-      return { match: false, diff: `Missing file: ${file}` };
-    }
-
-    const content1 = readFileSync(path1, "utf-8");
-    const content2 = readFileSync(path2, "utf-8");
-
-    if (content1 !== content2) {
-      return { match: false, diff: `Content differs: ${file}` };
-    }
-  }
-
-  return { match: true };
-}
 
 interface BenchmarkResult {
   project: string;
@@ -447,7 +424,7 @@ function benchmarkProject(
 
   // Benchmark Node.js tsc
   const nodeTimes: number[] = [];
-  let nodeResult: RunResult = { time: 0, success: false, outputFiles: 0, outputSize: 0 };
+  let nodeResult: RunResult = { time: 0, success: false, outputFiles: 0, outputSize: 0, diagnostics: 0 };
 
   for (let i = 0; i < runs; i++) {
     nodeResult = runTsc("node", [nodeTsc, ...tscArgs], nodeOutDir, debug);
@@ -460,7 +437,7 @@ function benchmarkProject(
 
   // Benchmark EdgeBox tsc (worker .mjs via Node.js — V8 inlines WASM)
   const edgeboxTimes: number[] = [];
-  let edgeboxResult: RunResult = { time: 0, success: false, outputFiles: 0, outputSize: 0 };
+  let edgeboxResult: RunResult = { time: 0, success: false, outputFiles: 0, outputSize: 0, diagnostics: 0 };
 
   for (let i = 0; i < runs; i++) {
     edgeboxResult = runTsc("node", [edgeboxTsc, ...tscArgs], edgeboxOutDir, debug);
@@ -503,8 +480,12 @@ function benchmarkProject(
     }
   }
 
-  // Compare outputs
-  const comparison = compareOutputs(nodeOutDir, edgeboxOutDir);
+  // Compare diagnostic counts (with --noEmit, both should report the same type errors)
+  const diagMatch = nodeResult.diagnostics === edgeboxResult.diagnostics;
+  const comparison = {
+    match: diagMatch,
+    diff: diagMatch ? undefined : `Diagnostics: Node=${nodeResult.diagnostics} EdgeBox=${edgeboxResult.diagnostics}`,
+  };
 
   // Calculate stats
   const nodeMean = nodeTimes.reduce((a, b) => a + b, 0) / nodeTimes.length;
@@ -543,15 +524,15 @@ function benchmarkProject(
     tsgoSpeedup = nodeMean / tsgoMean;
   }
 
-  console.log(`    Node.js:  ${nodeMean.toFixed(0)}ms`);
+  console.log(`    Node.js:  ${nodeMean.toFixed(0)}ms (${nodeResult.diagnostics} errors)`);
   if (bunMean !== undefined) {
     console.log(`    Bun:      ${bunMean.toFixed(0)}ms - ${bunSpeedup!.toFixed(2)}x vs EdgeBox`);
   }
-  console.log(`    EdgeBox:  ${edgeboxMean.toFixed(0)}ms - ${speedup.toFixed(2)}x vs Node`);
+  console.log(`    EdgeBox:  ${edgeboxMean.toFixed(0)}ms (${edgeboxResult.diagnostics} errors) - ${speedup.toFixed(2)}x vs Node`);
   if (tsgoMean !== undefined) {
     console.log(`    tsgo:     ${tsgoMean.toFixed(0)}ms - ${tsgoSpeedup!.toFixed(2)}x vs Node`);
   }
-  console.log(`    Output:   ${comparison.match ? "✓ Match" : `✗ ${comparison.diff}`}`);
+  console.log(`    Match:    ${comparison.match ? "✓ Same diagnostics" : `✗ ${comparison.diff}`}`);
 
   // Cleanup
   rmSync(nodeOutDir, { recursive: true, force: true });
