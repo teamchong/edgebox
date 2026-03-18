@@ -1838,6 +1838,15 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             }
             defer if (alloc_manifest) |am| allocator.free(am);
 
+            // Read read manifest — functions that read struct fields from args
+            var read_manifest_buf: [4096]u8 = undefined;
+            const read_manifest_path = std.fmt.bufPrint(&read_manifest_buf, "{s}/read_manifest.json", .{cache_dir}) catch null;
+            var read_manifest: ?[]const u8 = null;
+            if (read_manifest_path) |rmp| {
+                read_manifest = std.fs.cwd().readFileAlloc(allocator, rmp, 8 * 1024 * 1024) catch null;
+            }
+            defer if (read_manifest) |rm| allocator.free(rm);
+
             // Read clean bundle
             var clean_content: ?[]const u8 = null;
             if (clean_bundle_path) |cbp| {
@@ -1981,6 +1990,61 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             }
                         }
                     }
+
+                    // === Parse read manifest: functions that read struct fields ===
+                    const ReadSite = struct {
+                        name: []const u8,
+                        line_num: u32,
+                        struct_args: u8, // bitmask: which args are structs
+                        // Per-arg field names (up to 8 args, 16 fields each)
+                        arg_fields: [8][16][]const u8,
+                        arg_field_counts: [8]u8,
+                    };
+                    var read_sites: std.ArrayListUnmanaged(ReadSite) = .{};
+                    defer read_sites.deinit(allocator);
+                    if (read_manifest) |rm_content| {
+                        var rm_parsed = std.json.parseFromSlice(std.json.Value, allocator, rm_content, .{}) catch null;
+                        defer if (rm_parsed) |*p| p.deinit();
+                        if (rm_parsed) |p| {
+                            if (p.value == .array) {
+                                for (p.value.array.items) |item| {
+                                    if (item != .object) continue;
+                                    const obj = item.object;
+                                    const name_val = obj.get("name") orelse continue;
+                                    if (name_val != .string) continue;
+                                    const name = allocator.dupe(u8, name_val.string) catch continue;
+                                    var rs = ReadSite{
+                                        .name = name,
+                                        .line_num = @intCast(@as(u32, @bitCast(@as(i32, @intCast(if (obj.get("line")) |l| (if (l == .integer) l.integer else 0) else 0))))),
+                                        .struct_args = @intCast(@as(u8, @bitCast(@as(i8, @intCast(if (obj.get("struct_args")) |sa| (if (sa == .integer) sa.integer else 0) else 0))))),
+                                        .arg_fields = undefined,
+                                        .arg_field_counts = .{0} ** 8,
+                                    };
+                                    @memset(&rs.arg_fields, .{""} ** 16);
+                                    if (obj.get("read_fields")) |rf| {
+                                        if (rf == .object) {
+                                            var rf_iter = rf.object.iterator();
+                                            while (rf_iter.next()) |entry| {
+                                                const ai = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
+                                                if (ai >= 8) continue;
+                                                if (entry.value_ptr.* == .array) {
+                                                    for (entry.value_ptr.array.items, 0..) |fv, fi| {
+                                                        if (fi >= 16) break;
+                                                        if (fv == .string) {
+                                                            rs.arg_fields[ai][fi] = allocator.dupe(u8, fv.string) catch continue;
+                                                            rs.arg_field_counts[ai] = @intCast(fi + 1);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    read_sites.append(allocator, rs) catch continue;
+                                }
+                            }
+                        }
+                    }
+                    std.debug.print("[soa] Loaded {d} read sites from manifest\n", .{read_sites.items.len});
 
                     // === SOA Transform: rewrite factory functions to allocate in WASM linear memory ===
                     // Parse alloc manifest and generate SOA pool declarations
@@ -2428,8 +2492,102 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         }
                         const provenance = provenance_buf[0..prov_count];
 
+                        // Read-site rewrite state: track current function's struct params
+                        var rs_active = false; // true when inside a read-site function
+                        var rs_depth: u32 = 0; // brace depth tracking
+                        var rs_start_depth: u32 = 0; // depth at function entry
+                        var rs_param_names: [8][]const u8 = .{""} ** 8;
+                        var rs_struct_mask: u8 = 0;
+                        var rs_fields: [8][16][]const u8 = undefined;
+                        var rs_field_counts: [8]u8 = .{0} ** 8;
+                        @memset(&rs_fields, .{""} ** 16);
+
                         var src_pos: usize = 0;
                         char_loop: while (src_pos < cc.len) {
+                            // Track brace depth for read-site function boundary
+                            if (cc[src_pos] == '{') rs_depth += 1;
+                            if (cc[src_pos] == '}') {
+                                if (rs_depth > 0) rs_depth -= 1;
+                                if (rs_active and rs_depth < rs_start_depth) {
+                                    rs_active = false; // exited the function
+                                }
+                            }
+
+                            // Detect function entry: `function NAME(` where NAME is in read_sites
+                            if (!rs_active and read_sites.items.len > 0 and
+                                src_pos + 9 < cc.len and std.mem.startsWith(u8, cc[src_pos..], "function "))
+                            {
+                                const name_start = src_pos + 9;
+                                var name_end = name_start;
+                                while (name_end < cc.len and isIdentChar(cc[name_end])) name_end += 1;
+                                if (name_end > name_start and name_end < cc.len and cc[name_end] == '(') {
+                                    const fname = cc[name_start..name_end];
+                                    for (read_sites.items) |rs| {
+                                        if (std.mem.eql(u8, rs.name, fname)) {
+                                            // Parse param names from source
+                                            var ppos = name_end + 1;
+                                            var pi: u8 = 0;
+                                            while (ppos < cc.len and cc[ppos] != ')' and pi < 8) {
+                                                while (ppos < cc.len and (cc[ppos] == ' ' or cc[ppos] == ',')) ppos += 1;
+                                                if (ppos >= cc.len or cc[ppos] == ')') break;
+                                                const ps = ppos;
+                                                while (ppos < cc.len and isIdentChar(cc[ppos])) ppos += 1;
+                                                if (ppos > ps) {
+                                                    rs_param_names[pi] = cc[ps..ppos];
+                                                    pi += 1;
+                                                }
+                                                // Skip default value
+                                                if (ppos < cc.len and cc[ppos] == '=') {
+                                                    while (ppos < cc.len and cc[ppos] != ',' and cc[ppos] != ')') ppos += 1;
+                                                }
+                                            }
+                                            rs_struct_mask = rs.struct_args;
+                                            rs_fields = rs.arg_fields;
+                                            rs_field_counts = rs.arg_field_counts;
+                                            rs_start_depth = rs_depth;
+                                            rs_active = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Read-site rewrite: PARAM.FIELD → __col_FIELD[PARAM.__idx]
+                            if (rs_active and isIdentChar(cc[src_pos]) and
+                                (src_pos == 0 or !isIdentChar(cc[src_pos - 1])))
+                            {
+                                var id_end = src_pos;
+                                while (id_end < cc.len and isIdentChar(cc[id_end])) id_end += 1;
+                                if (id_end < cc.len and cc[id_end] == '.') {
+                                    const ident = cc[src_pos..id_end];
+                                    const f_start = id_end + 1;
+                                    var f_end = f_start;
+                                    while (f_end < cc.len and isIdentChar(cc[f_end])) f_end += 1;
+                                    if (f_end > f_start) {
+                                        const field = cc[f_start..f_end];
+                                        // Check: is IDENT a struct param and FIELD a known field?
+                                        var rewritten = false;
+                                        for (0..8) |ai| {
+                                            if (rs_struct_mask & (@as(u8, 1) << @intCast(ai)) == 0) continue;
+                                            if (!std.mem.eql(u8, rs_param_names[ai], ident)) continue;
+                                            // Check if field is in this arg's field list
+                                            for (rs_fields[ai][0..rs_field_counts[ai]]) |rf| {
+                                                if (std.mem.eql(u8, rf, field)) {
+                                                    // Don't rewrite if followed by = (assignment)
+                                                    if (f_end < cc.len and (cc[f_end] == '=' and (f_end + 1 >= cc.len or cc[f_end + 1] != '='))) break;
+                                                    // Rewrite: PARAM.FIELD → __col_FIELD[PARAM.__idx]
+                                                    w.print("__col_{s}[{s}.__idx]", .{ field, ident }) catch {};
+                                                    src_pos = f_end;
+                                                    rewritten = true;
+                                                    break;
+                                                }
+                                            }
+                                            break;
+                                        }
+                                        if (rewritten) continue :char_loop;
+                                    }
+                                }
+                            }
                             // === SOA base capture ===
                             // At `VAR = []` declaration, emit base offset for index alignment
                             for (provenance) |prov| {
