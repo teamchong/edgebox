@@ -2047,6 +2047,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         }
                     }
 
+
                     // Generate SOA pool declarations for each alloc site shape
                     if (alloc_sites.items.len > 0) {
                         // Ensure WASM memory views exist (may not have been created if no WASM functions)
@@ -2078,14 +2079,6 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 w.print("const __soa_{d}_{s} = [];\n", .{ si, fname }) catch {};
                             }
                             w.print("let __soa_{d}__ctr = 0;\n", .{si}) catch {};
-                            // Shared class: all handles have same hidden class → V8 inlines getters
-                            w.print("class __SOA_{d} {{\n", .{si}) catch {};
-                            w.writeAll("  constructor(idx) { this.__idx = idx; }\n") catch {};
-                            for (site.field_names[0..site.field_count]) |fname| {
-                                w.print("  get {s}() {{ return __soa_{d}_{s}[this.__idx]; }}\n", .{ fname, si, fname }) catch {};
-                                w.print("  set {s}(v) {{ __soa_{d}_{s}[this.__idx] = v; }}\n", .{ fname, si, fname }) catch {};
-                            }
-                            w.writeAll("}\n") catch {};
                         }
                     }
 
@@ -2137,7 +2130,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 }
                                 if (!soa_match) continue;
 
-                                w.print("  if (arr.length > 0 && (arr[0] instanceof __SOA_{d} || arr.__soa === {d})) {{\n", .{ si, si }) catch {};
+                                w.print("  if (arr.__soa === {d}) {{\n", .{si}) catch {};
                                 if (stride == 1) {
                                     // Zero-copy: pass SOA array pointer directly
                                     w.print("    return __wasm.exports.{s}_batch(__soa_{d}_{s}.byteOffset, arr.length", .{ wfe.name, si, first_field }) catch {};
@@ -2149,8 +2142,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     w.writeAll("    for (let __i = 0; __i < __n; __i++) {\n") catch {};
                                     for (wfe.struct_field_names[sai][0..field_count], 0..) |fname, fi| {
                                         if (fname.len == 0) continue;
-                                        // Raw index: arr[i] is SOA index, use directly; handle: use .__idx
-                                        w.print("      __m[__b + __i * {d} + {d}] = __soa_{d}_{s}[typeof arr[__i] === 'number' ? arr[__i] : arr[__i].__idx];\n", .{ stride, fi, si, fname }) catch {};
+                                        // Read field from plain object (returned by SOA factory)
+                                        w.print("      __m[__b + __i * {d} + {d}] = arr[__i].{s};\n", .{ stride, fi, fname }) catch {};
                                     }
                                     w.writeAll("    }\n") catch {};
                                     w.print("    return __wasm.exports.{s}_batch(__p, __n", .{wfe.name}) catch {};
@@ -2641,8 +2634,14 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         // Raw index return — no V8 HeapObject, zero GC pressure
                                         w.print("  return __idx;\n}}\n", .{}) catch {};
                                     } else {
-                                        // Handle object — shared hidden class for V8 inline caching
-                                        w.print("  return new __SOA_{d}(__idx);\n}}\n", .{si}) catch {};
+                                        // Plain object return — V8 fast hidden class for random reads.
+                                        // SOA columns populated in shadow for iteration use.
+                                        w.writeAll("  return {") catch {};
+                                        for (site.field_names[0..site.field_count], 0..) |fname, fi| {
+                                            if (fi > 0) w.writeAll(", ") catch {};
+                                            w.print("{s}: {s}", .{ fname, param_names[fi] }) catch {};
+                                        }
+                                        w.writeAll("};\n}\n") catch {};
                                     }
 
                                     // Skip the original function body
@@ -2897,8 +2896,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                                         // Use batch function (flat access) not original (gather/indirect).
                                                         // readKind_batch reads flat i32 values = SOA layout.
                                                         // sumKinds reads pointers-to-structs = AOS with indirection.
-                                                        w.print("  if ({s}.length > 0 && ({s}[0] instanceof __SOA_{d} || {s}.__soa === {d})) return __wasm.exports.{s}_batch(__soa_{d}_{s}.byteOffset, {s}.length);\n", .{
-                                                            param_names[0], param_names[0], si, param_names[0], si, bf.name, si, bfield, param_names[0],
+                                                        w.print("  if ({s}.__soa === {d}) return __wasm.exports.{s}_batch(__soa_{d}_{s}.byteOffset, {s}.length);\n", .{
+                                                            param_names[0], si, bf.name, si, bfield, param_names[0],
                                                         }) catch {};
                                                         soa_matched = true;
                                                         break;
@@ -3124,9 +3123,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                                     prov.site_idx, fname, prov.var_name, idx_expr,
                                                 }) catch {};
                                             } else {
-                                                // Handle-based: VAR[expr].field → __soa_N_field[VAR[expr].__idx]
-                                                w.print("__soa_{d}_{s}[{s}[{s}].__idx]", .{
-                                                    prov.site_idx, fname, prov.var_name, idx_expr,
+                                                // No index alignment — leave as plain object access (V8 inline cache)
+                                                w.print("{s}[{s}].{s}", .{
+                                                    prov.var_name, idx_expr, fname,
                                                 }) catch {};
                                             }
                                         }
