@@ -42,7 +42,7 @@ function findWorkerFiles(workerDir) {
     process.exit(1);
   }
   const files = readdirSync(abs);
-  const workerMjs = files.find((f) => f.endsWith("-worker.mjs"));
+  const workerMjs = files.find((f) => f.endsWith("-worker.js") || f.endsWith("-worker.mjs"));
   const standaloneWasm = files.find((f) => f.endsWith("-standalone.wasm"));
 
   if (!workerMjs) {

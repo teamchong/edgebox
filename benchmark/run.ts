@@ -187,11 +187,11 @@ function buildEdgeboxTsc(): string | null {
   // Use relative path from PROJECT_ROOT to avoid path.join issues with absolute paths
   const tscSourceRel = relative(PROJECT_ROOT, tscSourceAbs);
   const outputDir = join(PROJECT_ROOT, "zig-out/bin", tscSourceRel);
-  const workerMjs = join(outputDir, "_tsc-worker.mjs");
+  const workerJs = join(outputDir, "_tsc-worker.js");
 
   // Check if already compiled
-  if (existsSync(workerMjs)) {
-    return workerMjs;
+  if (existsSync(workerJs)) {
+    return workerJs;
   }
 
   // Build edgebox if needed
@@ -218,7 +218,7 @@ function buildEdgeboxTsc(): string | null {
     return null;
   }
 
-  return existsSync(workerMjs) ? workerMjs : null;
+  return existsSync(workerJs) ? workerJs : null;
 }
 
 // ============================================================================
