@@ -2834,9 +2834,6 @@ fn emitNumericInstruction(
             const base_raw = numVstackPop(vstack);
             // For f64 tier, base and index are f64 — convert to i32 for memory addressing.
             // Peephole: if value is sitofp(i32), grab the i32 operand directly.
-            // This happens for loop counter locals (i32 shadow → sitofp at get_loc).
-            // Eliminating the fptosi(sitofp(x)) round-trip gives LLVM a clean i32
-            // induction variable for stride detection → enables SIMD vectorization.
             const base_i32 = switch (kind) {
                 .i32 => base_raw,
                 .f64 => if (c.LLVMGetInstructionOpcode(base_raw) == c.LLVMSIToFP)
@@ -2851,16 +2848,48 @@ fn emitNumericInstruction(
                 else
                     builder.buildFPToSI(idx_raw, llvm.i32Type(), "arr_idx_i32"),
             };
-            const base_ptr = c.LLVMBuildIntToPtr(builder.ref, base_i32, llvm.ptrType(), "arr_base");
-            // i32 tier: i32 elements (4 bytes). f64 tier: f64 elements (8 bytes)
-            const arr_elem_type: llvm.Type = switch (kind) {
-                .i32 => llvm.i32Type(),
-                .f64 => llvm.doubleType(),
-            };
-            var gep_indices = [_]llvm.Value{idx_i32};
-            const elem_ptr = c.LLVMBuildGEP2(builder.ref, arr_elem_type, base_ptr, &gep_indices, 1, "arr_gep");
-            const loaded = builder.buildLoad(arr_elem_type, elem_ptr, "arr_elem");
-            vstack.append(allocator, loaded) catch return CodegenError.OutOfMemory;
+
+            // Check if this is an array-of-struct arg (pool pointer).
+            // For pool args, compute element address (base + index * stride)
+            // instead of loading a value. The subsequent field_get loads the field.
+            var is_pool_arg = false;
+            if (struct_layout_global) |si| {
+                if (si.array_of_struct_args != 0) {
+                    var source = base_i32;
+                    if (c.LLVMGetInstructionOpcode(source) == c.LLVMLoad)
+                        source = c.LLVMGetOperand(source, 0);
+                    for (0..@min(arg_count, 8)) |ai| {
+                        if (si.array_of_struct_args & (@as(u8, 1) << @intCast(ai)) != 0 and
+                            params.*[@intCast(ai)] == source)
+                        {
+                            // Stride in bytes: field_count * sizeof(i32)
+                            const stride_bytes: i32 = @intCast(@as(u32, si.field_counts[@intCast(ai)]) * 4);
+                            const stride_val = llvm.constInt32(stride_bytes);
+                            const offset = c.LLVMBuildMul(builder.ref, idx_i32, stride_val, "aos_stride");
+                            const elem_addr = c.LLVMBuildAdd(builder.ref, base_i32, offset, "aos_elem");
+                            const result = switch (kind) {
+                                .i32 => elem_addr,
+                                .f64 => builder.buildSIToFP(elem_addr, llvm.doubleType(), "aos_elem_f64"),
+                            };
+                            vstack.append(allocator, result) catch return CodegenError.OutOfMemory;
+                            is_pool_arg = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!is_pool_arg) {
+                const base_ptr = c.LLVMBuildIntToPtr(builder.ref, base_i32, llvm.ptrType(), "arr_base");
+                const arr_elem_type: llvm.Type = switch (kind) {
+                    .i32 => llvm.i32Type(),
+                    .f64 => llvm.doubleType(),
+                };
+                var gep_indices = [_]llvm.Value{idx_i32};
+                const elem_ptr = c.LLVMBuildGEP2(builder.ref, arr_elem_type, base_ptr, &gep_indices, 1, "arr_gep");
+                const loaded = builder.buildLoad(arr_elem_type, elem_ptr, "arr_elem");
+                vstack.append(allocator, loaded) catch return CodegenError.OutOfMemory;
+            }
         },
 
         .field_get => {
@@ -2882,13 +2911,17 @@ fn emitNumericInstruction(
             var field_offset: u32 = 0;
             if (struct_layout_global) |si| {
                 // Identify which arg produced this struct pointer by tracing
-                // the LLVM value back through load/sitofp to the param alloca.
+                // the LLVM value back through load/sitofp/add to the param alloca.
                 var source_alloca = base_i32;
+                // AOS path: base is add(load(alloca), mul(idx, stride))
+                if (c.LLVMGetInstructionOpcode(source_alloca) == c.LLVMAdd)
+                    source_alloca = c.LLVMGetOperand(source_alloca, 0);
                 if (c.LLVMGetInstructionOpcode(source_alloca) == c.LLVMLoad)
                     source_alloca = c.LLVMGetOperand(source_alloca, 0);
+                const combined_mask = si.struct_args | si.array_of_struct_args;
                 var found_arg: u3 = 0;
                 for (0..@min(arg_count, 8)) |ai| {
-                    if (si.struct_args & (@as(u8, 1) << @intCast(ai)) != 0 and
+                    if (combined_mask & (@as(u8, 1) << @intCast(ai)) != 0 and
                         params.*[@intCast(ai)] == source_alloca)
                     {
                         found_arg = @intCast(ai);

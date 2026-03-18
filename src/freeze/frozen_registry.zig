@@ -910,17 +910,19 @@ pub fn generateModuleZigShardedWithBackend(
                                         // Detect struct args for manifest
                                         const struct_args_info = numeric_handlers.detectStructArgs(sf.func.instructions, sf.func.arg_count);
                                         const struct_args_mask: u8 = if (struct_args_info) |si| si.struct_args else 0;
+                                        const aos_mask: u8 = if (struct_args_info) |si| si.array_of_struct_args else 0;
 
                                         var entry_buf: [1024]u8 = undefined;
-                                        const entry = std.fmt.bufPrint(&entry_buf, "{{\"name\":\"{s}\",\"args\":{d},\"type\":\"{s}\",\"instrs\":{d},\"recursive\":{d},\"array_args\":{d},\"mutated_args\":{d},\"read_array_args\":{d},\"length_args\":{d},\"has_loop\":{d},\"has_bitwise\":{d},\"line\":{d},\"struct_args\":{d}", .{ manifest_name, sf.func.arg_count, type_str, sf.func.instructions.len, recursive, array_args_mask, mutated_args_mask, read_array_args_mask, length_args_mask, has_loop, has_bitwise, sf.func.line_num, struct_args_mask }) catch continue;
+                                        const entry = std.fmt.bufPrint(&entry_buf, "{{\"name\":\"{s}\",\"args\":{d},\"type\":\"{s}\",\"instrs\":{d},\"recursive\":{d},\"array_args\":{d},\"mutated_args\":{d},\"read_array_args\":{d},\"length_args\":{d},\"has_loop\":{d},\"has_bitwise\":{d},\"line\":{d},\"struct_args\":{d},\"array_of_struct_args\":{d}", .{ manifest_name, sf.func.arg_count, type_str, sf.func.instructions.len, recursive, array_args_mask, mutated_args_mask, read_array_args_mask, length_args_mask, has_loop, has_bitwise, sf.func.line_num, struct_args_mask, aos_mask }) catch continue;
                                         mf.writeAll(entry) catch {};
 
-                                        // Write struct field names for each struct arg
+                                        // Write struct field names for each struct/array-of-struct arg
                                         if (struct_args_info) |si| {
+                                            const combined_mask = si.struct_args | si.array_of_struct_args;
                                             mf.writeAll(",\"struct_fields\":{") catch {};
                                             var first_arg = true;
                                             for (0..8) |ai| {
-                                                if (si.struct_args & (@as(u8, 1) << @intCast(ai)) == 0) continue;
+                                                if (combined_mask & (@as(u8, 1) << @intCast(ai)) == 0) continue;
                                                 if (!first_arg) mf.writeAll(",") catch {};
                                                 first_arg = false;
                                                 var arg_buf: [8]u8 = undefined;
@@ -1710,10 +1712,12 @@ pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
         has_struct_info = true;
 
         if (debug) {
-            std.debug.print("[wasm-struct] {s}: struct args=0x{x}, fields:", .{ func.name, struct_args.struct_args });
+            const combined = struct_args.struct_args | struct_args.array_of_struct_args;
+            std.debug.print("[wasm-struct] {s}: struct=0x{x} aos=0x{x}, fields:", .{ func.name, struct_args.struct_args, struct_args.array_of_struct_args });
             for (0..8) |ai| {
-                if (struct_args.struct_args & (@as(u8, 1) << @intCast(ai)) != 0) {
-                    std.debug.print(" arg{d}=[", .{ai});
+                if (combined & (@as(u8, 1) << @intCast(ai)) != 0) {
+                    const tag: []const u8 = if (struct_args.array_of_struct_args & (@as(u8, 1) << @intCast(ai)) != 0) "arr" else "arg";
+                    std.debug.print(" {s}{d}=[", .{ tag, ai });
                     for (struct_args.field_atoms[ai][0..struct_args.field_counts[ai]], 0..) |atom, fi| {
                         if (fi > 0) std.debug.print(",", .{});
                         if (resolveAtomToName(func, atom)) |name| {

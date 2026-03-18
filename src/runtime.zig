@@ -445,7 +445,10 @@ const WasmFunc = struct {
     is_f64: bool,
     // Struct arg support: which args are JS objects to be flattened into WASM memory
     struct_args: u8 = 0,
-    // Field names per struct arg (up to 8 args × 16 fields)
+    // Array-of-struct arg support: arg is an array whose elements are struct objects
+    // (accessed via arr[i].field pattern — get_array_el → get_field)
+    array_of_struct_args: u8 = 0,
+    // Field names per struct/AOS arg (up to 8 args × 16 fields)
     struct_field_names: [8][16][]const u8 = [_][16][]const u8{[_][]const u8{""} ** 16} ** 8,
     struct_field_counts: [8]u8 = [_]u8{0} ** 8,
 };
@@ -493,6 +496,11 @@ fn shouldTrampolineToWasm(mf: WasmFunc, calls_wasm: bool) bool {
     if (mf.mutated_args == 0 and mf.array_args != 0 and
         mf.length_args == 0 and mf.has_loop and mf.instr_count < 200 and
         array_arg_count >= 2 and scalar_arg_count >= 2) return false;
+
+    // Array-of-struct arg: function iterates array[i].field in WASM.
+    // Trampoline materializes entire array into flat pool — always worth it
+    // because the function loops over the pool internally in WASM.
+    if (mf.array_of_struct_args != 0) return true;
 
     // Struct arg functions: object fields are copied to flat WASM memory.
     // Copy cost is O(field_count) per call — cheap but adds up for small functions
@@ -1843,10 +1851,12 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     .is_anon = std.mem.startsWith(u8, name, "__anon_"),
                                     .is_f64 = if (jsonStr(obj, "type")) |t| std.mem.eql(u8, t, "f64") else false,
                                 };
-                                // Parse struct_args and struct_fields from manifest
+                                // Parse struct_args, array_of_struct_args, and struct_fields from manifest
                                 const sa = jsonInt(obj, "struct_args");
-                                if (sa != 0) {
-                                    wasm_funcs[wasm_func_count].struct_args = @truncate(sa);
+                                const aos = jsonInt(obj, "array_of_struct_args");
+                                if (sa != 0) wasm_funcs[wasm_func_count].struct_args = @truncate(sa);
+                                if (aos != 0) wasm_funcs[wasm_func_count].array_of_struct_args = @truncate(aos);
+                                if (sa != 0 or aos != 0) {
                                     if (obj.get("struct_fields")) |sf_val| {
                                         if (sf_val == .object) {
                                             var sf_it = sf_val.object.iterator();
@@ -1916,8 +1926,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             const ro = wfe.array_args & ~wfe.mutated_args;
                             if (ro != 0) any_cacheable_args = true;
                         }
-                        // Struct args need __m (i32 view) + stack allocator
-                        if (wfe.struct_args != 0) {
+                        // Struct/AOS args need __m (i32 view) + stack allocator
+                        if (wfe.struct_args != 0 or wfe.array_of_struct_args != 0) {
                             has_array_funcs = true;
                             has_i32_array_funcs = true;
                         }
@@ -2336,7 +2346,52 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     }
                                 }
 
-                                if (mf.struct_args != 0 and mf.array_args == 0) {
+                                if (mf.array_of_struct_args != 0) {
+                                    // Array-of-struct args — materialize JS array of objects
+                                    // into flat WASM pool, pass (pool_ptr, count, ...scalars)
+                                    w.writeAll("\n") catch {};
+                                    w.writeAll("  const __sp0 = __wasmStackSave();\n") catch {};
+                                    var si: u32 = 0;
+                                    while (si < param_count) : (si += 1) {
+                                        if (mf.array_of_struct_args & (@as(u8, 1) << @intCast(si)) != 0) {
+                                            const fc = mf.struct_field_counts[si];
+                                            if (fc == 0) continue;
+                                            const stride = @as(u32, fc);
+                                            // Allocate pool: arr.length * field_count * 4 bytes
+                                            w.print("  const __n{d} = {s}.length;\n", .{ si, param_names[si] }) catch {};
+                                            w.print("  const __p{d} = __wasmStackAlloc(__n{d} * {d});\n", .{ si, si, stride * 4 }) catch {};
+                                            w.print("  const __b{d} = __p{d} >> 2;\n", .{ si, si }) catch {};
+                                            // Copy loop: write each element's fields
+                                            w.print("  for (let __i = 0; __i < __n{d}; __i++) {{\n", .{si}) catch {};
+                                            for (mf.struct_field_names[si][0..fc], 0..) |field_name, fi| {
+                                                if (field_name.len == 0) continue;
+                                                if (stride == 1) {
+                                                    w.print("    __m[__b{d} + __i] = {s}[__i].{s};\n", .{ si, param_names[si], field_name }) catch {};
+                                                } else {
+                                                    w.print("    __m[__b{d} + __i * {d} + {d}] = {s}[__i].{s};\n", .{ si, stride, fi, param_names[si], field_name }) catch {};
+                                                }
+                                            }
+                                            w.writeAll("  }\n") catch {};
+                                        }
+                                    }
+                                    // Call WASM: AOS args become pool_ptr, scalars pass through
+                                    w.print("  const __r = __wasm.exports.{s}(", .{mf.name}) catch {};
+                                    {
+                                        var first_arg = true;
+                                        si = 0;
+                                        while (si < param_count) : (si += 1) {
+                                            if (!first_arg) w.writeAll(", ") catch {};
+                                            if (mf.array_of_struct_args & (@as(u8, 1) << @intCast(si)) != 0) {
+                                                w.print("__p{d}", .{si}) catch {};
+                                            } else {
+                                                w.writeAll(param_names[si]) catch {};
+                                            }
+                                            first_arg = false;
+                                        }
+                                    }
+                                    w.writeAll(");\n") catch {};
+                                    w.writeAll("  __wasmStackRestore(__sp0);\n  return __r;\n}") catch {};
+                                } else if (mf.struct_args != 0 and mf.array_args == 0) {
                                     // Struct args — flatten JS object fields into WASM linear memory
                                     w.writeAll("\n") catch {};
                                     w.writeAll("  const __sp0 = __wasmStackSave();\n") catch {};

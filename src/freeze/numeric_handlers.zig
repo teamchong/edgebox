@@ -972,6 +972,9 @@ pub const MAX_STRUCT_FIELDS = 16;
 pub const StructArgInfo = struct {
     /// Bitmask: bit N set = arg N is a struct-typed object
     struct_args: u8,
+    /// Bitmask: bit N set = arg N is an array of struct-typed objects
+    /// (accessed via get_array_el → get_field pattern)
+    array_of_struct_args: u8,
     /// Per-arg field atoms (up to MAX_STRUCT_FIELDS per arg, up to 8 args)
     /// Stored as atom indices. field_counts[i] = number of fields for arg i.
     field_atoms: [8][MAX_STRUCT_FIELDS]u32,
@@ -991,6 +994,7 @@ pub fn detectStructArgs(instructions: anytype, arg_count: u32) ?StructArgInfo {
     var sp: usize = 0;
     var info = StructArgInfo{
         .struct_args = 0,
+        .array_of_struct_args = 0,
         .field_atoms = undefined,
         .field_counts = [_]u8{0} ** 8,
     };
@@ -1015,9 +1019,11 @@ pub fn detectStructArgs(instructions: anytype, arg_count: u32) ?StructArgInfo {
                 has_field_get = true;
                 if (sp >= 1) {
                     const obj_arg = stack[sp - 1];
-                    if (obj_arg >= 0 and obj_arg < 8) {
-                        // This get_field is on a known arg — record the atom
-                        const ai: u3 = @intCast(obj_arg);
+                    // Stack encoding: 0..7 = direct arg N, 8..15 = element of arg N-8
+                    const is_direct = obj_arg >= 0 and obj_arg < 8;
+                    const is_element = obj_arg >= 8 and obj_arg < 16;
+                    if (is_direct or is_element) {
+                        const ai: u3 = if (is_element) @intCast(obj_arg - 8) else @intCast(obj_arg);
                         const atom: u32 = switch (instr.operand) {
                             .atom => |a| a,
                             else => {
@@ -1031,17 +1037,23 @@ pub fn detectStructArgs(instructions: anytype, arg_count: u32) ?StructArgInfo {
                         if (fc < MAX_STRUCT_FIELDS) {
                             var found = false;
                             for (info.field_atoms[ai][0..fc]) |existing| {
-                                if (existing == atom) { found = true; break; }
+                                if (existing == atom) {
+                                    found = true;
+                                    break;
+                                }
                             }
                             if (!found) {
                                 info.field_atoms[ai][fc] = atom;
                                 info.field_counts[ai] = fc + 1;
                             }
                         } else {
-                            // Too many fields — bail out for this arg
                             has_unsafe_field_get = true;
                         }
-                        info.struct_args |= @as(u8, 1) << ai;
+                        if (is_element) {
+                            info.array_of_struct_args |= @as(u8, 1) << ai;
+                        } else {
+                            info.struct_args |= @as(u8, 1) << ai;
+                        }
                     } else {
                         // get_field on a non-arg value (local, computed) — not safe
                         has_unsafe_field_get = true;
@@ -1049,9 +1061,18 @@ pub fn detectStructArgs(instructions: anytype, arg_count: u32) ?StructArgInfo {
                     stack[sp - 1] = -1; // result is not an arg
                 }
             },
-            // Generic stack effects (same as detectArrayArgs)
+            // Array element access: if array is arg N, result is "element of arg N"
+            // (stack encoding: 8 + N), enabling get_array_el → get_field detection
             .array_get => {
-                if (sp >= 2) { sp -= 2; if (sp < stack.len) { stack[sp] = -1; sp += 1; } }
+                if (sp >= 2) {
+                    const arr_val = stack[sp - 2];
+                    sp -= 2;
+                    if (sp < stack.len) {
+                        // If array was a direct arg (0..7), result is element-of-arg (8..15)
+                        stack[sp] = if (arr_val >= 0 and arr_val < 8) (arr_val + 8) else -1;
+                        sp += 1;
+                    }
+                }
             },
             .array_get2 => {
                 if (sp >= 2) { sp -= 1; if (sp < stack.len) { stack[sp] = -1; sp += 1; } }
@@ -1127,7 +1148,7 @@ pub fn detectStructArgs(instructions: anytype, arg_count: u32) ?StructArgInfo {
 
     // Must have at least one field_get on an arg, and NO unsafe field access
     if (!has_field_get or has_unsafe_field_get) return null;
-    if (info.struct_args == 0) return null;
+    if (info.struct_args == 0 and info.array_of_struct_args == 0) return null;
 
     return info;
 }
