@@ -2057,23 +2057,37 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 \\
                             ) catch {};
                         }
-                        w.writeAll("// SOA pools: contiguous per-field arrays (V8 optimizes Smi-only to typed backing)\n") catch {};
-                        for (alloc_sites.items, 0..) |site, si| {
-                            // Skip sites with non-identifier field names (e.g. "SHA-1", "2.5.4.3")
-                            var valid_fields = true;
-                            for (site.field_names[0..site.field_count]) |fname| {
-                                if (fname.len == 0) { valid_fields = false; break; }
-                                for (fname) |c| {
-                                    if (!isIdentChar(c)) { valid_fields = false; break; }
+                        // Global per-field SOA columns: one array per unique field name
+                        // across ALL alloc sites. Single __idx counter shared by all factories.
+                        // This enables read-site rewrite: node.kind → __col_kind[node.__idx]
+                        w.writeAll("let __col_idx = 0;\n") catch {};
+                        {
+                            // Collect unique field names
+                            var unique_fields: [256][]const u8 = undefined;
+                            var unique_count: usize = 0;
+                            for (alloc_sites.items) |site| {
+                                for (site.field_names[0..site.field_count]) |fname| {
+                                    if (fname.len == 0) continue;
+                                    var valid = true;
+                                    for (fname) |c| {
+                                        if (!isIdentChar(c)) { valid = false; break; }
+                                    }
+                                    if (!valid) continue;
+                                    // Deduplicate
+                                    var found = false;
+                                    for (unique_fields[0..unique_count]) |existing| {
+                                        if (std.mem.eql(u8, existing, fname)) { found = true; break; }
+                                    }
+                                    if (!found and unique_count < unique_fields.len) {
+                                        unique_fields[unique_count] = fname;
+                                        unique_count += 1;
+                                    }
                                 }
-                                if (!valid_fields) break;
                             }
-                            if (!valid_fields) continue;
-                            // SOA columns — plain JS arrays (V8 auto-promotes Smi-only to typed backing)
-                            for (site.field_names[0..site.field_count]) |fname| {
-                                w.print("const __soa_{d}_{s} = [];\n", .{ si, fname }) catch {};
+                            for (unique_fields[0..unique_count]) |fname| {
+                                w.print("const __col_{s} = [];\n", .{fname}) catch {};
                             }
-                            w.print("let __soa_{d}__ctr = 0;\n", .{si}) catch {};
+                            std.debug.print("[soa] {d} global columns for {d} alloc sites\n", .{ unique_count, alloc_sites.items.len });
                         }
                     }
 
@@ -2420,7 +2434,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             // At `VAR = []` declaration, emit base offset for index alignment
                             for (provenance) |prov| {
                                 if (prov.decl_end > 0 and src_pos == prov.decl_end) {
-                                    w.print(";const __{s}_soa_base = __soa_{d}__ctr", .{ prov.var_name, prov.site_idx }) catch {};
+                                    w.print(";const __{s}_soa_base = __col_idx", .{prov.var_name}) catch {};
                                     // Raw index: tag array so trampolines detect SOA provenance
                                     if (prov.raw_index) {
                                         w.print(";{s}.__soa={d}", .{ prov.var_name, prov.site_idx }) catch {};
@@ -2510,7 +2524,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
 
                             // === SOA Transform: match factory functions and rewrite body ===
                             if (alloc_sites.items.len > 0 and std.mem.startsWith(u8, cc[src_pos..], "function ")) {
-                                for (alloc_sites.items, 0..) |site, si| {
+                                for (alloc_sites.items) |site| {
                                     // Skip sites with non-identifier field names
                                     var valid_site = true;
                                     for (site.field_names[0..site.field_count]) |fname| {
@@ -2613,10 +2627,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     if (site.is_constructor) {
                                         // Constructor: inject __idx + column writes after {, keep body
                                         w.writeAll(cc[src_pos .. scan + 1]) catch {};
-                                        w.print("\n  this.__idx = __soa_{d}__ctr++;\n", .{si}) catch {};
+                                        w.writeAll("\n  this.__idx = __col_idx++;\n") catch {};
                                         // Write param values to SOA columns (same data as this.X = param)
                                         for (site.field_names[0..site.field_count], 0..) |fname, fi| {
-                                            w.print("  __soa_{d}_{s}[this.__idx] = {s};\n", .{ si, fname, param_names[fi] }) catch {};
+                                            w.print("  __col_{s}[this.__idx] = {s};\n", .{ fname, param_names[fi] }) catch {};
                                         }
                                         src_pos = scan + 1; // continue — let original body run too
                                         continue :char_loop;
@@ -2626,9 +2640,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     w.writeAll(cc[src_pos .. scan + 1]) catch {};
                                     w.writeAll("\n") catch {};
 
-                                    w.print("  const __idx = __soa_{d}__ctr++;\n", .{si}) catch {};
+                                    w.writeAll("  const __idx = __col_idx++;\n") catch {};
                                     for (site.field_names[0..site.field_count], 0..) |fname, fi| {
-                                        w.print("  __soa_{d}_{s}[__idx] = {s};\n", .{ si, fname, param_names[fi] }) catch {};
+                                        w.print("  __col_{s}[__idx] = {s};\n", .{ fname, param_names[fi] }) catch {};
                                     }
                                     // Return plain object WITH __idx for SOA column reads
                                     w.writeAll("  return {__idx, ") catch {};
@@ -3106,9 +3120,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                                 if (!if_match) continue;
                                                 const inner_idx = idx_expr[ia + 1 .. k3 - 1];
                                                 // Emit: __soa_N_field[__VAR_base + (__soa_M_innerfield[__IVAR_base + (inner_idx)])]
-                                                w.print("__soa_{d}_{s}[__{s}_soa_base + (__soa_{d}_{s}[__{s}_soa_base + ({s})])]", .{
-                                                    prov.site_idx, fname, prov.var_name,
-                                                    ip.site_idx, ifn, ip.var_name, inner_idx,
+                                                w.print("__col_{s}[__{s}_soa_base + (__col_{s}[__{s}_soa_base + ({s})])]", .{
+                                                    fname, prov.var_name,
+                                                    ifn, ip.var_name, inner_idx,
                                                 }) catch {};
                                                 inner_transformed = true;
                                                 break;
@@ -3117,13 +3131,13 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         if (!inner_transformed) {
                                             if (prov.decl_end > 0) {
                                                 // Index-aligned: VAR[expr].field → __soa_N_field[__VAR_soa_base + (expr)]
-                                                w.print("__soa_{d}_{s}[__{s}_soa_base + ({s})]", .{
-                                                    prov.site_idx, fname, prov.var_name, idx_expr,
+                                                w.print("__col_{s}[__{s}_soa_base + ({s})]", .{
+                                                    fname, prov.var_name, idx_expr,
                                                 }) catch {};
                                             } else {
                                                 // SOA column read via __idx: VAR[expr].field → __soa_N_field[VAR[expr].__idx]
-                                                w.print("__soa_{d}_{s}[{s}[{s}].__idx]", .{
-                                                    prov.site_idx, fname, prov.var_name, idx_expr,
+                                                w.print("__col_{s}[{s}[{s}].__idx]", .{
+                                                    fname, prov.var_name, idx_expr,
                                                 }) catch {};
                                             }
                                         }
