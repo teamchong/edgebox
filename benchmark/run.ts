@@ -437,13 +437,11 @@ function benchmarkProject(
   const tsgoOutDir = join(OUT_DIR, `${project.name}_tsgo`);
 
   const tscArgs = [
-    "--outDir", "",  // Placeholder, replaced below
+    "--noEmit",
     "--target", "ES2020",
     "--module", "ESNext",
     "--moduleResolution", "node",
     "--skipLibCheck",
-    "--noEmit", "false",
-    "--declaration", "false",
     ...tsFiles,
   ];
 
@@ -452,9 +450,7 @@ function benchmarkProject(
   let nodeResult: RunResult = { time: 0, success: false, outputFiles: 0, outputSize: 0 };
 
   for (let i = 0; i < runs; i++) {
-    const args = [...tscArgs];
-    args[1] = nodeOutDir;
-    nodeResult = runTsc("node", [nodeTsc, ...args], nodeOutDir, debug);
+    nodeResult = runTsc("node", [nodeTsc, ...tscArgs], nodeOutDir, debug);
     if (!nodeResult.success) {
       console.log(`    Node.js: Failed - ${nodeResult.error}`);
       return null;
@@ -467,9 +463,7 @@ function benchmarkProject(
   let edgeboxResult: RunResult = { time: 0, success: false, outputFiles: 0, outputSize: 0 };
 
   for (let i = 0; i < runs; i++) {
-    const args = [...tscArgs];
-    args[1] = edgeboxOutDir;
-    edgeboxResult = runTsc("node", [edgeboxTsc, ...args], edgeboxOutDir, debug);
+    edgeboxResult = runTsc("node", [edgeboxTsc, ...tscArgs], edgeboxOutDir, debug);
     if (!edgeboxResult.success) {
       console.log(`    EdgeBox: Failed - ${edgeboxResult.error}`);
       return null;
@@ -483,9 +477,7 @@ function benchmarkProject(
 
   if (includeBun && bunPath) {
     for (let i = 0; i < runs; i++) {
-      const args = [...tscArgs];
-      args[1] = bunOutDir;
-      const bunResult = runTsc(bunPath, [nodeTsc, ...args], bunOutDir, debug);
+      const bunResult = runTsc(bunPath, [nodeTsc, ...tscArgs], bunOutDir, debug);
       if (!bunResult.success) {
         console.log(`    Bun: Failed - ${bunResult.error}`);
         bunTimes = [];
@@ -501,9 +493,7 @@ function benchmarkProject(
 
   if (includeTsgo && tsgoPath) {
     for (let i = 0; i < runs; i++) {
-      const args = [...tscArgs];
-      args[1] = tsgoOutDir;
-      tsgoResult = runTsc(tsgoPath, args, tsgoOutDir, debug);
+      tsgoResult = runTsc(tsgoPath, tscArgs, tsgoOutDir, debug);
       if (!tsgoResult.success) {
         console.log(`    tsgo: Failed - ${tsgoResult.error}`);
         tsgoTimes = []; // Skip tsgo stats
@@ -553,11 +543,11 @@ function benchmarkProject(
     tsgoSpeedup = nodeMean / tsgoMean;
   }
 
-  console.log(`    Node.js:  ${nodeMean.toFixed(0)}ms (${nodeResult.outputFiles} files)`);
+  console.log(`    Node.js:  ${nodeMean.toFixed(0)}ms`);
   if (bunMean !== undefined) {
     console.log(`    Bun:      ${bunMean.toFixed(0)}ms - ${bunSpeedup!.toFixed(2)}x vs EdgeBox`);
   }
-  console.log(`    EdgeBox:  ${edgeboxMean.toFixed(0)}ms (${edgeboxResult.outputFiles} files) - ${speedup.toFixed(2)}x vs Node`);
+  console.log(`    EdgeBox:  ${edgeboxMean.toFixed(0)}ms - ${speedup.toFixed(2)}x vs Node`);
   if (tsgoMean !== undefined) {
     console.log(`    tsgo:     ${tsgoMean.toFixed(0)}ms - ${tsgoSpeedup!.toFixed(2)}x vs Node`);
   }
