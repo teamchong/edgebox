@@ -1000,6 +1000,9 @@ pub fn detectStructArgs(instructions: anytype, arg_count: u32) ?StructArgInfo {
     };
     var has_field_get = false;
     var has_unsafe_field_get = false;
+    // Track which locals hold arg values: local_args[i] = arg index or -1
+    // Enables detection of `var x = node; x.kind` as struct field read on arg
+    var local_args: [64]i8 = .{-1} ** 64;
 
     for (instructions) |instr| {
         const handler = getHandler(instr.opcode);
@@ -1014,6 +1017,43 @@ pub fn detectStructArgs(instructions: anytype, arg_count: u32) ?StructArgInfo {
                     stack[sp] = if (idx < arg_count) @intCast(idx) else -1;
                     sp += 1;
                 }
+            },
+            .get_loc, .get_loc_check => {
+                const loc_idx: u8 = handler.index orelse switch (instr.operand) {
+                    .loc => |a| @intCast(a),
+                    .u8 => |a| a,
+                    else => 255,
+                };
+                if (sp < stack.len) {
+                    stack[sp] = if (loc_idx < local_args.len) local_args[loc_idx] else -1;
+                    sp += 1;
+                }
+                continue; // skip default handler below
+            },
+            .put_loc, .put_loc_check => {
+                if (sp >= 1) {
+                    const val = stack[sp - 1];
+                    sp -= 1;
+                    const loc_idx: u8 = handler.index orelse switch (instr.operand) {
+                        .loc => |a| @intCast(a),
+                        .u8 => |a| a,
+                        else => 255,
+                    };
+                    if (loc_idx < local_args.len) local_args[loc_idx] = val;
+                }
+                continue;
+            },
+            .set_loc => {
+                // set_loc keeps value on stack but also stores to local
+                if (sp >= 1) {
+                    const loc_idx: u8 = handler.index orelse switch (instr.operand) {
+                        .loc => |a| @intCast(a),
+                        .u8 => |a| a,
+                        else => 255,
+                    };
+                    if (loc_idx < local_args.len) local_args[loc_idx] = stack[sp - 1];
+                }
+                continue;
             },
             .field_get => {
                 has_field_get = true;
@@ -1092,16 +1132,14 @@ pub fn detectStructArgs(instructions: anytype, arg_count: u32) ?StructArgInfo {
             .post_inc_dec => {
                 if (sp >= 1) { stack[sp - 1] = -1; if (sp < stack.len) { stack[sp] = -1; sp += 1; } }
             },
-            .get_loc, .get_loc_check => {
-                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
-            },
+            // get_loc/put_loc/set_loc handled above (with local-to-arg tracking)
             .get_loc_pair => {
                 if (sp + 1 < stack.len) { stack[sp] = -1; stack[sp + 1] = -1; sp += 2; }
             },
-            .put_loc, .put_loc_check, .put_arg => {
+            .put_arg => {
                 if (sp >= 1) sp -= 1;
             },
-            .set_loc, .set_arg => {},
+            .set_arg => {},
             .stack_dup => {
                 if (sp >= 1 and sp < stack.len) { stack[sp] = stack[sp - 1]; sp += 1; }
             },

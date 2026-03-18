@@ -796,9 +796,9 @@ fn generateInt32Body(
 
     // Allocate local variables if needed
     builder.positionAtEnd(llvm_blocks[0]);
-    var locals_buf: [48]llvm.Value = undefined;
+    var locals_buf: [256]llvm.Value = undefined;
     const local_count = analyzed.var_count;
-    for (0..@min(local_count, 48)) |i| {
+    for (0..@min(local_count, 256)) |i| {
         var loc_name: [16]u8 = undefined;
         const name = std.fmt.bufPrintZ(&loc_name, "loc_{d}", .{i}) catch "loc";
         locals_buf[i] = builder.buildAlloca(llvm.i32Type(), name);
@@ -870,7 +870,7 @@ fn emitInt32Instruction(
     instr: Instruction,
     params: *[8]llvm.Value,
     arg_count: u32,
-    locals: *[48]llvm.Value,
+    locals: *[256]llvm.Value,
     local_count: u32,
     llvm_blocks: []llvm.BasicBlock,
     block_count: usize,
@@ -961,7 +961,7 @@ fn emitInt32Instruction(
                 .u16 => |a| a,
                 else => 0,
             };
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             const loc_ptr = locals.*[idx];
             const val = builder.buildLoad(llvm.i32Type(), loc_ptr, "loc");
             vstack.append(allocator, val) catch return CodegenError.OutOfMemory;
@@ -974,7 +974,7 @@ fn emitInt32Instruction(
                 else => 0,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             const val = i32VstackPop(vstack);
             _ = builder.buildStore(val, locals.*[idx]);
         },
@@ -986,7 +986,7 @@ fn emitInt32Instruction(
                 else => 0,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             const val = vstack.items[vstack.items.len - 1]; // peek, don't pop
             _ = builder.buildStore(val, locals.*[idx]);
         },
@@ -1090,7 +1090,7 @@ fn emitInt32Instruction(
                 .u16 => |a| a,
                 else => 0,
             };
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             const loc_ptr = locals.*[idx];
             const val = builder.buildLoad(llvm.i32Type(), loc_ptr, "loc");
             vstack.append(allocator, val) catch return CodegenError.OutOfMemory;
@@ -1104,7 +1104,7 @@ fn emitInt32Instruction(
                 else => 0,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             const val = i32VstackPop(vstack);
             _ = builder.buildStore(val, locals.*[idx]);
         },
@@ -1116,7 +1116,7 @@ fn emitInt32Instruction(
                 .u16 => |a| a,
                 else => 0,
             };
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             _ = builder.buildStore(llvm.constInt32(0), locals.*[idx]);
         },
 
@@ -1152,7 +1152,7 @@ fn emitInt32Instruction(
                 else => 0,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             const val = i32VstackPop(vstack);
             const loc_ptr = locals.*[idx];
             const old_val = builder.buildLoad(llvm.i32Type(), loc_ptr, "addloc_old");
@@ -1168,7 +1168,7 @@ fn emitInt32Instruction(
                 .u16 => |a| a,
                 else => 0,
             };
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             const loc_ptr = locals.*[idx];
             const old_val = builder.buildLoad(llvm.i32Type(), loc_ptr, "incloc_old");
             const new_val = builder.buildNSWAdd(old_val, llvm.constInt32(1), "incloc_new");
@@ -1183,7 +1183,7 @@ fn emitInt32Instruction(
                 .u16 => |a| a,
                 else => 0,
             };
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             const loc_ptr = locals.*[idx];
             const old_val = builder.buildLoad(llvm.i32Type(), loc_ptr, "decloc_old");
             const new_val = builder.buildNSWSub(old_val, llvm.constInt32(1), "decloc_new");
@@ -1457,9 +1457,9 @@ fn generateNumericBody(
 
     // Allocate locals in entry block (LLVM mem2reg requires allocas in entry)
     builder.positionAtEnd(entry_bb);
-    var locals_buf: [48]llvm.Value = undefined;
+    var locals_buf: [256]llvm.Value = undefined;
     const local_count = analyzed.var_count;
-    for (0..@min(local_count, 48)) |i| {
+    for (0..@min(local_count, 256)) |i| {
         var loc_name: [16]u8 = undefined;
         const name = std.fmt.bufPrintZ(&loc_name, "loc_{d}", .{i}) catch "loc";
         locals_buf[i] = builder.buildAlloca(elem_type, name);
@@ -1494,8 +1494,8 @@ fn generateNumericBody(
     // in the GEP breaks stride detection). We maintain i32 shadows for locals
     // modified by inc_loc/dec_loc. get_loc pushes sitofp(shadow) — the sitofp
     // is peephole-eliminated in array_get, giving LLVM a clean i32 stride.
-    var counter_mask: u48 = 0;
-    var i32_shadows: [48]llvm.Value = undefined;
+    var counter_mask: u64 = 0;
+    var i32_shadows: [256]llvm.Value = undefined;
     if (kind == .f64) {
         for (blocks) |block| {
             for (block.instructions) |cinstr| {
@@ -1507,13 +1507,13 @@ fn generateNumericBody(
                         .u16 => |a| a,
                         else => continue,
                     };
-                    if (cidx < 48) counter_mask |= @as(u48, 1) << @intCast(cidx);
+                    if (cidx < 64) counter_mask |= @as(u64, 1) << @intCast(cidx);
                 }
             }
         }
         if (counter_mask != 0) {
-            for (0..@min(local_count, 48)) |i| {
-                if (counter_mask & (@as(u48, 1) << @intCast(i)) != 0) {
+            for (0..@min(local_count, 256)) |i| {
+                if (counter_mask & (@as(u64, 1) << @intCast(i)) != 0) {
                     var sname: [16]u8 = undefined;
                     const sn = std.fmt.bufPrintZ(&sname, "is_{d}", .{i}) catch "is";
                     i32_shadows[i] = builder.buildAlloca(llvm.i32Type(), sn);
@@ -1945,7 +1945,7 @@ fn emitNumericInstruction(
     instr: Instruction,
     params: *[8]llvm.Value,
     arg_count: u32,
-    locals: *[48]llvm.Value,
+    locals: *[256]llvm.Value,
     local_count: u32,
     llvm_blocks: []llvm.BasicBlock,
     block_count: usize,
@@ -1956,8 +1956,8 @@ fn emitNumericInstruction(
     module: llvm.Module,
     analyzed: AnalyzedFunction,
     length_params: *const [8]?llvm.Value,
-    i32_shadows: *[48]llvm.Value,
-    counter_mask: u48,
+    i32_shadows: *[256]llvm.Value,
+    counter_mask: u64,
 ) CodegenError!void {
     _ = length_params; // Handled by peephole in generateNumericBody
     const handler = numeric_handlers.getHandler(instr.opcode);
@@ -2085,11 +2085,11 @@ fn emitNumericInstruction(
                 .u16 => |a| a,
                 else => 0,
             };
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             // f64 tier: for loop counter locals, load i32 shadow and sitofp.
             // array_get peephole detects the sitofp and uses the i32 directly.
-            if (kind == .f64 and counter_mask != 0 and idx < 48 and
-                counter_mask & (@as(u48, 1) << @intCast(idx)) != 0)
+            if (kind == .f64 and counter_mask != 0 and idx < 256 and
+                counter_mask & (@as(u64, 1) << @intCast(idx)) != 0)
             {
                 const i32_val = builder.buildLoad(llvm.i32Type(), i32_shadows.*[idx], "loc_i32");
                 const f64_val = builder.buildSIToFP(i32_val, llvm.doubleType(), "loc_sitofp");
@@ -2102,7 +2102,7 @@ fn emitNumericInstruction(
 
         .get_loc_pair => {
             // Fused: push loc0, then push loc1
-            if (0 >= @min(local_count, 48) or 1 >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            if (0 >= @min(local_count, 256) or 1 >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             const val0 = builder.buildLoad(elem_type, locals.*[0], "loc0");
             const val1 = builder.buildLoad(elem_type, locals.*[1], "loc1");
             vstack.append(allocator, val0) catch return CodegenError.OutOfMemory;
@@ -2117,12 +2117,12 @@ fn emitNumericInstruction(
                 else => 0,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             const val = numVstackPop(vstack);
             _ = builder.buildStore(val, locals.*[idx]);
             // Sync i32 shadow for loop counter locals
-            if (kind == .f64 and counter_mask != 0 and idx < 48 and
-                counter_mask & (@as(u48, 1) << @intCast(idx)) != 0)
+            if (kind == .f64 and counter_mask != 0 and idx < 256 and
+                counter_mask & (@as(u64, 1) << @intCast(idx)) != 0)
             {
                 _ = builder.buildStore(
                     builder.buildFPToSI(val, llvm.i32Type(), "sh_fptosi"),
@@ -2139,11 +2139,11 @@ fn emitNumericInstruction(
                 else => 0,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             const val = vstack.items[vstack.items.len - 1]; // peek
             _ = builder.buildStore(val, locals.*[idx]);
-            if (kind == .f64 and counter_mask != 0 and idx < 48 and
-                counter_mask & (@as(u48, 1) << @intCast(idx)) != 0)
+            if (kind == .f64 and counter_mask != 0 and idx < 256 and
+                counter_mask & (@as(u64, 1) << @intCast(idx)) != 0)
             {
                 _ = builder.buildStore(
                     builder.buildFPToSI(val, llvm.i32Type(), "sh_fptosi"),
@@ -2159,10 +2159,10 @@ fn emitNumericInstruction(
                 .u16 => |a| a,
                 else => 0,
             };
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             _ = builder.buildStore(zero_val, locals.*[idx]);
-            if (kind == .f64 and counter_mask != 0 and idx < 48 and
-                counter_mask & (@as(u48, 1) << @intCast(idx)) != 0)
+            if (kind == .f64 and counter_mask != 0 and idx < 256 and
+                counter_mask & (@as(u64, 1) << @intCast(idx)) != 0)
             {
                 _ = builder.buildStore(llvm.constInt32(0), i32_shadows.*[idx]);
             }
@@ -2382,7 +2382,7 @@ fn emitNumericInstruction(
                 else => 0,
             };
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             const val = numVstackPop(vstack);
             const loc_ptr = locals.*[idx];
             const old_val = builder.buildLoad(elem_type, loc_ptr, "addloc_old");
@@ -2395,8 +2395,8 @@ fn emitNumericInstruction(
                 },
             };
             _ = builder.buildStore(new_val, loc_ptr);
-            if (kind == .f64 and counter_mask != 0 and idx < 48 and
-                counter_mask & (@as(u48, 1) << @intCast(idx)) != 0)
+            if (kind == .f64 and counter_mask != 0 and idx < 256 and
+                counter_mask & (@as(u64, 1) << @intCast(idx)) != 0)
             {
                 _ = builder.buildStore(
                     builder.buildFPToSI(new_val, llvm.i32Type(), "sh_addloc"),
@@ -2412,7 +2412,7 @@ fn emitNumericInstruction(
                 .u16 => |a| a,
                 else => 0,
             };
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             const loc_ptr = locals.*[idx];
             const old_val = builder.buildLoad(elem_type, loc_ptr, "incloc_old");
             const new_val = switch (kind) {
@@ -2425,8 +2425,8 @@ fn emitNumericInstruction(
             };
             _ = builder.buildStore(new_val, loc_ptr);
             // Maintain i32 shadow: shadow += 1 (clean stride for vectorization)
-            if (kind == .f64 and counter_mask != 0 and idx < 48 and
-                counter_mask & (@as(u48, 1) << @intCast(idx)) != 0)
+            if (kind == .f64 and counter_mask != 0 and idx < 256 and
+                counter_mask & (@as(u64, 1) << @intCast(idx)) != 0)
             {
                 const sh_old = builder.buildLoad(llvm.i32Type(), i32_shadows.*[idx], "sh_inc_old");
                 _ = builder.buildStore(
@@ -2443,7 +2443,7 @@ fn emitNumericInstruction(
                 .u16 => |a| a,
                 else => 0,
             };
-            if (idx >= @min(local_count, 48)) return CodegenError.UnsupportedOpcode;
+            if (idx >= @min(local_count, 256)) return CodegenError.UnsupportedOpcode;
             const loc_ptr = locals.*[idx];
             const old_val = builder.buildLoad(elem_type, loc_ptr, "decloc_old");
             const new_val = switch (kind) {
@@ -2455,8 +2455,8 @@ fn emitNumericInstruction(
                 },
             };
             _ = builder.buildStore(new_val, loc_ptr);
-            if (kind == .f64 and counter_mask != 0 and idx < 48 and
-                counter_mask & (@as(u48, 1) << @intCast(idx)) != 0)
+            if (kind == .f64 and counter_mask != 0 and idx < 256 and
+                counter_mask & (@as(u64, 1) << @intCast(idx)) != 0)
             {
                 const sh_old = builder.buildLoad(llvm.i32Type(), i32_shadows.*[idx], "sh_dec_old");
                 _ = builder.buildStore(

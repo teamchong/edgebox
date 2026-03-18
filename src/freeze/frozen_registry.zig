@@ -358,6 +358,7 @@ pub fn generateModuleZigShardedWithBackend(
     };
     var generated_all = std.ArrayListUnmanaged(GeneratedFunc){};
     defer generated_all.deinit(allocator);
+    var generated_all_full_len: usize = 0; // Before L2 truncation (for WASM scan)
 
     // Filter: skip functions with unsupported opcodes or unbuildable CFGs
     for (analysis.functions.items, 0..) |func, idx| {
@@ -514,6 +515,7 @@ pub fn generateModuleZigShardedWithBackend(
                 effective_max, insert2_count, put_arg_count, call_ctor_count, nested_for_of_count, array_from_count, put_loc_check_count,
             });
         }
+        generated_all_full_len = generated_all.items.len;
         generated_all.items.len = effective_max;
         std.debug.print("[freeze] Limited to {d} of {d} freezable functions\n", .{ effective_max, total_before });
     }
@@ -663,11 +665,13 @@ pub fn generateModuleZigShardedWithBackend(
                 var f64_infos = std.ArrayListUnmanaged(F64Info){};
                 defer f64_infos.deinit(allocator);
 
-                // Scan for additional numeric-tier functions not in int32 shard:
-                // - f64-tier functions (use div/float ops)
-                // - i32-tier functions rejected by isPureInt32Function (e.g., backward jumps)
-                // LLVM handles backward jumps fine (proper basic blocks), so we can
-                // include while-loop functions like mandelbrot that the old Zig hotpath rejects.
+                // Scan ALL functions for WASM eligibility (not L2-limited).
+                // WASM functions run in V8's code cache, not the frozen interpreter.
+                // The L2 budget only constrains the thin LLVM codegen (native binary path).
+                const saved_len = generated_all.items.len;
+                if (generated_all_full_len > 0) generated_all.items.len = generated_all_full_len;
+                defer generated_all.items.len = saved_len;
+
                 var extra_i32_count: usize = 0;
                 for (generated_all.items, 0..) |gf, gi| {
                     // Skip functions already in int32 shard
@@ -1860,7 +1864,9 @@ pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
         }
     }
 
-    return if (has_float_const) .f64 else kind;
+    const result_kind = if (has_float_const) .f64 else kind;
+    if (debug) std.debug.print("[wasm-ACCEPT] {s}: tier={s} structs={}\n", .{ func.name, @tagName(result_kind), has_struct_info });
+    return result_kind;
 }
 
 /// Analyze a function that contains Math.* intrinsic patterns.
