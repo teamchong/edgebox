@@ -1031,7 +1031,7 @@ fn printUsage() void {
         \\  edgebox pack <worker-dir>     Pack workerd single binary
         \\
         \\Output (in zig-out/bin/<app.js>/):
-        \\  <app>-worker.mjs        Worker module (V8 JIT + WASM AOT)
+        \\  <app>-worker.js        Worker module (V8 JIT + WASM AOT)
         \\  <app>-standalone.wasm   WASM numeric kernels
         \\  <app>-config.capnp      workerd configuration
         \\
@@ -1812,7 +1812,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
     if (has_standalone_wasm) {
         var worker_path_buf: [4096]u8 = undefined;
         var config_path_buf: [4096]u8 = undefined;
-        const worker_path = std.fmt.bufPrint(&worker_path_buf, "{s}/{s}-worker.mjs", .{ output_dir, output_base }) catch null;
+        const worker_path = std.fmt.bufPrint(&worker_path_buf, "{s}/{s}-worker.js", .{ output_dir, output_base }) catch null;
         const config_path = std.fmt.bufPrint(&config_path_buf, "{s}/{s}-config.capnp", .{ output_dir, output_base }) catch null;
 
         if (worker_path != null and config_path != null) {
@@ -1941,28 +1941,14 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     defer w.flush() catch {};
                     w.print(
                         \\// EdgeBox AOT+JIT (auto-generated)
-                        \\// Source transform: function bodies replaced with WASM calls
-                        \\// V8 inlines these WASM calls into JS (zero overhead)
+                        \\const {{ readFileSync }} = require('fs');
+                        \\const {{ dirname, join }} = require('path');
+                        \\const __dir = __dirname;
+                        \\const buf = readFileSync(join(__dir, '{s}'));
+                        \\const __wasm = new WebAssembly.Instance(new WebAssembly.Module(buf), {{ env: {{ pow: Math.pow }} }});
+                        \\__wasm.exports.memory.grow({d});
                         \\
-                        \\import {{ readFileSync }} from 'fs';
-                        \\import {{ fileURLToPath }} from 'url';
-                        \\import {{ dirname, join }} from 'path';
-                        \\import {{ createRequire }} from 'module';
-                        \\const require = createRequire(import.meta.url);
-                        \\
-                        \\let __wasm;
-                        \\if (typeof process !== 'undefined' && process.versions?.node) {{
-                        \\  const __dir = dirname(fileURLToPath(import.meta.url));
-                        \\  const buf = readFileSync(join(__dir, '{s}'));
-                        \\  __wasm = new WebAssembly.Instance(new WebAssembly.Module(buf), {{ env: {{ pow: Math.pow }} }});
-                        \\  __wasm.exports.memory.grow({d});
-                        \\}} else {{
-                        \\  const {{ default: __wasmModule }} = await import('{s}');
-                        \\  __wasm = new WebAssembly.Instance(__wasmModule, {{ env: {{ pow: Math.pow }} }});
-                        \\  __wasm.exports.memory.grow({d});
-                        \\}}
-                        \\
-                    , .{ wasm_filename, mem_grow_pages, wasm_filename, mem_grow_pages }) catch {};
+                    , .{ wasm_filename, mem_grow_pages }) catch {};
                     if (has_array_funcs) {
                         // Memory views + stack allocator for WASM linear memory
                         w.writeAll("const __wbuf = __wasm ? __wasm.exports.memory.buffer : null;\n") catch {};
@@ -3166,7 +3152,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                 if (std.fs.cwd().createFile(cp, .{})) |cf| {
                     defer cf.close();
                     var wn_buf: [256]u8 = undefined;
-                    const wn = std.fmt.bufPrint(&wn_buf, "{s}-worker.mjs", .{output_base}) catch "worker.mjs";
+                    const wn = std.fmt.bufPrint(&wn_buf, "{s}-worker.js", .{output_base}) catch "worker.mjs";
                     var cf_buf: [4096]u8 = undefined;
                     var cf_state = cf.writer(&cf_buf);
                     const cw = &cf_state.interface;
@@ -3305,7 +3291,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         if (has_worker_files) {
             var wp_summary: [4096]u8 = undefined;
             var cp_summary: [4096]u8 = undefined;
-            const wp_s = std.fmt.bufPrint(&wp_summary, "{s}/{s}-worker.mjs", .{ output_dir, output_base }) catch "";
+            const wp_s = std.fmt.bufPrint(&wp_summary, "{s}/{s}-worker.js", .{ output_dir, output_base }) catch "";
             const cp_s = std.fmt.bufPrint(&cp_summary, "{s}/{s}-config.capnp", .{ output_dir, output_base }) catch "";
             std.debug.print("  {s}  (V8 + WASM AOT)\n", .{wp_s});
             std.debug.print("  {s}  (workerd config)\n", .{cp_s});
@@ -3314,7 +3300,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         if (has_worker_files) {
             var wp_run: [4096]u8 = undefined;
             var cp_run: [4096]u8 = undefined;
-            const wp_r = std.fmt.bufPrint(&wp_run, "{s}/{s}-worker.mjs", .{ output_dir, output_base }) catch "";
+            const wp_r = std.fmt.bufPrint(&wp_run, "{s}/{s}-worker.js", .{ output_dir, output_base }) catch "";
             const cp_r = std.fmt.bufPrint(&cp_run, "{s}/{s}-config.capnp", .{ output_dir, output_base }) catch "";
             std.debug.print("  node {s}  # Node.js (V8 JIT + WASM AOT)\n", .{wp_r});
             std.debug.print("  npx workerd serve {s}  # Cloudflare Workers\n", .{cp_r});
@@ -3383,7 +3369,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         std.debug.print("Files created:\n", .{});
         if (has_worker_files) {
             var wp_buf4: [4096]u8 = undefined;
-            const wp2 = std.fmt.bufPrint(&wp_buf4, "{s}/{s}-worker.mjs", .{ output_dir, output_base }) catch "";
+            const wp2 = std.fmt.bufPrint(&wp_buf4, "{s}/{s}-worker.js", .{ output_dir, output_base }) catch "";
             std.debug.print("  {s}  - Worker module (V8 + WASM)\n", .{wp2});
         }
         if (has_standalone_wasm) {
@@ -3394,7 +3380,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         std.debug.print("\nTo run:\n", .{});
         if (has_worker_files) {
             var wp_buf5: [4096]u8 = undefined;
-            const wp3 = std.fmt.bufPrint(&wp_buf5, "{s}/{s}-worker.mjs", .{ output_dir, output_base }) catch "";
+            const wp3 = std.fmt.bufPrint(&wp_buf5, "{s}/{s}-worker.js", .{ output_dir, output_base }) catch "";
             std.debug.print("  node {s}  # V8 + WASM (fastest)\n", .{wp3});
         }
         std.debug.print("  ./{s}\n\n", .{binary_path});

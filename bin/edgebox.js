@@ -72,9 +72,20 @@ function pack(workerDir) {
   console.log(`  Worker: ${w.workerMjs}`);
   console.log(`  WASM:   ${w.standaloneWasm || "none"}`);
 
-  // Strip Node.js imports for workerd compatibility
+  // Strip Node.js ESM imports, inject require shim for workerd
   const content = readFileSync(w.workerMjs, "utf-8");
-  let workerdContent = content
+
+  // Provide require() via workerd's nodejs_compat built-in modules
+  const requireShim = `
+import nodefs from 'node:fs';
+import nodepath from 'node:path';
+import nodeos from 'node:os';
+import nodecrypto from 'node:crypto';
+const __modules = { fs: nodefs, path: nodepath, os: nodeos, crypto: nodecrypto, inspector: {}, perf_hooks: { performance: globalThis.performance || {} } };
+function require(id) { return __modules[id] || __modules[id.replace('node:','')] || {}; }
+`;
+
+  let workerdContent = requireShim + content
     .replace(/^import \{[^}]+\} from '[^']+';$/gm, "")
     .replace(/^const require = createRequire\([^)]+\);$/gm, "");
 
