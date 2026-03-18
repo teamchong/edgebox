@@ -1868,14 +1868,14 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             }
             defer if (alloc_manifest) |am| allocator.free(am);
 
-            // Read read manifest — functions that read struct fields from args
-            var read_manifest_buf: [4096]u8 = undefined;
-            const read_manifest_path = std.fmt.bufPrint(&read_manifest_buf, "{s}/read_manifest.json", .{cache_dir}) catch null;
-            var read_manifest: ?[]const u8 = null;
-            if (read_manifest_path) |rmp| {
-                read_manifest = std.fs.cwd().readFileAlloc(allocator, rmp, 8 * 1024 * 1024) catch null;
+            // Read patch manifest — bytecode-driven source patches (line, field, arg)
+            var patch_manifest_buf: [4096]u8 = undefined;
+            const patch_manifest_path_rt = std.fmt.bufPrint(&patch_manifest_buf, "{s}/patch_manifest.json", .{cache_dir}) catch null;
+            var patch_manifest: ?[]const u8 = null;
+            if (patch_manifest_path_rt) |pmp| {
+                patch_manifest = std.fs.cwd().readFileAlloc(allocator, pmp, 8 * 1024 * 1024) catch null;
             }
-            defer if (read_manifest) |rm| allocator.free(rm);
+            defer if (patch_manifest) |pm| allocator.free(pm);
 
             // Read clean bundle
             var clean_content: ?[]const u8 = null;
@@ -2022,71 +2022,39 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         }
                     }
 
-                    // === Parse read manifest: functions that read struct fields ===
-                    const ReadSite = struct {
-                        name: []const u8,
-                        line_num: u32,
-                        struct_args: u8, // bitmask: which args are structs
-                        // Per-arg field names (up to 8 args, 16 fields each)
-                        arg_fields: [8][16][]const u8,
-                        arg_field_counts: [8]u8,
-                    };
-                    var read_sites: std.ArrayListUnmanaged(ReadSite) = .{};
-                    defer read_sites.deinit(allocator);
-                    if (read_manifest) |rm_content| {
-                        var rm_parsed = std.json.parseFromSlice(std.json.Value, allocator, rm_content, .{}) catch null;
-                        defer if (rm_parsed) |*p| p.deinit();
-                        if (rm_parsed) |p| {
+                    // Column existence set (populated during column declaration)
+                    var col_set = std.StringHashMap(void).init(allocator);
+                    defer col_set.deinit();
+
+                    // === Parse patch manifest: bytecode-driven field access patches ===
+                    // Each patch: {line, field} — apply at the source line level
+                    const PatchEntry = struct { line: u32, field: []const u8 };
+                    var patches: std.ArrayListUnmanaged(PatchEntry) = .{};
+                    defer patches.deinit(allocator);
+                    // Build set of line numbers that have patches
+                    var patch_lines = std.AutoHashMap(u32, void).init(allocator);
+                    defer patch_lines.deinit();
+                    var patch_set = std.AutoHashMap(u64, []const u8).init(allocator);
+                    defer patch_set.deinit();
+                    if (patch_manifest) |pm_content| {
+                        var pm_parsed = std.json.parseFromSlice(std.json.Value, allocator, pm_content, .{}) catch null;
+                        defer if (pm_parsed) |*p| p.deinit();
+                        if (pm_parsed) |p| {
                             if (p.value == .array) {
                                 for (p.value.array.items) |item| {
                                     if (item != .object) continue;
                                     const obj = item.object;
-                                    const name_val = obj.get("name") orelse continue;
-                                    if (name_val != .string) continue;
-                                    const name = allocator.dupe(u8, name_val.string) catch continue;
-                                    var rs = ReadSite{
-                                        .name = name,
-                                        .line_num = @intCast(@as(u32, @bitCast(@as(i32, @intCast(if (obj.get("line")) |l| (if (l == .integer) l.integer else 0) else 0))))),
-                                        .struct_args = @intCast(@as(u8, @bitCast(@as(i8, @intCast(if (obj.get("struct_args")) |sa| (if (sa == .integer) sa.integer else 0) else 0))))),
-                                        .arg_fields = undefined,
-                                        .arg_field_counts = .{0} ** 8,
-                                    };
-                                    @memset(&rs.arg_fields, .{""} ** 16);
-                                    if (obj.get("read_fields")) |rf| {
-                                        if (rf == .object) {
-                                            var rf_iter = rf.object.iterator();
-                                            while (rf_iter.next()) |entry| {
-                                                const ai = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
-                                                if (ai >= 8) continue;
-                                                if (entry.value_ptr.* == .array) {
-                                                    for (entry.value_ptr.array.items, 0..) |fv, fi| {
-                                                        if (fi >= 16) break;
-                                                        if (fv == .string) {
-                                                            rs.arg_fields[ai][fi] = allocator.dupe(u8, fv.string) catch continue;
-                                                            rs.arg_field_counts[ai] = @intCast(fi + 1);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    read_sites.append(allocator, rs) catch continue;
+                                    const line_val = obj.get("line") orelse continue;
+                                    const line: u32 = if (line_val == .integer) @intCast(@as(u32, @bitCast(@as(i32, @intCast(line_val.integer))))) else continue;
+                                    const field_val = obj.get("field") orelse continue;
+                                    if (field_val != .string) continue;
+                                    const field = allocator.dupe(u8, field_val.string) catch continue;
+                                    patches.append(allocator, .{ .line = line, .field = field }) catch continue;
                                 }
                             }
                         }
                     }
-                    // Build hashmap for O(1) function name lookup
-                    var rs_map = std.StringHashMap(*const ReadSite).init(allocator);
-                    defer rs_map.deinit();
-                    for (read_sites.items) |*rs| {
-                        rs_map.put(rs.name, rs) catch continue;
-                    }
-                    const rs_map_count = rs_map.count();
-                    std.debug.print("[soa] Loaded {d} read sites, {d} unique names\n", .{ read_sites.items.len, rs_map_count });
-
-                    // Column existence set (populated during column declaration)
-                    var col_set = std.StringHashMap(void).init(allocator);
-                    defer col_set.deinit();
+                    std.debug.print("[soa] Loaded {d} patches for {d} lines\n", .{ patches.items.len, patch_lines.count() });
 
                     // === SOA Transform: rewrite factory functions to allocate in WASM linear memory ===
                     // Parse alloc manifest and generate SOA pool declarations
@@ -2197,7 +2165,44 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             }
                             std.debug.print("[soa] {d} global columns for {d} alloc sites\n", .{ unique_count, alloc_sites.items.len });
                         }
-                        // col_set populated in column declaration loop above
+                        // Compute polyfill line offset: patches use full-bundle line numbers
+                        // but cc (clean_content) doesn't include polyfill lines
+                        var bundle_line_count: u32 = 1;
+                        if (alloc_manifest) |am| {
+                            // Count lines in the full bundle by reading it
+                            var bpath_buf: [4096]u8 = undefined;
+                            const bpath = std.fmt.bufPrint(&bpath_buf, "{s}/bundle.js", .{cache_dir}) catch null;
+                            if (bpath) |bp| {
+                                if (std.fs.cwd().readFileAlloc(allocator, bp, 50 * 1024 * 1024)) |bundle_src| {
+                                    defer allocator.free(bundle_src);
+                                    for (bundle_src) |c| {
+                                        if (c == '\n') bundle_line_count += 1;
+                                    }
+                                } else |_| {}
+                            }
+                            _ = am;
+                        }
+                        var clean_line_count: u32 = 1;
+                        if (clean_content) |ccc| {
+                            for (ccc) |c| {
+                                if (c == '\n') clean_line_count += 1;
+                            }
+                        }
+                        const line_offset: i32 = @as(i32, @intCast(bundle_line_count)) - @as(i32, @intCast(clean_line_count));
+                        std.debug.print("[soa] Line offset: {d} (bundle={d}, clean={d})\n", .{ line_offset, bundle_line_count, clean_line_count });
+
+                        // Filter patches by col_set and apply line offset
+                        for (patches.items) |pe| {
+                            if (!col_set.contains(pe.field)) continue;
+                            const adjusted_line = @as(i32, @intCast(pe.line)) - line_offset;
+                            if (adjusted_line < 1) continue;
+                            const line: u32 = @intCast(adjusted_line);
+                            patch_lines.put(line, {}) catch {};
+                            var fh: u64 = 0;
+                            for (pe.field) |c| fh = fh *% 31 + c;
+                            patch_set.put(line *% 1000003 + fh, pe.field) catch {};
+                        }
+                        std.debug.print("[soa] {d} patches active ({d} lines) after col_set + offset filter\n", .{ patch_set.count(), patch_lines.count() });
                     }
 
                     // Batch struct helpers: for each struct function with _batch variant,
@@ -2537,105 +2542,47 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         }
                         const provenance = provenance_buf[0..prov_count];
 
-                        // Read-site rewrite state: track current function's struct params
-                        var rs_active = false; // true when inside a read-site function
-                        var rs_end_pos: usize = 0; // position where current read-site function ends
-                        var rs_param_names: [8][]const u8 = .{""} ** 8;
-                        var rs_struct_mask: u8 = 0;
-                        var rs_fields: [8][16][]const u8 = undefined;
-                        var rs_field_counts: [8]u8 = .{0} ** 8;
-                        @memset(&rs_fields, .{""} ** 16);
-                        var rs_func_count: u32 = 0;
                         var rs_rewrite_count: u32 = 0;
+                        var current_line: u32 = 1;
 
                         var src_pos: usize = 0;
                         char_loop: while (src_pos < cc.len) {
 
-                            // Detect function entry: `function NAME(` where NAME is in read_sites
-                            if (!rs_active and rs_map_count > 0 and
-                                src_pos + 9 < cc.len and std.mem.startsWith(u8, cc[src_pos..], "function "))
-                            {
-                                const name_start = src_pos + 9;
-                                var name_end = name_start;
-                                while (name_end < cc.len and isIdentChar(cc[name_end])) name_end += 1;
-                                if (name_end > name_start and name_end < cc.len and cc[name_end] == '(') {
-                                    const fname = cc[name_start..name_end];
-                                    if (rs_map.get(fname)) |rs| {
-                                            // Parse param names from source
-                                            var ppos = name_end + 1;
-                                            var pi: u8 = 0;
-                                            while (ppos < cc.len and cc[ppos] != ')' and pi < 8) {
-                                                while (ppos < cc.len and (cc[ppos] == ' ' or cc[ppos] == ',')) ppos += 1;
-                                                if (ppos >= cc.len or cc[ppos] == ')') break;
-                                                const ps = ppos;
-                                                while (ppos < cc.len and isIdentChar(cc[ppos])) ppos += 1;
-                                                if (ppos > ps) {
-                                                    rs_param_names[pi] = cc[ps..ppos];
-                                                    pi += 1;
-                                                }
-                                                // Skip default value
-                                                if (ppos < cc.len and cc[ppos] == '=') {
-                                                    while (ppos < cc.len and cc[ppos] != ',' and cc[ppos] != ')') ppos += 1;
-                                                }
-                                            }
-                                            rs_struct_mask = rs.*.struct_args;
-                                            rs_fields = rs.*.arg_fields;
-                                            rs_field_counts = rs.*.arg_field_counts;
-                                            // Find the function body '{' and its matching '}'
-                                            var brace_pos = name_end;
-                                            while (brace_pos < cc.len and cc[brace_pos] != '{') brace_pos += 1;
-                                            if (brace_pos < cc.len) {
-                                                rs_end_pos = skipJsFunctionBody(cc, brace_pos);
-                                                rs_active = true;
-                                                rs_func_count += 1;
-                                            }
-                                        }
-                                    }
-                                }
+                            // === Line-level patch application ===
+                            // Track line number and apply patches from bytecode analysis
+                            if (cc[src_pos] == '\n') current_line += 1;
 
-                            // Check if we've exited the read-site function
-                            if (rs_active and src_pos >= rs_end_pos) {
-                                rs_active = false;
-                            }
-
-                            // Read-site rewrite: PARAM.FIELD → __col_FIELD[PARAM.__idx]
-                            if (rs_active and isIdentChar(cc[src_pos]) and
+                            // Check if current line has patches and we're at an IDENT.FIELD
+                            if (patch_lines.contains(current_line) and isIdentChar(cc[src_pos]) and
                                 (src_pos == 0 or !isIdentChar(cc[src_pos - 1])))
                             {
                                 var id_end = src_pos;
                                 while (id_end < cc.len and isIdentChar(cc[id_end])) id_end += 1;
                                 if (id_end < cc.len and cc[id_end] == '.') {
-                                    const ident = cc[src_pos..id_end];
                                     const f_start = id_end + 1;
                                     var f_end = f_start;
                                     while (f_end < cc.len and isIdentChar(cc[f_end])) f_end += 1;
                                     if (f_end > f_start) {
                                         const field = cc[f_start..f_end];
-                                        // Check: is IDENT a struct param and FIELD a known field?
-                                        var rewritten = false;
-                                        for (0..8) |ai| {
-                                            if (rs_struct_mask & (@as(u8, 1) << @intCast(ai)) == 0) continue;
-                                            if (!std.mem.eql(u8, rs_param_names[ai], ident)) continue;
-                                            // Check if field is in this arg's field list AND column exists
-                                            for (rs_fields[ai][0..rs_field_counts[ai]]) |rf| {
-                                                if (std.mem.eql(u8, rf, field) and col_set.contains(field)) {
-                                                    // Don't rewrite if followed by = (assignment) or += |= etc
-                                                    var eq_check = f_end;
-                                                    while (eq_check < cc.len and cc[eq_check] == ' ') eq_check += 1;
-                                                    if (eq_check < cc.len and cc[eq_check] == '=' and (eq_check + 1 >= cc.len or cc[eq_check + 1] != '=')) break;
-                                                    if (eq_check < cc.len and eq_check + 1 < cc.len and cc[eq_check + 1] == '=' and (cc[eq_check] == '+' or cc[eq_check] == '-' or cc[eq_check] == '|' or cc[eq_check] == '&')) break;
-                                                    // Don't rewrite if followed by ++ or -- (postfix inc/dec)
-                                                    if (eq_check + 1 < cc.len and ((cc[eq_check] == '+' and cc[eq_check + 1] == '+') or (cc[eq_check] == '-' and cc[eq_check + 1] == '-'))) break;
-                                                    // Rewrite: PARAM.FIELD → __rd(PARAM, "FIELD", __col_FIELD)
-                                                    w.print("__rd({s},\"{s}\",__col_{s})", .{ ident, field, field }) catch {};
-                                                    src_pos = f_end;
-                                                    rewritten = true;
-                                                    break;
-                                                }
+                                        // Check if (line, field) is in the patch set
+                                        var fh: u64 = 0;
+                                        for (field) |c| fh = fh *% 31 + c;
+                                        const key = current_line *% 1000003 + fh;
+                                        if (patch_set.contains(key)) {
+                                            const ident = cc[src_pos..id_end];
+                                            // Skip assignments and increments
+                                            var eq_check = f_end;
+                                            while (eq_check < cc.len and cc[eq_check] == ' ') eq_check += 1;
+                                            const is_assign = eq_check < cc.len and cc[eq_check] == '=' and (eq_check + 1 >= cc.len or cc[eq_check + 1] != '=');
+                                            const is_compound = eq_check + 1 < cc.len and cc[eq_check + 1] == '=' and (cc[eq_check] == '+' or cc[eq_check] == '-' or cc[eq_check] == '|' or cc[eq_check] == '&');
+                                            const is_inc = eq_check + 1 < cc.len and ((cc[eq_check] == '+' and cc[eq_check + 1] == '+') or (cc[eq_check] == '-' and cc[eq_check + 1] == '-'));
+                                            if (!is_assign and !is_compound and !is_inc) {
+                                                w.print("__rd({s},\"{s}\",__col_{s})", .{ ident, field, field }) catch {};
+                                                src_pos = f_end;
+                                                rs_rewrite_count += 1;
+                                                continue :char_loop;
                                             }
-                                            break;
                                         }
-                                        if (rewritten) { rs_rewrite_count += 1; continue :char_loop; }
                                     }
                                 }
                             }
@@ -3368,7 +3315,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             }
                         }
                         w.flush() catch {};
-                        std.debug.print("[soa] Read-site: {d} functions matched, {d} field reads rewritten\n", .{ rs_func_count, rs_rewrite_count });
+                        std.debug.print("[soa] Patch: {d} field reads rewritten (from {d} patches)\n", .{ rs_rewrite_count, patches.items.len });
                     } else {
                         w.writeAll("// ERROR: Original source not available\n") catch {};
                     }
