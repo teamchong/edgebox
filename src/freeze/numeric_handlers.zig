@@ -179,8 +179,8 @@ pub fn getHandler(opcode: Opcode) NumericHandler {
         // ── Null/undefined as numeric constants ─────────────────
         // In JS: null + 1 === 1 (null coerces to 0), undefined + 1 === NaN
         // In i32 context with bitwise: both coerce to 0 (NaN | 0 === 0)
-        .null => .{ .pattern = .push_const, .value = 0 },
-        .undefined => .{ .pattern = .push_const, .value = 0 },
+        .null => .{ .pattern = .unsupported },
+        .undefined => .{ .pattern = .unsupported },
 
         // ── Null/undefined checks (always false in numeric context) ──
         .is_undefined, .is_null, .is_undefined_or_null => .{ .pattern = .always_false },

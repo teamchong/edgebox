@@ -665,9 +665,6 @@ pub fn generateModuleZigShardedWithBackend(
                 var f64_infos = std.ArrayListUnmanaged(F64Info){};
                 defer f64_infos.deinit(allocator);
 
-                // Scan ALL functions for WASM eligibility (not L2-limited).
-                // WASM functions run in V8's code cache, not the frozen interpreter.
-                // The L2 budget only constrains the thin LLVM codegen (native binary path).
                 var extra_i32_count: usize = 0;
                 for (generated_all.items, 0..) |gf, gi| {
                     // Skip functions already in int32 shard
