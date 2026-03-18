@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "AOT optimizer for V8 JavaScript — compiles numeric kernels to WebAssembly for 2-9x speedups",
   "type": "module",
+  "bin": {
+    "edgebox": "bin/edgebox.js"
+  },
   "scripts": {
     "build": "zig build cli",
     "bench": "bash bench/run_all.sh"

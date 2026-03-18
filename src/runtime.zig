@@ -1026,31 +1026,27 @@ pub fn main() !void {
 
 fn printUsage() void {
     std.debug.print(
-        \\EdgeBox — JIT+AOT JavaScript compiler for V8
+        \\EdgeBox — AOT optimizer for V8 JavaScript
         \\
         \\Usage:
-        \\  edgebox <app.js>   Compile JS with AOT numeric kernels for V8/workerd
+        \\  edgebox <app.js>              Compile (V8 + WASM AOT kernels)
+        \\  edgebox pack <worker-dir>     Pack workerd single binary
         \\
         \\Output (in zig-out/bin/<app.js>/):
         \\  <app>-worker.mjs        Worker module (V8 JIT + WASM AOT)
-        \\  <app>-standalone.wasm   WASM AOT-compiled numeric kernels
+        \\  <app>-standalone.wasm   WASM numeric kernels
         \\  <app>-config.capnp      workerd configuration
         \\
         \\Options:
         \\  -f, --force      Clean previous build outputs first
-        \\  --no-polyfill    Skip Node.js polyfills
-        \\  --no-freeze      Skip freeze analysis (faster builds)
-        \\  --no-bundle      Skip Bun bundler (simple JS without imports)
-        \\  --debug          Debug optimization (faster compile)
         \\  --output-dir=X   Custom output directory (default: zig-out)
-        \\  --with-binary    Also build native binary (QuickJS + frozen interpreter)
         \\  -h, --help       Show this help
         \\  -v, --version    Show version
         \\
         \\Examples:
-        \\  edgebox app.js                          Build Worker + WASM AOT
-        \\  node zig-out/bin/app.js/app-worker.mjs  Run on Node.js (V8 + WASM)
-        \\  npx workerd serve zig-out/bin/app.js/app-config.capnp  Run on workerd
+        \\  edgebox app.js                                  Compile
+        \\  edgebox pack zig-out/bin/app.js/                Pack workerd binary
+        \\  npx workerd serve zig-out/bin/app.js/app-config.capnp
         \\
     , .{});
 }

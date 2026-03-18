@@ -1,6 +1,6 @@
 # EdgeBox
 
-**AOT optimizer for V8 JavaScript** — automatically compiles numeric JS kernels to WebAssembly for 2-9x speedups. Works with Node.js, Deno, Cloudflare Workers, and any V8 runtime.
+**AOT optimizer for V8 JavaScript** — compiles numeric JS kernels to WebAssembly for 2-9x speedups. Ships as a workerd single binary.
 
 ![EdgeBox Architecture](diagram.svg)
 
@@ -28,12 +28,7 @@ This means a JS function that calls `__wasm.exports.fib(n)` compiles to nearly t
 
 EdgeBox exploits this: it compiles numeric JS functions to WASM exports, then rewrites the JS source with thin trampolines that V8 inlines away. The result is LLVM-optimized numeric code running at full speed inside V8's pipeline.
 
-**Supported V8 runtimes:**
-- **Node.js 22+** (V8 v12.4+)
-- **Deno** (V8-based)
-- **Cloudflare Workers** (workerd, V8-based)
-- **Chrome 120+** (for browser workloads)
-- Any V8 embedder with default flags
+**Runtime:** workerd (Cloudflare Workers runtime, V8-based). Single binary deployment — no Node.js required.
 
 ## The Solution: AOT+JIT Compilation
 
@@ -114,28 +109,15 @@ for (var j = 0; j < nodes.length; j++) {
 
 ### Real-World: TypeScript Compiler (TSC)
 
-EdgeBox compiles the TypeScript compiler (`_tsc.js`, 130K+ lines) with 446 SOA alloc sites detected and 8 numeric WASM kernels. No code changes to TSC — just `edgebox _tsc.js`.
-
-**3-way comparison: EdgeBox vs Node.js vs Bun**
-
-| Project | Files | EdgeBox | Node.js | Bun |
-|---------|:-----:|:-------:|:-------:|:---:|
-| rxjs | 207 | **0.58s** | 0.77s | 1.00s |
-| playwright | 358 | **2.06s** | 3.04s | 4.15s |
-
-| Runner | vs Node.js | vs Bun | How |
-|--------|:----------:|:------:|-----|
-| **EdgeBox** | **1.5x faster** | **2.0x faster** | `node _tsc-worker.mjs` (V8 inlines WASM) |
-| Node.js | baseline | 1.4x faster | `node tsc.js` |
-| Bun | 0.7x (slower) | baseline | `bun tsc.js` (JSC doesn't inline WASM) |
+EdgeBox compiles the TypeScript compiler (`_tsc.js`, 130K+ lines) with 8 numeric WASM kernels. No code changes to TSC — just `edgebox _tsc.js`.
 
 ```bash
-# Generate worker + pack into single binary
+# Compile + pack
 edgebox _tsc.js
-./scripts/pack-workerd.sh zig-out/bin/_tsc.js/   # → standalone workerd binary (116MB)
+edgebox pack zig-out/bin/_tsc.js/    # → standalone workerd binary (121MB)
 ```
 
-Tested with `tsc --noEmit` on Node.js v24 and Bun v1.2. EdgeBox benefits come from SOA transforms (446 factory functions → contiguous arrays) and 8 WASM numeric kernels that V8 TurboFan inlines.
+Diagnostic output matches Node.js `tsc` exactly across all test projects (CI-verified).
 
 ### Where It Excels vs Where It Doesn't
 
@@ -152,24 +134,24 @@ Tested with `tsc --noEmit` on Node.js v24 and Bun v1.2. EdgeBox benefits come fr
 ## Quick Start
 
 ```bash
-# Build EdgeBox compiler
-zig build cli
+# Install
+zig build cli        # Build native compiler
+npm install workerd  # For single binary packing
 
-# Compile your JS → optimized output
-./zig-out/bin/edgebox my-app.js
+# Compile
+npx edgebox my-app.js
 
 # Output:
-#   zig-out/bin/my-app.js/my-app-worker.mjs        — JS module (with WASM trampolines)
-#   zig-out/bin/my-app.js/my-app-standalone.wasm    — Standalone WASM (AOT numeric kernels)
+#   zig-out/bin/my-app.js/my-app-worker.mjs        — Worker module (V8 JIT + WASM AOT)
+#   zig-out/bin/my-app.js/my-app-standalone.wasm    — WASM numeric kernels
+#   zig-out/bin/my-app.js/my-app-config.capnp       — workerd configuration
 
-# Run on Node.js (V8 inlines WASM — zero overhead)
-node zig-out/bin/my-app.js/my-app-worker.mjs
-
-# Run on workerd (Cloudflare Workers runtime)
-npx workerd serve zig-out/bin/my-app.js/my-app-config.capnp
+# Run (pick one)
+npx workerd serve zig-out/bin/my-app.js/my-app-config.capnp   # workerd
+./zig-out/bin/my-app.js/my-app-workerd                         # single binary
 
 # Pack into single binary (workerd + V8 embedded)
-./scripts/pack-workerd.sh zig-out/bin/my-app.js/
+npx edgebox pack zig-out/bin/my-app.js/
 
 # Run benchmarks
 bash bench/run_all.sh

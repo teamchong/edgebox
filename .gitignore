@@ -96,6 +96,7 @@ node-core/
 
 # Generated standalone binaries
 bin/
+!bin/edgebox.js
 fib
 fib_*
 fib45*
