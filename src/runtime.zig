@@ -554,6 +554,131 @@ fn skipJsFunctionBody(cc: []const u8, brace_pos: usize) usize {
     return scan;
 }
 
+/// Result of detecting a batch-eligible for-loop.
+const BatchLoopMatch = struct {
+    loop_end: usize, // position after the closing `}`
+    func_name: []const u8, // name of the struct function to batch
+    arr_name: []const u8, // array variable name
+    acc_name: []const u8, // accumulator variable name
+    scalar_args: []const u8, // scalar args after the array element (e.g. ", 3, 0x20")
+};
+
+/// Detect for-loop patterns calling struct functions with array element args.
+/// Pattern: for (V = 0; V < ARR.length; V++) { ACC = ACC + FN(ARR[V], ...) | 0; }
+/// Also matches: for (V = 0; V < ARR.length; V++) { ACC = (ACC + FN(ARR[V], ...)) | 0; }
+fn detectBatchLoop(cc: []const u8, for_pos: usize, wasm_funcs: []const WasmFunc) ?BatchLoopMatch {
+    // Find the opening paren of for(
+    var p = for_pos + 3; // skip "for"
+    while (p < cc.len and cc[p] == ' ') p += 1;
+    if (p >= cc.len or cc[p] != '(') return null;
+    p += 1; // skip '('
+
+    // Parse init: V = 0 or V = EXPR
+    while (p < cc.len and cc[p] == ' ') p += 1;
+    const var_start = p;
+    while (p < cc.len and isIdentChar(cc[p])) p += 1;
+    const loop_var = cc[var_start..p];
+    if (loop_var.len == 0) return null;
+    // Skip to semicolon (past " = 0" or similar)
+    while (p < cc.len and cc[p] != ';') p += 1;
+    if (p >= cc.len) return null;
+    p += 1; // skip ';'
+
+    // Parse condition: V < ARR.length
+    while (p < cc.len and cc[p] == ' ') p += 1;
+    // Verify loop var matches
+    if (!std.mem.startsWith(u8, cc[p..], loop_var)) return null;
+    p += loop_var.len;
+    while (p < cc.len and cc[p] == ' ') p += 1;
+    if (p >= cc.len or cc[p] != '<') return null;
+    p += 1;
+    while (p < cc.len and cc[p] == ' ') p += 1;
+    // Parse ARR.length
+    const arr_start = p;
+    while (p < cc.len and isIdentChar(cc[p])) p += 1;
+    const arr_name = cc[arr_start..p];
+    if (arr_name.len == 0) return null;
+    if (!std.mem.startsWith(u8, cc[p..], ".length")) return null;
+    p += 7; // skip ".length"
+    // Skip to semicolon
+    while (p < cc.len and cc[p] != ';') p += 1;
+    if (p >= cc.len) return null;
+    p += 1; // skip ';'
+
+    // Skip increment (V++ or V = V + 1 | 0)
+    while (p < cc.len and cc[p] != ')') p += 1;
+    if (p >= cc.len) return null;
+    p += 1; // skip ')'
+
+    // Find the loop body opening brace
+    while (p < cc.len and (cc[p] == ' ' or cc[p] == '\n' or cc[p] == '\r')) p += 1;
+    if (p >= cc.len or cc[p] != '{') return null;
+    const body_start = p + 1;
+    const loop_end = skipJsFunctionBody(cc, p);
+    const body = cc[body_start..@min(loop_end - 1, cc.len)];
+
+    // Search body for: ACC = (ACC + FN(ARR[V], ...) | 0;
+    // or: ACC = ACC + FN(ARR[V], ...) | 0;
+    for (wasm_funcs) |wfe| {
+        if (wfe.struct_args == 0) continue;
+        // Find FN(ARR[V] in body
+        const fn_call = std.mem.indexOf(u8, body, wfe.name) orelse continue;
+        const call_pos = fn_call + wfe.name.len;
+        if (call_pos >= body.len or body[call_pos] != '(') continue;
+        // Check ARR[V] follows
+        const after_paren = call_pos + 1;
+        if (!std.mem.startsWith(u8, body[after_paren..], arr_name)) continue;
+        const after_arr = after_paren + arr_name.len;
+        if (after_arr >= body.len or body[after_arr] != '[') continue;
+        if (!std.mem.startsWith(u8, body[after_arr + 1 ..], loop_var)) continue;
+
+        // Find the accumulator: look for ACC = (ACC + before the function call
+        // Scan backwards from fn_call to find pattern: ACC = ACC + or ACC = (ACC +
+        var acc_end: usize = 0;
+        if (fn_call > 4) {
+            // Skip backwards past " + " or " + ("
+            var rp = fn_call;
+            while (rp > 0 and (body[rp - 1] == ' ' or body[rp - 1] == '+' or body[rp - 1] == '(')) rp -= 1;
+            acc_end = rp;
+            while (rp > 0 and isIdentChar(body[rp - 1])) rp -= 1;
+            // Check this is ACC = ACC + pattern
+            const maybe_acc2 = body[rp..acc_end];
+            if (rp >= 4) {
+                // Scan left past ' =' to find the ACC name on the LHS of assignment
+                var rp2 = rp;
+                while (rp2 > 0 and (body[rp2 - 1] == ' ' or body[rp2 - 1] == '=' or body[rp2 - 1] == '(')) rp2 -= 1;
+                // rp2 now points past the ACC ident chars — scan to find start
+                const acc1_end = rp2;
+                while (rp2 > 0 and isIdentChar(body[rp2 - 1])) rp2 -= 1;
+                const acc_name = body[rp2..acc1_end];
+                if (acc_name.len > 0 and std.mem.eql(u8, acc_name, maybe_acc2)) {
+                    // Find scalar args: everything between ARR[V] and the closing )
+                    const arr_bracket_end = after_arr + 1 + loop_var.len + 1; // skip "]"
+                    const fn_close = std.mem.indexOfPos(u8, body, arr_bracket_end, ")") orelse continue;
+                    const scalar_args_str = if (fn_close > arr_bracket_end + 1)
+                        std.mem.trim(u8, body[arr_bracket_end..fn_close], " ")
+                    else
+                        "";
+                    // Strip leading comma
+                    const scalar_args = if (scalar_args_str.len > 0 and scalar_args_str[0] == ',')
+                        std.mem.trimLeft(u8, scalar_args_str[1..], " ")
+                    else
+                        scalar_args_str;
+
+                    return BatchLoopMatch{
+                        .loop_end = loop_end,
+                        .func_name = wfe.name,
+                        .arr_name = arr_name,
+                        .acc_name = acc_name,
+                        .scalar_args = scalar_args,
+                    };
+                }
+            }
+        }
+    }
+    return null;
+}
+
 /// Check if a function body calls any other WASM function.
 fn bodyCallsWasmFunc(cc: []const u8, match_end: usize, self_name: []const u8, wasm_funcs: []const WasmFunc) bool {
     const bp = std.mem.indexOfPos(u8, cc, match_end, "{") orelse return false;
@@ -1753,6 +1878,83 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             }
                         }
                     }
+
+                    // Batch struct helpers: for each struct function with _batch variant,
+                    // generate a JS function that copies array fields into WASM pool and
+                    // calls the batched WASM function in a single invocation.
+                    for (wasm_funcs[0..wasm_func_count]) |wfe| {
+                        if (wfe.struct_args == 0) continue;
+                        // Find first struct arg and its fields
+                        var sai: u32 = 0;
+                        var field_count: u8 = 0;
+                        while (sai < 8) : (sai += 1) {
+                            if (wfe.struct_args & (@as(u8, 1) << @intCast(sai)) != 0) {
+                                field_count = wfe.struct_field_counts[sai];
+                                break;
+                            }
+                        }
+                        if (field_count == 0) continue;
+                        const stride = @as(u32, field_count);
+
+                        // Generate: function __batch_FUNC(arr, ...scalars) {
+                        //   const sp = __wasmStackSave();
+                        //   const n = arr.length;
+                        //   const pool = __wasmStackAlloc(n * stride * 4);
+                        //   const base = pool >> 2;
+                        //   for (let i = 0; i < n; i++) {
+                        //     __m[base + i * stride + 0] = arr[i].field0;
+                        //     __m[base + i * stride + 1] = arr[i].field1;
+                        //     ...
+                        //   }
+                        //   const r = __wasm.exports.FUNC_batch(pool, n, ...scalars);
+                        //   __wasmStackRestore(sp);
+                        //   return r;
+                        // }
+                        w.print("function __batch_{s}(arr", .{wfe.name}) catch {};
+                        // Scalar params (non-struct args)
+                        var scalar_names: [8][]const u8 = undefined;
+                        var scalar_count_2: u32 = 0;
+                        {
+                            var pi: u32 = 0;
+                            while (pi < wfe.arg_count) : (pi += 1) {
+                                if (wfe.struct_args & (@as(u8, 1) << @intCast(pi)) == 0) {
+                                    var sname_buf: [8]u8 = undefined;
+                                    const sname = std.fmt.bufPrint(&sname_buf, "__s{d}", .{pi}) catch "__s";
+                                    w.print(", {s}", .{sname}) catch {};
+                                    scalar_names[scalar_count_2] = sname;
+                                    scalar_count_2 += 1;
+                                }
+                            }
+                        }
+                        w.writeAll(") {\n") catch {};
+                        w.writeAll("  const __sp0 = __wasmStackSave();\n  const __n = arr.length;\n") catch {};
+                        w.print("  const __pool = __wasmStackAlloc(__n * {d});\n", .{stride * 4}) catch {};
+                        w.writeAll("  const __base = __pool >> 2;\n") catch {};
+                        // Copy loop
+                        w.writeAll("  for (let __i = 0; __i < __n; __i++) {\n") catch {};
+                        for (wfe.struct_field_names[sai][0..field_count], 0..) |fname, fi| {
+                            if (fname.len == 0) continue;
+                            if (stride == 1) {
+                                w.print("    __m[__base + __i] = arr[__i].{s};\n", .{fname}) catch {};
+                            } else {
+                                w.print("    __m[__base + __i * {d} + {d}] = arr[__i].{s};\n", .{stride, fi, fname}) catch {};
+                            }
+                        }
+                        w.writeAll("  }\n") catch {};
+                        // Call batch WASM
+                        w.print("  const __r = __wasm.exports.{s}_batch(__pool, __n", .{wfe.name}) catch {};
+                        {
+                            var pi: u32 = 0;
+                            while (pi < wfe.arg_count) : (pi += 1) {
+                                if (wfe.struct_args & (@as(u8, 1) << @intCast(pi)) == 0) {
+                                    w.print(", __s{d}", .{pi}) catch {};
+                                }
+                            }
+                        }
+                        w.writeAll(");\n") catch {};
+                        w.writeAll("  __wasmStackRestore(__sp0);\n  return __r;\n}\n") catch {};
+                    }
+
                     w.writeAll("\n") catch {};
 
                     // Source transform: copy original source, but replace function bodies
@@ -1855,6 +2057,30 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
 
                         var src_pos: usize = 0;
                         while (src_pos < cc.len) {
+                            // === Batch struct detection ===
+                            // Pattern: for (V = 0; V < ARR.length; V++) { ACC = (ACC + FN(ARR[V], ...) | 0; }
+                            // where FN is a batch-eligible struct function.
+                            // Replace: ACC = (ACC + __batch_FN(ARR, ...)) | 0;
+                            if (src_pos + 4 < cc.len and std.mem.startsWith(u8, cc[src_pos..], "for ") or
+                                (src_pos + 4 < cc.len and std.mem.startsWith(u8, cc[src_pos..], "for(")))
+                            {
+                                if (detectBatchLoop(cc, src_pos, wasm_funcs[0..wasm_func_count])) |batch| {
+                                    // Write everything before the loop
+                                    // The loop is already in the output stream at src_pos.
+                                    // Write the batch replacement and skip past the original loop.
+                                    w.print("{s} = ({s} + __batch_{s}({s}", .{
+                                        batch.acc_name, batch.acc_name, batch.func_name, batch.arr_name,
+                                    }) catch {};
+                                    // Write scalar args
+                                    if (batch.scalar_args.len > 0) {
+                                        w.print(", {s}", .{batch.scalar_args}) catch {};
+                                    }
+                                    w.writeAll(")) | 0;\n") catch {};
+                                    src_pos = batch.loop_end;
+                                    continue;
+                                }
+                            }
+
                             // Try to match `function NAME(` for each WASM function
                             var matched_func: ?WasmFunc = null;
                             var matched_func_idx: usize = 0;

@@ -468,6 +468,146 @@ pub fn generateStandaloneWasm(
         return .{ .func_count = 0, .has_functions = false };
     }
 
+    // === Pass 3: Generate _batch wrappers for struct functions ===
+    // For struct functions, generate a batch variant that takes (pool, count, ...scalars)
+    // and loops internally, calling the original per-element. LLVM inlines the callee
+    // at O3, producing a tight loop over contiguous memory.
+    for (functions, 0..) |sf, fi| {
+        const si = sf.struct_layout orelse continue;
+        const func = sf.func;
+
+        // Compute struct stride (total fields across all struct args)
+        var struct_stride: u32 = 0;
+        var struct_arg_idx: u3 = 0;
+        for (0..@min(func.arg_count, 8)) |ai| {
+            if (si.struct_args & (@as(u8, 1) << @intCast(ai)) != 0) {
+                struct_stride += si.field_counts[ai];
+                struct_arg_idx = @intCast(ai);
+                break; // batch over first struct arg only
+            }
+        }
+        if (struct_stride == 0) continue;
+
+        const func_name2 = if (sf.name.len == 0 and fi < synth_names.len)
+            std.mem.sliceTo(&synth_names[fi], 0)
+        else
+            sf.name;
+
+        // Look up the original function
+        var orig_name_buf: [256]u8 = undefined;
+        const orig_name = std.fmt.bufPrintZ(&orig_name_buf, "{s}", .{func_name2}) catch continue;
+        const orig_fn = native.module.getNamedFunction(orig_name) orelse continue;
+
+        // Count scalar (non-struct) args
+        var scalar_count: u32 = 0;
+        for (0..func.arg_count) |ai| {
+            if (si.struct_args & (@as(u8, 1) << @intCast(ai)) == 0) scalar_count += 1;
+        }
+
+        // Batch function: (pool_ptr: i32, count: i32, ...scalar_args: elem_type) → elem_type
+        const elem_type: llvm.Type = switch (sf.value_kind) {
+            .i32 => llvm.i32Type(),
+            .f64 => llvm.doubleType(),
+        };
+        var batch_params: [16]llvm.Type = undefined;
+        batch_params[0] = llvm.i32Type(); // pool_ptr
+        batch_params[1] = llvm.i32Type(); // count
+        var bp_idx: u32 = 2;
+        for (0..func.arg_count) |ai| {
+            if (si.struct_args & (@as(u8, 1) << @intCast(ai)) == 0) {
+                batch_params[bp_idx] = elem_type;
+                bp_idx += 1;
+            }
+        }
+        const batch_fn_ty = llvm.functionType(elem_type, batch_params[0..bp_idx], false);
+
+        var batch_name_buf: [256]u8 = undefined;
+        const batch_name = std.fmt.bufPrintZ(&batch_name_buf, "{s}_batch", .{func_name2}) catch continue;
+        const batch_fn = native.module.addFunction(batch_name, batch_fn_ty);
+        llvm.setLinkage(batch_fn, c.LLVMExternalLinkage);
+
+        // Function body: if (count <= 0) return 0; sum = 0; for (i = 0; i < count; i++) sum += orig(pool + i*stride, scalars...); return sum;
+        const entry_bb = llvm.appendBasicBlock(batch_fn, "entry");
+        const loop_bb = llvm.appendBasicBlock(batch_fn, "loop");
+        const exit_bb = llvm.appendBasicBlock(batch_fn, "exit");
+
+        builder.positionAtEnd(entry_bb);
+        const pool_param = c.LLVMGetParam(batch_fn, 0);
+        const count_param = c.LLVMGetParam(batch_fn, 1);
+        // Guard: skip loop if count <= 0
+        const has_items = c.LLVMBuildICmp(builder.ref, c.LLVMIntSGT, count_param, llvm.constInt32(0), "has_items");
+        _ = builder.buildCondBr(has_items, loop_bb, exit_bb);
+
+        builder.positionAtEnd(loop_bb);
+        // PHI nodes: i (i32), sum (elem_type)
+        const phi_i = c.LLVMBuildPhi(builder.ref, llvm.i32Type(), "i");
+        const phi_sum = c.LLVMBuildPhi(builder.ref, elem_type, "sum");
+
+        // ptr = pool + i * stride * 4
+        const stride_bytes = llvm.constInt32(@intCast(struct_stride * 4));
+        const offset = builder.buildMul(phi_i, stride_bytes, "off");
+        const ptr = builder.buildAdd(pool_param, offset, "ptr");
+
+        // Build call args: struct arg gets ptr, scalars get batch params
+        var call_args: [16]llvm.Value = undefined;
+        var ca_idx: u32 = 0;
+        var scalar_param_idx: u32 = 2;
+        for (0..func.arg_count) |ai| {
+            if (si.struct_args & (@as(u8, 1) << @intCast(ai)) != 0) {
+                // Struct arg → pointer (i32 in i32 tier, convert for f64 tier)
+                call_args[ca_idx] = switch (sf.value_kind) {
+                    .i32 => ptr,
+                    .f64 => builder.buildSIToFP(ptr, llvm.doubleType(), "ptr_f64"),
+                };
+            } else {
+                // Scalar arg → pass through from batch params
+                call_args[ca_idx] = c.LLVMGetParam(batch_fn, @intCast(scalar_param_idx));
+                scalar_param_idx += 1;
+            }
+            ca_idx += 1;
+        }
+
+        // Call original function
+        const orig_fn_ty = c.LLVMGlobalGetValueType(orig_fn);
+        const call_result = builder.buildCall(orig_fn_ty, orig_fn, call_args[0..ca_idx], "r");
+
+        // sum += result
+        const new_sum = switch (sf.value_kind) {
+            .i32 => builder.buildAdd(phi_sum, call_result, "sum_next"),
+            .f64 => builder.buildFAdd(phi_sum, call_result, "sum_next"),
+        };
+
+        // i++
+        const new_i = builder.buildAdd(phi_i, llvm.constInt32(1), "i_next");
+
+        // Loop condition: i < count
+        const cond = c.LLVMBuildICmp(builder.ref, c.LLVMIntSLT, new_i, count_param, "cond");
+        _ = builder.buildCondBr(cond, loop_bb, exit_bb);
+
+        // Wire PHI incoming values
+        var phi_i_vals = [_]llvm.Value{ llvm.constInt32(0), new_i };
+        var phi_i_bbs = [_]llvm.BasicBlock{ entry_bb, loop_bb };
+        c.LLVMAddIncoming(phi_i, &phi_i_vals, &phi_i_bbs, 2);
+
+        const zero_sum: llvm.Value = switch (sf.value_kind) {
+            .i32 => llvm.constInt32(0),
+            .f64 => llvm.constF64(0.0),
+        };
+        var phi_sum_vals = [_]llvm.Value{ zero_sum, new_sum };
+        var phi_sum_bbs = [_]llvm.BasicBlock{ entry_bb, loop_bb };
+        c.LLVMAddIncoming(phi_sum, &phi_sum_vals, &phi_sum_bbs, 2);
+
+        // Exit: PHI merges zero (from entry guard) and final sum (from loop)
+        builder.positionAtEnd(exit_bb);
+        const exit_phi = c.LLVMBuildPhi(builder.ref, elem_type, "result");
+        var exit_vals = [_]llvm.Value{ zero_sum, new_sum };
+        var exit_bbs = [_]llvm.BasicBlock{ entry_bb, loop_bb };
+        c.LLVMAddIncoming(exit_phi, &exit_vals, &exit_bbs, 2);
+        _ = builder.buildRet(exit_phi);
+
+        generated_count += 1;
+    }
+
     // Dump pre-optimization IR for debugging
     if (std.posix.getenv("EDGEBOX_DUMP_WASM_IR")) |_| {
         const ir = native.module.printToString();

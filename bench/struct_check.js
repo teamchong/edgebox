@@ -13,6 +13,11 @@ function checkBoth(t, kind, mask) {
   return t.kind === kind && (t.flags & mask) !== 0 ? 1 : 0;
 }
 
+// Multi-struct-arg: exercises the codegen fix for compare(nodeA, nodeB)
+function sameKind(a, b) {
+  return a.kind === b.kind ? 1 : 0;
+}
+
 function sumKinds(arr, count) {
   var sum = 0;
   for (var i = 0; i < count; i = i + 1 | 0) {
@@ -52,3 +57,11 @@ for (var r = 0; r < RUNS; r++) {
 }
 t1 = Date.now();
 console.log("sumKinds: " + (t1 - t0) + "ms (sum=" + r2 + ")");
+
+// Multi-struct-arg correctness check: compare types[k] vs types[k+16]
+// (same kind since kind = k % 16, so k and k+16 always match)
+var r3 = 0;
+for (var k = 0; k < 1000; k++) {
+  r3 = (r3 + sameKind(types[k], types[k + 16])) | 0;
+}
+console.log("sameKind: matches=" + r3 + " (expected 1000)");

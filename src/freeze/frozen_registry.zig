@@ -941,6 +941,8 @@ pub fn generateModuleZigShardedWithBackend(
                                                 mf.writeAll("]") catch {};
                                             }
                                             mf.writeAll("}") catch {};
+                                            // Batch variant is always generated for struct functions
+                                            mf.writeAll(",\"has_batch\":1") catch {};
                                         }
 
                                         mf.writeAll("}") catch {};
