@@ -2165,4 +2165,56 @@ pub fn build(b: *std.Build) void {
     if (!skip_frozen_test and source_dir.len > 0) {
         cli_step.dependOn(wasm_static_step);
     }
+
+    // ===================
+    // edgebox-v8-test — V8 linking test (Phase 1 of V8 embedding)
+    // Verifies librusty_v8.a links correctly. Run: zig build v8-test
+    // ===================
+    {
+        const v8_lib_name = switch (target.result.cpu.arch) {
+            .x86_64 => switch (target.result.os.tag) {
+                .linux => "librusty_v8_release_x86_64-unknown-linux-gnu.a",
+                .macos => "librusty_v8_release_x86_64-apple-darwin.a",
+                else => null,
+            },
+            .aarch64 => switch (target.result.os.tag) {
+                .linux => "librusty_v8_release_aarch64-unknown-linux-gnu.a",
+                .macos => "librusty_v8_release_aarch64-apple-darwin.a",
+                else => null,
+            },
+            else => null,
+        };
+
+        if (v8_lib_name) |lib_name| {
+            const v8_test_exe = b.addExecutable(.{
+                .name = "edgebox-v8-test",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/v8_test.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }),
+            });
+
+            // Link prebuilt librusty_v8.a (V8 engine + binding.cc extern "C" functions)
+            v8_test_exe.addObjectFile(b.path(b.fmt("vendor/v8/{s}", .{lib_name})));
+
+            // Stub implementations for Rust callbacks (temporal_rs, inspector, etc.)
+            v8_test_exe.root_module.addCSourceFile(.{
+                .file = b.path("src/v8_stubs.c"),
+                .flags = &.{},
+            });
+
+            // V8 dependencies
+            v8_test_exe.linkLibC();
+            v8_test_exe.linkLibCpp();
+            v8_test_exe.linkSystemLibrary("pthread");
+
+            const v8_test_step = b.step("v8-test", "Build V8 linking test (Phase 1)");
+            v8_test_step.dependOn(&b.addInstallArtifact(v8_test_exe, .{}).step);
+        } else {
+            const v8_test_step = b.step("v8-test", "Build V8 linking test (unsupported platform)");
+            const v8_fail = b.addFail("v8-test: unsupported platform (need x86_64/aarch64 linux/macos)");
+            v8_test_step.dependOn(&v8_fail.step);
+        }
+    }
 }
