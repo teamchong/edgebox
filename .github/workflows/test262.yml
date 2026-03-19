@@ -115,7 +115,7 @@ jobs:
 
       - name: Compile shard
         run: |
-          ./zig-out/bin/edgebox --minimal zig-out/test262-shard-${{ matrix.shard }}.js
+          ./zig-out/bin/edgebox-compile --minimal zig-out/test262-shard-${{ matrix.shard }}.js
 
       - name: Run tests
         id: run

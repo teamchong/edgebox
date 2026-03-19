@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
 EDGEBOX="$ROOT_DIR/zig-out/bin/edgebox"
-EDGEBOXC="$ROOT_DIR/zig-out/bin/edgebox"
+EDGEBOXC="$ROOT_DIR/zig-out/bin/edgebox-compile"
 
 # Create temp directories
 TEST_DIR="/tmp/edgebox-fast-tests"

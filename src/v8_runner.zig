@@ -1,7 +1,6 @@
-// v8_runner.zig — V8 embed runner: executes JavaScript files with Node.js compatibility
+// EdgeBox — V8 JavaScript runtime with AOT WASM kernels, snapshots, and parallel IO
 //
-// This is the main entry point for running JS files (like _tsc.js) through V8
-// with full filesystem access via __edgebox_io_sync.
+// Primary entry point for running JS files through embedded V8.
 //
 // Features:
 // - CJS module wrapping with __filename/__dirname
@@ -10,11 +9,11 @@
 // - Single binary mode: JS + code cache appended to binary (edgebox pack)
 //
 // Usage:
-//   edgebox-v8 <script.js> [args...]      Run a JS file
-//   edgebox-v8 pack <script.js> [output]   Pack into single binary
+//   edgebox <script.js> [args...]      Run a JS file
+//   edgebox pack <script.js> [output]  Pack into single binary
 //
-// Build: zig build v8-run
-// Run:   ./zig-out/bin/edgebox-v8 node_modules/typescript/lib/_tsc.js --version
+// Build: zig build v8-run   (or: zig build cli)
+// Run:   ./zig-out/bin/edgebox node_modules/typescript/lib/_tsc.js --version
 
 const std = @import("std");
 const v8 = @import("v8.zig");
@@ -31,7 +30,7 @@ pub fn main() !void {
     var args = try std.process.argsWithAllocator(alloc);
     defer args.deinit();
 
-    const bin_name = args.next() orelse "edgebox-v8";
+    const bin_name = args.next() orelse "edgebox";
 
     // Check for embedded app first (single binary mode)
     const embedded = readEmbeddedApp(alloc) catch null;
@@ -49,7 +48,7 @@ pub fn main() !void {
     // Normal mode — parse args for script path or pack subcommand
     const first_arg = args.next() orelse {
         const stderr = std.fs.File.stderr();
-        stderr.writeAll("Usage: edgebox-v8 <script.js> [args...]\n       edgebox-v8 pack <script.js> [output]\n") catch {};
+        stderr.writeAll("Usage: edgebox <script.js> [args...]\n       edgebox pack <script.js> [output]\n") catch {};
         std.process.exit(1);
     };
 
@@ -57,7 +56,7 @@ pub fn main() !void {
     if (std.mem.eql(u8, first_arg, "pack")) {
         const script_arg = args.next() orelse {
             const stderr = std.fs.File.stderr();
-            stderr.writeAll("Usage: edgebox-v8 pack <script.js> [output-binary]\n") catch {};
+            stderr.writeAll("Usage: edgebox pack <script.js> [output-binary]\n") catch {};
             std.process.exit(1);
         };
         const output_name = args.next() orelse blk: {

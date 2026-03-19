@@ -25,7 +25,7 @@ cp "$WASM_FILE" "$TEMP_DIR/app/app.wasm"
 
 # Compile using edgebox's AOT compiler
 # The build process will generate app.aot from app.wasm
-./zig-out/bin/edgebox build "$TEMP_DIR/app" --force
+./zig-out/bin/edgebox-compile build "$TEMP_DIR/app" --force
 
 # Copy the AOT file to the target location
 if [ -f "zig-out/bin/app/app.aot" ]; then

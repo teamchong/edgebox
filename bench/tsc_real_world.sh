@@ -73,7 +73,7 @@ benchmark "Node.js" "node typescript/tsc_bench.js"
 benchmark "Bun" "bun typescript/tsc_bench.js"
 
 # Check for EdgeBox AOT
-EDGEBOX="../zig-out/bin/edgebox"
+EDGEBOX="../zig-out/bin/edgebox-compile"
 AOT_PATH="../zig-out/bin/bench/tsc_bench.aot"
 
 if [ -f "$EDGEBOX" ] && [ -f "$AOT_PATH" ]; then
@@ -99,5 +99,5 @@ echo "Lower times are better."
 echo ""
 echo "Note: To test EdgeBox, first build the TSC benchmark:"
 echo "  cd $(dirname $BENCH_DIR)"
-echo "  zig-out/bin/edgebox build bench/typescript/tsc_bench.js"
+echo "  zig-out/bin/edgebox-compile build bench/typescript/tsc_bench.js"
 echo ""

@@ -183,7 +183,7 @@ function downloadProject(project: Project): string | null {
 }
 
 function buildEdgeboxTsc(): string | null {
-  const edgeboxPath = join(PROJECT_ROOT, "zig-out/bin/edgebox");
+  const edgeboxPath = join(PROJECT_ROOT, "zig-out/bin/edgebox-compile");
   const tscSourceAbs = join(BENCHMARK_DIR, "node_modules/typescript/lib/_tsc.js");
   // Use relative path from PROJECT_ROOT to avoid path.join issues with absolute paths
   const tscSourceRel = relative(PROJECT_ROOT, tscSourceAbs);

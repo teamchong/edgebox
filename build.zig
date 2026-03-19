@@ -220,10 +220,10 @@ pub fn build(b: *std.Build) void {
     wasm_step.dependOn(&wasm_install.step);
 
     // ===================
-    // Native CLI executable
+    // AOT compiler (build tool for generating WASM kernels)
     // ===================
     const exe = b.addExecutable(.{
-        .name = "edgebox",
+        .name = "edgebox-compile",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/cli.zig"),
             .target = target,
@@ -1682,11 +1682,11 @@ pub fn build(b: *std.Build) void {
     }
 
     // ===================
-    // edgebox - the compiler/build tool (JIT+AOT for V8/workerd)
+    // edgebox-compile - the AOT compiler/build tool
     // Compiles JS → WASM numeric kernels + worker.mjs trampolines
     // ===================
     const build_exe = b.addExecutable(.{
-        .name = "edgebox",
+        .name = "edgebox-compile",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/runtime.zig"),
             .target = target,
@@ -1991,39 +1991,23 @@ pub fn build(b: *std.Build) void {
     verify_opcodes_step.dependOn(&verify_opcodes_run.step);
 
     // ===================
-    // cli - builds all CLI tools
+    // cli - builds the primary edgebox binary (V8 runner) + AOT compiler
     // ===================
-    // cli: build edgebox (compiler) + wasm-opt — the worker path tools
-    const cli_step = b.step("cli", "Build edgebox compiler (JIT+AOT for V8/workerd)");
+    const cli_step = b.step("cli", "Build edgebox (V8 runner) + edgebox-compile (AOT compiler)");
+
+    // compile: build just the AOT compiler
+    const compile_step = b.step("compile", "Build edgebox-compile (AOT compiler only)");
+    compile_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
+    compile_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
+
+    // cli also builds the AOT compiler tools
     cli_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
 
-    // ===================
-    // edgebox-workerd — workerd runner with Zig IO server
-    // ===================
-    const workerd_runner_exe = b.addExecutable(.{
-        .name = "edgebox-workerd",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/edgebox_workerd.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    workerd_runner_exe.linkLibC();
-
-    b.installArtifact(workerd_runner_exe);
-
-    const workerd_runner_step = b.step("workerd-runner", "Build edgebox-workerd (workerd + Zig IO server)");
-    workerd_runner_step.dependOn(&b.addInstallArtifact(workerd_runner_exe, .{}).step);
-
-    // cli also builds the workerd runner
-    cli_step.dependOn(&b.addInstallArtifact(workerd_runner_exe, .{}).step);
-
-    // cli-full: also builds WAMR runner, sandbox, etc. (for --with-binary)
-    const cli_full_step = b.step("cli-full", "Build all CLI tools including WAMR runner and sandbox");
+    // cli-full: also builds WAMR runner, sandbox, etc. (legacy tools)
+    const cli_full_step = b.step("cli-full", "Build all tools including legacy WAMR runner and sandbox");
     cli_full_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
     cli_full_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
-    cli_full_step.dependOn(&b.addInstallArtifact(workerd_runner_exe, .{}).step);
     cli_full_step.dependOn(&b.addInstallArtifact(sandbox_exe, .{}).step);
     cli_full_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
     if (enable_gpu) {
@@ -2220,10 +2204,10 @@ pub fn build(b: *std.Build) void {
             const v8_test_step = b.step("v8-test", "Build V8 embedding test (Phases 1+2)");
             v8_test_step.dependOn(&b.addInstallArtifact(v8_test_exe, .{}).step);
 
-            // edgebox-v8 — V8 runner for executing JS files
-            // Usage: ./zig-out/bin/edgebox-v8 <script.js> [args...]
+            // edgebox — primary V8 runner for executing JS files
+            // Usage: ./zig-out/bin/edgebox <script.js> [args...]
             const v8_run_exe = b.addExecutable(.{
-                .name = "edgebox-v8",
+                .name = "edgebox",
                 .root_module = b.createModule(.{
                     .root_source_file = b.path("src/v8_runner.zig"),
                     .target = target,
@@ -2245,14 +2229,17 @@ pub fn build(b: *std.Build) void {
             v8_run_exe.linkLibCpp();
             v8_run_exe.linkSystemLibrary("pthread");
 
-            const v8_run_step = b.step("v8-run", "Build V8 JS runner (edgebox-v8)");
+            const v8_run_step = b.step("v8-run", "Build edgebox V8 runner");
             v8_run_step.dependOn(&b.addInstallArtifact(v8_run_exe, .{}).step);
+
+            // cli step depends on V8 runner as the primary binary
+            cli_step.dependOn(&b.addInstallArtifact(v8_run_exe, .{}).step);
         } else {
             const v8_test_step = b.step("v8-test", "Build V8 embedding test (unsupported platform)");
             const v8_fail = b.addFail("v8-test: unsupported platform (need x86_64/aarch64 linux/macos)");
             v8_test_step.dependOn(&v8_fail.step);
 
-            const v8_run_step = b.step("v8-run", "Build V8 JS runner (unsupported platform)");
+            const v8_run_step = b.step("v8-run", "Build edgebox V8 runner (unsupported platform)");
             const v8_run_fail = b.addFail("v8-run: unsupported platform (need x86_64/aarch64 linux/macos)");
             v8_run_step.dependOn(&v8_run_fail.step);
         }

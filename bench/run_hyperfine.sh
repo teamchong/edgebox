@@ -111,7 +111,7 @@ done
 WASMTIME_RUN="wasmtime run -W unknown-imports-default"
 
 EDGEBOX="$ROOT_DIR/zig-out/bin/edgebox"
-EDGEBOXC="$ROOT_DIR/zig-out/bin/edgebox"
+EDGEBOXC="$ROOT_DIR/zig-out/bin/edgebox-compile"
 
 # Suppress debug/info messages during benchmarks
 export EDGEBOX_QUIET=1

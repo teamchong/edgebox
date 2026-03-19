@@ -7,7 +7,7 @@
 
 set -e
 
-EDGEBOXC="./zig-out/bin/edgebox"
+EDGEBOXC="./zig-out/bin/edgebox-compile"
 NODE="node"
 RESULTS_FILE="bench/results_vs_node.md"
 

@@ -36,7 +36,7 @@ elif [ "$BUN_TEST" = "1" ]; then
     RESULTS_FILE="node-test-results-${MODULE}-bun.txt"
 else
     RUNTIME="edgebox"
-    RUNTIME_CMD="./zig-out/bin/edgebox"
+    RUNTIME_CMD="./zig-out/bin/edgebox-compile"
     RESULTS_FILE="node-test-results-${MODULE}.txt"
 fi
 
@@ -91,7 +91,7 @@ run_test() {
         local compile_output
         local compile_exit=0
         local compile_start=$(get_time_ms)
-        compile_output=$(./zig-out/bin/edgebox build "$test_app_dir" 2>&1) || compile_exit=$?
+        compile_output=$(./zig-out/bin/edgebox-compile build "$test_app_dir" 2>&1) || compile_exit=$?
         local compile_end=$(get_time_ms)
         compile_time_ms=$((compile_end - compile_start))
         TOTAL_COMPILE_TIME=$((TOTAL_COMPILE_TIME + compile_time_ms))

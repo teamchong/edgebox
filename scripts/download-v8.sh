@@ -129,5 +129,5 @@ fi
 echo ""
 echo "[v8] Done! rusty_v8 ${V8_VERSION} installed to ${VENDOR_DIR}"
 echo ""
-echo "Build: zig build v8-test"
-echo "Run:   ./zig-out/bin/edgebox-v8-test"
+echo "Build: zig build cli"
+echo "Run:   ./zig-out/bin/edgebox <script.js>"
