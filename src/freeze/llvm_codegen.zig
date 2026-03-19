@@ -936,7 +936,7 @@ fn emitInt32Instruction(
             const idx: u32 = handler.index orelse switch (instr.operand) {
                 .arg => |a| a,
                 .u8 => |a| a,
-                else => 0,
+                else => return CodegenError.UnsupportedOpcode,
             };
             if (idx >= arg_count) return CodegenError.UnsupportedOpcode;
             const val = builder.buildLoad(llvm.i32Type(), params[idx], "arg");
@@ -2041,7 +2041,7 @@ fn emitNumericInstruction(
             const idx: u32 = handler.index orelse switch (instr.operand) {
                 .arg => |a| a,
                 .u8 => |a| a,
-                else => 0,
+                else => return CodegenError.UnsupportedOpcode,
             };
             if (idx >= arg_count) return CodegenError.UnsupportedOpcode;
             const val = builder.buildLoad(elem_type, params[idx], "arg");
