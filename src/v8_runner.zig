@@ -163,12 +163,20 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
     };
     var origin = v8.ScriptOrigin.init(@ptrCast(name_str));
 
+    // Load code cache into V8's CachedData if available
     var cached_data: ?*v8.CachedData = null;
     if (cache_bytes) |cb| {
-        cached_data = v8.ScriptCompilerApi.createCachedData(cb.ptr, @intCast(cb.len));
+        if (cb.len > 0) {
+            // V8 requires the buffer to outlive compilation, and CachedData is
+            // created with BufferNotOwned so we keep ownership of cache_bytes.
+            cached_data = v8.ScriptCompilerApi.createCachedData(cb.ptr, @intCast(cb.len));
+        }
     }
 
-    var compiler_source = v8.CompilerSource.init(source_str, &origin, cached_data);
+    // Construct Source in-place — avoids bitwise copy of C++ object with internal pointers.
+    // Takes ownership of cached_data (freed by Source destructor on deinit).
+    var compiler_source: v8.CompilerSource = .{};
+    compiler_source.initInPlace(source_str, &origin, cached_data);
     defer compiler_source.deinit();
 
     const compile_options: c_int = if (cached_data != null)
@@ -208,7 +216,8 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         }
     }
 
-    if (cached_data) |cd| v8.ScriptCompilerApi.deleteCachedData(cd);
+    // Note: do NOT call deleteCachedData here — the Source destructor
+    // (compiler_source.deinit) owns the CachedData and frees it.
 
     // Execute
     _ = v8.ScriptApi.run(script, context) orelse {
@@ -436,7 +445,8 @@ fn generateCodeCache(alloc: std.mem.Allocator, script_code: []const u8) ![]const
     const name = v8.StringApi.fromUtf8(isolate, "app.js") orelse return error.StringFailed;
     var origin = v8.ScriptOrigin.init(@ptrCast(name));
 
-    var cs = v8.CompilerSource.init(src, &origin, null);
+    var cs: v8.CompilerSource = .{};
+    cs.initInPlace(src, &origin, null);
     defer cs.deinit();
 
     const script = v8.ScriptCompilerApi.compile(ctx, &cs, v8.ScriptCompilerApi.kNoCompileOptions) orelse

@@ -298,7 +298,9 @@
   _modules['node:process'] = _proc;
 
   // ====== Console ======
-  if (!globalThis.console) {
+  // Always override — V8 provides a built-in console but its output goes
+  // to a ConsoleDelegate (no-op by default). Replace with IO-bridge version.
+  {
     globalThis.console = {
       log: function() { _proc.stdout.write(Array.prototype.join.call(arguments, ' ') + '\n'); },
       error: function() { _proc.stderr.write(Array.prototype.join.call(arguments, ' ') + '\n'); },

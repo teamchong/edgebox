@@ -429,12 +429,12 @@ pub const CompilerSource = struct {
     // Source is ~104 bytes on 64-bit (see binding.cc static_asserts)
     const max_size = 128; // generous upper bound
 
-    pub fn init(source: *const String, origin: *const ScriptOrigin, cached_data: ?*CachedData) CompilerSource {
-        var cs = CompilerSource{};
+    /// Construct Source in-place. Must be called on a stable (non-moved) pointer.
+    /// Do NOT assign the result of this to a new variable — call on a var directly.
+    pub fn initInPlace(self: *CompilerSource, source: *const String, origin: *const ScriptOrigin, cached_data: ?*CachedData) void {
         const actual_size = bridge.edgebox_v8_source_sizeof();
         std.debug.assert(actual_size <= max_size);
-        c.v8__ScriptCompiler__Source__CONSTRUCT(&cs.buf, source, &origin.buf, cached_data);
-        return cs;
+        c.v8__ScriptCompiler__Source__CONSTRUCT(&self.buf, source, &origin.buf, cached_data);
     }
 
     pub fn deinit(self: *CompilerSource) void {
