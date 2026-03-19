@@ -15,7 +15,7 @@ inputs:
     required: false
     default: 'false'
   build-test262:
-    description: 'Build test262 runner'
+    description: 'Build test262 runner (requires WAMR)'
     required: false
     default: 'false'
   build-benchmarks:
@@ -99,7 +99,7 @@ runs:
           /usr/lib/llvm-20/bin/opt --version || { echo "ERROR: LLVM 20 opt not found"; exit 1; }
         fi
 
-    # === Cache ALL build outputs ===
+    # === Cache build outputs (no WAMR — worker path only) ===
     - name: Cache EdgeBox build
       id: cache-edgebox
       uses: actions/cache@v4
@@ -108,9 +108,7 @@ runs:
           zig-out/bin/
           zig-out/cache/
           vendor/binaryen/
-          vendor/wamr/product-mini/platforms/*/build/
-          vendor/wamr/wamr-compiler/build/
-        key: edgebox-full-v7-${{ runner.os }}-${{ hashFiles('build.zig', 'scripts/build-wamr.sh', 'vendor/wamr/core/version.h', 'patches/wamr/*.patch', 'src/**/*.zig', 'src/freeze/*.zig', 'bench/*.js', 'src/polyfills/*.js') }}
+        key: edgebox-v8-${{ runner.os }}-${{ hashFiles('build.zig', 'src/**/*.zig', 'src/freeze/*.zig', 'bench/*.js', 'src/polyfills/*.js') }}
 
     # === Build Binaryen (if cache miss) ===
     - name: Build Binaryen
@@ -131,23 +129,14 @@ runs:
           sudo ldconfig
         fi
 
-    # === Build WAMR (if cache miss) ===
-    - name: Build WAMR
-      if: steps.cache-edgebox.outputs.cache-hit != 'true'
-      shell: bash
-      run: ./scripts/build-wamr.sh
-
-    # === Build EdgeBox (if cache miss) ===
+    # === Build EdgeBox CLI (if cache miss) ===
     - name: Build EdgeBox
       if: steps.cache-edgebox.outputs.cache-hit != 'true'
       shell: bash
       run: |
         # Use baseline CPU for portable binaries (avoid SIGILL on different runners)
-        # cli = EdgeBox compiler (worker .mjs + .wasm generation)
+        # cli = EdgeBox compiler (worker .mjs + .wasm generation) — no WAMR needed
         zig build cli -Doptimize=ReleaseFast -Dcpu=baseline
-        # runner = WAMR runtime (only needed for --with-binary native path)
-        zig build runner -Doptimize=ReleaseFast -Dcpu=baseline || echo "Runner build skipped (WAMR optional)"
-        ${{ inputs.build-test262 == 'true' && 'zig build test262 -Doptimize=ReleaseFast -Dcpu=baseline' || '' }}
 
     # === Build benchmarks (if cache miss and requested) ===
     - name: Build Benchmarks
@@ -173,20 +162,22 @@ runs:
           sudo ldconfig
         fi
 
-    # === Build test262 (on cache hit, if requested) ===
-    - name: Build test262 (cache hit)
-      if: steps.cache-edgebox.outputs.cache-hit == 'true' && inputs.build-test262 == 'true'
+    # === Build WAMR + test262 (only when requested — weekly CI) ===
+    - name: Build WAMR (for test262)
+      if: inputs.build-test262 == 'true'
       shell: bash
-      run: |
-        zig build test262 -Doptimize=ReleaseFast -Dcpu=baseline
+      run: ./scripts/build-wamr.sh
 
-    # === Build WAMR compiler (for test262 AOT) ===
-    - name: Build WAMR compiler
+    - name: Build test262
+      if: inputs.build-test262 == 'true'
+      shell: bash
+      run: zig build test262 -Doptimize=ReleaseFast -Dcpu=baseline
+
+    - name: Build WAMR compiler (for test262 AOT)
       if: inputs.build-test262 == 'true'
       shell: bash
       run: ./scripts/build-wamr-compiler.sh
 
-    # === Build AOT for test262 (always needed for test262 runs) ===
     - name: Build AOT base module
       if: inputs.build-test262 == 'true'
       shell: bash
