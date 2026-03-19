@@ -416,6 +416,104 @@ pub const ObjectApi = struct {
 };
 
 // ============================================================
+// ScriptCompiler API — code caching
+// ============================================================
+
+const UnboundScript = opaque {};
+pub const CachedData = opaque {};
+
+/// ScriptCompiler::Source — in-place constructed, ~104 bytes on 64-bit.
+pub const CompilerSource = struct {
+    buf: [max_size]u8 align(@alignOf(usize)) = undefined,
+
+    // Source is ~104 bytes on 64-bit (see binding.cc static_asserts)
+    const max_size = 128; // generous upper bound
+
+    pub fn init(source: *const String, origin: *const ScriptOrigin, cached_data: ?*CachedData) CompilerSource {
+        var cs = CompilerSource{};
+        const actual_size = bridge.edgebox_v8_source_sizeof();
+        std.debug.assert(actual_size <= max_size);
+        c.v8__ScriptCompiler__Source__CONSTRUCT(&cs.buf, source, &origin.buf, cached_data);
+        return cs;
+    }
+
+    pub fn deinit(self: *CompilerSource) void {
+        c.v8__ScriptCompiler__Source__DESTRUCT(&self.buf);
+    }
+
+    pub fn getCachedData(self: *const CompilerSource) ?*const CachedData {
+        return c.v8__ScriptCompiler__Source__GetCachedData(&self.buf);
+    }
+};
+
+/// CachedData memory layout (64-bit):
+///   offset 0: data pointer (8 bytes)
+///   offset 8: length (4 bytes)
+///   offset 12: rejected (4 bytes)
+///   offset 16: buffer_policy (4 bytes + 4 padding)
+const CachedDataLayout = extern struct {
+    data: [*]const u8,
+    length: i32,
+    rejected: i32,
+    buffer_policy: i32,
+    _pad: i32 = 0,
+};
+
+pub const ScriptCompilerApi = struct {
+    // CompileOptions
+    pub const kNoCompileOptions: c_int = 0;
+    pub const kConsumeCodeCache: c_int = 1;
+    pub const kEagerCompile: c_int = 2;
+
+    // NoCacheReason
+    pub const kNoCacheNoReason: c_int = 0;
+
+    /// Create CachedData from raw bytes (for loading from disk).
+    pub fn createCachedData(data: [*]const u8, length: i32) *CachedData {
+        return c.v8__ScriptCompiler__CachedData__NEW(data, length);
+    }
+
+    /// Delete CachedData.
+    pub fn deleteCachedData(cd: *CachedData) void {
+        c.v8__ScriptCompiler__CachedData__DELETE(cd);
+    }
+
+    /// Compile with options (code cache consume/produce).
+    pub fn compile(context: *const Context, source: *CompilerSource, options: c_int) ?*const Script {
+        return c.v8__ScriptCompiler__Compile(context, &source.buf, options, kNoCacheNoReason);
+    }
+
+    /// Get CachedData raw bytes.
+    pub fn getCachedDataBytes(cd: *const CachedData) struct { data: [*]const u8, length: i32, rejected: bool } {
+        const layout: *const CachedDataLayout = @ptrCast(@alignCast(cd));
+        return .{
+            .data = layout.data,
+            .length = layout.length,
+            .rejected = layout.rejected != 0,
+        };
+    }
+};
+
+pub const UnboundScriptApi = struct {
+    /// Create code cache from an UnboundScript.
+    pub fn createCodeCache(us: *const UnboundScript) *CachedData {
+        return c.v8__UnboundScript__CreateCodeCache(us);
+    }
+
+    /// Bind an UnboundScript to the current context, producing a Script.
+    pub fn bindToCurrentContext(us: *const UnboundScript) *const Script {
+        return c.v8__UnboundScript__BindToCurrentContext(us);
+    }
+};
+
+pub const ScriptExtApi = struct {
+    /// Get the UnboundScript from a compiled Script (for creating code cache).
+    pub fn getUnboundScript(script: *const Script) *const UnboundScript {
+        return c.v8__Script__GetUnboundScript(script);
+    }
+};
+
+// ============================================================
 // High-level eval helper
 // ============================================================
 
@@ -569,6 +667,19 @@ const c = struct {
     // Object
     extern fn v8__Object__Set(obj: *const Object, context: *const Context, key: *const Value, value: *const Value) u8;
     extern fn v8__Object__Get(obj: *const Object, context: *const Context, key: *const Value) ?*const Value;
+
+    // ScriptCompiler
+    extern fn v8__ScriptCompiler__Source__CONSTRUCT(buf: *[CompilerSource.max_size]u8, source: *const String, origin: *const [ScriptOrigin.max_size]u8, cached_data: ?*CachedData) void;
+    extern fn v8__ScriptCompiler__Source__DESTRUCT(buf: *[CompilerSource.max_size]u8) void;
+    extern fn v8__ScriptCompiler__Source__GetCachedData(buf: *const [CompilerSource.max_size]u8) ?*const CachedData;
+    extern fn v8__ScriptCompiler__CachedData__NEW(data: [*]const u8, length: c_int) *CachedData;
+    extern fn v8__ScriptCompiler__CachedData__DELETE(cd: *CachedData) void;
+    extern fn v8__ScriptCompiler__Compile(context: *const Context, source: *[CompilerSource.max_size]u8, options: c_int, no_cache_reason: c_int) ?*const Script;
+
+    // UnboundScript / code cache
+    extern fn v8__Script__GetUnboundScript(script: *const Script) *const UnboundScript;
+    extern fn v8__UnboundScript__CreateCodeCache(us: *const UnboundScript) *CachedData;
+    extern fn v8__UnboundScript__BindToCurrentContext(us: *const UnboundScript) *const Script;
 };
 
 // Functions from v8_bridge.cpp
@@ -576,4 +687,5 @@ const bridge = struct {
     extern fn edgebox_v8_create_isolate() *Isolate;
     extern fn edgebox_v8_script_origin_sizeof() usize;
     extern fn edgebox_v8_create_params_sizeof() usize;
+    extern fn edgebox_v8_source_sizeof() usize;
 };

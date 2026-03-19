@@ -9,6 +9,7 @@
 
 #include "v8-isolate.h"
 #include "v8-script.h"
+#include "v8-context.h"
 
 // Functions from librusty_v8.a (binding.cc)
 extern "C" {
@@ -39,6 +40,11 @@ size_t edgebox_v8_script_origin_sizeof() {
 // but available without calling into librusty_v8.
 size_t edgebox_v8_create_params_sizeof() {
   return sizeof(v8::Isolate::CreateParams);
+}
+
+// --- ScriptCompiler::Source size ---
+size_t edgebox_v8_source_sizeof() {
+  return sizeof(v8::ScriptCompiler::Source);
 }
 
 } // extern "C"
