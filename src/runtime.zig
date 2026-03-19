@@ -1978,11 +1978,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     const mem_grow_pages: u32 = if (has_array_funcs) 256 else 16;
 
                     // Preamble: load WASM module (compatible with Node.js + workerd)
-                    var w_buf: [65536]u8 = undefined;
+                    // Small buffer forces frequent flushes
+                    var w_buf: [4096]u8 = undefined;
                     var w_state = wf.writer(&w_buf);
                     const w = &w_state.interface;
-                    // Flush periodically to avoid data loss
-                    var flush_counter: u32 = 0;
                     w.print(
                         \\// EdgeBox AOT+JIT (auto-generated)
                         \\const {{ readFileSync }} = require('fs');
@@ -2089,8 +2088,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             site.field_count = @intCast(fi + 1);
                                         }
                                     }
-                                    // Only load pass-through factories (every field value is a direct get_arg).
-                                    // Computed/closure factories may store strings/objects — Int32Array would corrupt them.
+                                    // Only load pass-through factories (proven working)
                                     const pt = obj.get("pass_through") orelse continue;
                                     const is_pt = if (pt == .bool) pt.bool else false;
                                     if (!is_pt or site.field_count == 0) continue;
@@ -2819,14 +2817,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
 
                                     // === All validation passed — now emit ===
                                     if (site.is_constructor) {
-                                        // Constructor: inject __idx + column writes after {, keep body
-                                        w.writeAll(cc[src_pos .. scan + 1]) catch {};
-                                        w.writeAll("\n  this.__idx = __col_idx++;\n") catch {};
-                                        // Write param values to SOA columns (same data as this.X = param)
-                                        for (site.field_names[0..site.field_count], 0..) |fname, fi| {
-                                            w.print("  __col_{s}[this.__idx] = {s};\n", .{ fname, param_names[fi] }) catch {};
-                                        }
-                                        src_pos = scan + 1; // continue — let original body run too
+                                        // Skip constructors for now — adding __idx changes V8 hidden class
+                                        // and may break performance or semantics
+                                        // TODO: find a way to add __idx without affecting hidden class
                                         continue :char_loop;
                                     }
 
@@ -3344,16 +3337,12 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 // No match — copy one character
                                 w.writeAll(cc[src_pos .. src_pos + 1]) catch {};
                                 src_pos += 1;
-                                // Periodic flush every ~50KB to avoid buffer overflow
-                                flush_counter += 1;
-                                if (flush_counter >= 50000) {
-                                    w.flush() catch {};
-                                    flush_counter = 0;
-                                }
                             }
                         }
-                        w.flush() catch {};
-                        std.debug.print("[soa] Patch: {d} field reads rewritten (from {d} patches)\n", .{ rs_rewrite_count, patches.items.len });
+                        std.debug.print("[soa] Patch: {d} field reads rewritten (from {d} patches), src_pos={d}/{d}\n", .{ rs_rewrite_count, patches.items.len, src_pos, cc.len });
+                        w.flush() catch |err| {
+                            std.debug.print("[build] FLUSH ERROR: {}\n", .{err});
+                        };
                     } else {
                         w.writeAll("// ERROR: Original source not available\n") catch {};
                     }
