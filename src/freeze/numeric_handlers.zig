@@ -463,7 +463,7 @@ pub fn detectArrayArgs(instructions: anytype, arg_count: u32) u8 {
         switch (handler.pattern) {
             .get_arg => {
                 const idx: u8 = handler.index orelse switch (instr.operand) {
-                    .arg => |a| @intCast(a),
+                    .arg => |a| std.math.cast(u8, a) orelse 255,
                     .u8 => |a| a,
                     else => 255,
                 };
@@ -618,7 +618,7 @@ pub fn detectMutatedArgs(instructions: anytype, arg_count: u32) u8 {
         switch (handler.pattern) {
             .get_arg => {
                 const idx: u8 = handler.index orelse switch (instr.operand) {
-                    .arg => |a| @intCast(a),
+                    .arg => |a| std.math.cast(u8, a) orelse 255,
                     .u8 => |a| a,
                     else => 255,
                 };
@@ -730,7 +730,7 @@ pub fn detectReadArrayArgs(instructions: anytype, arg_count: u32) u8 {
         switch (handler.pattern) {
             .get_arg => {
                 const idx: u8 = handler.index orelse switch (instr.operand) {
-                    .arg => |a| @intCast(a),
+                    .arg => |a| std.math.cast(u8, a) orelse 255,
                     .u8 => |a| a,
                     else => 255,
                 };
@@ -850,7 +850,7 @@ pub fn detectLengthArgs(instructions: anytype, arg_count: u32) u8 {
         switch (handler.pattern) {
             .get_arg => {
                 const idx: u8 = handler.index orelse switch (instr.operand) {
-                    .arg => |a| @intCast(a),
+                    .arg => |a| std.math.cast(u8, a) orelse 255,
                     .u8 => |a| a,
                     else => 255,
                 };
@@ -1009,7 +1009,7 @@ pub fn detectStructArgs(instructions: anytype, arg_count: u32) ?StructArgInfo {
         switch (handler.pattern) {
             .get_arg => {
                 const idx: u8 = handler.index orelse switch (instr.operand) {
-                    .arg => |a| @intCast(a),
+                    .arg => |a| std.math.cast(u8, a) orelse 255,
                     .u8 => |a| a,
                     else => 255,
                 };
@@ -1020,7 +1020,7 @@ pub fn detectStructArgs(instructions: anytype, arg_count: u32) ?StructArgInfo {
             },
             .get_loc, .get_loc_check => {
                 const loc_idx: u8 = handler.index orelse switch (instr.operand) {
-                    .loc => |a| @intCast(a),
+                    .loc => |a| std.math.cast(u8, a) orelse 255,
                     .u8 => |a| a,
                     else => 255,
                 };
@@ -1035,7 +1035,7 @@ pub fn detectStructArgs(instructions: anytype, arg_count: u32) ?StructArgInfo {
                     const val = stack[sp - 1];
                     sp -= 1;
                     const loc_idx: u8 = handler.index orelse switch (instr.operand) {
-                        .loc => |a| @intCast(a),
+                        .loc => |a| std.math.cast(u8, a) orelse 255,
                         .u8 => |a| a,
                         else => 255,
                     };
@@ -1047,7 +1047,7 @@ pub fn detectStructArgs(instructions: anytype, arg_count: u32) ?StructArgInfo {
                 // set_loc keeps value on stack but also stores to local
                 if (sp >= 1) {
                     const loc_idx: u8 = handler.index orelse switch (instr.operand) {
-                        .loc => |a| @intCast(a),
+                        .loc => |a| std.math.cast(u8, a) orelse 255,
                         .u8 => |a| a,
                         else => 255,
                     };

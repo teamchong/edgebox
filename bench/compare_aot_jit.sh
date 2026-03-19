@@ -18,7 +18,7 @@ fi
 
 basename=$(basename "${FILE%.js}")
 outdir="zig-out/bin/$FILE"
-worker="$outdir/${basename}-worker.mjs"
+worker="$outdir/${basename}-worker.js"
 wasm="$outdir/${basename}-standalone.wasm"
 
 # Step 1: Compile

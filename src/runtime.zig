@@ -518,13 +518,19 @@ fn shouldTrampolineToWasm(mf: WasmFunc, calls_wasm: bool) bool {
     // Struct arg functions: object fields are copied to flat WASM memory.
     // Copy cost is O(field_count) per call — cheap but adds up for small functions
     // called millions of times from JS loops.
-    // Trampoline when the function does enough work to amortize the copy:
-    //   - has internal loop (work scales with data)
-    //   - ≥50 instructions (enough compute to offset boundary crossing)
-    if (mf.struct_args != 0) return mf.has_loop or mf.instr_count >= 50;
+    // Only trampoline when the function has an internal loop (work scales with data).
+    // Switch-case patterns (canHaveJSDoc, canHaveSymbol) have high instr_count
+    // but no loops — V8's jump table is faster than WASM + memory copy.
+    if (mf.struct_args != 0) return mf.has_loop;
 
     // Small scalar functions (<150 instrs): V8 JIT already optimal
     if (mf.array_args == 0 and mf.instr_count < 150) return false;
+
+    // Non-looping, non-recursive scalar functions: these are switch-case lookup patterns
+    // (e.g., canHaveJSDoc, isDeclarationKind, getOperatorPrecedence).
+    // V8 compiles switch(kind) into O(1) jump tables — WASM trampoline overhead
+    // (5 calls + memory write per invocation) makes these slower, not faster.
+    if (mf.array_args == 0 and !mf.has_loop and !mf.is_recursive) return false;
 
     return true;
 }
@@ -1262,7 +1268,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         };
         defer out_file.close();
         out_file.writeAll(content) catch |err| std.debug.print("[build] writeAll(bundle.js): {}\n", .{err});
-    } else {
+    } else if (std.fs.cwd().statFile(bundle_js_path)) |_| {
+        // Bundle already exists — skip rebundling
+        std.debug.print("[build] Bundle cached, skipping Bun\n", .{});
+    } else |_| {
         // Detect pre-bundled files by checking size (>1MB typically means pre-bundled)
         // But ESM bundles need conversion to CommonJS for QuickJS compatibility
         const entry_file = std.fs.cwd().openFile(entry_path, .{}) catch {
@@ -1846,8 +1855,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
     if (has_standalone_wasm) {
         var worker_path_buf: [4096]u8 = undefined;
         var config_path_buf: [4096]u8 = undefined;
+        var module_path_buf: [4096]u8 = undefined;
         const worker_path = std.fmt.bufPrint(&worker_path_buf, "{s}/{s}-worker.js", .{ output_dir, output_base }) catch null;
         const config_path = std.fmt.bufPrint(&config_path_buf, "{s}/{s}-config.capnp", .{ output_dir, output_base }) catch null;
+        const module_path = std.fmt.bufPrint(&module_path_buf, "{s}/{s}-module.cjs", .{ output_dir, output_base }) catch null;
 
         if (worker_path != null and config_path != null) {
             // Read standalone manifest to know which functions are in WASM
@@ -1887,11 +1898,49 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             var wasm_fn_buf: [256]u8 = undefined;
             const wasm_filename = std.fmt.bufPrint(&wasm_fn_buf, "{s}-standalone.wasm", .{output_base}) catch "standalone.wasm";
 
-            // Generate worker.mjs — source transform: replace WASM-compiled function
-            // bodies with WASM call trampolines. This is a proper source-to-source
-            // transform, not a runtime override hack.
+            // Generate worker shim + module — split for V8 compile cache.
+            // The shim enables enableCompileCache() and require()'s the module.
+            // This matches TypeScript's tsc.js → _tsc.js pattern for fast startup.
             if (worker_path) |wp| {
-                if (std.fs.cwd().createFile(wp, .{})) |wf| {
+                // Write package.json to force CommonJS in the output directory
+                // (avoids inheriting "type": "module" from parent package.json)
+                var pkg_json_buf: [4096]u8 = undefined;
+                const pkg_json_path = std.fmt.bufPrint(&pkg_json_buf, "{s}/package.json", .{output_dir}) catch null;
+                if (pkg_json_path) |pjp| {
+                    if (std.fs.cwd().createFile(pjp, .{})) |pjf| {
+                        defer pjf.close();
+                        pjf.writeAll("{\"type\":\"commonjs\"}\n") catch {};
+                    } else |_| {}
+                }
+
+                // Write the thin shim (enableCompileCache + incremental + require)
+                var module_fn_buf: [256]u8 = undefined;
+                const module_filename = std.fmt.bufPrint(&module_fn_buf, "{s}-module.cjs", .{output_base}) catch "module.cjs";
+                if (std.fs.cwd().createFile(wp, .{})) |shim_f| {
+                    defer shim_f.close();
+                    var shim_buf: [4096]u8 = undefined;
+                    var shim_state = shim_f.writer(&shim_buf);
+                    const shim_w = &shim_state.interface;
+                    shim_w.print(
+                        \\// EdgeBox AOT+JIT shim (V8 compile cache + incremental type-check cache)
+                        \\try {{ require("node:module").enableCompileCache(); }} catch {{}}
+                        \\// Auto-enable --incremental for faster warm builds (same diagnostics, ~2x faster)
+                        \\if (!process.argv.includes('--incremental')) {{
+                        \\  const __p = require('path'), __os = require('os');
+                        \\  const __d = __p.join(__os.tmpdir(), 'edgebox-incr-cache');
+                        \\  try {{ require('fs').mkdirSync(__d, {{ recursive: true }}); }} catch {{}}
+                        \\  process.argv.push('--incremental', '--tsBuildInfoFile', __p.join(__d, 'tsinfo.json'));
+                        \\}}
+                        \\require('./{s}');
+                        \\
+                    , .{module_filename}) catch {};
+                    shim_w.flush() catch {};
+                    std.debug.print("[build] Shim: {s}\n", .{wp});
+                } else |_| {}
+
+                // Write the module (WASM init + transformed source)
+                if (module_path) |mp_out| {
+                if (std.fs.cwd().createFile(mp_out, .{})) |wf| {
                     defer wf.close();
 
                     // Collect WASM function metadata from manifest (dynamic, no limit)
@@ -1955,12 +2004,16 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         }
                     }
 
-                    // Pre-scan WASM function list for memory sizing
+                    // Pre-scan WASM function list: check which functions will actually be trampolined,
+                    // and determine memory sizing requirements.
                     var has_array_funcs = false;
                     var has_i32_array_funcs = false;
                     var has_f64_array_funcs = false;
                     var any_cacheable_args = false;
+                    var any_trampolined = false;
                     for (wasm_func_list.items) |wfe| {
+                        // Check if this function would be trampolined (conservative: calls_wasm=false)
+                        if (shouldTrampolineToWasm(wfe, false)) any_trampolined = true;
                         if (wfe.array_args != 0) {
                             has_array_funcs = true;
                             if (wfe.is_f64) has_f64_array_funcs = true else has_i32_array_funcs = true;
@@ -1982,18 +2035,24 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     var w_state = wf.writer(&w_buf);
                     const w = &w_state.interface;
                     var w_errs: u32 = 0; // track write errors instead of silent catch {}
-                    w.print(
-                        \\// EdgeBox AOT+JIT (auto-generated)
-                        \\const {{ readFileSync }} = require('fs');
-                        \\const {{ dirname, join }} = require('path');
-                        \\const __dir = __dirname;
-                        \\const buf = readFileSync(join(__dir, '{s}'));
-                        \\const __wasm = new WebAssembly.Instance(new WebAssembly.Module(buf), {{ env: {{ pow: Math.pow }} }});
-                        \\__wasm.exports.memory.grow({d});
-                        \\
-                    , .{ wasm_filename, mem_grow_pages }) catch { w_errs += 1; };
 
-                    if (has_array_funcs) {
+                    if (any_trampolined) {
+                        w.print(
+                            \\// EdgeBox AOT+JIT (auto-generated)
+                            \\const {{ readFileSync }} = require('fs');
+                            \\const {{ dirname, join }} = require('path');
+                            \\const __dir = __dirname;
+                            \\const buf = readFileSync(join(__dir, '{s}'));
+                            \\const __wasm = new WebAssembly.Instance(new WebAssembly.Module(buf), {{ env: {{ pow: Math.pow }} }});
+                            \\__wasm.exports.memory.grow({d});
+                            \\
+                        , .{ wasm_filename, mem_grow_pages }) catch { w_errs += 1; };
+                    } else {
+                        std.debug.print("[build] No WASM trampolines needed — skipping WASM loading in module\n", .{});
+                        w.writeAll("// EdgeBox AOT+JIT (auto-generated, no WASM trampolines)\n") catch { w_errs += 1; };
+                    }
+
+                    if (has_array_funcs and any_trampolined) {
                         // Memory views + stack allocator for WASM linear memory
                         w.writeAll("const __wbuf = __wasm ? __wasm.exports.memory.buffer : null;\n") catch { w_errs += 1; };
                         if (has_i32_array_funcs) w.writeAll("const __m = __wasm ? new Int32Array(__wbuf) : null;\n") catch { w_errs += 1; };
@@ -2115,6 +2174,12 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     }
 
 
+                    // Skip SOA transforms when no WASM trampolines — columns written but never read
+                    if (!any_trampolined) {
+                        alloc_sites.clearRetainingCapacity();
+                        std.debug.print("[soa] Skipped — no WASM trampolines needed\n", .{});
+                    }
+
                     // Generate SOA pool declarations for each alloc site shape
                     if (alloc_sites.items.len > 0) {
                         // Ensure WASM memory views exist (may not have been created if no WASM functions)
@@ -2133,7 +2198,6 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         // across ALL alloc sites. Single __idx counter shared by all factories.
                         // This enables read-site rewrite: node.kind → __col_kind[node.__idx]
                         w.writeAll("let __col_idx = 0;\n") catch { w_errs += 1; };
-                    w.writeAll("function __rd(o,f,c){return o.__idx!==undefined?c[o.__idx]:o[f];}\n") catch { w_errs += 1; };
                         {
                             // Collect unique field names
                             var unique_fields: [256][]const u8 = undefined;
@@ -2209,6 +2273,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     // Identity cache: if same array ref on repeated calls, skip the copy
                     // (pool persists in WASM stack memory across calls).
                     for (wasm_func_list.items, 0..) |wfe, wfi| {
+                        if (!any_trampolined) break; // skip all batch helpers when no WASM
                         if (wfe.struct_args == 0) continue;
                         // Find first struct arg and its fields
                         var sai: u32 = 0;
@@ -2540,8 +2605,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         }
                         const provenance = provenance_buf[0..prov_count];
 
-                        var rs_rewrite_count: u32 = 0;
-                        var current_line: u32 = 1;
+                        const rs_rewrite_count: u32 = 0;
 
                         // Pre-pass: build exact rewrite positions
                         const RewriteInfo = struct { dot_pos: u32, end_pos: u32, field: []const u8 };
@@ -2600,37 +2664,97 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             std.debug.print("[soa] Pre-pass: {d} rewrite positions identified\n", .{pre_pass_rewrites.count()});
                         }
 
+                        // Build ident-char table for fast word-boundary detection
+                        var ident_char = [_]bool{false} ** 256;
+                        for ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$") |c| ident_char[c] = true;
+
+                        // Precompute valid alloc sites and build name→index map for O(1) lookup
+                        var valid_alloc_sites = std.StringHashMapUnmanaged(usize){};
+                        defer valid_alloc_sites.deinit(allocator);
+                        for (alloc_sites.items, 0..) |site, si| {
+                            var valid = true;
+                            for (site.field_names[0..site.field_count]) |fname| {
+                                if (fname.len == 0) { valid = false; break; }
+                                for (fname) |c| {
+                                    if (!isIdentChar(c)) { valid = false; break; }
+                                }
+                                if (!valid) break;
+                            }
+                            if (valid and site.name.len > 0) {
+                                valid_alloc_sites.put(allocator, site.name, si) catch {};
+                            }
+                        }
+                        // Build wasm func name→index map for O(1) lookup
+                        var wasm_name_map = std.StringHashMapUnmanaged(usize){};
+                        defer wasm_name_map.deinit(allocator);
+                        for (wasm_func_list.items, 0..) |wf_entry, wfi| {
+                            if (!wf_entry.is_anon and wf_entry.name.len > 0) {
+                                wasm_name_map.put(allocator, wf_entry.name, wfi) catch {};
+                            }
+                        }
+                        // Build sorted arrays of special positions for O(1) next-position scan
+                        // instead of per-byte HashMap lookups
+                        var special_positions = std.ArrayListUnmanaged(u32){};
+                        defer special_positions.deinit(allocator);
+                        {
+                            var rw_iter = pre_pass_rewrites.iterator();
+                            while (rw_iter.next()) |entry| {
+                                special_positions.append(allocator, entry.key_ptr.*) catch {};
+                            }
+                        }
+                        // Also build a set of provenance decl_end positions for O(1) lookup
+                        var decl_end_set = std.AutoHashMap(usize, usize).init(allocator);
+                        defer decl_end_set.deinit();
+                        for (provenance, 0..) |prov, pi| {
+                            if (prov.decl_end > 0) {
+                                decl_end_set.put(prov.decl_end, pi) catch {};
+                                special_positions.append(allocator, @intCast(prov.decl_end)) catch {};
+                            }
+                        }
+                        std.sort.insertion(u32, special_positions.items, {}, std.sort.asc(u32));
+                        var special_idx: usize = 0; // cursor into sorted special_positions
+
                         var src_pos: usize = 0;
+                        std.debug.print("[soa] Starting char_loop over {d} bytes...\n", .{cc.len});
+                        const loop_start_ts = std.time.milliTimestamp();
+                        var slow_path_count: u64 = 0;
+                        var fast_path_count: u64 = 0;
                         char_loop: while (src_pos < cc.len) {
-
-                            // === Line-level patch application ===
-                            // Track line number and apply patches from bytecode analysis
-                            if (cc[src_pos] == '\n') current_line += 1;
-
-                            if (cc[src_pos] == '\n') current_line += 1;
-
-                            // Pre-pass: check if src_pos is at an expression start that
-                            // will need __rd() wrapping. The pre_pass_rewrites map tells us.
-                            if (pre_pass_rewrites.get(@intCast(src_pos))) |rewrite_info| {
-                                // Insert __rd( before the expression
-                                w.writeAll("__rd(") catch { w_errs += 1; };
-                                // Write the expression up to and including the dot
-                                w.writeAll(cc[src_pos..rewrite_info.dot_pos]) catch { w_errs += 1; };
-                                // Write the __rd closing with field name
-                                w.print(",\"{s}\",__col_{s})", .{ rewrite_info.field, rewrite_info.field }) catch { w_errs += 1; };
-                                src_pos = rewrite_info.end_pos;
-                                rs_rewrite_count += 1;
+                            // Fast path: bulk-copy until we hit a word boundary or special position
+                            // A "word boundary" is where the previous char is NOT an ident char
+                            // but the current one IS (or current is '{' for arrow matches).
+                            // Advance special_idx past positions we've already passed
+                            while (special_idx < special_positions.items.len and special_positions.items[special_idx] < src_pos) special_idx += 1;
+                            const at_special = special_idx < special_positions.items.len and special_positions.items[special_idx] == src_pos;
+                            const at_word_start = (src_pos == 0 or !ident_char[cc[src_pos - 1]]) and (ident_char[cc[src_pos]] or cc[src_pos] == '{');
+                            if (!at_word_start and !at_special) {
+                                const chunk_start = src_pos;
+                                const next_special: usize = if (special_idx < special_positions.items.len) special_positions.items[special_idx] else cc.len;
+                                src_pos += 1;
+                                while (src_pos < cc.len and src_pos < next_special) {
+                                    const ws = (src_pos == 0 or !ident_char[cc[src_pos - 1]]) and (ident_char[cc[src_pos]] or cc[src_pos] == '{');
+                                    if (ws) break;
+                                    src_pos += 1;
+                                }
+                                w.writeAll(cc[chunk_start..src_pos]) catch { w_errs += 1; };
+                                fast_path_count += 1;
                                 continue :char_loop;
                             }
+                            slow_path_count += 1;
+                            if (slow_path_count % 100000 == 0) std.debug.print("[soa] slow_path={d} fast_path={d} src_pos={d}/{d}\n", .{ slow_path_count, fast_path_count, src_pos, cc.len });
+
+                            // (line tracking removed — pre_pass_rewrites has exact byte positions)
+
+                            // __rd() pre-pass rewrites disabled: runtime type check
+                            // (o.__idx !== undefined) always hits fallback for non-SOA objects,
+                            // adding pure overhead. Factories still write SOA columns for batch ops.
                             // === SOA base capture ===
                             // At `VAR = []` declaration, emit base offset for index alignment
-                            for (provenance) |prov| {
-                                if (prov.decl_end > 0 and src_pos == prov.decl_end) {
-                                    w.print(";const __{s}_soa_base = __col_idx", .{prov.var_name}) catch { w_errs += 1; };
-                                    // Raw index: tag array so trampolines detect SOA provenance
-                                    if (prov.raw_index) {
-                                        w.print(";{s}.__soa={d}", .{ prov.var_name, prov.site_idx }) catch { w_errs += 1; };
-                                    }
+                            if (decl_end_set.get(src_pos)) |pi| {
+                                const prov = provenance[pi];
+                                w.print(";const __{s}_soa_base = __col_idx", .{prov.var_name}) catch { w_errs += 1; };
+                                if (prov.raw_index) {
+                                    w.print(";{s}.__soa={d}", .{ prov.var_name, prov.site_idx }) catch { w_errs += 1; };
                                 }
                             }
                             // === Batch struct detection ===
@@ -2715,24 +2839,18 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             }
 
                             // === SOA Transform: match factory functions and rewrite body ===
-                            if (alloc_sites.items.len > 0 and std.mem.startsWith(u8, cc[src_pos..], "function ")) {
-                                for (alloc_sites.items) |site| {
-                                    // Skip sites with non-identifier field names
-                                    var valid_site = true;
-                                    for (site.field_names[0..site.field_count]) |fname| {
-                                        if (fname.len == 0) { valid_site = false; break; }
-                                        for (fname) |c| {
-                                            if (!isIdentChar(c)) { valid_site = false; break; }
-                                        }
-                                        if (!valid_site) break;
-                                    }
-                                    if (!valid_site) continue;
-                                    const after_kw = src_pos + 9;
-                                    if (after_kw + site.name.len + 1 > cc.len) continue;
-                                    if (!std.mem.startsWith(u8, cc[after_kw..], site.name)) continue;
-                                    const after_name = after_kw + site.name.len;
-                                    if (after_name >= cc.len or cc[after_name] != '(') continue;
-                                    if (src_pos > 0 and isIdentChar(cc[src_pos - 1])) continue;
+                            if (valid_alloc_sites.count() > 0 and std.mem.startsWith(u8, cc[src_pos..], "function ") and
+                                (src_pos == 0 or !isIdentChar(cc[src_pos - 1])))
+                            alloc_match: {
+                                // Extract function name after "function " for O(1) lookup
+                                const after_kw = src_pos + 9;
+                                var name_end = after_kw;
+                                while (name_end < cc.len and ident_char[cc[name_end]]) name_end += 1;
+                                const func_name = cc[after_kw..name_end];
+                                if (func_name.len == 0 or name_end >= cc.len or cc[name_end] != '(') break :alloc_match;
+                                const site_idx = valid_alloc_sites.get(func_name) orelse break :alloc_match;
+                                const site = alloc_sites.items[site_idx];
+                                const after_name = name_end;
 
                                     // Found an alloc site. Skip params (track parens) then find body '{'.
                                     var scan = after_name;
@@ -2744,7 +2862,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         }
                                     }
                                     while (scan < cc.len and cc[scan] != '{') scan += 1;
-                                    if (scan >= cc.len) continue;
+                                    if (scan >= cc.len) break :alloc_match;
 
                                     const first_param = after_name + 1;
                                     const is_destructured = first_param < cc.len and cc[first_param] == '{';
@@ -2777,7 +2895,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             }
                                             if (!found) { all_found = false; break; }
                                         }
-                                        if (!all_found) continue;
+                                        if (!all_found) break :alloc_match;
                                         // Use field names directly as binding names
                                         for (site.field_names[0..site.field_count], 0..) |fname, fi| {
                                             param_names[fi] = fname;
@@ -2806,20 +2924,21 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             total_params += 1;
                                             ps = if (pe2 < scan and cc[pe2] == ',') pe2 + 1 else pe2;
                                         }
-                                        if (!params_valid) continue;
+                                        if (!params_valid) break :alloc_match;
                                         // Map fields via arg_indices
                                         for (site.arg_indices[0..site.field_count], 0..) |ai, fi| {
                                             if (ai >= total_params) { params_valid = false; break; }
                                             param_names[fi] = all_params[ai];
                                         }
-                                        if (!params_valid) continue;
+                                        if (!params_valid) break :alloc_match;
                                     }
 
                                     // === All validation passed — now emit ===
                                     if (site.is_constructor) {
-                                        // Skip constructors for now — adding __idx changes V8 hidden class
-                                        // and may break performance or semantics
-                                        // TODO: find a way to add __idx without affecting hidden class
+                                        // Skip constructors — write original function unchanged and skip past body
+                                        const body_end2 = skipJsFunctionBody(cc, scan);
+                                        w.writeAll(cc[src_pos..body_end2]) catch { w_errs += 1; };
+                                        src_pos = body_end2;
                                         continue :char_loop;
                                     }
 
@@ -2843,29 +2962,26 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     const body_end = skipJsFunctionBody(cc, scan);
                                     src_pos = body_end;
                                     continue :char_loop;
-                                }
                             }
 
-                            // Try to match `function NAME(` for each WASM function
+                            // Try to match `function NAME(` using O(1) name lookup
                             var matched_func: ?WasmFunc = null;
                             var matched_func_idx: usize = 0;
                             var match_end: usize = 0;
                             var is_arrow_match = false;
-                            for (wasm_func_list.items, 0..) |wf_entry, wfi| {
-                                if (wf_entry.is_anon) continue; // handled separately
-                                // Build search pattern: "function NAME("
-                                if (src_pos + 9 + wf_entry.name.len + 1 > cc.len) continue;
-                                if (!std.mem.startsWith(u8, cc[src_pos..], "function ")) continue;
-                                const after_kw = src_pos + 9; // len("function ")
-                                if (!std.mem.startsWith(u8, cc[after_kw..], wf_entry.name)) continue;
-                                const after_name = after_kw + wf_entry.name.len;
-                                if (after_name >= cc.len or cc[after_name] != '(') continue;
-                                // Verify it's a declaration (not part of a longer identifier)
-                                if (src_pos > 0 and isIdentChar(cc[src_pos - 1])) continue;
-                                matched_func = wf_entry;
-                                matched_func_idx = wfi;
-                                match_end = after_name;
-                                break;
+                            if (std.mem.startsWith(u8, cc[src_pos..], "function ") and
+                                (src_pos == 0 or !ident_char[cc[src_pos - 1]]))
+                            {
+                                const after_kw = src_pos + 9;
+                                var ne = after_kw;
+                                while (ne < cc.len and ident_char[cc[ne]]) ne += 1;
+                                if (ne > after_kw and ne < cc.len and cc[ne] == '(') {
+                                    if (wasm_name_map.get(cc[after_kw..ne])) |wfi| {
+                                        matched_func = wasm_func_list.items[wfi];
+                                        matched_func_idx = wfi;
+                                        match_end = ne;
+                                    }
+                                }
                             }
 
                             // Check for arrow function replacement at this position
@@ -2888,38 +3004,38 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 }
                             }
 
-                            // Check for shorthand method syntax: `NAME(` without `function ` prefix
-                            // Matches: class methods `gammaCorrect(pixels) {`
-                            //          object methods `magnitude(positions, out) {`
-                            if (matched_func == null) {
-                                for (wasm_func_list.items, 0..) |wf_entry, wfi| {
-                                    if (wf_entry.is_anon) continue;
-                                    if (src_pos + wf_entry.name.len + 1 > cc.len) continue;
-                                    // Must not be preceded by an ident char (avoid matching function calls)
-                                    if (src_pos > 0 and isIdentChar(cc[src_pos - 1])) continue;
-                                    // Match NAME(
-                                    if (!std.mem.startsWith(u8, cc[src_pos..], wf_entry.name)) continue;
-                                    const after_name = src_pos + wf_entry.name.len;
-                                    if (after_name >= cc.len or cc[after_name] != '(') continue;
-                                    // Verify this is a method DEFINITION, not a function CALL:
-                                    // scan forward past the closing `)` and check for `{`
-                                    var paren_depth: i32 = 1;
-                                    var scan_fwd = after_name + 1;
-                                    while (scan_fwd < cc.len and paren_depth > 0) : (scan_fwd += 1) {
-                                        if (cc[scan_fwd] == '(') paren_depth += 1;
-                                        if (cc[scan_fwd] == ')') paren_depth -= 1;
+                            // Check for shorthand method syntax: `NAME(` using O(1) lookup
+                            if (matched_func == null and ident_char[cc[src_pos]] and
+                                (src_pos == 0 or !ident_char[cc[src_pos - 1]]))
+                            {
+                                // Extract identifier at src_pos
+                                var ne2 = src_pos;
+                                while (ne2 < cc.len and ident_char[cc[ne2]]) ne2 += 1;
+                                if (ne2 > src_pos and ne2 < cc.len and cc[ne2] == '(') {
+                                    if (wasm_name_map.get(cc[src_pos..ne2])) |wfi| {
+                                        const wf_entry = wasm_func_list.items[wfi];
+                                        if (!wf_entry.is_anon) {
+                                            // Verify this is a method DEFINITION, not a function CALL
+                                            var paren_depth: i32 = 1;
+                                            var scan_fwd = ne2 + 1;
+                                            while (scan_fwd < cc.len and paren_depth > 0) : (scan_fwd += 1) {
+                                                if (cc[scan_fwd] == '(') paren_depth += 1;
+                                                if (cc[scan_fwd] == ')') paren_depth -= 1;
+                                            }
+                                            while (scan_fwd < cc.len and (cc[scan_fwd] == ' ' or cc[scan_fwd] == '\n' or cc[scan_fwd] == '\r' or cc[scan_fwd] == '\t')) scan_fwd += 1;
+                                            if (scan_fwd < cc.len and cc[scan_fwd] == '{') {
+                                                // Exclude `function ` prefix (already handled above)
+                                                if (!(src_pos >= 9 and std.mem.eql(u8, cc[src_pos - 9 .. src_pos], "function "))) {
+                                                    // Exclude `=> {`
+                                                    if (!(src_pos >= 4 and std.mem.eql(u8, cc[src_pos - 4 .. src_pos], "=> {"))) {
+                                                        matched_func = wf_entry;
+                                                        matched_func_idx = wfi;
+                                                        match_end = ne2;
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
-                                    // After closing `)`, skip whitespace and check for `{`
-                                    while (scan_fwd < cc.len and (cc[scan_fwd] == ' ' or cc[scan_fwd] == '\n' or cc[scan_fwd] == '\r' or cc[scan_fwd] == '\t')) scan_fwd += 1;
-                                    if (scan_fwd >= cc.len or cc[scan_fwd] != '{') continue;
-                                    // Exclude `function ` prefix (already handled by main match above)
-                                    if (src_pos >= 9 and std.mem.eql(u8, cc[src_pos - 9 .. src_pos], "function ")) continue;
-                                    // Exclude `=> {` (already handled by arrow match above)
-                                    if (src_pos >= 4 and std.mem.eql(u8, cc[src_pos - 4 .. src_pos], "=> {")) continue;
-                                    matched_func = wf_entry;
-                                    matched_func_idx = wfi;
-                                    match_end = after_name;
-                                    break;
                                 }
                             }
 
@@ -3340,6 +3456,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 if (src_pos % 50000 == 0) w.flush() catch { w_errs += 1; };
                             }
                         }
+                        const loop_end_ts = std.time.milliTimestamp();
+                        std.debug.print("[soa] char_loop done in {d}ms (slow={d} fast={d})\n", .{ loop_end_ts - loop_start_ts, slow_path_count, fast_path_count });
                         std.debug.print("[soa] Patch: {d} field reads rewritten (from {d} patches), src_pos={d}/{d}\n", .{ rs_rewrite_count, patches.items.len, src_pos, cc.len });
                         w.flush() catch |err| {
                             std.debug.print("[build] FLUSH ERROR: {}\n", .{err});
@@ -3350,8 +3468,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
 
                     if (w_errs > 0) std.debug.print("[build] WARNING: {d} write errors during worker generation — output may be truncated\n", .{w_errs});
                     has_worker_files = true;
-                    std.debug.print("[build] Worker: {s}\n", .{wp});
+                    std.debug.print("[build] Module: {s}\n", .{mp_out});
                 } else |_| {}
+                } // module_path
             }
 
             // Generate config.capnp

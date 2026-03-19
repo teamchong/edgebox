@@ -607,10 +607,21 @@ async function main() {
     execSync("npm install typescript", { cwd: BENCHMARK_DIR, stdio: "inherit" });
   }
 
+  // Use tsc.js (the real entry point users run) — it uses enableCompileCache() + require()
+  // Our worker must match this with its own enableCompileCache() + require() shim
   const nodeTsc = join(BENCHMARK_DIR, "node_modules/typescript/lib/tsc.js");
   if (!existsSync(nodeTsc)) {
     console.error("TypeScript not found. Run: npm install typescript");
     process.exit(1);
+  }
+
+  // Clean EdgeBox incremental cache to ensure cold start on first run
+  {
+    const tmpDir = process.env.TMPDIR || process.env.TMP || "/tmp";
+    const incrCacheDir = join(tmpDir, "edgebox-incr-cache");
+    if (existsSync(incrCacheDir)) {
+      rmSync(incrCacheDir, { recursive: true, force: true });
+    }
   }
 
   // Build EdgeBox tsc
