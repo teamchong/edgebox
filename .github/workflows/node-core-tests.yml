@@ -1,12 +1,21 @@
 name: Node.js Core API Tests
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   schedule:
     - cron: '0 8 * * 0'  # Weekly on Sunday at 8 AM (offset from test262)
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src/polyfills/**'
+      - 'scripts/run-node-core-tests.sh'
+      - '.github/workflows/node-core-tests.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/polyfills/**'
+      - 'scripts/run-node-core-tests.sh'
+      - '.github/workflows/node-core-tests.yml'
 
 # Tests Node.js Core API compatibility using official nodejs/node test suite.
 # This measures EdgeBox's Node.js API compatibility (fs, buffer, crypto, etc.)

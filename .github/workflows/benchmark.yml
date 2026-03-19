@@ -1,10 +1,23 @@
 name: Benchmark
 
 on:
+  schedule:
+    - cron: '0 4 * * 0'  # Weekly on Sunday at 4 AM UTC
+  workflow_dispatch:
   push:
     branches: [main]
+    paths:
+      - 'bench/**'
+      - 'src/freeze/llvm_codegen.zig'
+      - 'src/freeze/numeric_handlers.zig'
+      - '.github/workflows/benchmark.yml'
   pull_request:
     branches: [main]
+    paths:
+      - 'bench/**'
+      - 'src/freeze/llvm_codegen.zig'
+      - 'src/freeze/numeric_handlers.zig'
+      - '.github/workflows/benchmark.yml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

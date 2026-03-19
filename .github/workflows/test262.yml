@@ -1,13 +1,21 @@
 name: ES2024 Compatibility
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   schedule:
     - cron: '0 6 * * 0'  # Weekly on Sunday
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'patches/quickjs/**'
+      - 'scripts/bundle-test262.js'
+      - '.github/workflows/test262.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'patches/quickjs/**'
+      - 'scripts/bundle-test262.js'
+      - '.github/workflows/test262.yml'
 
 # Tests ECMAScript 2024 (ES2024) compliance using the official TC39 test262 suite.
 # Uses sharded bundled compilation: ~1000 tests per shard, runs in parallel.
