@@ -24,7 +24,9 @@ pub fn registerGlobals(isolate: *v8.Isolate, context: *const v8.Context) void {
 }
 
 /// The V8 callback for __edgebox_io_sync(jsonString) → jsonString
-fn ioSyncCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
+/// The V8 callback for __edgebox_io_sync. Public so v8_runner.zig can use
+/// its address in the snapshot external_references array.
+pub fn ioSyncCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
     const isolate: *v8.Isolate = v8.CallbackInfoApi.getIsolate(info);
     var rv = v8.CallbackInfoApi.getReturnValue(info);
 

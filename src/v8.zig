@@ -514,6 +514,89 @@ pub const ScriptExtApi = struct {
 };
 
 // ============================================================
+// Snapshot API — create and load V8 heap snapshots
+// ============================================================
+
+/// StartupData — V8 snapshot blob (data pointer + size).
+/// Layout: { const char* data; int raw_size; } + padding.
+pub const StartupData = extern struct {
+    data: ?[*]const u8,
+    raw_size: i32,
+    _pad: i32 = 0,
+};
+
+/// SnapshotCreator — creates V8 heap snapshots.
+/// Size: sizeof(size_t) = 8 bytes on 64-bit (just a pointer to impl).
+pub const SnapshotCreator = struct {
+    buf: [max_size]u8 align(@alignOf(usize)) = undefined,
+
+    const max_size = @sizeOf(usize); // 8 bytes, just a pointer
+
+    /// Create a SnapshotCreator with external references.
+    /// external_refs is a null-terminated array of function pointers.
+    /// The SnapshotCreator owns its Isolate — do NOT dispose it separately.
+    pub fn init(external_refs: ?[*]const usize) SnapshotCreator {
+        var sc = SnapshotCreator{};
+        const actual_size = bridge.edgebox_v8_snapshot_creator_sizeof();
+        std.debug.assert(actual_size <= max_size);
+        bridge.edgebox_v8_snapshot_creator_new(&sc.buf, external_refs);
+        return sc;
+    }
+
+    pub fn deinit(self: *SnapshotCreator) void {
+        c.v8__SnapshotCreator__DESTRUCT(@ptrCast(&self.buf));
+    }
+
+    /// Get the Isolate owned by this SnapshotCreator.
+    pub fn getIsolate(self: *const SnapshotCreator) *Isolate {
+        return c.v8__SnapshotCreator__GetIsolate(@ptrCast(&self.buf));
+    }
+
+    /// Set the default context to be included in the snapshot.
+    /// Must be called before createBlob().
+    pub fn setDefaultContext(self: *SnapshotCreator, context: *const Context) void {
+        c.v8__SnapshotCreator__SetDefaultContext(@ptrCast(&self.buf), context);
+    }
+
+    /// Create the snapshot blob. Returns StartupData with the serialized heap.
+    /// The caller must free the data with StartupData.delete().
+    /// function_code_handling: 0 = kClear, 1 = kKeep
+    pub fn createBlob(self: *SnapshotCreator, function_code_handling: c_int) StartupData {
+        return c.v8__SnapshotCreator__CreateBlob(@ptrCast(&self.buf), function_code_handling);
+    }
+
+    /// FunctionCodeHandling enum values
+    pub const kClear: c_int = 0;
+    pub const kKeep: c_int = 1;
+};
+
+pub const SnapshotApi = struct {
+    /// Create an Isolate from a snapshot blob with external references.
+    /// The snapshot data must remain valid during this call (V8 copies it).
+    pub fn createIsolateFromSnapshot(
+        snapshot_data: [*]const u8,
+        snapshot_len: i32,
+        external_refs: ?[*]const usize,
+    ) *Isolate {
+        return bridge.edgebox_v8_create_isolate_from_snapshot(
+            snapshot_data,
+            snapshot_len,
+            external_refs,
+        );
+    }
+
+    /// Check if StartupData is valid.
+    pub fn isValid(startup: *const StartupData) bool {
+        return c.v8__StartupData__IsValid(startup);
+    }
+
+    /// Delete StartupData's data buffer (allocated by V8 with new[]).
+    pub fn deleteData(data: [*]const u8) void {
+        c.v8__StartupData__data__DELETE(data);
+    }
+};
+
+// ============================================================
 // High-level eval helper
 // ============================================================
 
@@ -680,12 +763,32 @@ const c = struct {
     extern fn v8__Script__GetUnboundScript(script: *const Script) *const UnboundScript;
     extern fn v8__UnboundScript__CreateCodeCache(us: *const UnboundScript) *CachedData;
     extern fn v8__UnboundScript__BindToCurrentContext(us: *const UnboundScript) *const Script;
+
+    // SnapshotCreator
+    extern fn v8__SnapshotCreator__DESTRUCT(self: *anyopaque) void;
+    extern fn v8__SnapshotCreator__GetIsolate(self: *const anyopaque) *Isolate;
+    extern fn v8__SnapshotCreator__SetDefaultContext(self: *anyopaque, context: *const Context) void;
+    extern fn v8__SnapshotCreator__CreateBlob(self: *anyopaque, function_code_handling: c_int) StartupData;
+
+    // StartupData
+    extern fn v8__StartupData__IsValid(self: *const StartupData) bool;
+    extern fn v8__StartupData__data__DELETE(data: [*]const u8) void;
 };
 
 // Functions from v8_bridge.cpp
 const bridge = struct {
     extern fn edgebox_v8_create_isolate() *Isolate;
+    extern fn edgebox_v8_create_isolate_from_snapshot(
+        snapshot_data: [*]const u8,
+        snapshot_len: i32,
+        external_refs: ?[*]const usize,
+    ) *Isolate;
+    extern fn edgebox_v8_snapshot_creator_new(
+        buf: *[SnapshotCreator.max_size]u8,
+        external_refs: ?[*]const usize,
+    ) void;
     extern fn edgebox_v8_script_origin_sizeof() usize;
     extern fn edgebox_v8_create_params_sizeof() usize;
     extern fn edgebox_v8_source_sizeof() usize;
+    extern fn edgebox_v8_snapshot_creator_sizeof() usize;
 };

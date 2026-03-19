@@ -2204,7 +2204,42 @@ pub fn build(b: *std.Build) void {
             const v8_test_step = b.step("v8-test", "Build V8 embedding test (Phases 1+2)");
             v8_test_step.dependOn(&b.addInstallArtifact(v8_test_exe, .{}).step);
 
-            // edgebox — primary V8 runner for executing JS files
+            // Helper function to add V8 library + bridge to an executable
+            const v8_lib_path = b.path(b.fmt("vendor/v8/{s}", .{lib_name}));
+            const v8_inc_path = b.path("vendor/v8/include");
+            const v8_root_path = b.path("vendor/v8");
+            const v8_bridge_file = b.path("src/v8_bridge.cpp");
+            const v8_stubs_file = b.path("src/v8_stubs.c");
+
+            // Step 1: Build snapshot generator (links V8, runs at build time)
+            const snapshot_gen_exe = b.addExecutable(.{
+                .name = "v8-snapshot-gen",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/v8_snapshot_gen.zig"),
+                    .target = b.graph.host, // Always build for HOST (runs at build time)
+                    .optimize = .ReleaseFast,
+                }),
+            });
+            snapshot_gen_exe.addObjectFile(v8_lib_path);
+            snapshot_gen_exe.root_module.addCSourceFile(.{
+                .file = v8_bridge_file,
+                .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti" },
+            });
+            snapshot_gen_exe.root_module.addIncludePath(v8_inc_path);
+            snapshot_gen_exe.root_module.addIncludePath(v8_root_path);
+            snapshot_gen_exe.root_module.addCSourceFile(.{
+                .file = v8_stubs_file,
+                .flags = &.{},
+            });
+            snapshot_gen_exe.linkLibC();
+            snapshot_gen_exe.linkLibCpp();
+            snapshot_gen_exe.linkSystemLibrary("pthread");
+
+            // Step 2: Run snapshot-gen → writes snapshot to src/ for @embedFile
+            const run_snapshot_gen = b.addRunArtifact(snapshot_gen_exe);
+            run_snapshot_gen.addArg("src/v8_bootstrap.snapshot");
+
+            // Step 3: Build edgebox with embedded snapshot
             // Usage: ./zig-out/bin/edgebox <script.js> [args...]
             const v8_run_exe = b.addExecutable(.{
                 .name = "edgebox",
@@ -2214,15 +2249,17 @@ pub fn build(b: *std.Build) void {
                     .optimize = optimize,
                 }),
             });
-            v8_run_exe.addObjectFile(b.path(b.fmt("vendor/v8/{s}", .{lib_name})));
+            // Snapshot-gen must run before compiling edgebox
+            v8_run_exe.step.dependOn(&run_snapshot_gen.step);
+            v8_run_exe.addObjectFile(v8_lib_path);
             v8_run_exe.root_module.addCSourceFile(.{
-                .file = b.path("src/v8_bridge.cpp"),
+                .file = v8_bridge_file,
                 .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti" },
             });
-            v8_run_exe.root_module.addIncludePath(b.path("vendor/v8/include"));
-            v8_run_exe.root_module.addIncludePath(b.path("vendor/v8"));
+            v8_run_exe.root_module.addIncludePath(v8_inc_path);
+            v8_run_exe.root_module.addIncludePath(v8_root_path);
             v8_run_exe.root_module.addCSourceFile(.{
-                .file = b.path("src/v8_stubs.c"),
+                .file = v8_stubs_file,
                 .flags = &.{},
             });
             v8_run_exe.linkLibC();
@@ -2231,6 +2268,9 @@ pub fn build(b: *std.Build) void {
 
             const v8_run_step = b.step("v8-run", "Build edgebox V8 runner");
             v8_run_step.dependOn(&b.addInstallArtifact(v8_run_exe, .{}).step);
+
+            const snapshot_gen_step = b.step("v8-snapshot-gen", "Build V8 snapshot generator");
+            snapshot_gen_step.dependOn(&b.addInstallArtifact(snapshot_gen_exe, .{}).step);
 
             // cli step depends on V8 runner as the primary binary
             cli_step.dependOn(&b.addInstallArtifact(v8_run_exe, .{}).step);

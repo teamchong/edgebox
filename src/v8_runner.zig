@@ -91,6 +91,22 @@ pub fn main() !void {
     return runScript(alloc, script_code, disk_cache, abs_path, script_path, false);
 }
 
+/// Embedded V8 snapshot of the bootstrap context — generated at build time
+/// by v8_snapshot_gen. Contains console, require, fs, Buffer, process, etc.
+/// Using this skips ~200ms of bootstrap eval on every startup.
+const embedded_snapshot = @embedFile("v8_bootstrap.snapshot");
+
+/// External references for V8 snapshot deserialization — must match the array
+/// used during snapshot creation (in v8_snapshot_gen.zig).
+var external_refs: [2]usize = .{ 0, 0 };
+
+fn getExternalRefs() *const [2]usize {
+    if (external_refs[0] == 0) {
+        external_refs[0] = @intFromPtr(&v8_io.ioSyncCallback);
+    }
+    return &external_refs;
+}
+
 /// Core script execution: initialize V8, load bootstrap, compile + run script.
 fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]const u8, abs_path: []const u8, display_name: []const u8, is_embedded: bool) !void {
     _ = display_name;
@@ -99,7 +115,11 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
     _ = try v8.initPlatform();
     defer v8.disposePlatform();
 
-    const isolate = v8.IsolateApi.create();
+    // Create isolate from embedded snapshot — bootstrap context is pre-compiled
+    const isolate = if (embedded_snapshot.len > 0)
+        v8.SnapshotApi.createIsolateFromSnapshot(embedded_snapshot.ptr, @intCast(embedded_snapshot.len), getExternalRefs())
+    else
+        v8.IsolateApi.create();
     defer v8.IsolateApi.dispose(isolate);
     v8.IsolateApi.enter(isolate);
     defer v8.IsolateApi.exit(isolate);
@@ -110,15 +130,19 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
     v8.ContextApi.enter(context);
     defer v8.ContextApi.exit(context);
 
-    // Register IO bridge
-    v8_io.registerGlobals(isolate, context);
-
-    // Load bootstrap
-    const bootstrap_code = @embedFile("v8_bootstrap.js");
-    _ = v8.eval(isolate, context, bootstrap_code, "v8_bootstrap.js") catch |err| {
-        std.debug.print("[v8] ERROR: bootstrap failed: {}\n", .{err});
-        return err;
-    };
+    if (embedded_snapshot.len > 0) {
+        // Snapshot loaded — IO bridge callback restored via external_refs.
+        // Refresh runtime-specific data (argv, env come from snapshot-gen time).
+        _ = v8.eval(isolate, context, snapshot_init_js, "snapshot_init.js") catch {};
+    } else {
+        // Fallback: register IO bridge and eval bootstrap from source
+        v8_io.registerGlobals(isolate, context);
+        const bootstrap_code = @embedFile("v8_bootstrap.js");
+        _ = v8.eval(isolate, context, bootstrap_code, "v8_bootstrap.js") catch |err| {
+            std.debug.print("[v8] ERROR: bootstrap failed: {}\n", .{err});
+            return err;
+        };
+    }
 
     // For packed binaries: ensure process.argv has [exe, script, ...args] format
     // TSC uses process.argv.slice(2), so we need argv[1] to be the script path.
@@ -496,3 +520,17 @@ fn getCachePath(allocator: std.mem.Allocator, content: []const u8) ![]const u8 {
 
     return try std.fmt.allocPrint(allocator, "{s}/.cache/edgebox/v8-cache/{x}.codecache", .{ home, hash });
 }
+
+/// JS to run after loading a snapshot — refreshes runtime-specific data.
+const snapshot_init_js =
+    \\(function() {
+    \\  try {
+    \\    var r = JSON.parse(__edgebox_io_sync(JSON.stringify({op:'argv'})));
+    \\    if (r.ok) process.argv = r.data;
+    \\  } catch(e) {}
+    \\  try {
+    \\    var r = JSON.parse(__edgebox_io_sync(JSON.stringify({op:'env'})));
+    \\    if (r.ok) process.env = r.data;
+    \\  } catch(e) {}
+    \\})();
+;
