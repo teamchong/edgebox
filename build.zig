@@ -1998,10 +1998,32 @@ pub fn build(b: *std.Build) void {
     cli_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
 
+    // ===================
+    // edgebox-workerd — workerd runner with Zig IO server
+    // ===================
+    const workerd_runner_exe = b.addExecutable(.{
+        .name = "edgebox-workerd",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/edgebox_workerd.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    workerd_runner_exe.linkLibC();
+
+    b.installArtifact(workerd_runner_exe);
+
+    const workerd_runner_step = b.step("workerd-runner", "Build edgebox-workerd (workerd + Zig IO server)");
+    workerd_runner_step.dependOn(&b.addInstallArtifact(workerd_runner_exe, .{}).step);
+
+    // cli also builds the workerd runner
+    cli_step.dependOn(&b.addInstallArtifact(workerd_runner_exe, .{}).step);
+
     // cli-full: also builds WAMR runner, sandbox, etc. (for --with-binary)
     const cli_full_step = b.step("cli-full", "Build all CLI tools including WAMR runner and sandbox");
     cli_full_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
     cli_full_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
+    cli_full_step.dependOn(&b.addInstallArtifact(workerd_runner_exe, .{}).step);
     cli_full_step.dependOn(&b.addInstallArtifact(sandbox_exe, .{}).step);
     cli_full_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
     if (enable_gpu) {
