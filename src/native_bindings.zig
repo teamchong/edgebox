@@ -288,7 +288,7 @@ fn fsAppend(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callco
 
     // Create parent directories if they don't exist
     if (std.fs.path.dirname(resolved)) |parent| {
-        std.fs.cwd().makePath(parent) catch {};
+        std.fs.cwd().makePath(parent) catch |err| std.debug.print("[fs] makePath: {}\n", .{err});
     }
 
     // Open file for appending (create if doesn't exist)
@@ -382,7 +382,7 @@ fn fsOpen(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv
     // Create parent directories for write operations
     if (is_write or is_create) {
         if (std.fs.path.dirname(resolved)) |parent| {
-            std.fs.cwd().makePath(parent) catch {};
+            std.fs.cwd().makePath(parent) catch |err| std.debug.print("[fs] makePath: {}\n", .{err});
         }
     }
 
@@ -433,7 +433,7 @@ fn fsOpen(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv
         const stat = file.stat() catch {
             return qjs.JS_NewInt32(ctx, @intCast(fd_slot));
         };
-        file.seekTo(stat.size) catch {};
+        file.seekTo(stat.size) catch |err| std.debug.print("[fs] seekTo (append): {}\n", .{err});
     }
 
     return qjs.JS_NewInt32(ctx, @intCast(fd_slot));
@@ -809,7 +809,7 @@ fn fsRename(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callco
 
     // Create parent directories for destination if they don't exist
     if (std.fs.path.dirname(resolved_new)) |parent| {
-        std.fs.cwd().makePath(parent) catch {};
+        std.fs.cwd().makePath(parent) catch |err| std.debug.print("[fs] makePath: {}\n", .{err});
     }
 
     // Rename
@@ -846,7 +846,7 @@ fn fsCopy(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv
 
     // Create parent directories for destination if they don't exist
     if (std.fs.path.dirname(resolved_dest)) |parent| {
-        std.fs.cwd().makePath(parent) catch {};
+        std.fs.cwd().makePath(parent) catch |err| std.debug.print("[fs] makePath: {}\n", .{err});
     }
 
     // Copy file
@@ -958,7 +958,7 @@ fn fsSymlink(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callc
 
     // Create parent directories if they don't exist
     if (std.fs.path.dirname(resolved_link)) |parent| {
-        std.fs.cwd().makePath(parent) catch {};
+        std.fs.cwd().makePath(parent) catch |err| std.debug.print("[fs] makePath: {}\n", .{err});
     }
 
     // Create symlink
@@ -995,7 +995,7 @@ fn fsLink(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv
 
     // Create parent directories if they don't exist
     if (std.fs.path.dirname(resolved_new)) |parent| {
-        std.fs.cwd().makePath(parent) catch {};
+        std.fs.cwd().makePath(parent) catch |err| std.debug.print("[fs] makePath: {}\n", .{err});
     }
 
     // Create hard link using POSIX link syscall

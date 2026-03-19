@@ -357,7 +357,7 @@ fn loadConfig() Config {
             .read = dir.read,
             .write = dir.write,
             .execute = dir.execute,
-        }) catch {};
+        }) catch |err| std.debug.print("[config] dir append: {}\n", .{err});
     }
 
     // Mounts
@@ -365,7 +365,7 @@ fn loadConfig() Config {
         config.mounts.append(allocator, Mount{
             .host = allocator.dupe(u8, mount.host) catch continue,
             .guest = allocator.dupe(u8, mount.guest) catch continue,
-        }) catch {};
+        }) catch |err| std.debug.print("[config] mount append: {}\n", .{err});
     }
 
     // Environment variables (from .env file)
@@ -480,14 +480,14 @@ fn loadConfig() Config {
         // Build JSON array for __EDGEBOX_MOUNTS
         var mounts_json = std.ArrayListUnmanaged(u8){};
         defer mounts_json.deinit(allocator);
-        mounts_json.appendSlice(allocator, "[") catch {};
+        mounts_json.appendSlice(allocator, "[") catch |err| std.debug.print("[config] JSON: {}\n", .{err});
         for (config.mounts.items, 0..) |mount, i| {
-            if (i > 0) mounts_json.appendSlice(allocator, ",") catch {};
+            if (i > 0) mounts_json.appendSlice(allocator, ",") catch |err| std.debug.print("[config] JSON: {}\n", .{err});
             const entry = std.fmt.allocPrint(allocator, "{{\"host\":\"{s}\",\"guest\":\"{s}\"}}", .{ mount.host, mount.guest }) catch continue;
             defer allocator.free(entry);
-            mounts_json.appendSlice(allocator, entry) catch {};
+            mounts_json.appendSlice(allocator, entry) catch |err| std.debug.print("[config] JSON: {}\n", .{err});
         }
-        mounts_json.appendSlice(allocator, "]") catch {};
+        mounts_json.appendSlice(allocator, "]") catch |err| std.debug.print("[config] JSON: {}\n", .{err});
 
         const mounts_env = std.fmt.allocPrint(allocator, "__EDGEBOX_MOUNTS={s}", .{mounts_json.items}) catch null;
         if (mounts_env) |env_str| {
@@ -700,7 +700,7 @@ pub fn main() !void {
         } else if (wasm_path == null and !std.mem.startsWith(u8, arg, "-")) {
             wasm_path = arg;
         } else {
-            remaining_args.append(allocator, arg) catch {};
+            remaining_args.append(allocator, arg) catch |err| std.debug.print("[cli] arg append: {}\n", .{err});
         }
     }
 
@@ -1881,9 +1881,9 @@ fn fileWriteStart(exec_env: c.wasm_exec_env_t, path_ptr: u32, path_len: u32, dat
         if (last_slash > 0) {
             const parent = path[0..last_slash];
             if (path[0] == '/') {
-                std.fs.makeDirAbsolute(parent) catch {};
+                std.fs.makeDirAbsolute(parent) catch |err| std.debug.print("[runtime] makeDirAbsolute: {}\n", .{err});
             } else {
-                std.fs.cwd().makePath(parent) catch {};
+                std.fs.cwd().makePath(parent) catch |err| std.debug.print("[runtime] makePath: {}\n", .{err});
             }
         }
     }
@@ -2213,7 +2213,7 @@ fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr:
             if (env_map) |*em| {
                 var cred_iter = creds.iterator();
                 while (cred_iter.next()) |entry| {
-                    em.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+                    em.put(entry.key_ptr.*, entry.value_ptr.*) catch |err| std.debug.print("[runtime] env put: {}\n", .{err});
                 }
                 child.env_map = em;
                 std.debug.print("[SPAWN] Injecting {d} credentials for '{s}'\n", .{ creds.count(), binary_name });
@@ -2313,16 +2313,16 @@ fn spawnOutputLen(request_id: u32) i32 {
                 if (req.stdout_data) |data| {
                     for (data) |ch| {
                         switch (ch) {
-                            '"' => writer.writeAll("\\\"") catch {},
-                            '\\' => writer.writeAll("\\\\") catch {},
-                            '\n' => writer.writeAll("\\n") catch {},
-                            '\r' => writer.writeAll("\\r") catch {},
-                            '\t' => writer.writeAll("\\t") catch {},
+                            '"' => writer.writeAll("\\\"") catch |err| std.debug.print("[JSON] escape: {}\n", .{err}),
+                            '\\' => writer.writeAll("\\\\") catch |err| std.debug.print("[JSON] escape: {}\n", .{err}),
+                            '\n' => writer.writeAll("\\n") catch |err| std.debug.print("[JSON] escape: {}\n", .{err}),
+                            '\r' => writer.writeAll("\\r") catch |err| std.debug.print("[JSON] escape: {}\n", .{err}),
+                            '\t' => writer.writeAll("\\t") catch |err| std.debug.print("[JSON] escape: {}\n", .{err}),
                             else => {
                                 if (ch < 0x20) {
-                                    writer.print("\\u{x:0>4}", .{ch}) catch {};
+                                    writer.print("\\u{x:0>4}", .{ch}) catch |err| std.debug.print("[JSON] escape: {}\n", .{err});
                                 } else {
-                                    writer.writeByte(ch) catch {};
+                                    writer.writeByte(ch) catch |err| std.debug.print("[JSON] escape: {}\n", .{err});
                                 }
                             },
                         }
@@ -2335,16 +2335,16 @@ fn spawnOutputLen(request_id: u32) i32 {
                 if (req.stderr_data) |data| {
                     for (data) |ch| {
                         switch (ch) {
-                            '"' => writer.writeAll("\\\"") catch {},
-                            '\\' => writer.writeAll("\\\\") catch {},
-                            '\n' => writer.writeAll("\\n") catch {},
-                            '\r' => writer.writeAll("\\r") catch {},
-                            '\t' => writer.writeAll("\\t") catch {},
+                            '"' => writer.writeAll("\\\"") catch |err| std.debug.print("[JSON] escape: {}\n", .{err}),
+                            '\\' => writer.writeAll("\\\\") catch |err| std.debug.print("[JSON] escape: {}\n", .{err}),
+                            '\n' => writer.writeAll("\\n") catch |err| std.debug.print("[JSON] escape: {}\n", .{err}),
+                            '\r' => writer.writeAll("\\r") catch |err| std.debug.print("[JSON] escape: {}\n", .{err}),
+                            '\t' => writer.writeAll("\\t") catch |err| std.debug.print("[JSON] escape: {}\n", .{err}),
                             else => {
                                 if (ch < 0x20) {
-                                    writer.print("\\u{x:0>4}", .{ch}) catch {};
+                                    writer.print("\\u{x:0>4}", .{ch}) catch |err| std.debug.print("[JSON] escape: {}\n", .{err});
                                 } else {
-                                    writer.writeByte(ch) catch {};
+                                    writer.writeByte(ch) catch |err| std.debug.print("[JSON] escape: {}\n", .{err});
                                 }
                             },
                         }
@@ -2622,7 +2622,7 @@ fn httpRequest(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_p
                 const key = line[0..colon_pos];
                 const value = line[colon_pos + 2 ..];
                 if (show_debug) std.debug.print("[HTTP] Header: {s} = {s}\n", .{ key, value });
-                extra_headers.append(allocator, .{ .name = key, .value = value }) catch {};
+                extra_headers.append(allocator, .{ .name = key, .value = value }) catch |err| std.debug.print("[HTTP] header append: {}\n", .{err});
             }
         }
         if (show_debug) std.debug.print("[HTTP] Total headers parsed: {d}\n", .{extra_headers.items.len});
@@ -2800,25 +2800,25 @@ fn httpPoll(request_id: u32) i32 {
                             return -6;
                         };
 
-                        writer.writeByte('"') catch {};
+                        writer.writeByte('"') catch |err| std.debug.print("[JSON] escape: {}\n", .{err});
                         for (response_body) |ch| {
                             switch (ch) {
-                                '"' => writer.writeAll("\\\"") catch {},
-                                '\\' => writer.writeAll("\\\\") catch {},
-                                '\n' => writer.writeAll("\\n") catch {},
-                                '\r' => writer.writeAll("\\r") catch {},
-                                '\t' => writer.writeAll("\\t") catch {},
+                                '"' => writer.writeAll("\\\"") catch |err| std.debug.print("[JSON] escape: {}\n", .{err}),
+                                '\\' => writer.writeAll("\\\\") catch |err| std.debug.print("[JSON] escape: {}\n", .{err}),
+                                '\n' => writer.writeAll("\\n") catch |err| std.debug.print("[JSON] escape: {}\n", .{err}),
+                                '\r' => writer.writeAll("\\r") catch |err| std.debug.print("[JSON] escape: {}\n", .{err}),
+                                '\t' => writer.writeAll("\\t") catch |err| std.debug.print("[JSON] escape: {}\n", .{err}),
                                 else => {
                                     if (ch < 0x20) {
-                                        writer.print("\\u{x:0>4}", .{ch}) catch {};
+                                        writer.print("\\u{x:0>4}", .{ch}) catch |err| std.debug.print("[JSON] escape: {}\n", .{err});
                                     } else {
-                                        writer.writeByte(ch) catch {};
+                                        writer.writeByte(ch) catch |err| std.debug.print("[JSON] escape: {}\n", .{err});
                                     }
                                 },
                             }
                         }
-                        writer.writeByte('"') catch {};
-                        writer.writeAll(",\"headers\":{}}") catch {};
+                        writer.writeByte('"') catch |err| std.debug.print("[JSON] escape: {}\n", .{err});
+                        writer.writeAll(",\"headers\":{}}") catch |err| std.debug.print("[JSON] escape: {}\n", .{err});
 
                         req.response = json_buf.toOwnedSlice(allocator) catch null;
                         req.http_status = status_code;

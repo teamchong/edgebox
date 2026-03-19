@@ -1196,8 +1196,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         "";
 
     // Create directories
-    std.fs.cwd().makePath(cache_dir) catch {};
-    std.fs.cwd().makePath(output_dir) catch {};
+    std.fs.cwd().makePath(cache_dir) catch |err| std.debug.print("[build] makePath({s}): {}\n", .{ cache_dir, err });
+    std.fs.cwd().makePath(output_dir) catch |err| std.debug.print("[build] makePath({s}): {}\n", .{ output_dir, err });
 
     // Pre-calculate cache file paths (intermediate files)
     var bundle_js_path_buf: [4096]u8 = undefined;
@@ -1245,7 +1245,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
     if (options.no_bundle) {
         // Skip bundler - just copy the source file directly
         std.debug.print("[build] Skipping bundler (--no-bundle)\n", .{});
-        std.fs.cwd().makePath(cache_dir) catch {};
+        std.fs.cwd().makePath(cache_dir) catch |err| std.debug.print("[build] makePath: {}\n", .{err});
         const src_file = std.fs.cwd().openFile(entry_path, .{}) catch {
             std.debug.print("[error] Cannot open entry point: {s}\n", .{entry_path});
             std.process.exit(1);
@@ -1261,7 +1261,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             std.process.exit(1);
         };
         defer out_file.close();
-        out_file.writeAll(content) catch {};
+        out_file.writeAll(content) catch |err| std.debug.print("[build] writeAll(bundle.js): {}\n", .{err});
     } else {
         // Detect pre-bundled files by checking size (>1MB typically means pre-bundled)
         // But ESM bundles need conversion to CommonJS for QuickJS compatibility
@@ -1275,7 +1275,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         std.debug.print("[build] Bundling with Bun...\n", .{});
         // NOTE: We don't use --minify because it strips function names
         // which prevents frozen function matching by name
-        std.fs.cwd().makePath(output_dir) catch {};
+        std.fs.cwd().makePath(output_dir) catch |err| std.debug.print("[build] makePath: {}\n", .{err});
         const bun_result = try runCommand(allocator, &.{
             "bun",           "build",        entry_path,        bun_outfile_arg,
             "--target=node", "--format=cjs", "--external=fs",   "--external=path",
@@ -1302,7 +1302,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
     var clean_bundle_path_buf: [4096]u8 = undefined;
     const clean_bundle_path = std.fmt.bufPrint(&clean_bundle_path_buf, "{s}/bundle_clean.js", .{cache_dir}) catch null;
     if (clean_bundle_path) |cbp| {
-        std.fs.cwd().copyFile(bundle_js_path, std.fs.cwd(), cbp, .{}) catch {};
+        std.fs.cwd().copyFile(bundle_js_path, std.fs.cwd(), cbp, .{}) catch |err| std.debug.print("[build] copyFile: {}\n", .{err});
     }
 
     // Step 4: Prepend polyfills (skip if --no-polyfill flag)
@@ -1652,7 +1652,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             defer allocator.free(closure_json);
             const manifest_file = std.fs.cwd().createFile(closure_manifest_path, .{}) catch null;
             if (manifest_file) |mf| {
-                mf.writeAll(closure_json) catch {};
+                mf.writeAll(closure_json) catch |err| std.debug.print("[build] manifest write: {}\n", .{err});
                 mf.close();
                 std.debug.print("[build] Closure manifest: {s}\n", .{closure_manifest_path});
             }
@@ -1709,13 +1709,13 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                 \\const zig_runtime = @import("zig_runtime");
                 \\pub fn frozen_init_c(_: *zig_runtime.JSContext) c_int { return 0; }
                 \\
-            ) catch {};
+            ) catch |err| std.debug.print("[build] frozen_module write: {}\n", .{err});
             f.close();
         }
     }
 
     // Ensure output directory exists
-    std.fs.cwd().makePath(output_dir) catch {};
+    std.fs.cwd().makePath(output_dir) catch |err| std.debug.print("[build] makePath: {}\n", .{err});
 
     // Step 6d: Generate raw bytecode + build args (only needed for native/WASM-static binary)
     // Worker-only path skips this — it uses standalone.wasm + source transform, not @embedFile bytecode
@@ -1834,7 +1834,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         if (sw) |swp| {
             if (std.fs.cwd().createFile(swp, .{})) |f| {
                 defer f.close();
-                f.writeAll(&minimal_wasm) catch {};
+                f.writeAll(&minimal_wasm) catch |err| std.debug.print("[build] wasm write: {}\n", .{err});
                 has_standalone_wasm = true;
             } else |_| {}
         }
@@ -1981,6 +1981,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     var w_buf: [65536]u8 = undefined;
                     var w_state = wf.writer(&w_buf);
                     const w = &w_state.interface;
+                    var w_errs: u32 = 0; // track write errors instead of silent catch {}
                     w.print(
                         \\// EdgeBox AOT+JIT (auto-generated)
                         \\const {{ readFileSync }} = require('fs');
@@ -1990,13 +1991,13 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         \\const __wasm = new WebAssembly.Instance(new WebAssembly.Module(buf), {{ env: {{ pow: Math.pow }} }});
                         \\__wasm.exports.memory.grow({d});
                         \\
-                    , .{ wasm_filename, mem_grow_pages }) catch {};
+                    , .{ wasm_filename, mem_grow_pages }) catch { w_errs += 1; };
 
                     if (has_array_funcs) {
                         // Memory views + stack allocator for WASM linear memory
-                        w.writeAll("const __wbuf = __wasm ? __wasm.exports.memory.buffer : null;\n") catch {};
-                        if (has_i32_array_funcs) w.writeAll("const __m = __wasm ? new Int32Array(__wbuf) : null;\n") catch {};
-                        if (has_f64_array_funcs) w.writeAll("const __m_f64 = __wasm ? new Float64Array(__wbuf) : null;\n") catch {};
+                        w.writeAll("const __wbuf = __wasm ? __wasm.exports.memory.buffer : null;\n") catch { w_errs += 1; };
+                        if (has_i32_array_funcs) w.writeAll("const __m = __wasm ? new Int32Array(__wbuf) : null;\n") catch { w_errs += 1; };
+                        if (has_f64_array_funcs) w.writeAll("const __m_f64 = __wasm ? new Float64Array(__wbuf) : null;\n") catch { w_errs += 1; };
                         w.writeAll(
                             \\let __sp = __wbuf.byteLength;
                             \\function __wasmStackSave() { return __sp; }
@@ -2004,17 +2005,17 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             \\function __wasmStackAlloc(n) { __sp = (__sp - n) & ~7; return __sp; }
                             \\function __wasmArray(T, n) { return new T(__wbuf, __wasmStackAlloc(n * T.BYTES_PER_ELEMENT), n); }
                             \\
-                        ) catch {};
+                        ) catch { w_errs += 1; };
                         // Per-arg identity cache for repeated calls with same array ref
                         if (any_cacheable_args) {
-                            w.writeAll("let __last_fn = -1;\n") catch {};
+                            w.writeAll("let __last_fn = -1;\n") catch { w_errs += 1; };
                             for (wasm_func_list.items, 0..) |wfe, wfi| {
                                 const read_only = wfe.array_args & ~wfe.mutated_args;
                                 if (read_only == 0) continue;
                                 var ai: u32 = 0;
                                 while (ai < 8) : (ai += 1) {
                                     if (read_only & (@as(u8, 1) << @intCast(ai)) != 0)
-                                        w.print("let __c{d}_{d}=null;\n", .{ wfi, ai }) catch {};
+                                        w.print("let __c{d}_{d}=null;\n", .{ wfi, ai }) catch { w_errs += 1; };
                                 }
                             }
                         }
@@ -2118,21 +2119,21 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     if (alloc_sites.items.len > 0) {
                         // Ensure WASM memory views exist (may not have been created if no WASM functions)
                         if (!has_array_funcs) {
-                            w.writeAll("const __wbuf = __wasm ? __wasm.exports.memory.buffer : null;\n") catch {};
-                            w.writeAll("const __m = __wasm ? new Int32Array(__wbuf) : null;\n") catch {};
+                            w.writeAll("const __wbuf = __wasm ? __wasm.exports.memory.buffer : null;\n") catch { w_errs += 1; };
+                            w.writeAll("const __m = __wasm ? new Int32Array(__wbuf) : null;\n") catch { w_errs += 1; };
                             w.writeAll(
                                 \\let __sp = __wbuf.byteLength;
                                 \\function __wasmStackSave() { return __sp; }
                                 \\function __wasmStackRestore(p) { __sp = p; }
                                 \\function __wasmStackAlloc(n) { __sp = (__sp - n) & ~7; return __sp; }
                                 \\
-                            ) catch {};
+                            ) catch { w_errs += 1; };
                         }
                         // Global per-field SOA columns: one array per unique field name
                         // across ALL alloc sites. Single __idx counter shared by all factories.
                         // This enables read-site rewrite: node.kind → __col_kind[node.__idx]
-                        w.writeAll("let __col_idx = 0;\n") catch {};
-                    w.writeAll("function __rd(o,f,c){return o.__idx!==undefined?c[o.__idx]:o[f];}\n") catch {};
+                        w.writeAll("let __col_idx = 0;\n") catch { w_errs += 1; };
+                    w.writeAll("function __rd(o,f,c){return o.__idx!==undefined?c[o.__idx]:o[f];}\n") catch { w_errs += 1; };
                         {
                             // Collect unique field names
                             var unique_fields: [256][]const u8 = undefined;
@@ -2157,8 +2158,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 }
                             }
                             for (unique_fields[0..unique_count]) |fname| {
-                                w.print("const __col_{s} = [];\n", .{fname}) catch {};
-                                col_set.put(fname, {}) catch {};
+                                w.print("const __col_{s} = [];\n", .{fname}) catch { w_errs += 1; };
+                                col_set.put(fname, {}) catch { w_errs += 1; };
                             }
                             std.debug.print("[soa] {d} global columns for {d} alloc sites\n", .{ unique_count, alloc_sites.items.len });
                         }
@@ -2194,10 +2195,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             const adjusted_line = @as(i32, @intCast(pe.line)) - line_offset;
                             if (adjusted_line < 1) continue;
                             const line: u32 = @intCast(adjusted_line);
-                            patch_lines.put(line, {}) catch {};
+                            patch_lines.put(line, {}) catch { w_errs += 1; };
                             var fh: u64 = 0;
                             for (pe.field) |c| fh = fh *% 31 + c;
-                            patch_set.put(line *% 1000003 + fh, pe.field) catch {};
+                            patch_set.put(line *% 1000003 + fh, pe.field) catch { w_errs += 1; };
                         }
                         std.debug.print("[soa] {d} patches active ({d} lines) after col_set + offset filter\n", .{ patch_set.count(), patch_lines.count() });
                     }
@@ -2222,18 +2223,18 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         const stride = @as(u32, field_count);
 
                         // Per-function identity cache variables
-                        w.print("let __bp_{d}_arr = null, __bp_{d}_pool = 0, __bp_{d}_sp = 0;\n", .{ wfi, wfi, wfi }) catch {};
-                        w.print("function __batch_{d}(arr", .{wfi}) catch {};
+                        w.print("let __bp_{d}_arr = null, __bp_{d}_pool = 0, __bp_{d}_sp = 0;\n", .{ wfi, wfi, wfi }) catch { w_errs += 1; };
+                        w.print("function __batch_{d}(arr", .{wfi}) catch { w_errs += 1; };
                         // Scalar params (non-struct args)
                         {
                             var pi: u32 = 0;
                             while (pi < wfe.arg_count) : (pi += 1) {
                                 if (wfe.struct_args & (@as(u8, 1) << @intCast(pi)) == 0) {
-                                    w.print(", __s{d}", .{pi}) catch {};
+                                    w.print(", __s{d}", .{pi}) catch { w_errs += 1; };
                                 }
                             }
                         }
-                        w.writeAll(") {\n") catch {};
+                        w.writeAll(") {\n") catch { w_errs += 1; };
                         // SOA fast path: if elements are SOA handles, data is already in WASM memory
                         if (alloc_sites.items.len > 0) {
                             // Match batch function's struct fields against SOA sites
@@ -2250,80 +2251,80 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 }
                                 if (!soa_match) continue;
 
-                                w.print("  if (arr.__soa === {d}) {{\n", .{si}) catch {};
+                                w.print("  if (arr.__soa === {d}) {{\n", .{si}) catch { w_errs += 1; };
                                 if (stride == 1) {
                                     // Zero-copy: pass SOA array pointer directly
-                                    w.print("    return __wasm.exports.{s}_batch(__soa_{d}_{s}.byteOffset, arr.length", .{ wfe.name, si, first_field }) catch {};
+                                    w.print("    return __wasm.exports.{s}_batch(__soa_{d}_{s}.byteOffset, arr.length", .{ wfe.name, si, first_field }) catch { w_errs += 1; };
                                 } else {
                                     // Multi-field: read from contiguous SOA arrays (cache-friendly) into interleaved pool
-                                    w.writeAll("    const __n = arr.length;\n") catch {};
-                                    w.print("    const __p = __wasmStackAlloc(__n * {d});\n", .{stride * 4}) catch {};
-                                    w.writeAll("    const __b = __p >> 2;\n") catch {};
-                                    w.writeAll("    for (let __i = 0; __i < __n; __i++) {\n") catch {};
+                                    w.writeAll("    const __n = arr.length;\n") catch { w_errs += 1; };
+                                    w.print("    const __p = __wasmStackAlloc(__n * {d});\n", .{stride * 4}) catch { w_errs += 1; };
+                                    w.writeAll("    const __b = __p >> 2;\n") catch { w_errs += 1; };
+                                    w.writeAll("    for (let __i = 0; __i < __n; __i++) {\n") catch { w_errs += 1; };
                                     for (wfe.struct_field_names[sai][0..field_count], 0..) |fname, fi| {
                                         if (fname.len == 0) continue;
                                         // Read field from plain object (returned by SOA factory)
-                                        w.print("      __m[__b + __i * {d} + {d}] = arr[__i].{s};\n", .{ stride, fi, fname }) catch {};
+                                        w.print("      __m[__b + __i * {d} + {d}] = arr[__i].{s};\n", .{ stride, fi, fname }) catch { w_errs += 1; };
                                     }
-                                    w.writeAll("    }\n") catch {};
-                                    w.print("    return __wasm.exports.{s}_batch(__p, __n", .{wfe.name}) catch {};
+                                    w.writeAll("    }\n") catch { w_errs += 1; };
+                                    w.print("    return __wasm.exports.{s}_batch(__p, __n", .{wfe.name}) catch { w_errs += 1; };
                                 }
                                 // Append scalar params
                                 {
                                     var pi2: u32 = 0;
                                     while (pi2 < wfe.arg_count) : (pi2 += 1) {
                                         if (wfe.struct_args & (@as(u8, 1) << @intCast(pi2)) == 0) {
-                                            w.print(", __s{d}", .{pi2}) catch {};
+                                            w.print(", __s{d}", .{pi2}) catch { w_errs += 1; };
                                         }
                                     }
                                 }
-                                w.writeAll(");\n  }\n") catch {};
+                                w.writeAll(");\n  }\n") catch { w_errs += 1; };
                                 break; // use first matching SOA site
                             }
                         }
                         // Identity cache fast path: same array ref → zero-copy
-                        w.print("  if (arr === __bp_{d}_arr) return __wasm.exports.{s}_batch(__bp_{d}_pool, arr.length", .{ wfi, wfe.name, wfi }) catch {};
+                        w.print("  if (arr === __bp_{d}_arr) return __wasm.exports.{s}_batch(__bp_{d}_pool, arr.length", .{ wfi, wfe.name, wfi }) catch { w_errs += 1; };
                         {
                             var pi: u32 = 0;
                             while (pi < wfe.arg_count) : (pi += 1) {
                                 if (wfe.struct_args & (@as(u8, 1) << @intCast(pi)) == 0) {
-                                    w.print(", __s{d}", .{pi}) catch {};
+                                    w.print(", __s{d}", .{pi}) catch { w_errs += 1; };
                                 }
                             }
                         }
-                        w.writeAll(");\n") catch {};
+                        w.writeAll(");\n") catch { w_errs += 1; };
                         // Cache miss: free old pool, allocate new, copy fields
-                        w.print("  if (__bp_{d}_arr !== null) __wasmStackRestore(__bp_{d}_sp);\n", .{ wfi, wfi }) catch {};
-                        w.print("  __bp_{d}_sp = __wasmStackSave();\n", .{wfi}) catch {};
-                        w.writeAll("  const __n = arr.length;\n") catch {};
-                        w.print("  __bp_{d}_pool = __wasmStackAlloc(__n * {d});\n", .{ wfi, stride * 4 }) catch {};
-                        w.print("  const __base = __bp_{d}_pool >> 2;\n", .{wfi}) catch {};
+                        w.print("  if (__bp_{d}_arr !== null) __wasmStackRestore(__bp_{d}_sp);\n", .{ wfi, wfi }) catch { w_errs += 1; };
+                        w.print("  __bp_{d}_sp = __wasmStackSave();\n", .{wfi}) catch { w_errs += 1; };
+                        w.writeAll("  const __n = arr.length;\n") catch { w_errs += 1; };
+                        w.print("  __bp_{d}_pool = __wasmStackAlloc(__n * {d});\n", .{ wfi, stride * 4 }) catch { w_errs += 1; };
+                        w.print("  const __base = __bp_{d}_pool >> 2;\n", .{wfi}) catch { w_errs += 1; };
                         // Copy loop
-                        w.writeAll("  for (let __i = 0; __i < __n; __i++) {\n") catch {};
+                        w.writeAll("  for (let __i = 0; __i < __n; __i++) {\n") catch { w_errs += 1; };
                         for (wfe.struct_field_names[sai][0..field_count], 0..) |fname, fi| {
                             if (fname.len == 0) continue;
                             if (stride == 1) {
-                                w.print("    __m[__base + __i] = arr[__i].{s};\n", .{fname}) catch {};
+                                w.print("    __m[__base + __i] = arr[__i].{s};\n", .{fname}) catch { w_errs += 1; };
                             } else {
-                                w.print("    __m[__base + __i * {d} + {d}] = arr[__i].{s};\n", .{stride, fi, fname}) catch {};
+                                w.print("    __m[__base + __i * {d} + {d}] = arr[__i].{s};\n", .{stride, fi, fname}) catch { w_errs += 1; };
                             }
                         }
-                        w.writeAll("  }\n") catch {};
-                        w.print("  __bp_{d}_arr = arr;\n", .{wfi}) catch {};
+                        w.writeAll("  }\n") catch { w_errs += 1; };
+                        w.print("  __bp_{d}_arr = arr;\n", .{wfi}) catch { w_errs += 1; };
                         // Call batch WASM
-                        w.print("  return __wasm.exports.{s}_batch(__bp_{d}_pool, __n", .{ wfe.name, wfi }) catch {};
+                        w.print("  return __wasm.exports.{s}_batch(__bp_{d}_pool, __n", .{ wfe.name, wfi }) catch { w_errs += 1; };
                         {
                             var pi: u32 = 0;
                             while (pi < wfe.arg_count) : (pi += 1) {
                                 if (wfe.struct_args & (@as(u8, 1) << @intCast(pi)) == 0) {
-                                    w.print(", __s{d}", .{pi}) catch {};
+                                    w.print(", __s{d}", .{pi}) catch { w_errs += 1; };
                                 }
                             }
                         }
-                        w.writeAll(");\n}\n") catch {};
+                        w.writeAll(");\n}\n") catch { w_errs += 1; };
                     }
 
-                    w.writeAll("\n") catch {};
+                    w.writeAll("\n") catch { w_errs += 1; };
 
                     // Source transform: copy original source, but replace function bodies
                     // for WASM-compiled functions with WASM call trampolines.
@@ -2594,7 +2595,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     .dot_pos = @intCast(pp_pos),
                                     .end_pos = @intCast(fe),
                                     .field = field,
-                                }) catch {};
+                                }) catch { w_errs += 1; };
                             }
                             std.debug.print("[soa] Pre-pass: {d} rewrite positions identified\n", .{pre_pass_rewrites.count()});
                         }
@@ -2612,11 +2613,11 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             // will need __rd() wrapping. The pre_pass_rewrites map tells us.
                             if (pre_pass_rewrites.get(@intCast(src_pos))) |rewrite_info| {
                                 // Insert __rd( before the expression
-                                w.writeAll("__rd(") catch {};
+                                w.writeAll("__rd(") catch { w_errs += 1; };
                                 // Write the expression up to and including the dot
-                                w.writeAll(cc[src_pos..rewrite_info.dot_pos]) catch {};
+                                w.writeAll(cc[src_pos..rewrite_info.dot_pos]) catch { w_errs += 1; };
                                 // Write the __rd closing with field name
-                                w.print(",\"{s}\",__col_{s})", .{ rewrite_info.field, rewrite_info.field }) catch {};
+                                w.print(",\"{s}\",__col_{s})", .{ rewrite_info.field, rewrite_info.field }) catch { w_errs += 1; };
                                 src_pos = rewrite_info.end_pos;
                                 rs_rewrite_count += 1;
                                 continue :char_loop;
@@ -2625,10 +2626,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             // At `VAR = []` declaration, emit base offset for index alignment
                             for (provenance) |prov| {
                                 if (prov.decl_end > 0 and src_pos == prov.decl_end) {
-                                    w.print(";const __{s}_soa_base = __col_idx", .{prov.var_name}) catch {};
+                                    w.print(";const __{s}_soa_base = __col_idx", .{prov.var_name}) catch { w_errs += 1; };
                                     // Raw index: tag array so trampolines detect SOA provenance
                                     if (prov.raw_index) {
-                                        w.print(";{s}.__soa={d}", .{ prov.var_name, prov.site_idx }) catch {};
+                                        w.print(";{s}.__soa={d}", .{ prov.var_name, prov.site_idx }) catch { w_errs += 1; };
                                     }
                                 }
                             }
@@ -2645,12 +2646,12 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     // Write the batch replacement and skip past the original loop.
                                     w.print("{s} = ({s} + __batch_{d}({s}", .{
                                         batch.acc_name, batch.acc_name, batch.func_idx, batch.arr_name,
-                                    }) catch {};
+                                    }) catch { w_errs += 1; };
                                     // Write scalar args
                                     if (batch.scalar_args.len > 0) {
-                                        w.print(", {s}", .{batch.scalar_args}) catch {};
+                                        w.print(", {s}", .{batch.scalar_args}) catch { w_errs += 1; };
                                     }
-                                    w.writeAll(")) | 0;\n") catch {};
+                                    w.writeAll(")) | 0;\n") catch { w_errs += 1; };
                                     src_pos = batch.loop_end;
                                     continue;
                                 }
@@ -2666,9 +2667,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             {
                                 if (detectPushLoop(cc, src_pos, wasm_func_list.items)) |push| {
                                     // Write the original push loop unchanged
-                                    w.writeAll(cc[src_pos..push.loop_end]) catch {};
+                                    w.writeAll(cc[src_pos..push.loop_end]) catch { w_errs += 1; };
                                     // Append pool materialization for each matched struct function
-                                    w.writeAll("\n") catch {};
+                                    w.writeAll("\n") catch { w_errs += 1; };
                                     for (wasm_func_list.items, 0..) |wfe, wfi| {
                                         if (wfe.struct_args == 0) continue;
                                         // Match fields
@@ -2692,21 +2693,21 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         if (!fields_match) continue;
                                         const s = @as(u32, match_fc);
                                         // Emit pool materialization
-                                        w.print("__bp_{d}_sp = __wasmStackSave(); ", .{wfi}) catch {};
-                                        w.print("__bp_{d}_pool = __wasmStackAlloc({s}.length * {d}); ", .{ wfi, push.arr_name, s * 4 }) catch {};
-                                        w.writeAll("{\n") catch {};
-                                        w.print("  const __b = __bp_{d}_pool >> 2;\n", .{wfi}) catch {};
-                                        w.print("  for (let __i = 0; __i < {s}.length; __i++) {{\n", .{push.arr_name}) catch {};
+                                        w.print("__bp_{d}_sp = __wasmStackSave(); ", .{wfi}) catch { w_errs += 1; };
+                                        w.print("__bp_{d}_pool = __wasmStackAlloc({s}.length * {d}); ", .{ wfi, push.arr_name, s * 4 }) catch { w_errs += 1; };
+                                        w.writeAll("{\n") catch { w_errs += 1; };
+                                        w.print("  const __b = __bp_{d}_pool >> 2;\n", .{wfi}) catch { w_errs += 1; };
+                                        w.print("  for (let __i = 0; __i < {s}.length; __i++) {{\n", .{push.arr_name}) catch { w_errs += 1; };
                                         for (wfe.struct_field_names[match_sai][0..match_fc], 0..) |fname, fi| {
                                             if (fname.len == 0) continue;
                                             if (s == 1) {
-                                                w.print("    __m[__b + __i] = {s}[__i].{s};\n", .{ push.arr_name, fname }) catch {};
+                                                w.print("    __m[__b + __i] = {s}[__i].{s};\n", .{ push.arr_name, fname }) catch { w_errs += 1; };
                                             } else {
-                                                w.print("    __m[__b + __i * {d} + {d}] = {s}[__i].{s};\n", .{ s, fi, push.arr_name, fname }) catch {};
+                                                w.print("    __m[__b + __i * {d} + {d}] = {s}[__i].{s};\n", .{ s, fi, push.arr_name, fname }) catch { w_errs += 1; };
                                             }
                                         }
-                                        w.writeAll("  }\n}\n") catch {};
-                                        w.print("__bp_{d}_arr = {s};\n", .{ wfi, push.arr_name }) catch {};
+                                        w.writeAll("  }\n}\n") catch { w_errs += 1; };
+                                        w.print("__bp_{d}_arr = {s};\n", .{ wfi, push.arr_name }) catch { w_errs += 1; };
                                     }
                                     src_pos = push.loop_end;
                                     continue;
@@ -2823,20 +2824,20 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     }
 
                                     // Factory: replace body with column writes + return
-                                    w.writeAll(cc[src_pos .. scan + 1]) catch {};
-                                    w.writeAll("\n") catch {};
+                                    w.writeAll(cc[src_pos .. scan + 1]) catch { w_errs += 1; };
+                                    w.writeAll("\n") catch { w_errs += 1; };
 
-                                    w.writeAll("  const __idx = __col_idx++;\n") catch {};
+                                    w.writeAll("  const __idx = __col_idx++;\n") catch { w_errs += 1; };
                                     for (site.field_names[0..site.field_count], 0..) |fname, fi| {
-                                        w.print("  __col_{s}[__idx] = {s};\n", .{ fname, param_names[fi] }) catch {};
+                                        w.print("  __col_{s}[__idx] = {s};\n", .{ fname, param_names[fi] }) catch { w_errs += 1; };
                                     }
                                     // Return plain object WITH __idx for SOA column reads
-                                    w.writeAll("  return {__idx, ") catch {};
+                                    w.writeAll("  return {__idx, ") catch { w_errs += 1; };
                                     for (site.field_names[0..site.field_count], 0..) |fname, fi| {
-                                        if (fi > 0) w.writeAll(", ") catch {};
-                                        w.print("{s}: {s}", .{ fname, param_names[fi] }) catch {};
+                                        if (fi > 0) w.writeAll(", ") catch { w_errs += 1; };
+                                        w.print("{s}: {s}", .{ fname, param_names[fi] }) catch { w_errs += 1; };
                                     }
-                                    w.writeAll("};\n}\n") catch {};
+                                    w.writeAll("};\n}\n") catch { w_errs += 1; };
 
                                     // Skip the original function body
                                     const body_end = skipJsFunctionBody(cc, scan);
@@ -2929,7 +2930,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 else
                                     false;
                                 if (!shouldTrampolineToWasm(mf, calls_wasm)) {
-                                    w.writeAll(cc[src_pos .. src_pos + 1]) catch {};
+                                    w.writeAll(cc[src_pos .. src_pos + 1]) catch { w_errs += 1; };
                                     src_pos += 1;
                                     continue;
                                 }
@@ -2940,13 +2941,13 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 else
                                     std.mem.indexOfPos(u8, cc, match_end, "{") orelse {
                                         // No brace found — write char and advance
-                                        w.writeAll(cc[src_pos .. src_pos + 1]) catch {};
+                                        w.writeAll(cc[src_pos .. src_pos + 1]) catch { w_errs += 1; };
                                         src_pos += 1;
                                         continue;
                                     };
 
                                 // Write everything up to and including the opening brace
-                                w.writeAll(cc[src_pos .. brace_pos + 1]) catch {};
+                                w.writeAll(cc[src_pos .. brace_pos + 1]) catch { w_errs += 1; };
 
                                 const scan = skipJsFunctionBody(cc, brace_pos);
 
@@ -2981,8 +2982,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 if (mf.array_of_struct_args != 0) {
                                     // Array-of-struct args — materialize JS array of objects
                                     // into flat WASM pool, pass (pool_ptr, count, ...scalars)
-                                    w.writeAll("\n") catch {};
-                                    w.writeAll("  const __sp0 = __wasmStackSave();\n") catch {};
+                                    w.writeAll("\n") catch { w_errs += 1; };
+                                    w.writeAll("  const __sp0 = __wasmStackSave();\n") catch { w_errs += 1; };
                                     var si: u32 = 0;
                                     while (si < param_count) : (si += 1) {
                                         if (mf.array_of_struct_args & (@as(u8, 1) << @intCast(si)) != 0) {
@@ -2990,43 +2991,43 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             if (fc == 0) continue;
                                             const stride = @as(u32, fc);
                                             // Allocate pool: arr.length * field_count * 4 bytes
-                                            w.print("  const __n{d} = {s}.length;\n", .{ si, param_names[si] }) catch {};
-                                            w.print("  const __p{d} = __wasmStackAlloc(__n{d} * {d});\n", .{ si, si, stride * 4 }) catch {};
-                                            w.print("  const __b{d} = __p{d} >> 2;\n", .{ si, si }) catch {};
+                                            w.print("  const __n{d} = {s}.length;\n", .{ si, param_names[si] }) catch { w_errs += 1; };
+                                            w.print("  const __p{d} = __wasmStackAlloc(__n{d} * {d});\n", .{ si, si, stride * 4 }) catch { w_errs += 1; };
+                                            w.print("  const __b{d} = __p{d} >> 2;\n", .{ si, si }) catch { w_errs += 1; };
                                             // Copy loop: write each element's fields
-                                            w.print("  for (let __i = 0; __i < __n{d}; __i++) {{\n", .{si}) catch {};
+                                            w.print("  for (let __i = 0; __i < __n{d}; __i++) {{\n", .{si}) catch { w_errs += 1; };
                                             for (mf.struct_field_names[si][0..fc], 0..) |field_name, fi| {
                                                 if (field_name.len == 0) continue;
                                                 if (stride == 1) {
-                                                    w.print("    __m[__b{d} + __i] = {s}[__i].{s};\n", .{ si, param_names[si], field_name }) catch {};
+                                                    w.print("    __m[__b{d} + __i] = {s}[__i].{s};\n", .{ si, param_names[si], field_name }) catch { w_errs += 1; };
                                                 } else {
-                                                    w.print("    __m[__b{d} + __i * {d} + {d}] = {s}[__i].{s};\n", .{ si, stride, fi, param_names[si], field_name }) catch {};
+                                                    w.print("    __m[__b{d} + __i * {d} + {d}] = {s}[__i].{s};\n", .{ si, stride, fi, param_names[si], field_name }) catch { w_errs += 1; };
                                                 }
                                             }
-                                            w.writeAll("  }\n") catch {};
+                                            w.writeAll("  }\n") catch { w_errs += 1; };
                                         }
                                     }
                                     // Call WASM: AOS args become pool_ptr, scalars pass through
-                                    w.print("  const __r = __wasm.exports.{s}(", .{mf.name}) catch {};
+                                    w.print("  const __r = __wasm.exports.{s}(", .{mf.name}) catch { w_errs += 1; };
                                     {
                                         var first_arg = true;
                                         si = 0;
                                         while (si < param_count) : (si += 1) {
-                                            if (!first_arg) w.writeAll(", ") catch {};
+                                            if (!first_arg) w.writeAll(", ") catch { w_errs += 1; };
                                             if (mf.array_of_struct_args & (@as(u8, 1) << @intCast(si)) != 0) {
-                                                w.print("__p{d}", .{si}) catch {};
+                                                w.print("__p{d}", .{si}) catch { w_errs += 1; };
                                             } else {
-                                                w.writeAll(param_names[si]) catch {};
+                                                w.writeAll(param_names[si]) catch { w_errs += 1; };
                                             }
                                             first_arg = false;
                                         }
                                     }
-                                    w.writeAll(");\n") catch {};
-                                    w.writeAll("  __wasmStackRestore(__sp0);\n  return __r;\n}") catch {};
+                                    w.writeAll(");\n") catch { w_errs += 1; };
+                                    w.writeAll("  __wasmStackRestore(__sp0);\n  return __r;\n}") catch { w_errs += 1; };
                                 } else if (mf.struct_args != 0 and mf.array_args == 0) {
                                     // Struct args — flatten JS object fields into WASM linear memory
-                                    w.writeAll("\n") catch {};
-                                    w.writeAll("  const __sp0 = __wasmStackSave();\n") catch {};
+                                    w.writeAll("\n") catch { w_errs += 1; };
+                                    w.writeAll("  const __sp0 = __wasmStackSave();\n") catch { w_errs += 1; };
                                     // Allocate + write fields for each struct arg
                                     var si: u32 = 0;
                                     while (si < param_count) : (si += 1) {
@@ -3034,41 +3035,41 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             const fc = mf.struct_field_counts[si];
                                             if (fc == 0) continue;
                                             // Allocate: fieldCount * 4 bytes (i32 per field)
-                                            w.print("  const __p{d} = __wasmStackAlloc({d});\n", .{ si, @as(u32, fc) * 4 }) catch {};
+                                            w.print("  const __p{d} = __wasmStackAlloc({d});\n", .{ si, @as(u32, fc) * 4 }) catch { w_errs += 1; };
                                             // Write each field: __m[(__pN >> 2) + offset] = param.fieldName
                                             for (mf.struct_field_names[si][0..fc], 0..) |field_name, fi| {
                                                 if (field_name.len == 0) continue;
                                                 if (fi == 0) {
-                                                    w.print("  __m[__p{d} >> 2] = {s}.{s};\n", .{ si, param_names[si], field_name }) catch {};
+                                                    w.print("  __m[__p{d} >> 2] = {s}.{s};\n", .{ si, param_names[si], field_name }) catch { w_errs += 1; };
                                                 } else {
-                                                    w.print("  __m[(__p{d} >> 2) + {d}] = {s}.{s};\n", .{ si, fi, param_names[si], field_name }) catch {};
+                                                    w.print("  __m[(__p{d} >> 2) + {d}] = {s}.{s};\n", .{ si, fi, param_names[si], field_name }) catch { w_errs += 1; };
                                                 }
                                             }
                                         }
                                     }
                                     // Call WASM: struct args become pointers, scalars pass through
-                                    w.print("  const __r = __wasm.exports.{s}(", .{mf.name}) catch {};
+                                    w.print("  const __r = __wasm.exports.{s}(", .{mf.name}) catch { w_errs += 1; };
                                     {
                                         var first_arg = true;
                                         si = 0;
                                         while (si < param_count) : (si += 1) {
-                                            if (!first_arg) w.writeAll(", ") catch {};
+                                            if (!first_arg) w.writeAll(", ") catch { w_errs += 1; };
                                             if (mf.struct_args & (@as(u8, 1) << @intCast(si)) != 0) {
-                                                w.print("__p{d}", .{si}) catch {};
+                                                w.print("__p{d}", .{si}) catch { w_errs += 1; };
                                             } else {
-                                                w.writeAll(param_names[si]) catch {};
+                                                w.writeAll(param_names[si]) catch { w_errs += 1; };
                                             }
                                             first_arg = false;
                                         }
                                     }
-                                    w.writeAll(");\n") catch {};
-                                    w.writeAll("  __wasmStackRestore(__sp0);\n  return __r;\n}") catch {};
+                                    w.writeAll(");\n") catch { w_errs += 1; };
+                                    w.writeAll("  __wasmStackRestore(__sp0);\n  return __r;\n}") catch { w_errs += 1; };
                                 } else if (mf.array_args == 0 and mf.struct_args == 0) {
                                     // No array or struct args — simple scalar trampoline
-                                    w.print(" return __wasm.exports.{s}({s}); }}", .{ mf.name, params_str }) catch {};
+                                    w.print(" return __wasm.exports.{s}({s}); }}", .{ mf.name, params_str }) catch { w_errs += 1; };
                                 } else {
                                     // Array args — copy to/from WASM linear memory
-                                    w.writeAll("\n") catch {};
+                                    w.writeAll("\n") catch { w_errs += 1; };
 
                                     // SOA fast path for array-arg functions:
                                     // If elements are SOA handles, data is already in WASM memory.
@@ -3096,7 +3097,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                                         // sumKinds reads pointers-to-structs = AOS with indirection.
                                                         w.print("  if ({s}.__soa === {d}) return __wasm.exports.{s}_batch(__soa_{d}_{s}.byteOffset, {s}.length);\n", .{
                                                             param_names[0], si, bf.name, si, bfield, param_names[0],
-                                                        }) catch {};
+                                                        }) catch { w_errs += 1; };
                                                         soa_matched = true;
                                                         break;
                                                     }
@@ -3119,39 +3120,39 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     // (allocated via __wasmArray), skip copy entirely.
                                     // arr.buffer === __wbuf means the TypedArray is a view into WASM linear memory.
                                     // Zero-copy condition: all array args backed by WASM memory
-                                    w.writeAll("  if (") catch {};
+                                    w.writeAll("  if (") catch { w_errs += 1; };
                                     {
                                         var first_zc = true;
                                         var zi: u32 = 0;
                                         while (zi < param_count) : (zi += 1) {
                                             if (mf.array_args & (@as(u8, 1) << @intCast(zi)) != 0) {
-                                                if (!first_zc) w.writeAll(" && ") catch {};
-                                                w.print("{s}.buffer === __wbuf", .{param_names[zi]}) catch {};
+                                                if (!first_zc) w.writeAll(" && ") catch { w_errs += 1; };
+                                                w.print("{s}.buffer === __wbuf", .{param_names[zi]}) catch { w_errs += 1; };
                                                 first_zc = false;
                                             }
                                         }
                                     }
-                                    w.print(") return __wasm.exports.{s}(", .{mf.name}) catch {};
+                                    w.print(") return __wasm.exports.{s}(", .{mf.name}) catch { w_errs += 1; };
                                     {
                                         var first_arg = true;
                                         var zi: u32 = 0;
                                         while (zi < param_count) : (zi += 1) {
-                                            if (!first_arg) w.writeAll(", ") catch {};
+                                            if (!first_arg) w.writeAll(", ") catch { w_errs += 1; };
                                             if (mf.array_args & (@as(u8, 1) << @intCast(zi)) != 0) {
-                                                w.print("{s}.byteOffset", .{param_names[zi]}) catch {};
+                                                w.print("{s}.byteOffset", .{param_names[zi]}) catch { w_errs += 1; };
                                             } else {
-                                                w.writeAll(param_names[zi]) catch {};
+                                                w.writeAll(param_names[zi]) catch { w_errs += 1; };
                                             }
                                             first_arg = false;
                                         }
                                         zi = 0;
                                         while (zi < param_count) : (zi += 1) {
                                             if (mf.length_args & (@as(u8, 1) << @intCast(zi)) != 0) {
-                                                w.print(", {s}.length", .{param_names[zi]}) catch {};
+                                                w.print(", {s}.length", .{param_names[zi]}) catch { w_errs += 1; };
                                             }
                                         }
                                     }
-                                    w.writeAll(");\n") catch {};
+                                    w.writeAll(");\n") catch { w_errs += 1; };
 
                                     // Stack-scoped copy: save SP, allocate, copy, call, restore.
                                     // Identity cache: skip copy when same array ref on repeated calls.
@@ -3159,14 +3160,14 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     // Format function index for __last_fn tracking
                                     var mfi_buf: [16]u8 = undefined;
                                     const mfi_str = std.fmt.bufPrint(&mfi_buf, "{d}", .{matched_func_idx}) catch "0";
-                                    w.writeAll("  const __sp0 = __wasmStackSave();\n") catch {};
+                                    w.writeAll("  const __sp0 = __wasmStackSave();\n") catch { w_errs += 1; };
                                     var i: u32 = 0;
                                     while (i < param_count) : (i += 1) {
                                         if (mf.array_args & (@as(u8, 1) << @intCast(i)) != 0) {
                                             var idx_buf: [8]u8 = undefined;
                                             const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{i}) catch "0";
                                             // Stack-allocate: __pN = __wasmStackAlloc(arr.length * bytes_per_elem)
-                                            w.print("  const __p{s} = __wasmStackAlloc({s}.length{s});\n", .{ idx_str, param_names[i], alloc_shift }) catch {};
+                                            w.print("  const __p{s} = __wasmStackAlloc({s}.length{s});\n", .{ idx_str, param_names[i], alloc_shift }) catch { w_errs += 1; };
 
                                             if (read_only_args & (@as(u8, 1) << @intCast(i)) != 0) {
                                                 // Read-only: cache by reference identity. Skip copy when
@@ -3184,10 +3185,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                                 // Large arrays use identity cache for performance.
                                                 w.print("  if (__last_fn !== {s} || {s}.length < 128 || {s} !== __c{s}) {{ {s}.set({s}, __p{s}{s}); __c{s} = {s}; }}\n", .{
                                                     mfi_str, pn, pn, cid, mem_view, pn, idx_str, elem_shift, cid, pn,
-                                                }) catch {};
+                                                }) catch { w_errs += 1; };
                                             } else if (mf.read_array_args & (@as(u8, 1) << @intCast(i)) != 0) {
                                                 // Mutated + read: must copy in (function reads then writes)
-                                                w.print("  {s}.set({s}, __p{s}{s});\n", .{ mem_view, param_names[i], idx_str, elem_shift }) catch {};
+                                                w.print("  {s}.set({s}, __p{s}{s});\n", .{ mem_view, param_names[i], idx_str, elem_shift }) catch { w_errs += 1; };
                                             } else {
                                                 // Write-only: skip copy-in (data will be overwritten)
                                             }
@@ -3196,27 +3197,27 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     }
                                     // Track which function last wrote to WASM memory (cross-function cache safety)
                                     if (any_cacheable_args) {
-                                        w.print("  __last_fn = {s};\n", .{mfi_str}) catch {};
+                                        w.print("  __last_fn = {s};\n", .{mfi_str}) catch { w_errs += 1; };
                                     }
                                     // Call WASM — __pN is already a byte offset from stack allocator
-                                    w.print("  const __r = __wasm.exports.{s}(", .{mf.name}) catch {};
+                                    w.print("  const __r = __wasm.exports.{s}(", .{mf.name}) catch { w_errs += 1; };
                                     i = 0;
                                     while (i < param_count) : (i += 1) {
-                                        if (i > 0) w.writeAll(", ") catch {};
+                                        if (i > 0) w.writeAll(", ") catch { w_errs += 1; };
                                         if (mf.array_args & (@as(u8, 1) << @intCast(i)) != 0) {
-                                            w.print("__p{d}", .{i}) catch {};
+                                            w.print("__p{d}", .{i}) catch { w_errs += 1; };
                                         } else {
-                                            w.writeAll(param_names[i]) catch {};
+                                            w.writeAll(param_names[i]) catch { w_errs += 1; };
                                         }
                                     }
                                     // Append .length for array args that use get_length
                                     i = 0;
                                     while (i < param_count) : (i += 1) {
                                         if (mf.length_args & (@as(u8, 1) << @intCast(i)) != 0) {
-                                            w.print(", {s}.length", .{param_names[i]}) catch {};
+                                            w.print(", {s}.length", .{param_names[i]}) catch { w_errs += 1; };
                                         }
                                     }
-                                    w.writeAll(");\n") catch {};
+                                    w.writeAll(");\n") catch { w_errs += 1; };
                                     // Copy modified arrays back from WASM memory (only mutated ones)
                                     i = 0;
                                     while (i < param_count) : (i += 1) {
@@ -3225,13 +3226,13 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             // TypedArray fast path + plain Array fallback
                                             w.print("  if ({s}.set) {s}.set({s}.subarray(__p{d}{s}, (__p{d}{s}) + {s}.length));\n", .{
                                                 pn, pn, mem_view, i, elem_shift, i, elem_shift, pn,
-                                            }) catch {};
+                                            }) catch { w_errs += 1; };
                                             w.print("  else for (let __i = 0; __i < {s}.length; __i++) {s}[__i] = {s}[(__p{d}{s}) + __i];\n", .{
                                                 pn, pn, mem_view, i, elem_shift,
-                                            }) catch {};
+                                            }) catch { w_errs += 1; };
                                         }
                                     }
-                                    w.writeAll("  __wasmStackRestore(__sp0);\n  return __r;\n}") catch {};
+                                    w.writeAll("  __wasmStackRestore(__sp0);\n  return __r;\n}") catch { w_errs += 1; };
                                 }
 
                                 // src_pos = scan (past the closing brace we already consumed)
@@ -3309,7 +3310,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                                 w.print("__col_{s}[__{s}_soa_base + (__col_{s}[__{s}_soa_base + ({s})])]", .{
                                                     fname, prov.var_name,
                                                     ifn, ip.var_name, inner_idx,
-                                                }) catch {};
+                                                }) catch { w_errs += 1; };
                                                 inner_transformed = true;
                                                 break;
                                             }
@@ -3319,12 +3320,12 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                                 // Index-aligned: VAR[expr].field → __soa_N_field[__VAR_soa_base + (expr)]
                                                 w.print("__col_{s}[__{s}_soa_base + ({s})]", .{
                                                     fname, prov.var_name, idx_expr,
-                                                }) catch {};
+                                                }) catch { w_errs += 1; };
                                             } else {
                                                 // SOA column read via __idx: VAR[expr].field → __soa_N_field[VAR[expr].__idx]
                                                 w.print("__col_{s}[{s}[{s}].__idx]", .{
                                                     fname, prov.var_name, idx_expr,
-                                                }) catch {};
+                                                }) catch { w_errs += 1; };
                                             }
                                         }
                                         src_pos = fend;
@@ -3334,9 +3335,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 }
                                 if (prov_matched) continue :char_loop;
                                 // No match — copy one character
-                                w.writeAll(cc[src_pos .. src_pos + 1]) catch {};
+                                w.writeAll(cc[src_pos .. src_pos + 1]) catch { w_errs += 1; };
                                 src_pos += 1;
-                                if (src_pos % 50000 == 0) w.flush() catch {};
+                                if (src_pos % 50000 == 0) w.flush() catch { w_errs += 1; };
                             }
                         }
                         std.debug.print("[soa] Patch: {d} field reads rewritten (from {d} patches), src_pos={d}/{d}\n", .{ rs_rewrite_count, patches.items.len, src_pos, cc.len });
@@ -3344,9 +3345,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             std.debug.print("[build] FLUSH ERROR: {}\n", .{err});
                         };
                     } else {
-                        w.writeAll("// ERROR: Original source not available\n") catch {};
+                        w.writeAll("// ERROR: Original source not available\n") catch { w_errs += 1; };
                     }
 
+                    if (w_errs > 0) std.debug.print("[build] WARNING: {d} write errors during worker generation — output may be truncated\n", .{w_errs});
                     has_worker_files = true;
                     std.debug.print("[build] Worker: {s}\n", .{wp});
                 } else |_| {}
@@ -3361,7 +3363,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     var cf_buf: [4096]u8 = undefined;
                     var cf_state = cf.writer(&cf_buf);
                     const cw = &cf_state.interface;
-                    defer cw.flush() catch {};
+                    defer cw.flush() catch |err| std.debug.print("[build] config flush: {}\n", .{err});
                     cw.print(
                         \\using Workerd = import "/workerd/workerd.capnp";
                         \\
@@ -3383,7 +3385,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         \\  compatibilityFlags = ["nodejs_compat"],
                         \\);
                         \\
-                    , .{ wn, wasm_filename, wasm_filename }) catch {};
+                    , .{ wn, wasm_filename, wasm_filename }) catch |err| std.debug.print("[build] config write: {}\n", .{err});
                     std.debug.print("[build] Config: {s}\n", .{cp});
                 } else |_| {}
             }
@@ -3521,8 +3523,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         stripWasmDebug(allocator, wasm_path, stripped_path) catch |err| {
             std.debug.print("[warn] Debug strip failed: {}\n", .{err});
         };
-        std.fs.cwd().deleteFile(wasm_path) catch {};
-        std.fs.cwd().rename(stripped_path, wasm_path) catch {};
+        std.fs.cwd().deleteFile(wasm_path) catch |err| std.debug.print("[build] deleteFile: {}\n", .{err});
+        std.fs.cwd().rename(stripped_path, wasm_path) catch |err| std.debug.print("[build] rename: {}\n", .{err});
 
         // Step 9: Optimize WASM with Binaryen (wasm-opt)
         std.debug.print("[build] Running wasm-opt (Binaryen)...\n", .{});

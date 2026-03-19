@@ -1883,15 +1883,23 @@ fn rsaGenerateKeyPairSyncFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int,
         return qjs.JS_ThrowInternalError(ctx, "Failed to init p_minus_1");
     };
     defer p_minus_1.deinit();
-    p_minus_1.copy(p.toConst()) catch {};
-    p_minus_1.addScalar(&p_minus_1, -1) catch {};
+    p_minus_1.copy(p.toConst()) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to compute p - 1");
+    };
+    p_minus_1.addScalar(&p_minus_1, -1) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to compute p - 1");
+    };
 
     var q_minus_1 = BigInt.init(allocator) catch {
         return qjs.JS_ThrowInternalError(ctx, "Failed to init q_minus_1");
     };
     defer q_minus_1.deinit();
-    q_minus_1.copy(q.toConst()) catch {};
-    q_minus_1.addScalar(&q_minus_1, -1) catch {};
+    q_minus_1.copy(q.toConst()) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to compute q - 1");
+    };
+    q_minus_1.addScalar(&q_minus_1, -1) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to compute q - 1");
+    };
 
     var phi = BigInt.init(allocator) catch {
         return qjs.JS_ThrowInternalError(ctx, "Failed to init phi");

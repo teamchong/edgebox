@@ -287,7 +287,9 @@ pub fn generateStandaloneWasm(
 
         // Generate synthetic name for anonymous functions (null-terminated for sliceTo)
         if (sf.name.len == 0 and fi < synth_names.len) {
-            _ = std.fmt.bufPrintZ(&synth_names[fi], "__anon_L{d}", .{sf.func.line_num}) catch {};
+            _ = std.fmt.bufPrintZ(&synth_names[fi], "__anon_L{d}", .{sf.func.line_num}) catch |err| {
+                std.debug.print("[freeze] bufPrintZ for anon name failed: {}\n", .{err});
+            };
         }
 
         const elem_type: llvm.Type = switch (sf.value_kind) {

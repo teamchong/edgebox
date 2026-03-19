@@ -818,7 +818,8 @@ pub fn generateModuleZigShardedWithBackend(
                             if (manifest_path) |mp| {
                                 if (std.fs.cwd().createFile(mp, .{})) |mf| {
                                     defer mf.close();
-                                    mf.writeAll("[") catch {};
+                                    var manifest_errs: u32 = 0;
+                                    mf.writeAll("[") catch { manifest_errs += 1; };
 
                                     // Build name→array_args map for cross-call propagation
                                     const ArrayInfo = struct { array_args: u8, mutated_args: u8 };
@@ -827,12 +828,12 @@ pub fn generateModuleZigShardedWithBackend(
                                     for (wasm_funcs.items) |sf| {
                                         const aa = numeric_handlers.detectArrayArgs(sf.func.instructions, sf.func.arg_count);
                                         const ma = numeric_handlers.detectMutatedArgs(sf.func.instructions, sf.func.arg_count);
-                                        array_info_map.put(allocator, sf.name, .{ .array_args = aa, .mutated_args = ma }) catch {};
+                                        array_info_map.put(allocator, sf.name, .{ .array_args = aa, .mutated_args = ma }) catch { manifest_errs += 1; };
                                     }
 
                                     var first = true;
                                     for (wasm_funcs.items) |sf| {
-                                        if (!first) mf.writeAll(",") catch {};
+                                        if (!first) mf.writeAll(",") catch { manifest_errs += 1; };
                                         first = false;
                                         const type_str: []const u8 = switch (sf.value_kind) {
                                             .i32 => "i32",
@@ -886,42 +887,43 @@ pub fn generateModuleZigShardedWithBackend(
 
                                         var entry_buf: [1024]u8 = undefined;
                                         const entry = std.fmt.bufPrint(&entry_buf, "{{\"name\":\"{s}\",\"args\":{d},\"type\":\"{s}\",\"instrs\":{d},\"recursive\":{d},\"array_args\":{d},\"mutated_args\":{d},\"read_array_args\":{d},\"length_args\":{d},\"has_loop\":{d},\"has_bitwise\":{d},\"line\":{d},\"struct_args\":{d},\"array_of_struct_args\":{d}", .{ manifest_name, sf.func.arg_count, type_str, sf.func.instructions.len, recursive, array_args_mask, mutated_args_mask, read_array_args_mask, length_args_mask, has_loop, has_bitwise, sf.func.line_num, struct_args_mask, aos_mask }) catch continue;
-                                        mf.writeAll(entry) catch {};
+                                        mf.writeAll(entry) catch { manifest_errs += 1; };
 
                                         // Write struct field names for each struct/array-of-struct arg
                                         if (struct_args_info) |si| {
                                             const combined_mask = si.struct_args | si.array_of_struct_args;
-                                            mf.writeAll(",\"struct_fields\":{") catch {};
+                                            mf.writeAll(",\"struct_fields\":{") catch { manifest_errs += 1; };
                                             var first_arg = true;
                                             for (0..8) |ai| {
                                                 if (combined_mask & (@as(u8, 1) << @intCast(ai)) == 0) continue;
-                                                if (!first_arg) mf.writeAll(",") catch {};
+                                                if (!first_arg) mf.writeAll(",") catch { manifest_errs += 1; };
                                                 first_arg = false;
                                                 var arg_buf: [8]u8 = undefined;
                                                 const arg_key = std.fmt.bufPrint(&arg_buf, "\"{d}\":[", .{ai}) catch continue;
-                                                mf.writeAll(arg_key) catch {};
+                                                mf.writeAll(arg_key) catch { manifest_errs += 1; };
                                                 for (si.field_atoms[ai][0..si.field_counts[ai]], 0..) |atom, fi| {
-                                                    if (fi > 0) mf.writeAll(",") catch {};
-                                                    mf.writeAll("\"") catch {};
+                                                    if (fi > 0) mf.writeAll(",") catch { manifest_errs += 1; };
+                                                    mf.writeAll("\"") catch { manifest_errs += 1; };
                                                     if (resolveAtomToName(sf.func, atom)) |name| {
-                                                        mf.writeAll(name) catch {};
+                                                        mf.writeAll(name) catch { manifest_errs += 1; };
                                                     } else {
                                                         var atom_buf: [32]u8 = undefined;
                                                         const atom_str = std.fmt.bufPrint(&atom_buf, "atom{d}", .{atom}) catch continue;
-                                                        mf.writeAll(atom_str) catch {};
+                                                        mf.writeAll(atom_str) catch { manifest_errs += 1; };
                                                     }
-                                                    mf.writeAll("\"") catch {};
+                                                    mf.writeAll("\"") catch { manifest_errs += 1; };
                                                 }
-                                                mf.writeAll("]") catch {};
+                                                mf.writeAll("]") catch { manifest_errs += 1; };
                                             }
-                                            mf.writeAll("}") catch {};
+                                            mf.writeAll("}") catch { manifest_errs += 1; };
                                             // Batch variant is always generated for struct functions
-                                            mf.writeAll(",\"has_batch\":1") catch {};
+                                            mf.writeAll(",\"has_batch\":1") catch { manifest_errs += 1; };
                                         }
 
-                                        mf.writeAll("}") catch {};
+                                        mf.writeAll("}") catch { manifest_errs += 1; };
                                     }
-                                    mf.writeAll("]") catch {};
+                                    mf.writeAll("]") catch { manifest_errs += 1; };
+                                    if (manifest_errs > 0) std.debug.print("[freeze] WARNING: {d} manifest write errors\n", .{manifest_errs});
                                 } else |_| {}
                             }
                         }
@@ -1085,11 +1087,12 @@ pub fn generateModuleZigShardedWithBackend(
         if (alloc_manifest_path) |amp| {
             if (std.fs.cwd().createFile(amp, .{})) |amf| {
                 defer amf.close();
-                amf.writeAll("[") catch {};
+                var manifest_errs: u32 = 0;
+                amf.writeAll("[") catch { manifest_errs += 1; };
                 var alloc_count: usize = 0;
                 for (analysis.functions.items) |func| {
                     const alloc_info = numeric_handlers.detectAllocSites(func.instructions) orelse continue;
-                    if (alloc_count > 0) amf.writeAll(",") catch {};
+                    if (alloc_count > 0) amf.writeAll(",") catch { manifest_errs += 1; };
                     // Use synthetic name for anonymous functions
                     var synth_buf: [32]u8 = undefined;
                     const alloc_name = if (func.name.len == 0)
@@ -1101,32 +1104,33 @@ pub fn generateModuleZigShardedWithBackend(
                         alloc_name, func.line_num, func.arg_count,
                         if (alloc_info.pass_through) "true" else "false",
                     }) catch continue;
-                    amf.writeAll(entry) catch {};
+                    amf.writeAll(entry) catch { manifest_errs += 1; };
                     for (alloc_info.field_atoms[0..alloc_info.field_count], 0..) |atom, fi| {
-                        if (fi > 0) amf.writeAll(",") catch {};
-                        amf.writeAll("\"") catch {};
+                        if (fi > 0) amf.writeAll(",") catch { manifest_errs += 1; };
+                        amf.writeAll("\"") catch { manifest_errs += 1; };
                         if (resolveAtomToName(func, atom)) |name| {
-                            amf.writeAll(name) catch {};
+                            amf.writeAll(name) catch { manifest_errs += 1; };
                         } else {
                             var atom_buf: [32]u8 = undefined;
                             const atom_str = std.fmt.bufPrint(&atom_buf, "atom{d}", .{atom}) catch continue;
-                            amf.writeAll(atom_str) catch {};
+                            amf.writeAll(atom_str) catch { manifest_errs += 1; };
                         }
-                        amf.writeAll("\"") catch {};
+                        amf.writeAll("\"") catch { manifest_errs += 1; };
                     }
-                    amf.writeAll("],\"arg_indices\":[") catch {};
+                    amf.writeAll("],\"arg_indices\":[") catch { manifest_errs += 1; };
                     for (alloc_info.arg_indices[0..alloc_info.field_count], 0..) |ai, fi| {
-                        if (fi > 0) amf.writeAll(",") catch {};
+                        if (fi > 0) amf.writeAll(",") catch { manifest_errs += 1; };
                         var ai_buf: [8]u8 = undefined;
                         const ai_str = std.fmt.bufPrint(&ai_buf, "{d}", .{ai}) catch continue;
-                        amf.writeAll(ai_str) catch {};
+                        amf.writeAll(ai_str) catch { manifest_errs += 1; };
                     }
-                    amf.writeAll("],\"is_constructor\":") catch {};
-                    amf.writeAll(if (alloc_info.is_constructor) "true" else "false") catch {};
-                    amf.writeAll("}") catch {};
+                    amf.writeAll("],\"is_constructor\":") catch { manifest_errs += 1; };
+                    amf.writeAll(if (alloc_info.is_constructor) "true" else "false") catch { manifest_errs += 1; };
+                    amf.writeAll("}") catch { manifest_errs += 1; };
                     alloc_count += 1;
                 }
-                amf.writeAll("]") catch {};
+                amf.writeAll("]") catch { manifest_errs += 1; };
+                if (manifest_errs > 0) std.debug.print("[freeze] WARNING: {d} alloc manifest write errors\n", .{manifest_errs});
                 if (alloc_count > 0) {
                     std.debug.print("[freeze] Alloc sites: {d} factory functions with fixed shapes\n", .{alloc_count});
                 }
@@ -1141,11 +1145,12 @@ pub fn generateModuleZigShardedWithBackend(
         if (read_manifest_path) |rmp| {
             if (std.fs.cwd().createFile(rmp, .{})) |rmf| {
                 defer rmf.close();
-                rmf.writeAll("[") catch {};
+                var manifest_errs: u32 = 0;
+                rmf.writeAll("[") catch { manifest_errs += 1; };
                 var read_count: usize = 0;
                 for (analysis.functions.items) |func| {
                     const si = numeric_handlers.detectStructArgs(func.instructions, func.arg_count) orelse continue;
-                    if (read_count > 0) rmf.writeAll(",") catch {};
+                    if (read_count > 0) rmf.writeAll(",") catch { manifest_errs += 1; };
                     var synth_buf2: [32]u8 = undefined;
                     const read_name = if (func.name.len == 0)
                         std.fmt.bufPrint(&synth_buf2, "__anon_L{d}", .{func.line_num}) catch func.name
@@ -1156,33 +1161,34 @@ pub fn generateModuleZigShardedWithBackend(
                     const entry2 = std.fmt.bufPrint(&entry_buf2, "{{\"name\":\"{s}\",\"line\":{d},\"struct_args\":{d},\"read_fields\":{{", .{
                         read_name, func.line_num, combined,
                     }) catch continue;
-                    rmf.writeAll(entry2) catch {};
+                    rmf.writeAll(entry2) catch { manifest_errs += 1; };
                     var first_arg2 = true;
                     for (0..@min(func.arg_count, 8)) |ai| {
                         if (combined & (@as(u8, 1) << @intCast(ai)) == 0) continue;
-                        if (!first_arg2) rmf.writeAll(",") catch {};
+                        if (!first_arg2) rmf.writeAll(",") catch { manifest_errs += 1; };
                         first_arg2 = false;
                         var arg_buf2: [8]u8 = undefined;
                         const arg_key2 = std.fmt.bufPrint(&arg_buf2, "\"{d}\":[", .{ai}) catch continue;
-                        rmf.writeAll(arg_key2) catch {};
+                        rmf.writeAll(arg_key2) catch { manifest_errs += 1; };
                         for (si.field_atoms[ai][0..si.field_counts[ai]], 0..) |atom, fi| {
-                            if (fi > 0) rmf.writeAll(",") catch {};
-                            rmf.writeAll("\"") catch {};
+                            if (fi > 0) rmf.writeAll(",") catch { manifest_errs += 1; };
+                            rmf.writeAll("\"") catch { manifest_errs += 1; };
                             if (resolveAtomToName(func, atom)) |name| {
-                                rmf.writeAll(name) catch {};
+                                rmf.writeAll(name) catch { manifest_errs += 1; };
                             } else {
                                 var atom_buf2: [32]u8 = undefined;
                                 const atom_str2 = std.fmt.bufPrint(&atom_buf2, "atom{d}", .{atom}) catch continue;
-                                rmf.writeAll(atom_str2) catch {};
+                                rmf.writeAll(atom_str2) catch { manifest_errs += 1; };
                             }
-                            rmf.writeAll("\"") catch {};
+                            rmf.writeAll("\"") catch { manifest_errs += 1; };
                         }
-                        rmf.writeAll("]") catch {};
+                        rmf.writeAll("]") catch { manifest_errs += 1; };
                     }
-                    rmf.writeAll("}}") catch {};
+                    rmf.writeAll("}}") catch { manifest_errs += 1; };
                     read_count += 1;
                 }
-                rmf.writeAll("]") catch {};
+                rmf.writeAll("]") catch { manifest_errs += 1; };
+                if (manifest_errs > 0) std.debug.print("[freeze] WARNING: {d} read manifest write errors\n", .{manifest_errs});
                 if (read_count > 0) {
                     std.debug.print("[freeze] Read sites: {d} functions read struct fields from args\n", .{read_count});
                 }
@@ -1196,7 +1202,8 @@ pub fn generateModuleZigShardedWithBackend(
         if (patch_manifest_path) |pmp| {
             if (std.fs.cwd().createFile(pmp, .{})) |pmf| {
                 defer pmf.close();
-                pmf.writeAll("[") catch {};
+                var manifest_errs: u32 = 0;
+                pmf.writeAll("[") catch { manifest_errs += 1; };
                 var patch_count: usize = 0;
                 for (analysis.functions.items) |func| {
                     const si = numeric_handlers.detectStructArgs(func.instructions, func.arg_count) orelse continue;
@@ -1244,13 +1251,13 @@ pub fn generateModuleZigShardedWithBackend(
                                         if (resolveAtomToName(func, atom)) |field_name| {
                                             // Get source line from pc2line
                                             const line = module_parser.getLineForPC(func.pc2line, func.line_num, pc);
-                                            if (patch_count > 0) pmf.writeAll(",") catch {};
+                                            if (patch_count > 0) pmf.writeAll(",") catch { manifest_errs += 1; };
                                             // Emit patch entry
                                             var pbuf: [256]u8 = undefined;
                                             const pentry = std.fmt.bufPrint(&pbuf, "\n{{\"func\":\"{s}\",\"line\":{d},\"field\":\"{s}\",\"arg\":{d}}}", .{
                                                 func.name, line, field_name, obj_arg,
                                             }) catch continue;
-                                            pmf.writeAll(pentry) catch {};
+                                            pmf.writeAll(pentry) catch { manifest_errs += 1; };
                                             patch_count += 1;
                                         }
                                     }
@@ -1293,7 +1300,8 @@ pub fn generateModuleZigShardedWithBackend(
                         pc += instr.size;
                     }
                 }
-                pmf.writeAll("]") catch {};
+                pmf.writeAll("]") catch { manifest_errs += 1; };
+                if (manifest_errs > 0) std.debug.print("[freeze] WARNING: {d} patch manifest write errors\n", .{manifest_errs});
                 std.debug.print("[freeze] Patch manifest: {d} field read patches\n", .{patch_count});
             } else |_| {}
         }

@@ -1698,13 +1698,13 @@ fn generateThinFunction(
                 has_catch = true;
                 // Map catch target bytecode offset to (will map to LLVM block later)
                 if (instr.getJumpTarget()) |target_pc| {
-                    tctx.catch_targets.put(allocator, target_pc, undefined) catch {};
+                    tctx.catch_targets.put(allocator, target_pc, undefined) catch return CodegenError.UnsupportedOpcode;
                 }
             } else if (instr.opcode == .gosub) {
                 // The continuation point is the instruction AFTER gosub (pc + size)
                 // We'll map return_pc → block_id after blocks are created
                 const return_pc = instr.pc + instr.size;
-                tctx.gosub_return_targets.put(allocator, return_pc, 0) catch {};
+                tctx.gosub_return_targets.put(allocator, return_pc, 0) catch return CodegenError.UnsupportedOpcode;
             }
         }
         if (has_catch) {
@@ -1728,7 +1728,7 @@ fn generateThinFunction(
             (cl.bound_type == .array_length or cl.bound_type == .arg_length) and
             cl.accumulator_local != null)
         {
-            counted_loop_map.put(allocator, cl.header_block, cl) catch {};
+            counted_loop_map.put(allocator, cl.header_block, cl) catch return CodegenError.UnsupportedOpcode;
         }
     }
 

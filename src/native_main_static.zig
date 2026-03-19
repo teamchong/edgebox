@@ -540,7 +540,9 @@ pub fn main() !void {
                     std.debug.print("[profile] Call profiling enabled, will write to {s}\n", .{path_slice});
                 }
             } else {
-                filtered_args.append(allocator, arg) catch {};
+                filtered_args.append(allocator, arg) catch |err| {
+                    std.debug.print("[cli] Failed to append arg: {}\n", .{err});
+                };
             }
         }
 

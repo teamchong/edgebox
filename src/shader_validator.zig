@@ -73,7 +73,9 @@ pub const ValidationResult = struct {
     }
 
     pub fn addWarning(self: *ValidationResult, line: u32, message: []const u8) void {
-        self.warnings.append(.{ .line = line, .message = message }) catch {};
+        self.warnings.append(.{ .line = line, .message = message }) catch |err| {
+            std.debug.print("[shader] Warning dropped (line {d}): {}\n", .{ line, err });
+        };
     }
 };
 
