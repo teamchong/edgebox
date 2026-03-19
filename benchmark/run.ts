@@ -22,6 +22,7 @@
 
 import { execSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, readdirSync, readFileSync, writeFileSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { performance } from "node:perf_hooks";
 
@@ -617,8 +618,7 @@ async function main() {
 
   // Clean EdgeBox incremental cache to ensure cold start on first run
   {
-    const tmpDir = process.env.TMPDIR || process.env.TMP || "/tmp";
-    const incrCacheDir = join(tmpDir, "edgebox-incr-cache");
+    const incrCacheDir = join(tmpdir(), "edgebox-incr-cache");
     if (existsSync(incrCacheDir)) {
       rmSync(incrCacheDir, { recursive: true, force: true });
     }
