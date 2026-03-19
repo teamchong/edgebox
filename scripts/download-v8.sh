@@ -72,6 +72,35 @@ for FILE in binding.cc binding.hpp; do
     fi
 done
 
+# Download support.h (rusty_v8 helper types used by binding.cc)
+SUPPORT_URL="https://raw.githubusercontent.com/${REPO}/${V8_VERSION}/src/support.h"
+if [ ! -f "${VENDOR_DIR}/support.h" ]; then
+    echo "[v8] Fetching support.h..."
+    curl -fSL -o "${VENDOR_DIR}/support.h" "$SUPPORT_URL"
+else
+    echo "[v8] support.h already present"
+fi
+
+# Download V8 include headers (needed for C++ bridge compilation)
+# Extract V8 version from rusty_v8 version: v146.8.0 → V8 14.6.202.9
+# The headers come from chromium's V8 repo via gitiles archive API.
+V8_INCLUDE_DIR="${VENDOR_DIR}/include"
+if [ ! -d "$V8_INCLUDE_DIR" ] || [ ! -f "${V8_INCLUDE_DIR}/v8.h" ]; then
+    # Parse V8 engine version from the prebuilt library (if available) or use known mapping
+    # rusty_v8 v146.8.0 = V8 14.6.202.9
+    V8_ENGINE_VERSION="14.6.202.9"
+    INCLUDE_URL="https://chromium.googlesource.com/v8/v8/+archive/${V8_ENGINE_VERSION}/include.tar.gz"
+    echo "[v8] Downloading V8 ${V8_ENGINE_VERSION} include headers..."
+    TEMP_TAR=$(mktemp --suffix=.tar.gz)
+    curl -fSL -o "$TEMP_TAR" "$INCLUDE_URL"
+    mkdir -p "$V8_INCLUDE_DIR"
+    tar xzf "$TEMP_TAR" -C "$V8_INCLUDE_DIR"
+    rm "$TEMP_TAR"
+    echo "[v8] V8 headers installed ($(find "$V8_INCLUDE_DIR" -name '*.h' | wc -l) header files)"
+else
+    echo "[v8] V8 include headers already present"
+fi
+
 # Verify
 echo ""
 echo "[v8] Contents of ${VENDOR_DIR}:"
@@ -100,7 +129,5 @@ fi
 echo ""
 echo "[v8] Done! rusty_v8 ${V8_VERSION} installed to ${VENDOR_DIR}"
 echo ""
-echo "Next steps:"
-echo "  1. Extract function prototypes from binding.cc into v8_c_api.h"
-echo "  2. Add v8-test target to build.zig"
-echo "  3. zig build v8-test"
+echo "Build: zig build v8-test"
+echo "Run:   ./zig-out/bin/edgebox-v8-test"

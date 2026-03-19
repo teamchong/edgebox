@@ -2167,8 +2167,8 @@ pub fn build(b: *std.Build) void {
     }
 
     // ===================
-    // edgebox-v8-test — V8 linking test (Phase 1 of V8 embedding)
-    // Verifies librusty_v8.a links correctly. Run: zig build v8-test
+    // edgebox-v8-test — V8 embedding test (Phases 1+2)
+    // Links librusty_v8.a, compiles C++ bridge, evals JS. Run: zig build v8-test
     // ===================
     {
         const v8_lib_name = switch (target.result.cpu.arch) {
@@ -2198,6 +2198,14 @@ pub fn build(b: *std.Build) void {
             // Link prebuilt librusty_v8.a (V8 engine + binding.cc extern "C" functions)
             v8_test_exe.addObjectFile(b.path(b.fmt("vendor/v8/{s}", .{lib_name})));
 
+            // C++ bridge — handles CreateParams allocator setup, struct sizes
+            v8_test_exe.root_module.addCSourceFile(.{
+                .file = b.path("src/v8_bridge.cpp"),
+                .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti" },
+            });
+            v8_test_exe.root_module.addIncludePath(b.path("vendor/v8/include"));
+            v8_test_exe.root_module.addIncludePath(b.path("vendor/v8"));
+
             // Stub implementations for Rust callbacks (temporal_rs, inspector, etc.)
             v8_test_exe.root_module.addCSourceFile(.{
                 .file = b.path("src/v8_stubs.c"),
@@ -2209,10 +2217,10 @@ pub fn build(b: *std.Build) void {
             v8_test_exe.linkLibCpp();
             v8_test_exe.linkSystemLibrary("pthread");
 
-            const v8_test_step = b.step("v8-test", "Build V8 linking test (Phase 1)");
+            const v8_test_step = b.step("v8-test", "Build V8 embedding test (Phases 1+2)");
             v8_test_step.dependOn(&b.addInstallArtifact(v8_test_exe, .{}).step);
         } else {
-            const v8_test_step = b.step("v8-test", "Build V8 linking test (unsupported platform)");
+            const v8_test_step = b.step("v8-test", "Build V8 embedding test (unsupported platform)");
             const v8_fail = b.addFail("v8-test: unsupported platform (need x86_64/aarch64 linux/macos)");
             v8_test_step.dependOn(&v8_fail.step);
         }
