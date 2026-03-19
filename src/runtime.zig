@@ -1978,8 +1978,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     const mem_grow_pages: u32 = if (has_array_funcs) 256 else 16;
 
                     // Preamble: load WASM module (compatible with Node.js + workerd)
-                    // Small buffer forces frequent flushes
-                    var w_buf: [4096]u8 = undefined;
+                    var w_buf: [65536]u8 = undefined;
                     var w_state = wf.writer(&w_buf);
                     const w = &w_state.interface;
                     w.print(
@@ -3337,6 +3336,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 // No match — copy one character
                                 w.writeAll(cc[src_pos .. src_pos + 1]) catch {};
                                 src_pos += 1;
+                                if (src_pos % 50000 == 0) w.flush() catch {};
                             }
                         }
                         std.debug.print("[soa] Patch: {d} field reads rewritten (from {d} patches), src_pos={d}/{d}\n", .{ rs_rewrite_count, patches.items.len, src_pos, cc.len });
