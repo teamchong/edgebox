@@ -126,9 +126,12 @@
       var r = _ioSync('writeFile', { path: String(path), data: String(data) });
       if (!r.ok) { var err = new Error(r.error); throw err; }
     },
-    statSync: function(path) {
+    statSync: function(path, options) {
       var r = _ioSync('stat', { path: String(path) });
-      if (!r.ok) { var err = new Error(r.error || 'ENOENT'); err.code = r.code || 'ENOENT'; throw err; }
+      if (!r.ok) {
+        if (options && options.throwIfNoEntry === false) return undefined;
+        var err = new Error(r.error || 'ENOENT'); err.code = r.code || 'ENOENT'; throw err;
+      }
       return {
         isFile: function() { return r.isFile; },
         isDirectory: function() { return r.isDirectory; },
@@ -165,9 +168,45 @@
       var r = _ioSync('unlink', { path: String(path) });
       if (!r.ok) { var err = new Error(r.error); throw err; }
     },
+    // fd-based I/O — TSC uses openSync/writeSync/closeSync for output files
+    openSync: function(path, flags) {
+      var fd = { __path: String(path), __flags: flags, __data: '' };
+      _fs.__openFds = _fs.__openFds || {};
+      var id = (_fs.__nextFd = (_fs.__nextFd || 100)) + 1;
+      _fs.__nextFd = id;
+      _fs.__openFds[id] = fd;
+      if (flags === 'w' || flags === 'w+') fd.__data = '';
+      else {
+        try { fd.__data = _fs.readFileSync(path, 'utf8'); } catch(e) { fd.__data = ''; }
+      }
+      return id;
+    },
+    writeSync: function(fd, data) {
+      if (typeof fd === 'number' && _fs.__openFds && _fs.__openFds[fd]) {
+        _fs.__openFds[fd].__data += String(data);
+      }
+    },
+    closeSync: function(fd) {
+      if (typeof fd === 'number' && _fs.__openFds && _fs.__openFds[fd]) {
+        var info = _fs.__openFds[fd];
+        if (info.__flags === 'w' || info.__flags === 'w+') {
+          _fs.writeFileSync(info.__path, info.__data);
+        }
+        delete _fs.__openFds[fd];
+      }
+    },
+    watchFile: function() { return { close: function() {} }; },
+    unwatchFile: function() {},
+    watch: function() { return { close: function() {}, on: function() { return this; } }; },
     accessSync: function() { /* no-op, assume accessible */ },
     chmodSync: function() {},
-    lstatSync: function(path) { return _fs.statSync(path); },
+    renameSync: function(oldPath, newPath) {
+      // TSC uses this for atomic writes
+      var content = _fs.readFileSync(oldPath, 'utf8');
+      _fs.writeFileSync(newPath, content);
+      _fs.unlinkSync(oldPath);
+    },
+    lstatSync: function(path, options) { return _fs.statSync(path, options); },
     readFile: function(path, options, cb) {
       if (typeof options === 'function') { cb = options; options = undefined; }
       try { cb(null, _fs.readFileSync(path, options)); } catch(e) { cb(e); }
@@ -214,8 +253,8 @@
   _proc.arch = 'x64';
   _proc.version = 'v20.0.0';
   _proc.versions = { node: '20.0.0', v8: '14.6.202.9' };
-  _proc.stdout = { write: function(s) { _ioSync('writeStdout', { data: String(s) }); }, isTTY: false };
-  _proc.stderr = { write: function(s) { _ioSync('writeStderr', { data: String(s) }); }, isTTY: false };
+  _proc.stdout = { write: function(s) { _ioSync('writeStdout', { data: String(s) }); return true; }, isTTY: false, columns: 80, _handle: null };
+  _proc.stderr = { write: function(s) { _ioSync('writeStderr', { data: String(s) }); return true; }, isTTY: false };
   _proc.stdin = { isTTY: false };
   _proc.hrtime = function(prev) {
     var now = Date.now();
@@ -228,6 +267,21 @@
   _proc.nextTick = function(fn) { Promise.resolve().then(fn); };
   _proc.memoryUsage = function() { return { rss: 0, heapTotal: 0, heapUsed: 0, external: 0 }; };
   _proc.cpuUsage = function() { return { user: 0, system: 0 }; };
+  _proc.execArgv = [];
+  _proc.pid = 1;
+  _proc.ppid = 0;
+  _proc.title = 'edgebox';
+  _proc.execPath = '/usr/bin/edgebox';
+  _proc.binding = function() { return {}; };
+  _proc.umask = function() { return 0o22; };
+  _proc.on = function() { return _proc; };
+  _proc.once = function() { return _proc; };
+  _proc.off = function() { return _proc; };
+  _proc.emit = function() { return false; };
+  _proc.removeListener = function() { return _proc; };
+  _proc.addListener = function() { return _proc; };
+  _proc.listeners = function() { return []; };
+  _proc.removeAllListeners = function() { return _proc; };
 
   // Load actual argv and env from Zig
   try {
@@ -260,20 +314,81 @@
     };
   }
 
-  // ====== Buffer (minimal) ======
+  // ====== Buffer (with base64 support for TSC) ======
   if (!globalThis.Buffer) {
+    var _b64chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    var _b64lookup = new Uint8Array(128);
+    for (var i = 0; i < _b64chars.length; i++) _b64lookup[_b64chars.charCodeAt(i)] = i;
+
+    function _b64decode(str) {
+      str = str.replace(/[=]+$/, '');
+      var len = (str.length * 3) >> 2;
+      var bytes = new Uint8Array(len);
+      var p = 0;
+      for (var i = 0; i < str.length; i += 4) {
+        var a = _b64lookup[str.charCodeAt(i)];
+        var b = _b64lookup[str.charCodeAt(i + 1)];
+        var c = _b64lookup[str.charCodeAt(i + 2)];
+        var d = _b64lookup[str.charCodeAt(i + 3)];
+        bytes[p++] = (a << 2) | (b >> 4);
+        if (i + 2 < str.length) bytes[p++] = ((b & 15) << 4) | (c >> 2);
+        if (i + 3 < str.length) bytes[p++] = ((c & 3) << 6) | d;
+      }
+      return bytes.subarray(0, p);
+    }
+
+    function _b64encode(bytes) {
+      var result = '';
+      for (var i = 0; i < bytes.length; i += 3) {
+        var a = bytes[i], b = bytes[i + 1], c = bytes[i + 2];
+        result += _b64chars[a >> 2];
+        result += _b64chars[((a & 3) << 4) | ((b || 0) >> 4)];
+        result += (i + 1 < bytes.length) ? _b64chars[((b & 15) << 2) | ((c || 0) >> 6)] : '=';
+        result += (i + 2 < bytes.length) ? _b64chars[c & 63] : '=';
+      }
+      return result;
+    }
+
+    function _makeBuffer(bytes, originalStr) {
+      var buf = new Uint8Array(bytes);
+      buf.toString = function(enc) {
+        if (enc === 'base64') return _b64encode(this);
+        if (enc === 'utf8' || enc === 'utf-8' || !enc) {
+          var s = '';
+          for (var i = 0; i < this.length; i++) s += String.fromCharCode(this[i]);
+          return s;
+        }
+        if (enc === 'hex') {
+          var h = '';
+          for (var i = 0; i < this.length; i++) h += (this[i] < 16 ? '0' : '') + this[i].toString(16);
+          return h;
+        }
+        return originalStr || '';
+      };
+      return buf;
+    }
+
     globalThis.Buffer = {
       from: function(data, encoding) {
         if (typeof data === 'string') {
+          if (encoding === 'base64') {
+            return _makeBuffer(_b64decode(data));
+          }
+          // utf8 default
           var arr = [];
-          for (var i = 0; i < data.length; i++) arr.push(data.charCodeAt(i) & 0xff);
-          var buf = new Uint8Array(arr);
-          buf.toString = function(enc) { return data; };
-          return buf;
+          for (var i = 0; i < data.length; i++) {
+            var code = data.charCodeAt(i);
+            if (code < 0x80) { arr.push(code); }
+            else if (code < 0x800) { arr.push(0xC0 | (code >> 6), 0x80 | (code & 0x3F)); }
+            else { arr.push(0xE0 | (code >> 12), 0x80 | ((code >> 6) & 0x3F), 0x80 | (code & 0x3F)); }
+          }
+          return _makeBuffer(arr, data);
         }
-        return new Uint8Array(data);
+        if (data instanceof Uint8Array) return _makeBuffer(data);
+        if (Array.isArray(data)) return _makeBuffer(data);
+        return _makeBuffer(new Uint8Array(0));
       },
-      alloc: function(size) { return new Uint8Array(size); },
+      alloc: function(size) { return _makeBuffer(new Uint8Array(size)); },
       isBuffer: function(obj) { return obj instanceof Uint8Array; },
       concat: function(list) {
         var total = 0;
@@ -281,7 +396,11 @@
         var result = new Uint8Array(total);
         var offset = 0;
         for (var i = 0; i < list.length; i++) { result.set(list[i], offset); offset += list[i].length; }
-        return result;
+        return _makeBuffer(result);
+      },
+      byteLength: function(str, encoding) {
+        if (typeof str === 'string') return str.length;
+        return str.length || 0;
       }
     };
   }
@@ -399,6 +518,9 @@
   globalThis.require = _require;
   globalThis.module = { exports: {} };
   globalThis.exports = globalThis.module.exports;
+
+  // ====== Global aliases ======
+  if (typeof globalThis.global === 'undefined') globalThis.global = globalThis;
 
   // ====== Global stubs ======
   if (typeof globalThis.setTimeout === 'undefined') {

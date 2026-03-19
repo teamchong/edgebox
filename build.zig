@@ -2219,10 +2219,42 @@ pub fn build(b: *std.Build) void {
 
             const v8_test_step = b.step("v8-test", "Build V8 embedding test (Phases 1+2)");
             v8_test_step.dependOn(&b.addInstallArtifact(v8_test_exe, .{}).step);
+
+            // edgebox-v8 — V8 runner for executing JS files
+            // Usage: ./zig-out/bin/edgebox-v8 <script.js> [args...]
+            const v8_run_exe = b.addExecutable(.{
+                .name = "edgebox-v8",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/v8_runner.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }),
+            });
+            v8_run_exe.addObjectFile(b.path(b.fmt("vendor/v8/{s}", .{lib_name})));
+            v8_run_exe.root_module.addCSourceFile(.{
+                .file = b.path("src/v8_bridge.cpp"),
+                .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti" },
+            });
+            v8_run_exe.root_module.addIncludePath(b.path("vendor/v8/include"));
+            v8_run_exe.root_module.addIncludePath(b.path("vendor/v8"));
+            v8_run_exe.root_module.addCSourceFile(.{
+                .file = b.path("src/v8_stubs.c"),
+                .flags = &.{},
+            });
+            v8_run_exe.linkLibC();
+            v8_run_exe.linkLibCpp();
+            v8_run_exe.linkSystemLibrary("pthread");
+
+            const v8_run_step = b.step("v8-run", "Build V8 JS runner (edgebox-v8)");
+            v8_run_step.dependOn(&b.addInstallArtifact(v8_run_exe, .{}).step);
         } else {
             const v8_test_step = b.step("v8-test", "Build V8 embedding test (unsupported platform)");
             const v8_fail = b.addFail("v8-test: unsupported platform (need x86_64/aarch64 linux/macos)");
             v8_test_step.dependOn(&v8_fail.step);
+
+            const v8_run_step = b.step("v8-run", "Build V8 JS runner (unsupported platform)");
+            const v8_run_fail = b.addFail("v8-run: unsupported platform (need x86_64/aarch64 linux/macos)");
+            v8_run_step.dependOn(&v8_run_fail.step);
         }
     }
 }
