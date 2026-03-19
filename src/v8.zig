@@ -17,18 +17,18 @@ const std = @import("std");
 // Opaque V8 types — pointers from Zig's perspective
 // ============================================================
 const Platform = opaque {};
-const Isolate = opaque {};
-const Context = opaque {};
-const Value = opaque {};
+pub const Isolate = opaque {};
+pub const Context = opaque {};
+pub const Value = opaque {};
 const Script = opaque {};
-const String = opaque {};
-const Object = opaque {};
+pub const String = opaque {};
+pub const Object = opaque {};
 const ObjectTemplate = opaque {};
-const FunctionTemplate = opaque {};
+pub const FunctionTemplate = opaque {};
 const MicrotaskQueue = opaque {};
 const Data = opaque {};
 const Message = opaque {};
-const FunctionCallbackInfo = opaque {};
+pub const FunctionCallbackInfo = opaque {};
 const Name = opaque {};
 const Module = opaque {};
 
@@ -306,17 +306,98 @@ pub const ValueApi = struct {
 };
 
 // ============================================================
-// FunctionTemplate API
+// FunctionCallbackInfo + ReturnValue API
 // ============================================================
 
 pub const FunctionCallback = *const fn (*const FunctionCallbackInfo) callconv(.c) void;
+
+/// ReturnValue wraps the internal value slot pointer from V8.
+/// GetReturnValue returns uintptr_t* (the slot pointer).
+/// ReturnValue__Set expects ReturnValue* (pointer TO a struct containing the slot).
+/// So we store the slot in a struct and pass &self to Set.
+pub const ReturnValue = struct {
+    slot: *anyopaque,
+
+    pub fn set(self: *ReturnValue, value: *const Value) void {
+        c.v8__ReturnValue__Value__Set(self, value);
+    }
+
+    pub fn setInt32(self: *ReturnValue, val: i32) void {
+        c.v8__ReturnValue__Value__Set__Int32(self, val);
+    }
+
+    pub fn setUndefined(self: *ReturnValue) void {
+        c.v8__ReturnValue__Value__SetUndefined(self);
+    }
+
+    pub fn setNull(self: *ReturnValue) void {
+        c.v8__ReturnValue__Value__SetNull(self);
+    }
+};
+
+pub const CallbackInfoApi = struct {
+    pub fn getIsolate(info: *const FunctionCallbackInfo) *Isolate {
+        return c.v8__FunctionCallbackInfo__GetIsolate(info);
+    }
+
+    pub fn length(info: *const FunctionCallbackInfo) i32 {
+        return c.v8__FunctionCallbackInfo__Length(info);
+    }
+
+    pub fn get(info: *const FunctionCallbackInfo, index: i32) ?*const Value {
+        return c.v8__FunctionCallbackInfo__Get(info, index);
+    }
+
+    pub fn data(info: *const FunctionCallbackInfo) ?*const Value {
+        return c.v8__FunctionCallbackInfo__Data(info);
+    }
+
+    pub fn this(info: *const FunctionCallbackInfo) *const Object {
+        return c.v8__FunctionCallbackInfo__This(info);
+    }
+
+    /// Returns a ReturnValue. The caller must store it on the stack
+    /// and use its methods to set the return value.
+    pub fn getReturnValue(info: *const FunctionCallbackInfo) ReturnValue {
+        return .{ .slot = c.v8__FunctionCallbackInfo__GetReturnValue(info) };
+    }
+};
+
+// ReturnValueApi remains for backward compat but methods are now on ReturnValue itself
+pub const ReturnValueApi = struct {
+    pub fn set(rv: *ReturnValue, value: *const Value) void {
+        rv.set(value);
+    }
+
+    pub fn setInt32(rv: *ReturnValue, val: i32) void {
+        rv.setInt32(val);
+    }
+
+    pub fn setUndefined(rv: *ReturnValue) void {
+        rv.setUndefined();
+    }
+
+    pub fn setNull(rv: *ReturnValue) void {
+        rv.setNull();
+    }
+};
+
+// ============================================================
+// FunctionTemplate API
+// ============================================================
+
+pub const Function = opaque {};
 
 pub const FunctionTemplateApi = struct {
     pub fn create(
         isolate: *Isolate,
         callback: ?FunctionCallback,
     ) ?*const FunctionTemplate {
-        return c.v8__FunctionTemplate__New(isolate, callback, null, null, 0, 0, null);
+        return c.v8__FunctionTemplate__New(isolate, callback, null, null, 0, 0, 0, null, 0);
+    }
+
+    pub fn getFunction(tmpl: *const FunctionTemplate, context: *const Context) ?*const Function {
+        return c.v8__FunctionTemplate__GetFunction(tmpl, context);
     }
 };
 
@@ -455,7 +536,23 @@ const c = struct {
     extern fn v8__Value__NumberValue(val: *const Value, context: *const Context, out: *MaybeF64) void;
     extern fn v8__Value__BooleanValue(val: *const Value, isolate: *Isolate) bool;
 
+    // FunctionCallbackInfo
+    extern fn v8__FunctionCallbackInfo__GetIsolate(info: *const FunctionCallbackInfo) *Isolate;
+    extern fn v8__FunctionCallbackInfo__Length(info: *const FunctionCallbackInfo) c_int;
+    extern fn v8__FunctionCallbackInfo__Get(info: *const FunctionCallbackInfo, index: c_int) ?*const Value;
+    extern fn v8__FunctionCallbackInfo__Data(info: *const FunctionCallbackInfo) ?*const Value;
+    extern fn v8__FunctionCallbackInfo__This(info: *const FunctionCallbackInfo) *const Object;
+    extern fn v8__FunctionCallbackInfo__GetReturnValue(info: *const FunctionCallbackInfo) *anyopaque;
+
+    // ReturnValue
+    extern fn v8__ReturnValue__Value__Set(rv: *ReturnValue, value: *const Value) void;
+    extern fn v8__ReturnValue__Value__Set__Int32(rv: *ReturnValue, val: i32) void;
+    extern fn v8__ReturnValue__Value__SetUndefined(rv: *ReturnValue) void;
+    extern fn v8__ReturnValue__Value__SetNull(rv: *ReturnValue) void;
+
     // FunctionTemplate
+    // 9 params: isolate, callback, data, signature, length, constructor_behavior,
+    //           side_effect_type, c_functions, c_functions_len
     extern fn v8__FunctionTemplate__New(
         isolate: *Isolate,
         callback: ?FunctionCallback,
@@ -463,8 +560,11 @@ const c = struct {
         signature: ?*const anyopaque,
         length: c_int,
         constructor_behavior: c_int,
-        side_effect_type: ?*const anyopaque,
+        side_effect_type: c_int,
+        c_functions: ?*const anyopaque,
+        c_functions_len: usize,
     ) ?*const FunctionTemplate;
+    extern fn v8__FunctionTemplate__GetFunction(tmpl: *const FunctionTemplate, context: *const Context) ?*const Function;
 
     // Object
     extern fn v8__Object__Set(obj: *const Object, context: *const Context, key: *const Value, value: *const Value) u8;
