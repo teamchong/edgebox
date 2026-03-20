@@ -740,10 +740,12 @@ fn applyTscTransforms(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
             .needle = "typeCount++;\n    result.id = typeCount;",
             .replacement = "typeCount++;\n    result.id = typeCount;\n    if(typeof __pc_typeFlags!=='undefined'&&typeCount<262144){__pc_typeFlags[typeCount]=result.flags;if(result.objectFlags)__pc_objectFlags[typeCount]=result.objectFlags;if(typeCount===5000&&typeof __edgebox_trigger_build==='function')__edgebox_trigger_build(typeCount);}",
         },
-        // T2: isSimpleTypeRelatedTo → read from SOA column + flag table lookup
+        // T2: isSimpleTypeRelatedTo → read flags from SOA column
+        // Flag table lookup removed — 11-bit index misses on common flags
+        // (Never=bit17, Object=bit19, Undefined=bit15 are all above bit 11)
         .{
             .needle = "const s = source.flags;\n    const t = target.flags;",
-            .replacement = "const s = __pc_typeFlags[source.id|0] || source.flags;\n    const t = __pc_typeFlags[target.id|0] || target.flags;\n    if(typeof __pc_flagTable!=='undefined'){const __ft=__pc_flagTable[(s&2047)*2048+(t&2047)];if(__ft===1)return true;if(__ft===2)return false;}",
+            .replacement = "const s = __pc_typeFlags[source.id|0] || source.flags;\n    const t = __pc_typeFlags[target.id|0] || target.flags;",
         },
         // T3: getRelationKey → packed Smi integer when intersectionState is 0
         // Includes postFix check: only use Smi when postFix is empty (state=0)
