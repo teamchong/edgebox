@@ -1916,6 +1916,11 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     // Patch getFlowCacheKey "this" case: 3 IDs → integer
                     const fck2_needle = "return `0|${flowContainer ? getNodeId(flowContainer) : \"-1\"}|${getTypeId(declaredType)}|${getTypeId(initialType)}`;";
                     const fck2_repl = "{var __fc2=flowContainer?getNodeId(flowContainer):0,__dt2=getTypeId(declaredType),__it2=getTypeId(initialType);if(__fc2<100000&&__dt2<100000&&__it2<100000)return __fc2*10000000000+__dt2*100000+__it2+1;return`0|${flowContainer?getNodeId(flowContainer):\"-1\"}|${__dt2}|${__it2}`;}";
+                    // getTypeOfSymbol cache disabled — type resolution is context-dependent.
+                    // Caching breaks on deferred/instantiated types that vary during checking.
+                    // TODO: implement safe caching with invalidation (two-pass approach).
+                    const gtos_needle = "DISABLED_getTypeOfSymbol";
+                    const gtos_repl = "DISABLED_getTypeOfSymbol";
                     // Patch ALL Maps — FastRelationCache must be complete drop-in.
                     // Broad patching (all 161 Maps) causes silent crashes on some Maps
                     // that use Set-like iteration patterns our FastRelationCache doesn't handle.
@@ -1927,7 +1932,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             rcount += 1;
                     }
                     if (rcount > 0) {
-                        var buf = allocator.alloc(u8, orig.len + rcount * repl.len + grk_repl.len + 10 * sw_repl.len + fck_repl.len + fck2_repl.len) catch break :blk @as(?[]const u8, orig);
+                        var buf = allocator.alloc(u8, orig.len + rcount * repl.len + grk_repl.len + 10 * sw_repl.len + fck_repl.len + fck2_repl.len + gtos_repl.len) catch break :blk @as(?[]const u8, orig);
                         var pw: usize = 0;
                         var pr: usize = 0;
                         while (pr < orig.len) {
@@ -1968,7 +1973,16 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 pr += fck_needle.len;
                                 continue;
                             }
-                            // P5: getFlowCacheKey "this" → integer packing for 3-ID keys
+                            // P5: getTypeOfSymbol → flat array cache
+                            if (pr + gtos_needle.len <= orig.len and
+                                std.mem.startsWith(u8, orig[pr..], gtos_needle))
+                            {
+                                @memcpy(buf[pw..][0..gtos_repl.len], gtos_repl);
+                                pw += gtos_repl.len;
+                                pr += gtos_needle.len;
+                                continue;
+                            }
+                            // P6: getFlowCacheKey "this" → integer packing for 3-ID keys
                             if (pr + fck2_needle.len <= orig.len and
                                 std.mem.startsWith(u8, orig[pr..], fck2_needle))
                             {
