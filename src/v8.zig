@@ -123,7 +123,12 @@ pub const ScriptOrigin = struct {
 pub fn initPlatform() !*Platform {
     // Enable aggressive JIT optimization flags before V8 init
     // Enable concurrent recompilation + OSR for TurboFan optimization
-    const flags = "--max-old-space-size=4096 --concurrent-recompilation --use-osr";
+    // V8 optimization flags:
+    // - always-sparkplug: immediately tier up to baseline compiler (skip interpreter)
+    // - concurrent-recompilation: TurboFan compiles on background threads
+    // - use-osr: on-stack replacement (replace running code with optimized version)
+    // - no-lazy-feedback-allocation: allocate feedback vectors eagerly (faster JIT)
+    const flags = "--max-old-space-size=4096 --concurrent-recompilation --use-osr --always-sparkplug --no-lazy-feedback-allocation";
     c.v8__V8__SetFlagsFromString(flags.ptr, flags.len);
 
     const platform = c.v8__Platform__NewDefaultPlatform(0, false) orelse
