@@ -215,6 +215,18 @@ es2024_results.txt
 # Profiling data
 perf.data
 perf.data.*
+isolate-*.log
+
+# Root-level temp/debug JS files (keep only tracked source)
+/tsc_*.js
+/diagram*.js
+
+# Binary artifacts at root
+/*.o
+/edgebox-tsc
+
+# Benchmark generated snapshots
+benchmark/src/
 
 # Generated diagrams
 diagram
