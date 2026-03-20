@@ -703,7 +703,27 @@ fn applyTscTransforms(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
             .needle = "return symbol !== unknownSymbol ? `${flowContainer ? getNodeId(flowContainer) : \"-1\"}|${getTypeId(declaredType)}|${getTypeId(initialType)}|${getSymbolId(symbol)}` : void 0;",
             .replacement = "if(symbol===unknownSymbol)return void 0;var __fc=flowContainer?getNodeId(flowContainer)+1:0,__dt=getTypeId(declaredType),__it=getTypeId(initialType),__si=getSymbolId(symbol);return(__fc<2048&&__dt<2048&&__it<2048&&__si<2048)?__fc*8589934592+__dt*4194304+__it*2048+__si+1:`${__fc}|${__dt}|${__it}|${__si}`;",
         },
-        // T7: Parallel checkSourceFile sharding — when __EDGEBOX_SHARD is set,
+        // T7: accessibleChainCache key → packed integer
+        .{
+            .needle = "const key = `${useOnlyExternalAliasing ? 0 : 1}|${firstRelevantLocation ? getNodeId(firstRelevantLocation) : 0}|${meaning}`;",
+            .replacement = "const key = (useOnlyExternalAliasing?0:4194304)+(firstRelevantLocation?getNodeId(firstRelevantLocation):0)*8+meaning+1;",
+        },
+        // T8: decoratorContextOverrideType key → packed integer
+        .{
+            .needle = "const key = `${isPrivate ? \"p\" : \"P\"}${isStatic2 ? \"s\" : \"S\"}${nameType.id}`;",
+            .replacement = "const key = (isPrivate?2:0)+(isStatic2?1:0)+nameType.id*4+1;",
+        },
+        // T9: createSourceFile memoization — cache by fileName+size
+        .{
+            .needle = "function createSourceFile(fileName, sourceText, languageVersionOrOptions, setParentNodes = false, scriptKind) {",
+            .replacement = "function createSourceFile(fileName, sourceText, languageVersionOrOptions, setParentNodes = false, scriptKind) {var __ck=fileName+':'+sourceText.length;if(typeof __sfCache!=='undefined'&&__sfCache[__ck])return __sfCache[__ck];",
+        },
+        // T10: createSourceFile return — cache result before returning
+        .{
+            .needle = "(_b = tracing) == null ? void 0 : _b.pop();\n  return result;\n}\nfunction parseIsolatedEntityName",
+            .replacement = "(_b = tracing) == null ? void 0 : _b.pop();\n  if(typeof __sfCache!=='undefined')__sfCache[__ck]=result;\n  return result;\n}\nfunction parseIsolatedEntityName",
+        },
+        // T11: Parallel checkSourceFile sharding — when __EDGEBOX_SHARD is set,
         // each worker only checks its portion of source files
         .{
             .needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));",
