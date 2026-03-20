@@ -206,15 +206,17 @@ const embedded_snapshot = @embedFile("v8_bootstrap.snapshot");
 
 /// External references for V8 snapshot deserialization — must match the array
 /// used during snapshot creation (in v8_snapshot_gen.zig).
-/// Order: [ioSyncCallback, ioBatchCallback, readFileFastCallback, fileExistsFastCallback, 0]
-var external_refs: [5]usize = .{ 0, 0, 0, 0, 0 };
+/// Order: [ioSync, ioBatch, readFile, fileExists, dirExists, realpath, 0]
+var external_refs: [7]usize = .{ 0, 0, 0, 0, 0, 0, 0 };
 
-fn getExternalRefs() *const [5]usize {
+fn getExternalRefs() *const [7]usize {
     if (external_refs[0] == 0) {
         external_refs[0] = @intFromPtr(&v8_io.ioSyncCallback);
         external_refs[1] = @intFromPtr(&v8_io.ioBatchCallback);
         external_refs[2] = @intFromPtr(&v8_io.readFileFastCallback);
         external_refs[3] = @intFromPtr(&v8_io.fileExistsFastCallback);
+        external_refs[4] = @intFromPtr(&v8_io.dirExistsFastCallback);
+        external_refs[5] = @intFromPtr(&v8_io.realpathFastCallback);
     }
     return &external_refs;
 }
@@ -723,7 +725,12 @@ fn applyTscTransforms(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
             .needle = "(_b = tracing) == null ? void 0 : _b.pop();\n  return result;\n}\nfunction parseIsolatedEntityName",
             .replacement = "(_b = tracing) == null ? void 0 : _b.pop();\n  if(typeof __sfCache!=='undefined')__sfCache[__ck]=result;\n  return result;\n}\nfunction parseIsolatedEntityName",
         },
-        // T11: Parallel checkSourceFile sharding — when __EDGEBOX_SHARD is set,
+        // T11: fileSystemEntryExists → fast callbacks for file/dir checks
+        .{
+            .needle = "function fileSystemEntryExists(path, entryKind) {\n      const stat = statSync(path);\n      if (!stat) {\n        return false;\n      }\n      switch (entryKind) {\n        case 0 /* File */:\n          return stat.isFile();\n        case 1 /* Directory */:\n          return stat.isDirectory();",
+            .replacement = "function fileSystemEntryExists(path, entryKind) {\n      if(typeof __edgebox_file_exists==='function'){if(entryKind===0)return !!__edgebox_file_exists(path);if(entryKind===1)return !!__edgebox_dir_exists(path);}\n      const stat = statSync(path);\n      if (!stat) {\n        return false;\n      }\n      switch (entryKind) {\n        case 0 /* File */:\n          return stat.isFile();\n        case 1 /* Directory */:\n          return stat.isDirectory();",
+        },
+        // T12: Parallel checkSourceFile sharding — when __EDGEBOX_SHARD is set,
         // each worker only checks its portion of source files
         .{
             .needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));",

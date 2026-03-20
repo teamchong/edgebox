@@ -167,6 +167,11 @@
       });
     },
     realpathSync: function(path) {
+      if (typeof __edgebox_realpath === 'function') {
+        var result = __edgebox_realpath(String(path));
+        if (result === undefined) { var err = new Error('ENOENT'); err.code = 'ENOENT'; throw err; }
+        return result;
+      }
       var r = _ioSync('realpath', { path: String(path) });
       if (!r.ok) { var err = new Error(r.error); throw err; }
       return r.data;
