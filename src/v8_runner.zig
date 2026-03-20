@@ -861,7 +861,7 @@ fn applyTscTransforms(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
         // can use __pc_flagTable[(s&0x7FF)*2048+(t&0x7FF)] for O(1) lookup.
         .{
             .needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));",
-            .replacement = "{if(typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);const __files=host.getSourceFiles();const __shard=parseInt(process.env.__EDGEBOX_SHARD||'0');const __total=parseInt(process.env.__EDGEBOX_TOTAL||'1');const __start=Math.floor(__files.length*__shard/__total);const __end=Math.floor(__files.length*(__shard+1)/__total);for(let __i=__start;__i<__end;__i++)checkSourceFileWithEagerDiagnostics(__files[__i]);}",
+            .replacement = "{if(typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);const __files=host.getSourceFiles();const __shard=parseInt(process.env.__EDGEBOX_SHARD||'0');const __total=parseInt(process.env.__EDGEBOX_TOTAL||'1');const __start=Math.floor(__files.length*__shard/__total);const __end=Math.floor(__files.length*(__shard+1)/__total);for(let __i=__start;__i<__end;__i++){checkSourceFileWithEagerDiagnostics(__files[__i]);if(__i%50===49&&typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);}}",
         },
     };
 
