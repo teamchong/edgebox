@@ -1919,6 +1919,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     // Patch getFlowCacheKey array/object case: nodeId#typeId → integer
                     const fck3_needle = "return `${getNodeId(node)}#${getTypeId(declaredType)}`;";
                     const fck3_repl = "{var __ni=getNodeId(node),__di=getTypeId(declaredType);if(__ni<100000&&__di<100000)return __ni*100000+__di+1;return`${__ni}#${__di}`;}";
+                    // Parallel type checking: shard the forEach(sourceFiles, check) loop
+                    // When __EDGEBOX_WORKER env is set, only check files in this shard.
+                    const par_needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));";
+                    const par_repl = "{const __files=host.getSourceFiles();const __shard=parseInt(process.env.__EDGEBOX_SHARD||'0');const __total=parseInt(process.env.__EDGEBOX_TOTAL||'1');const __start=Math.floor(__files.length*__shard/__total);const __end=Math.floor(__files.length*(__shard+1)/__total);for(let __i=__start;__i<__end;__i++)checkSourceFileWithEagerDiagnostics(__files[__i]);}";
                     // getTypeOfSymbol cache disabled — type resolution is context-dependent.
                     // Caching breaks on deferred/instantiated types that vary during checking.
                     // TODO: implement safe caching with invalidation (two-pass approach).
@@ -1935,7 +1939,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             rcount += 1;
                     }
                     if (rcount > 0) {
-                        var buf = allocator.alloc(u8, orig.len + rcount * repl.len + grk_repl.len + 10 * sw_repl.len + fck_repl.len + fck2_repl.len + gtos_repl.len) catch break :blk @as(?[]const u8, orig);
+                        var buf = allocator.alloc(u8, orig.len + rcount * repl.len + grk_repl.len + 10 * sw_repl.len + fck_repl.len + fck2_repl.len + gtos_repl.len + par_repl.len) catch break :blk @as(?[]const u8, orig);
                         var pw: usize = 0;
                         var pr: usize = 0;
                         while (pr < orig.len) {
@@ -1994,7 +1998,16 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 pr += fck3_needle.len;
                                 continue;
                             }
-                            // P7: getFlowCacheKey "this" → integer packing for 3-ID keys
+                            // P7: parallel type checking — shard forEach loop
+                            if (pr + par_needle.len <= orig.len and
+                                std.mem.startsWith(u8, orig[pr..], par_needle))
+                            {
+                                @memcpy(buf[pw..][0..par_repl.len], par_repl);
+                                pw += par_repl.len;
+                                pr += par_needle.len;
+                                continue;
+                            }
+                            // P8: getFlowCacheKey "this" → integer packing for 3-ID keys
                             if (pr + fck2_needle.len <= orig.len and
                                 std.mem.startsWith(u8, orig[pr..], fck2_needle))
                             {
@@ -2042,7 +2055,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     var shim_state = shim_f.writer(&shim_buf);
                     const shim_w = &shim_state.interface;
                     shim_w.print(
-                        \\// EdgeBox AOT+JIT shim (V8 compile cache + incremental type-check cache)
+                        \\// EdgeBox AOT+JIT shim (V8 compile cache + parallel type checking)
                         \\try {{ require("node:module").enableCompileCache(); }} catch {{}}
                         \\// Auto-enable --incremental for faster warm builds (same diagnostics, ~2x faster)
                         \\if (!process.argv.includes('--incremental')) {{
@@ -2051,9 +2064,24 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         \\  try {{ require('fs').mkdirSync(__d, {{ recursive: true }}); }} catch {{}}
                         \\  process.argv.push('--incremental', '--tsBuildInfoFile', __p.join(__d, 'tsinfo.json'));
                         \\}}
-                        \\require('./{s}');
+                        \\// Parallel type checking: if EDGEBOX_PARALLEL=N, run N TSC instances
+                        \\// each checking a subset of files, then merge diagnostics.
+                        \\const __PARALLEL = parseInt(process.env.EDGEBOX_PARALLEL || '0', 10);
+                        \\if (__PARALLEL > 1 && !process.env.__EDGEBOX_WORKER) {{
+                        \\  const {{ Worker, isMainThread }} = require('worker_threads');
+                        \\  const __args = process.argv.slice(2);
+                        \\  const __workers = [];
+                        \\  for (let __i = 0; __i < __PARALLEL; __i++) {{
+                        \\    const __env = {{ ...(process.env), __EDGEBOX_WORKER: '1', __EDGEBOX_SHARD: String(__i), __EDGEBOX_TOTAL: String(__PARALLEL) }};
+                        \\    __workers.push(new Worker(require.resolve('./{s}'), {{ env: __env, argv: __args }}));
+                        \\  }}
+                        \\  let __done = 0;
+                        \\  __workers.forEach(w => w.on('exit', () => {{ __done++; if (__done === __PARALLEL) process.exit(0); }}));
+                        \\}} else {{
+                        \\  require('./{s}');
+                        \\}}
                         \\
-                    , .{module_filename}) catch {};
+                    , .{module_filename, module_filename}) catch {};
                     shim_w.flush() catch {};
                     std.debug.print("[build] Shim: {s}\n", .{wp});
                 } else |_| {}
