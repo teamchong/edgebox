@@ -479,6 +479,9 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         }
     }
 
+    // Flush buffered output before exiting
+    v8_io.flushAll();
+
     // Apply deferred exit code if process.exit was called
     if (v8_io.deferred_exit_code) |code| {
         std.process.exit(code);

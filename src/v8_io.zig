@@ -163,6 +163,14 @@ pub fn writeStdoutFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c
 /// Buffered stderr — TSC outputs diagnostics to stderr
 var stderr_buf: std.ArrayListUnmanaged(u8) = .{};
 
+/// Flush all buffered output. Call at end of script execution.
+pub fn flushAll() void {
+    flushStdout();
+    flushStderr();
+    // Wait for async stdout flush thread
+    if (stdout_flush_thread) |t| { t.join(); stdout_flush_thread = null; }
+}
+
 fn flushStderr() void {
     if (stderr_buf.items.len > 0) {
         const stderr = std.fs.File.stderr();
