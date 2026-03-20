@@ -203,17 +203,19 @@ const embedded_snapshot = @embedFile("v8_bootstrap.snapshot");
 
 /// External references for V8 snapshot deserialization — must match the array
 /// used during snapshot creation (in v8_snapshot_gen.zig).
-/// Order: [ioSync, ioBatch, readFile, fileExists, dirExists, realpath, 0]
-var external_refs: [7]usize = .{ 0, 0, 0, 0, 0, 0, 0 };
+/// Order: [ioSync, ioBatch, readFile, fileExists, writeStdout, writeStderr, dirExists, realpath, 0]
+var external_refs: [9]usize = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
-fn getExternalRefs() *const [7]usize {
+fn getExternalRefs() *const [9]usize {
     if (external_refs[0] == 0) {
         external_refs[0] = @intFromPtr(&v8_io.ioSyncCallback);
         external_refs[1] = @intFromPtr(&v8_io.ioBatchCallback);
         external_refs[2] = @intFromPtr(&v8_io.readFileFastCallback);
         external_refs[3] = @intFromPtr(&v8_io.fileExistsFastCallback);
-        external_refs[4] = @intFromPtr(&v8_io.dirExistsFastCallback);
-        external_refs[5] = @intFromPtr(&v8_io.realpathFastCallback);
+        external_refs[4] = @intFromPtr(&v8_io.writeStdoutFastCallback);
+        external_refs[5] = @intFromPtr(&v8_io.writeStderrFastCallback);
+        external_refs[6] = @intFromPtr(&v8_io.dirExistsFastCallback);
+        external_refs[7] = @intFromPtr(&v8_io.realpathFastCallback);
     }
     return &external_refs;
 }

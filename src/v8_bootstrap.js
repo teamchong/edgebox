@@ -288,8 +288,8 @@
   _proc.arch = 'x64';
   _proc.version = 'v20.0.0';
   _proc.versions = { node: '20.0.0', v8: '14.6.202.9' };
-  _proc.stdout = { write: function(s) { _ioSync('writeStdout', { data: String(s) }); return true; }, isTTY: false, columns: 80, _handle: null };
-  _proc.stderr = { write: function(s) { _ioSync('writeStderr', { data: String(s) }); return true; }, isTTY: false };
+  _proc.stdout = { write: function(s) { if (typeof __edgebox_write_stdout==='function') __edgebox_write_stdout(String(s)); else _ioSync('writeStdout', { data: String(s) }); return true; }, isTTY: false, columns: 80, _handle: null };
+  _proc.stderr = { write: function(s) { if (typeof __edgebox_write_stderr==='function') __edgebox_write_stderr(String(s)); else _ioSync('writeStderr', { data: String(s) }); return true; }, isTTY: false };
   _proc.stdin = { isTTY: false };
   _proc.hrtime = function(prev) {
     var now = Date.now();

@@ -42,6 +42,18 @@ pub fn registerGlobals(isolate: *v8.Isolate, context: *const v8.Context) void {
     const fe_key = v8.StringApi.fromUtf8(isolate, "__edgebox_file_exists") orelse return;
     _ = v8.ObjectApi.set(global, context, @ptrCast(fe_key), @ptrCast(fe_func));
 
+    // __edgebox_write_stdout(str) — fast stdout write (no JSON)
+    const ws_tmpl = v8.FunctionTemplateApi.create(isolate, &writeStdoutFastCallback) orelse return;
+    const ws_func = v8.FunctionTemplateApi.getFunction(ws_tmpl, context) orelse return;
+    const ws_key = v8.StringApi.fromUtf8(isolate, "__edgebox_write_stdout") orelse return;
+    _ = v8.ObjectApi.set(global, context, @ptrCast(ws_key), @ptrCast(ws_func));
+
+    // __edgebox_write_stderr(str) — fast stderr write (no JSON)
+    const we_tmpl = v8.FunctionTemplateApi.create(isolate, &writeStderrFastCallback) orelse return;
+    const we_func = v8.FunctionTemplateApi.getFunction(we_tmpl, context) orelse return;
+    const we_key = v8.StringApi.fromUtf8(isolate, "__edgebox_write_stderr") orelse return;
+    _ = v8.ObjectApi.set(global, context, @ptrCast(we_key), @ptrCast(we_func));
+
     // __edgebox_dir_exists(path) → boolean (fast path for directoryExists)
     const de_tmpl = v8.FunctionTemplateApi.create(isolate, &dirExistsFastCallback) orelse return;
     const de_func = v8.FunctionTemplateApi.getFunction(de_tmpl, context) orelse return;
@@ -56,6 +68,56 @@ pub fn registerGlobals(isolate: *v8.Isolate, context: *const v8.Context) void {
 }
 
 /// Fast readFile: path → string (no JSON serialize/parse overhead)
+/// Fast stdout write — no JSON
+pub fn writeStdoutFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
+    const isolate = v8.CallbackInfoApi.getIsolate(info);
+    if (v8.CallbackInfoApi.length(info) < 1) return;
+    const arg0 = v8.CallbackInfoApi.get(info, 0) orelse return;
+    if (!v8.ValueApi.isString(arg0)) return;
+
+    const str: *const v8.String = @ptrCast(arg0);
+    const len: usize = @intCast(v8.StringApi.utf8Length(str, isolate));
+    if (len == 0) return;
+
+    var stack_buf: [4096]u8 = undefined;
+    if (len <= stack_buf.len) {
+        const written = v8.StringApi.writeUtf8(str, isolate, &stack_buf);
+        const stdout = std.fs.File.stdout();
+        stdout.writeAll(stack_buf[0..written]) catch {};
+    } else {
+        const heap_buf = alloc.alloc(u8, len) catch return;
+        defer alloc.free(heap_buf);
+        const written = v8.StringApi.writeUtf8(str, isolate, heap_buf);
+        const stdout = std.fs.File.stdout();
+        stdout.writeAll(heap_buf[0..written]) catch {};
+    }
+}
+
+/// Fast stderr write — no JSON
+pub fn writeStderrFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
+    const isolate = v8.CallbackInfoApi.getIsolate(info);
+    if (v8.CallbackInfoApi.length(info) < 1) return;
+    const arg0 = v8.CallbackInfoApi.get(info, 0) orelse return;
+    if (!v8.ValueApi.isString(arg0)) return;
+
+    const str: *const v8.String = @ptrCast(arg0);
+    const len: usize = @intCast(v8.StringApi.utf8Length(str, isolate));
+    if (len == 0) return;
+
+    var stack_buf: [4096]u8 = undefined;
+    if (len <= stack_buf.len) {
+        const written = v8.StringApi.writeUtf8(str, isolate, &stack_buf);
+        const stderr = std.fs.File.stderr();
+        stderr.writeAll(stack_buf[0..written]) catch {};
+    } else {
+        const heap_buf = alloc.alloc(u8, len) catch return;
+        defer alloc.free(heap_buf);
+        const written = v8.StringApi.writeUtf8(str, isolate, heap_buf);
+        const stderr = std.fs.File.stderr();
+        stderr.writeAll(heap_buf[0..written]) catch {};
+    }
+}
+
 /// Directory exists cache
 var dir_exists_cache: std.StringHashMapUnmanaged(bool) = .{};
 
