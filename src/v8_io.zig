@@ -44,6 +44,9 @@ pub fn registerGlobals(isolate: *v8.Isolate, context: *const v8.Context) void {
 }
 
 /// Fast readFile: path → string (no JSON serialize/parse overhead)
+/// Raw file content cache (no JSON escaping — for fast callback)
+var raw_file_cache: std.StringHashMapUnmanaged([]const u8) = .{};
+
 pub fn readFileFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
     const isolate = v8.CallbackInfoApi.getIsolate(info);
     var rv = v8.CallbackInfoApi.getReturnValue(info);
@@ -64,19 +67,26 @@ pub fn readFileFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) v
     const written = v8.StringApi.writeUtf8(str, isolate, &path_buf);
     const path = path_buf[0..written];
 
-    // Read file content (uses cache if available)
-    const file = std.fs.cwd().openFile(path, .{}) catch { rv.setUndefined(); return; };
-    defer file.close();
-    const content = file.readToEndAlloc(alloc, 64 * 1024 * 1024) catch { rv.setUndefined(); return; };
-
-    // Create V8 string directly from file content — no JSON escaping needed!
-    // For large files, use external string (zero-copy from Zig buffer to V8)
-    const v8_str = if (content.len > 65536)
-        v8.StringApi.fromExternalOneByte(isolate, content)
-    else blk: {
-        defer alloc.free(content);
-        break :blk v8.StringApi.fromUtf8(isolate, content);
+    // Check raw content cache first
+    const cached_content = raw_file_cache.get(path);
+    const content = cached_content orelse blk: {
+        const file = std.fs.cwd().openFile(path, .{}) catch { rv.setUndefined(); return; };
+        defer file.close();
+        const data = file.readToEndAlloc(alloc, 64 * 1024 * 1024) catch { rv.setUndefined(); return; };
+        // Cache the raw content
+        const key = alloc.dupe(u8, path) catch path;
+        raw_file_cache.put(alloc, key, data) catch {};
+        break :blk data;
     };
+
+    // Create V8 string directly — no JSON escaping needed!
+    // Use external string (zero-copy) for all files > 128 bytes.
+    // fromExternalOneByte is zero-copy: V8 reads directly from Zig's buffer.
+    // fromUtf8 copies the string (only for tiny files where copy is free).
+    const v8_str = if (content.len > 128)
+        v8.StringApi.fromExternalOneByte(isolate, content)
+    else
+        v8.StringApi.fromUtf8(isolate, content);
 
     if (v8_str) |s| {
         rv.set(@ptrCast(s));
@@ -347,6 +357,13 @@ fn prefetchWorker(paths: []const []const u8, start: usize, end: usize) void {
         defer prefetch_mutex.unlock();
         const key = alloc.dupe(u8, path) catch continue;
         file_cache.put(alloc, key, final) catch {};
+
+        // Also cache in raw file cache (for fast readFile callback)
+        // Re-read the file for raw content (the 'content' was freed after JSON escape)
+        const raw_file = std.fs.cwd().openFile(path, .{}) catch continue;
+        defer raw_file.close();
+        const raw_content = raw_file.readToEndAlloc(alloc, 64 * 1024 * 1024) catch continue;
+        raw_file_cache.put(alloc, key, raw_content) catch {};
 
         // Also cache exists=true
         exists_cache.put(alloc, key, true) catch {};
