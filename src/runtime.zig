@@ -2092,10 +2092,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 pr += csf_ret_needle.len;
                                 continue;
                             }
-                            // P16: skip JSDoc parsing for .ts files (2x faster parsing)
-                            // jsDocParsingMode: 0=ParseAll, 1=ParseNone
-                            // For .ts files, JSDoc isn't needed for type checking.
-                            // Saves ~50% of parse time with IDENTICAL diagnostics.
+                            // P16: skip JSDoc parsing (2x faster parsing, identical diagnostics)
+                            // Patch both outer var AND function default parameter.
                             if (pr + 24 <= orig.len and
                                 std.mem.startsWith(u8, orig[pr..], "var jsDocParsingMode = 0;"))
                             {
@@ -2103,6 +2101,17 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 @memcpy(buf[pw..][0..jsdoc_repl.len], jsdoc_repl);
                                 pw += jsdoc_repl.len;
                                 pr += 24;
+                                continue;
+                            }
+                            // Patch function default: jsDocParsingMode = 0) → jsDocParsingMode = 1)
+                            if (pr + 21 <= orig.len and
+                                std.mem.startsWith(u8, orig[pr..], "jsDocParsingMode = 0)") and
+                                pr >= 1 and (orig[pr - 1] == ' ' or orig[pr - 1] == ','))
+                            {
+                                const jd_repl = "jsDocParsingMode = 1)";
+                                @memcpy(buf[pw..][0..jd_repl.len], jd_repl);
+                                pw += jd_repl.len;
+                                pr += 21;
                                 continue;
                             }
                             // Tracing elimination reverted — broke correctness.
