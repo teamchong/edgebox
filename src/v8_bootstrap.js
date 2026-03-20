@@ -190,10 +190,18 @@
       var withTypes = options && options.withFileTypes;
       var cacheKey = withTypes ? p + ':t' : p;
       if (_readdirCache[cacheKey] !== undefined) return _readdirCache[cacheKey];
-      var r = _ioSync('readdir', { path: p });
-      if (!r.ok) { var err = new Error(r.error || 'ENOENT'); err.code = r.code || 'ENOENT'; throw err; }
-      var result = r.entries.map(function(e) {
-        if (withTypes) return { name: e.name, isFile: function() { return !e.isDirectory; }, isDirectory: function() { return e.isDirectory; }, isSymbolicLink: function() { return false; } };
+      var entries;
+      if (typeof __edgebox_readdir === 'function') {
+        var json = __edgebox_readdir(p);
+        if (json === undefined) { var err = new Error('ENOENT'); err.code = 'ENOENT'; throw err; }
+        entries = JSON.parse(json);
+      } else {
+        var r = _ioSync('readdir', { path: p });
+        if (!r.ok) { var err = new Error(r.error || 'ENOENT'); err.code = r.code || 'ENOENT'; throw err; }
+        entries = r.entries.map(function(e) { return { name: e.name, d: e.isDirectory }; });
+      }
+      var result = entries.map(function(e) {
+        if (withTypes) return { name: e.name, isFile: function() { return !e.d; }, isDirectory: function() { return e.d; }, isSymbolicLink: function() { return false; } };
         return e.name;
       });
       _readdirCache[cacheKey] = result;

@@ -16,10 +16,10 @@ const v8_io = @import("v8_io.zig");
 /// External references for V8 snapshot — function pointers that V8 needs
 /// to serialize/deserialize. Must be null-terminated and consistent between
 /// snapshot creation (here) and snapshot loading (v8_runner.zig).
-/// Order: [ioSync, ioBatch, readFile, fileExists, writeStdout, writeStderr, dirExists, realpath, 0]
-var external_refs: [9]usize = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+/// External refs: all IO callbacks + null terminator
+var external_refs: [11]usize = .{0} ** 11;
 
-fn getExternalRefs() *const [9]usize {
+fn getExternalRefs() *const [11]usize {
     if (external_refs[0] == 0) {
         external_refs[0] = @intFromPtr(&v8_io.ioSyncCallback);
         external_refs[1] = @intFromPtr(&v8_io.ioBatchCallback);
@@ -27,8 +27,9 @@ fn getExternalRefs() *const [9]usize {
         external_refs[3] = @intFromPtr(&v8_io.fileExistsFastCallback);
         external_refs[4] = @intFromPtr(&v8_io.writeStdoutFastCallback);
         external_refs[5] = @intFromPtr(&v8_io.writeStderrFastCallback);
-        external_refs[6] = @intFromPtr(&v8_io.dirExistsFastCallback);
-        external_refs[7] = @intFromPtr(&v8_io.realpathFastCallback);
+        external_refs[6] = @intFromPtr(&v8_io.readdirFastCallback);
+        external_refs[7] = @intFromPtr(&v8_io.dirExistsFastCallback);
+        external_refs[8] = @intFromPtr(&v8_io.realpathFastCallback);
     }
     return &external_refs;
 }

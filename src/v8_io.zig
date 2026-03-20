@@ -54,6 +54,12 @@ pub fn registerGlobals(isolate: *v8.Isolate, context: *const v8.Context) void {
     const we_key = v8.StringApi.fromUtf8(isolate, "__edgebox_write_stderr") orelse return;
     _ = v8.ObjectApi.set(global, context, @ptrCast(we_key), @ptrCast(we_func));
 
+    // __edgebox_readdir(path) → string (JSON array of names, fast path)
+    const rd_tmpl = v8.FunctionTemplateApi.create(isolate, &readdirFastCallback) orelse return;
+    const rd_func = v8.FunctionTemplateApi.getFunction(rd_tmpl, context) orelse return;
+    const rd_key = v8.StringApi.fromUtf8(isolate, "__edgebox_readdir") orelse return;
+    _ = v8.ObjectApi.set(global, context, @ptrCast(rd_key), @ptrCast(rd_func));
+
     // __edgebox_dir_exists(path) → boolean (fast path for directoryExists)
     const de_tmpl = v8.FunctionTemplateApi.create(isolate, &dirExistsFastCallback) orelse return;
     const de_func = v8.FunctionTemplateApi.getFunction(de_tmpl, context) orelse return;
@@ -156,6 +162,61 @@ pub fn writeStderrFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c
     if (stderr_buf.items.len >= STDOUT_BUF_SIZE) {
         flushStderr();
     }
+}
+
+/// Fast readdir: returns JSON array string of {name, isDirectory} entries
+/// Still uses JSON for the result (V8 needs to parse it) but avoids
+/// the full JSON roundtrip of _ioSync.
+pub fn readdirFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
+    const isolate = v8.CallbackInfoApi.getIsolate(info);
+    var rv = v8.CallbackInfoApi.getReturnValue(info);
+
+    if (v8.CallbackInfoApi.length(info) < 1) { rv.setUndefined(); return; }
+    const arg0 = v8.CallbackInfoApi.get(info, 0) orelse { rv.setUndefined(); return; };
+    if (!v8.ValueApi.isString(arg0)) { rv.setUndefined(); return; }
+
+    const str: *const v8.String = @ptrCast(arg0);
+    const len: usize = @intCast(v8.StringApi.utf8Length(str, isolate));
+    if (len == 0 or len > 4096) { rv.setUndefined(); return; }
+
+    var path_buf: [4096]u8 = undefined;
+    const written = v8.StringApi.writeUtf8(str, isolate, &path_buf);
+    const path = path_buf[0..written];
+
+    // Check cache
+    if (readdir_cache.get(path)) |cached| {
+        const v8_str = v8.StringApi.fromUtf8(isolate, cached) orelse { rv.setUndefined(); return; };
+        rv.set(@ptrCast(v8_str));
+        return;
+    }
+
+    // Read directory
+    var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch { rv.setUndefined(); return; };
+    defer dir.close();
+
+    var result: std.ArrayListUnmanaged(u8) = .{};
+    result.appendSlice(alloc, "[") catch { rv.setUndefined(); return; };
+
+    var first = true;
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (!first) result.append(alloc, ',') catch {};
+        first = false;
+        const is_dir = entry.kind == .directory;
+        const item = std.fmt.allocPrint(alloc, "{{\"name\":\"{s}\",\"d\":{}}}", .{ entry.name, is_dir }) catch continue;
+        defer alloc.free(item);
+        result.appendSlice(alloc, item) catch {};
+    }
+
+    result.appendSlice(alloc, "]") catch {};
+    const final = result.toOwnedSlice(alloc) catch { rv.setUndefined(); return; };
+
+    // Cache
+    const key = alloc.dupe(u8, path) catch path;
+    readdir_cache.put(alloc, key, final) catch {};
+
+    const v8_str = v8.StringApi.fromUtf8(isolate, final) orelse { rv.setUndefined(); return; };
+    rv.set(@ptrCast(v8_str));
 }
 
 /// Directory exists cache

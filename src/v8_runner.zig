@@ -203,10 +203,10 @@ const embedded_snapshot = @embedFile("v8_bootstrap.snapshot");
 
 /// External references for V8 snapshot deserialization — must match the array
 /// used during snapshot creation (in v8_snapshot_gen.zig).
-/// Order: [ioSync, ioBatch, readFile, fileExists, writeStdout, writeStderr, dirExists, realpath, 0]
-var external_refs: [9]usize = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+/// External refs: all IO callbacks + null terminator
+var external_refs: [11]usize = .{0} ** 11;
 
-fn getExternalRefs() *const [9]usize {
+fn getExternalRefs() *const [11]usize {
     if (external_refs[0] == 0) {
         external_refs[0] = @intFromPtr(&v8_io.ioSyncCallback);
         external_refs[1] = @intFromPtr(&v8_io.ioBatchCallback);
@@ -214,8 +214,9 @@ fn getExternalRefs() *const [9]usize {
         external_refs[3] = @intFromPtr(&v8_io.fileExistsFastCallback);
         external_refs[4] = @intFromPtr(&v8_io.writeStdoutFastCallback);
         external_refs[5] = @intFromPtr(&v8_io.writeStderrFastCallback);
-        external_refs[6] = @intFromPtr(&v8_io.dirExistsFastCallback);
-        external_refs[7] = @intFromPtr(&v8_io.realpathFastCallback);
+        external_refs[6] = @intFromPtr(&v8_io.readdirFastCallback);
+        external_refs[7] = @intFromPtr(&v8_io.dirExistsFastCallback);
+        external_refs[8] = @intFromPtr(&v8_io.realpathFastCallback);
     }
     return &external_refs;
 }
@@ -264,21 +265,21 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         };
     }
 
-    // Register parallel execution API (lazy — no cold-start cost)
-    const v8_parallel = @import("v8_parallel.zig");
-    v8_parallel.registerGlobals(isolate, context);
+    // Register parallel/channel APIs only for non-TSC scripts.
+    // For TSC, skip these to reduce startup by ~50ms (SAB allocation + JS eval).
+    if (!is_tsc) {
+        const v8_parallel = @import("v8_parallel.zig");
+        v8_parallel.registerGlobals(isolate, context);
 
-    // Register channel API (Go-like channels for inter-worker communication)
-    const v8_channel = @import("v8_channel.zig");
-    v8_channel.registerGlobals(isolate, context);
+        const v8_channel = @import("v8_channel.zig");
+        v8_channel.registerGlobals(isolate, context);
 
-    // Register Zig-threaded parallel type checking
-    const v8_parallel_check = @import("v8_parallel_check.zig");
-    v8_parallel_check.registerGlobals(isolate, context);
+        const v8_parallel_check = @import("v8_parallel_check.zig");
+        v8_parallel_check.registerGlobals(isolate, context);
 
-    // Create JS-friendly wrappers: edgebox.parallel, edgebox.map, edgebox.reduce, edgebox.channel
-    const parallel_init_js = @embedFile("v8_parallel_init.js");
-    _ = v8.eval(isolate, context, parallel_init_js, "v8_parallel_init.js") catch {};
+        const parallel_init_js = @embedFile("v8_parallel_init.js");
+        _ = v8.eval(isolate, context, parallel_init_js, "v8_parallel_init.js") catch {};
+    }
 
     // For packed binaries: ensure process.argv has [exe, script, ...args] format
     // TSC uses process.argv.slice(2), so we need argv[1] to be the script path.
