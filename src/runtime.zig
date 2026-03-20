@@ -4479,14 +4479,23 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     }
 
                                     if (has_provenance) {
-                                        // Container SOA: write to columns, return original object (no __idx)
-                                        // Don't add __idx to avoid polluting object shape (breaks
-                                        // type comparison when TSC enumerates properties).
+                                        // Check: does ANY field from this factory have active reads?
+                                        // If not, skip factory rewrite entirely (avoids write overhead).
+                                        var any_active = false;
+                                        for (site.field_names[0..site.field_count]) |fname| {
+                                            if (active_cols.contains(fname)) { any_active = true; break; }
+                                        }
+                                        if (!any_active) {
+                                            // No active reads — skip factory rewrite, emit original body
+                                            const body_skip = skipJsFunctionBody(cc, scan);
+                                            w.writeAll(cc[src_pos..body_skip]) catch { w_errs += 1; };
+                                            src_pos = body_skip;
+                                            continue :char_loop;
+                                        }
+                                        // Container SOA: write to columns, return original object
                                         w.writeAll(cc[src_pos .. scan + 1]) catch { w_errs += 1; };
                                         w.writeAll("\n") catch { w_errs += 1; };
                                         w.writeAll("  const __idx = __col_idx++;\n") catch { w_errs += 1; };
-                                        // Only write columns that have active reads (Pass 1 result).
-                                        // Writing unused columns keeps object refs alive, preventing GC.
                                         for (site.field_names[0..site.field_count], 0..) |fname, fi| {
                                             if (!active_cols.contains(fname)) continue;
                                             w.print("  __col_{s}[__idx] = {s};\n", .{ fname, param_names[fi] }) catch { w_errs += 1; };
