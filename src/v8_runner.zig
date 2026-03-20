@@ -182,37 +182,33 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         const tsc_shim = @embedFile("v8_tsc_shim.js");
         _ = v8.eval(isolate, context, tsc_shim, "v8_tsc_shim.js") catch {};
 
-        // Patch ALL Map caches: "/* @__PURE__ */ new Map()" → "new __FastRelationCache()"
-        // FastMap is a full Map drop-in with adaptive Int32Array fast path for numeric keys.
-        // Supports: get, set, has, delete, clear, forEach, entries, keys, values, size, [Symbol.iterator]
+        // Patch only relation caches: "Relation = /* @__PURE__ */ new Map()"
+        // Broad patching (all 254 Maps) breaks on large projects like playwright.
+        // Relation caches are the verified-safe subset.
         const needle = "/* @__PURE__ */ new Map()";
         const replacement = "new __FastRelationCache()";
-        var count: usize = 0;
-        {
-            var ci: usize = 0;
-            while (ci + needle.len <= script_code.len) : (ci += 1) {
-                if (std.mem.startsWith(u8, script_code[ci..], needle)) count += 1;
+        var buf = try alloc.alloc(u8, script_code.len + 512);
+        var wi: usize = 0;
+        var ri: usize = 0;
+        while (ri < script_code.len) {
+            if (ri + needle.len <= script_code.len and
+                std.mem.startsWith(u8, script_code[ri..], needle) and
+                ri >= 15 and std.mem.indexOf(u8, script_code[ri - 15 .. ri], "Relation = ") != null)
+            {
+                @memcpy(buf[wi..][0..replacement.len], replacement);
+                wi += replacement.len;
+                ri += needle.len;
+            } else {
+                buf[wi] = script_code[ri];
+                wi += 1;
+                ri += 1;
             }
         }
-        if (count > 0) {
-            var buf = try alloc.alloc(u8, script_code.len + count * replacement.len);
-            var wi: usize = 0;
-            var ri: usize = 0;
-            while (ri < script_code.len) {
-                if (ri + needle.len <= script_code.len and
-                    std.mem.startsWith(u8, script_code[ri..], needle))
-                {
-                    @memcpy(buf[wi..][0..replacement.len], replacement);
-                    wi += replacement.len;
-                    ri += needle.len;
-                } else {
-                    buf[wi] = script_code[ri];
-                    wi += 1;
-                    ri += 1;
-                }
-            }
+        if (wi != script_code.len) {
             patched_script = buf[0..wi];
             final_code = patched_script.?;
+        } else {
+            alloc.free(buf);
         }
     }
 
