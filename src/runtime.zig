@@ -1916,6 +1916,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     // Patch getFlowCacheKey "this" case: 3 IDs → integer
                     const fck2_needle = "return `0|${flowContainer ? getNodeId(flowContainer) : \"-1\"}|${getTypeId(declaredType)}|${getTypeId(initialType)}`;";
                     const fck2_repl = "{var __fc2=flowContainer?getNodeId(flowContainer):0,__dt2=getTypeId(declaredType),__it2=getTypeId(initialType);if(__fc2<100000&&__dt2<100000&&__it2<100000)return __fc2*10000000000+__dt2*100000+__it2+1;return`0|${flowContainer?getNodeId(flowContainer):\"-1\"}|${__dt2}|${__it2}`;}";
+                    // Patch getFlowCacheKey array/object case: nodeId#typeId → integer
+                    const fck3_needle = "return `${getNodeId(node)}#${getTypeId(declaredType)}`;";
+                    const fck3_repl = "{var __ni=getNodeId(node),__di=getTypeId(declaredType);if(__ni<100000&&__di<100000)return __ni*100000+__di+1;return`${__ni}#${__di}`;}";
                     // getTypeOfSymbol cache disabled — type resolution is context-dependent.
                     // Caching breaks on deferred/instantiated types that vary during checking.
                     // TODO: implement safe caching with invalidation (two-pass approach).
@@ -1982,7 +1985,16 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 pr += gtos_needle.len;
                                 continue;
                             }
-                            // P6: getFlowCacheKey "this" → integer packing for 3-ID keys
+                            // P6: getFlowCacheKey array/object → integer packing for 2-ID keys
+                            if (pr + fck3_needle.len <= orig.len and
+                                std.mem.startsWith(u8, orig[pr..], fck3_needle))
+                            {
+                                @memcpy(buf[pw..][0..fck3_repl.len], fck3_repl);
+                                pw += fck3_repl.len;
+                                pr += fck3_needle.len;
+                                continue;
+                            }
+                            // P7: getFlowCacheKey "this" → integer packing for 3-ID keys
                             if (pr + fck2_needle.len <= orig.len and
                                 std.mem.startsWith(u8, orig[pr..], fck2_needle))
                             {
