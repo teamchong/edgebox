@@ -90,7 +90,10 @@ bundle_original.c
 # Generated build files (now in zig-out/, but kept here for backwards compatibility)
 bundle_compiled.c
 frozen_functions.c
+frozen_module
+frozen_module.c
 claude_bundle_compiled.c
+out.c
 *.rej
 node-core/
 
@@ -101,6 +104,7 @@ fib
 fib_*
 fib45*
 tsc_native
+tsc_*.js
 vendor/llvm-lto/
 
 # Test binaries and temp directories
@@ -110,6 +114,8 @@ cmp_only
 cmp_test
 simple
 small_test
+test_build
+test_lto
 test_simple/
 src/test_comp
 src/test_import
@@ -143,6 +149,7 @@ vendor/**/.patches-applied
 # Large compiled binaries (should not be in git)
 /edgebox-native-embed
 /tsc_standalone_frozen
+/edgebox-tsc
 
 # Temporary binaries at root (no extension)
 /check_size
@@ -152,6 +159,8 @@ vendor/**/.patches-applied
 /test_p384
 /test_div.js
 /test_div_direct.js
+/zig_codegen_full
+/-o
 
 # Debug/experimental benchmark files
 bench/*_debug.js
@@ -185,6 +194,7 @@ test-npm/rxjs/test_rxjs_minimal.js
 src/v8_bootstrap.snapshot
 
 # WIP/experimental source files
+src/async/
 src/wasi_process.zig
 src/wasi_tty.zig
 src/wasm_bump.zig

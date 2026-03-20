@@ -2039,11 +2039,15 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     if (any_trampolined) {
                         w.print(
                             \\// EdgeBox AOT+JIT (auto-generated)
-                            \\const {{ readFileSync }} = require('fs');
-                            \\const {{ dirname, join }} = require('path');
-                            \\const __dir = __dirname;
-                            \\const buf = readFileSync(join(__dir, '{s}'));
-                            \\const __wasm = new WebAssembly.Instance(new WebAssembly.Module(buf), {{ env: {{ pow: Math.pow }} }});
+                            \\var __wasm;
+                            \\if (globalThis.__edgebox_wasm_module) {{
+                            \\  __wasm = new WebAssembly.Instance(globalThis.__edgebox_wasm_module, {{ env: {{ pow: Math.pow }} }});
+                            \\}} else {{
+                            \\  const {{ readFileSync }} = require('fs');
+                            \\  const {{ join }} = require('path');
+                            \\  const buf = readFileSync(join(__dirname, '{s}'));
+                            \\  __wasm = new WebAssembly.Instance(new WebAssembly.Module(buf), {{ env: {{ pow: Math.pow }} }});
+                            \\}}
                             \\__wasm.exports.memory.grow({d});
                             \\
                         , .{ wasm_filename, mem_grow_pages }) catch { w_errs += 1; };
@@ -2174,16 +2178,20 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     }
 
 
-                    // Skip SOA transforms when no WASM trampolines — columns written but never read
-                    if (!any_trampolined) {
-                        alloc_sites.clearRetainingCapacity();
-                        std.debug.print("[soa] Skipped — no WASM trampolines needed\n", .{});
+                    // When no WASM trampolines, SOA can still help via factory-level SOA:
+                    // factories with ≥5 calls get SOA pools, field reads rewritten.
+                    // Only skip if there are truly no alloc sites at all.
+                    if (!any_trampolined and alloc_sites.items.len > 0) {
+                        std.debug.print("[soa] No WASM trampolines, but {d} alloc sites available for factory-level SOA\n", .{alloc_sites.items.len});
+                    } else if (!any_trampolined) {
+                        std.debug.print("[soa] Skipped — no WASM trampolines and no alloc sites\n", .{});
                     }
 
                     // Generate SOA pool declarations for each alloc site shape
                     if (alloc_sites.items.len > 0) {
                         // Ensure WASM memory views exist (may not have been created if no WASM functions)
-                        if (!has_array_funcs) {
+                        // Only emit if WASM is actually loaded (has trampolines)
+                        if (!has_array_funcs and any_trampolined) {
                             w.writeAll("const __wbuf = __wasm ? __wasm.exports.memory.buffer : null;\n") catch { w_errs += 1; };
                             w.writeAll("const __m = __wasm ? new Int32Array(__wbuf) : null;\n") catch { w_errs += 1; };
                             w.writeAll(
@@ -2489,47 +2497,128 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             }
                         }
 
-                        // === Local array provenance tracking ===
-                        // Pre-scan for `VAR.push(FACTORY(` patterns to find which arrays
-                        // are filled exclusively from one SOA factory. Then at read sites,
-                        // transform `VAR[expr].field` → `__soa_N_field[VAR[expr].__idx]`
-                        // (or `__soa_N_field[expr]` when index alignment is provable).
+                        // === Local provenance tracking (expanded) ===
+                        // Pre-scan for object allocation patterns to find which containers
+                        // are filled exclusively from one SOA factory. Detected patterns:
+                        //   1. VAR.push(FACTORY(        — array push (original)
+                        //   2. VAR.set(KEY, FACTORY(    — Map.set (new)
+                        //   3. VAR[EXPR] = FACTORY(     — direct index assignment (new)
+                        //   4. VAR.push(new CTOR(       — constructor via push (new)
+                        //   5. VAR.set(KEY, new CTOR(   — constructor via Map.set (new)
+                        // Then at read sites, transform `VAR[expr].field` or `VAR.get(key).field`
+                        // → `__soa_N_field[idx]` for flat typed-array access.
                         const ProvEntry = struct { var_name: []const u8, site_idx: usize, decl_end: usize, raw_index: bool };
                         var provenance_buf: [64]ProvEntry = undefined;
                         var prov_count: usize = 0;
                         if (alloc_sites.items.len > 0) {
-                            const push_pat = ".push(";
+                            // Helper: try to match a factory/constructor name and record provenance
+                            const matchAndRecord = struct {
+                                fn match(
+                                    cc_slice: []const u8,
+                                    start: usize,
+                                    vn: []const u8,
+                                    sites: []const AllocSite,
+                                    buf: *[64]ProvEntry,
+                                    count: *usize,
+                                ) void {
+                                    var pos = start;
+                                    // Skip 'new ' prefix if present (constructor pattern)
+                                    if (pos + 4 <= cc_slice.len and std.mem.startsWith(u8, cc_slice[pos..], "new ")) {
+                                        pos += 4;
+                                        while (pos < cc_slice.len and cc_slice[pos] == ' ') pos += 1;
+                                    }
+                                    // Read factory/constructor name
+                                    var fe = pos;
+                                    while (fe < cc_slice.len and isIdentChar(cc_slice[fe])) fe += 1;
+                                    if (fe == pos or fe >= cc_slice.len or cc_slice[fe] != '(') return;
+                                    const fn_name = cc_slice[pos..fe];
+                                    // Match against alloc sites
+                                    for (sites, 0..) |site, si| {
+                                        if (std.mem.eql(u8, site.name, fn_name)) {
+                                            // Deduplicate by variable name
+                                            var dup = false;
+                                            for (buf.*[0..count.*]) |p| {
+                                                if (std.mem.eql(u8, p.var_name, vn)) { dup = true; break; }
+                                            }
+                                            if (!dup and count.* < buf.len) {
+                                                buf.*[count.*] = .{ .var_name = vn, .site_idx = si, .decl_end = 0, .raw_index = false };
+                                                count.* += 1;
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                            }.match;
+
                             var sp: usize = 0;
-                            while (sp + push_pat.len < cc.len) : (sp += 1) {
-                                if (!std.mem.startsWith(u8, cc[sp..], push_pat)) continue;
-                                // Look back for variable name
-                                const ve = sp;
-                                var vs = ve;
-                                while (vs > 0 and isIdentChar(cc[vs - 1])) vs -= 1;
-                                if (vs == ve) continue;
-                                const vn = cc[vs..ve];
-                                // Look forward for factory name after '('
-                                const fs = sp + push_pat.len;
-                                var fe = fs;
-                                while (fe < cc.len and isIdentChar(cc[fe])) fe += 1;
-                                if (fe == fs or fe >= cc.len or cc[fe] != '(') continue;
-                                const fn_name = cc[fs..fe];
-                                // Match against alloc sites
-                                for (alloc_sites.items, 0..) |site, si| {
-                                    if (std.mem.eql(u8, site.name, fn_name)) {
-                                        // Deduplicate
-                                        var dup = false;
-                                        for (provenance_buf[0..prov_count]) |p| {
-                                            if (std.mem.eql(u8, p.var_name, vn)) { dup = true; break; }
+                            while (sp < cc.len) : (sp += 1) {
+                                // Pattern 1: VAR.push(FACTORY( or VAR.push(new CTOR(
+                                if (sp + 6 < cc.len and std.mem.startsWith(u8, cc[sp..], ".push(")) {
+                                    const ve = sp;
+                                    var vs = ve;
+                                    while (vs > 0 and isIdentChar(cc[vs - 1])) vs -= 1;
+                                    if (vs < ve) {
+                                        const vn = cc[vs..ve];
+                                        matchAndRecord(cc, sp + 6, vn, alloc_sites.items, &provenance_buf, &prov_count);
+                                    }
+                                    continue;
+                                }
+                                // Pattern 2: VAR.set(KEY, FACTORY( or VAR.set(KEY, new CTOR(
+                                if (sp + 5 < cc.len and std.mem.startsWith(u8, cc[sp..], ".set(")) {
+                                    const ve = sp;
+                                    var vs = ve;
+                                    while (vs > 0 and isIdentChar(cc[vs - 1])) vs -= 1;
+                                    if (vs < ve) {
+                                        const vn = cc[vs..ve];
+                                        // Skip past the key argument: find ', ' after first arg
+                                        var kp = sp + 5;
+                                        var depth_s: u32 = 1;
+                                        while (kp < cc.len and depth_s > 0) : (kp += 1) {
+                                            if (cc[kp] == '(') depth_s += 1;
+                                            if (cc[kp] == ')') depth_s -= 1;
+                                            if (depth_s == 1 and cc[kp] == ',') break;
                                         }
-                                        if (!dup and prov_count < provenance_buf.len) {
-                                            provenance_buf[prov_count] = .{ .var_name = vn, .site_idx = si, .decl_end = 0, .raw_index = false };
-                                            prov_count += 1;
+                                        if (kp < cc.len and cc[kp] == ',') {
+                                            kp += 1;
+                                            while (kp < cc.len and cc[kp] == ' ') kp += 1;
+                                            matchAndRecord(cc, kp, vn, alloc_sites.items, &provenance_buf, &prov_count);
                                         }
-                                        break;
+                                    }
+                                    continue;
+                                }
+                                // Pattern 3: VAR[EXPR] = FACTORY( or VAR[EXPR] = new CTOR(
+                                // Look for '] = ' followed by factory name
+                                if (cc[sp] == ']' and sp + 3 < cc.len) {
+                                    var eq = sp + 1;
+                                    while (eq < cc.len and cc[eq] == ' ') eq += 1;
+                                    if (eq < cc.len and cc[eq] == '=' and eq + 1 < cc.len and cc[eq + 1] != '=') {
+                                        eq += 1;
+                                        while (eq < cc.len and cc[eq] == ' ') eq += 1;
+                                        // Find the variable name before '['
+                                        var bk = sp;
+                                        // Walk back past the bracket expression
+                                        var bdepth: u32 = 1;
+                                        if (bk > 0) bk -= 1; // skip ']'
+                                        while (bk > 0 and bdepth > 0) : (bk -= 1) {
+                                            if (cc[bk] == ']') bdepth += 1;
+                                            if (cc[bk] == '[') bdepth -= 1;
+                                        }
+                                        // bk now points at '[', variable name is before it
+                                        if (bk < cc.len and cc[bk] == '[') {
+                                            const ve2 = bk;
+                                            var vs2 = ve2;
+                                            while (vs2 > 0 and isIdentChar(cc[vs2 - 1])) vs2 -= 1;
+                                            if (vs2 < ve2) {
+                                                const vn = cc[vs2..ve2];
+                                                matchAndRecord(cc, eq, vn, alloc_sites.items, &provenance_buf, &prov_count);
+                                            }
+                                        }
                                     }
                                 }
                             }
+                        }
+                        if (prov_count > 0) {
+                            std.debug.print("[soa] Provenance: {d} containers from {d} alloc sites\n", .{ prov_count, alloc_sites.items.len });
                         }
                         // Find `VAR = []` declarations for each provenance entry (index alignment)
                         {
@@ -2581,8 +2670,46 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         if (cc[k2] == ']') depth2 -= 1;
                                     }
                                     if (k2 >= cc.len or cc[k2] != '.') {
-                                        provenance_buf[pi].raw_index = false;
-                                        break;
+                                        // Before rejecting, check if this VAR[expr] is the RHS
+                                        // of `const/var/let ALIAS = VAR[expr]` — alias pattern.
+                                        // If so, the field accesses happen through the alias,
+                                        // not directly after the bracket.
+                                        var is_alias_rhs = false;
+                                        {
+                                            // Scan backwards from VAR[ to find `= ` then identifier then keyword
+                                            var bk2 = sp2;
+                                            while (bk2 > 0 and cc[bk2 - 1] == ' ') bk2 -= 1;
+                                            if (bk2 > 0 and cc[bk2 - 1] == '=') {
+                                                // Check it's not == or =>
+                                                if (bk2 >= 2 and (cc[bk2 - 2] == '=' or cc[bk2 - 2] == '!' or cc[bk2 - 2] == '<' or cc[bk2 - 2] == '>')) {
+                                                    // comparison operator — not alias
+                                                } else {
+                                                    bk2 -= 1; // past '='
+                                                    while (bk2 > 0 and cc[bk2 - 1] == ' ') bk2 -= 1;
+                                                    // Should be at end of identifier
+                                                    const id_e = bk2;
+                                                    while (bk2 > 0 and isIdentChar(cc[bk2 - 1])) bk2 -= 1;
+                                                    if (bk2 < id_e) {
+                                                        // Found identifier — check for keyword before it
+                                                        var kw_e = bk2;
+                                                        while (kw_e > 0 and cc[kw_e - 1] == ' ') kw_e -= 1;
+                                                        if (kw_e >= 4 and std.mem.eql(u8, cc[kw_e - 4 .. kw_e], "let ")) {
+                                                            is_alias_rhs = true;
+                                                        } else if (kw_e >= 4 and std.mem.eql(u8, cc[kw_e - 4 .. kw_e], "var ")) {
+                                                            is_alias_rhs = true;
+                                                        } else if (kw_e >= 6 and std.mem.eql(u8, cc[kw_e - 6 .. kw_e], "const ")) {
+                                                            is_alias_rhs = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if (!is_alias_rhs) {
+                                            provenance_buf[pi].raw_index = false;
+                                            break;
+                                        }
+                                        // Alias RHS — skip this occurrence (field access validated separately)
+                                        continue;
                                     }
                                     const fstart2 = k2 + 1;
                                     var fend2 = fstart2;
@@ -2603,7 +2730,589 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 }
                             }
                         }
+                        // === Factory-level SOA (expanded) ===
+                        // For factories with ≥5 total call sites (regardless of container),
+                        // activate SOA directly. This handles the dominant pattern in real code:
+                        //   var x = createType(flags, name);  // → SOA pool allocation
+                        //   ... x.flags ...                   // → __soa_N_flags[x.__idx]
+                        // No container provenance needed — every object from the factory
+                        // goes into the SOA pool, and field reads are rewritten universally.
+                        if (prov_count == 0 and alloc_sites.items.len > 0) {
+                            const MIN_FACTORY_CALLS: usize = 5;
+                            for (alloc_sites.items, 0..) |site, si| {
+                                if (site.field_count < 3 or site.name.len == 0) continue;
+                                // Count total call sites in source: `factoryName(`
+                                var call_count: usize = 0;
+                                var scan: usize = 0;
+                                while (scan + site.name.len + 1 < cc.len) : (scan += 1) {
+                                    if (scan > 0 and isIdentChar(cc[scan - 1])) continue;
+                                    if (!std.mem.startsWith(u8, cc[scan..], site.name)) continue;
+                                    const after_name = scan + site.name.len;
+                                    if (after_name < cc.len and cc[after_name] == '(') {
+                                        call_count += 1;
+                                        if (call_count >= MIN_FACTORY_CALLS) break;
+                                    }
+                                }
+                                if (call_count >= MIN_FACTORY_CALLS and prov_count < provenance_buf.len) {
+                                    // Create a synthetic provenance entry with a special marker name
+                                    // "__factory_N" indicates this is factory-level SOA, not container SOA
+                                    const marker = std.fmt.allocPrint(allocator, "__factory_{d}", .{si}) catch continue;
+                                    provenance_buf[prov_count] = .{
+                                        .var_name = marker,
+                                        .site_idx = si,
+                                        .decl_end = 0,
+                                        .raw_index = false,
+                                    };
+                                    prov_count += 1;
+                                    std.debug.print("[soa] Factory-level SOA: {s} ({d} calls, {d} fields)\n", .{
+                                        site.name, call_count, site.field_count,
+                                    });
+                                }
+                            }
+                        }
+
                         const provenance = provenance_buf[0..prov_count];
+
+                        // === Local variable alias detection ===
+                        // Pre-scan for `const/var/let X = PROV_VAR[expr]` patterns.
+                        // When ALL uses of X are `.field` reads (safe SOA fields), we can rewrite
+                        // `X.field` → `__col_field[__PROV_soa_base + (expr)]` — raw column access.
+                        // This captures the dominant real-world pattern:
+                        //   for (let i = 0; i < arr.length; i++) {
+                        //     const node = arr[i];    // ← alias assignment
+                        //     if (node.kind === 3)    // ← alias read → __col_kind[base + i]
+                        //       sum += node.symbolId; // ← alias read → __col_symbolId[base + i]
+                        //   }
+                        const AliasEntry = struct {
+                            alias_name: []const u8, // local variable name (e.g. "node")
+                            prov_idx: usize, // index into provenance[]
+                            idx_expr: []const u8, // index expression between [] (e.g. "i")
+                            assign_pos: usize, // position of the assignment in source
+                            scope_start: usize, // position of enclosing '{' (for scope-aware matching)
+                            scope_end: usize, // position of matching '}' (for scope-aware matching)
+                        };
+                        var alias_buf: [128]AliasEntry = undefined;
+                        var alias_count: usize = 0;
+                        // Build alias name→index map for O(1) lookup in char_loop
+                        var alias_map = std.StringHashMapUnmanaged(usize){};
+                        defer alias_map.deinit(allocator);
+                        if (prov_count > 0) {
+                            // Scan for: const/var/let IDENT = PROV_VAR[expr]
+                            // where PROV_VAR has decl_end > 0 (index-aligned)
+                            const keywords = [_][]const u8{ "const ", "var ", "let " };
+                            var ap: usize = 0;
+                            while (ap + 10 < cc.len) : (ap += 1) {
+                                // Must be at a word boundary
+                                if (ap > 0 and isIdentChar(cc[ap - 1])) continue;
+                                // Match keyword
+                                var kw_len: usize = 0;
+                                for (keywords) |kw| {
+                                    if (ap + kw.len < cc.len and std.mem.startsWith(u8, cc[ap..], kw)) {
+                                        kw_len = kw.len;
+                                        break;
+                                    }
+                                }
+                                if (kw_len == 0) continue;
+                                // Extract identifier after keyword
+                                var id_start = ap + kw_len;
+                                while (id_start < cc.len and cc[id_start] == ' ') id_start += 1;
+                                var id_end = id_start;
+                                while (id_end < cc.len and isIdentChar(cc[id_end])) id_end += 1;
+                                if (id_end == id_start) continue;
+                                const alias_name = cc[id_start..id_end];
+                                // Skip if alias name starts with __ (internal variable)
+                                if (alias_name.len >= 2 and alias_name[0] == '_' and alias_name[1] == '_') continue;
+                                // Must be followed by ` = ` (not `==` or `=>`)
+                                var eq_pos = id_end;
+                                while (eq_pos < cc.len and cc[eq_pos] == ' ') eq_pos += 1;
+                                if (eq_pos >= cc.len or cc[eq_pos] != '=') continue;
+                                if (eq_pos + 1 < cc.len and (cc[eq_pos + 1] == '=' or cc[eq_pos + 1] == '>')) continue;
+                                eq_pos += 1;
+                                while (eq_pos < cc.len and cc[eq_pos] == ' ') eq_pos += 1;
+                                // Now match PROV_VAR[expr]
+                                var rhs_end = eq_pos;
+                                while (rhs_end < cc.len and isIdentChar(cc[rhs_end])) rhs_end += 1;
+                                if (rhs_end == eq_pos or rhs_end >= cc.len or cc[rhs_end] != '[') continue;
+                                const rhs_name = cc[eq_pos..rhs_end];
+                                // Match against provenance entries with decl_end > 0
+                                var matched_pi: ?usize = null;
+                                for (provenance, 0..) |prov, pi| {
+                                    if (prov.decl_end == 0) continue;
+                                    if (std.mem.eql(u8, prov.var_name, rhs_name)) {
+                                        matched_pi = pi;
+                                        break;
+                                    }
+                                }
+                                if (matched_pi == null) continue;
+                                const pi = matched_pi.?;
+                                // Extract index expression between [ and ]
+                                var bracket_depth: u32 = 1;
+                                var bk = rhs_end + 1;
+                                while (bk < cc.len and bracket_depth > 0) : (bk += 1) {
+                                    if (cc[bk] == '[') bracket_depth += 1;
+                                    if (cc[bk] == ']') bracket_depth -= 1;
+                                }
+                                // bk is past the ']'
+                                if (bk == 0 or bk > cc.len) continue;
+                                const idx_expr = cc[rhs_end + 1 .. bk - 1];
+                                if (idx_expr.len == 0) continue;
+                                // Check the rest of the statement: must end with ; or newline (not `.field` after])
+                                var after_bracket = bk;
+                                while (after_bracket < cc.len and cc[after_bracket] == ' ') after_bracket += 1;
+                                if (after_bracket < cc.len and cc[after_bracket] == '.') continue; // e.g. `const x = arr[i].field` — not an alias
+                                // === Scope-aware safety check ===
+                                // Find the enclosing block: scan backwards from alias assignment to find
+                                // the opening '{', then forward to find matching '}'. Only check uses
+                                // within this scope — same name in other functions is a different variable.
+                                var scope_start = ap;
+                                var scope_end = cc.len;
+                                {
+                                    // Find enclosing '{' by counting brace depth backwards
+                                    var brace_depth_back: i32 = 0;
+                                    var scan_back = ap;
+                                    while (scan_back > 0) {
+                                        scan_back -= 1;
+                                        if (cc[scan_back] == '}') brace_depth_back += 1;
+                                        if (cc[scan_back] == '{') {
+                                            if (brace_depth_back == 0) {
+                                                scope_start = scan_back;
+                                                break;
+                                            }
+                                            brace_depth_back -= 1;
+                                        }
+                                    }
+                                    // Find matching '}' by counting brace depth forward from scope_start
+                                    var brace_depth_fwd: u32 = 0;
+                                    var scan_fwd = scope_start;
+                                    while (scan_fwd < cc.len) : (scan_fwd += 1) {
+                                        if (cc[scan_fwd] == '{') brace_depth_fwd += 1;
+                                        if (cc[scan_fwd] == '}') {
+                                            brace_depth_fwd -= 1;
+                                            if (brace_depth_fwd == 0) {
+                                                scope_end = scan_fwd;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                // Safety check: verify all uses of alias_name within scope are `.field` reads
+                                const site = alloc_sites.items[provenance[pi].site_idx];
+                                var safe = true;
+                                var check_pos = bk; // start after the alias assignment
+                                var in_string: u8 = 0; // 0 = not in string, '"'/'\'' = in that string
+                                while (check_pos + alias_name.len < scope_end) : (check_pos += 1) {
+                                    // Track string literals to avoid matching inside them
+                                    if (in_string != 0) {
+                                        if (cc[check_pos] == in_string and (check_pos == 0 or cc[check_pos - 1] != '\\')) {
+                                            in_string = 0;
+                                        }
+                                        continue;
+                                    }
+                                    if (cc[check_pos] == '"' or cc[check_pos] == '\'') {
+                                        in_string = cc[check_pos];
+                                        continue;
+                                    }
+                                    if (check_pos > 0 and isIdentChar(cc[check_pos - 1])) continue;
+                                    if (!std.mem.startsWith(u8, cc[check_pos..], alias_name)) continue;
+                                    const after_alias = check_pos + alias_name.len;
+                                    if (after_alias >= cc.len) continue;
+                                    // Check what follows the alias name
+                                    if (isIdentChar(cc[after_alias])) continue; // part of longer name (e.g. nodeName)
+                                    if (cc[after_alias] == '.') {
+                                        // Field access: alias.field — check it's a safe SOA read
+                                        const fs2 = after_alias + 1;
+                                        var fe2 = fs2;
+                                        while (fe2 < cc.len and isIdentChar(cc[fe2])) fe2 += 1;
+                                        if (fe2 == fs2) { safe = false; break; } // bare dot (syntax error)
+                                        const fn2 = cc[fs2..fe2];
+                                        // Reject method calls: alias.method(
+                                        if (fe2 < cc.len and cc[fe2] == '(') { safe = false; break; }
+                                        // Reject field assignment: alias.field = value
+                                        var eq2 = fe2;
+                                        while (eq2 < cc.len and cc[eq2] == ' ') eq2 += 1;
+                                        if (eq2 < cc.len and cc[eq2] == '=' and (eq2 + 1 >= cc.len or cc[eq2 + 1] != '=')) { safe = false; break; }
+                                        // Reject compound assignment: alias.field += / |= / etc
+                                        if (eq2 + 1 < cc.len and cc[eq2 + 1] == '=' and (cc[eq2] == '+' or cc[eq2] == '-' or cc[eq2] == '|' or cc[eq2] == '&' or cc[eq2] == '*')) { safe = false; break; }
+                                        // Reject increment/decrement: alias.field++ / alias.field--
+                                        if (eq2 + 1 < cc.len and ((cc[eq2] == '+' and cc[eq2 + 1] == '+') or (cc[eq2] == '-' and cc[eq2 + 1] == '-'))) { safe = false; break; }
+                                        // Verify field is a known SOA field
+                                        var is_soa_field = false;
+                                        for (site.field_names[0..site.field_count]) |sf| {
+                                            if (std.mem.eql(u8, sf, fn2)) { is_soa_field = true; break; }
+                                        }
+                                        if (!is_soa_field) { safe = false; break; }
+                                        // This use is safe — skip past it
+                                        check_pos = fe2;
+                                        continue;
+                                    } else if (cc[after_alias] == '=' and (after_alias + 1 >= cc.len or cc[after_alias + 1] != '=')) {
+                                        // Reassignment: alias = ... — NOT safe (changes what the name refers to)
+                                        safe = false;
+                                        break;
+                                    } else if (cc[after_alias] == '[') {
+                                        // Subscript: alias[expr] — not a safe .field pattern
+                                        safe = false;
+                                        break;
+                                    } else if (cc[after_alias] == '(') {
+                                        // Function call on alias: alias() — not safe
+                                        safe = false;
+                                        break;
+                                    } else if (cc[after_alias] == ' ' or cc[after_alias] == ';' or cc[after_alias] == '\n' or
+                                        cc[after_alias] == ')' or cc[after_alias] == ',' or cc[after_alias] == ']' or
+                                        cc[after_alias] == ':' or cc[after_alias] == '?')
+                                    {
+                                        // Bare reference: might be comparison, ternary, or passing to function
+                                        var sp3 = after_alias;
+                                        while (sp3 < cc.len and cc[sp3] == ' ') sp3 += 1;
+                                        // Safe: comparison operators (alias === x, alias !== x, etc.)
+                                        if (sp3 < cc.len and (cc[sp3] == '=' or cc[sp3] == '!') and
+                                            sp3 + 1 < cc.len and cc[sp3 + 1] == '=')
+                                        {
+                                            continue; // alias === x or alias !== x
+                                        }
+                                        if (sp3 < cc.len and (cc[sp3] == '<' or cc[sp3] == '>')) continue;
+                                        // Safe: alias after operator in expression (... + alias, etc.)
+                                        if (sp3 < cc.len and (cc[sp3] == ')' or cc[sp3] == ';' or cc[sp3] == '\n' or cc[sp3] == ']' or cc[sp3] == '}')) {
+                                            // End of expression — check what's before: is it in a comparison context?
+                                            // Conservative: reject bare references that could be passed by value
+                                            // Exception: `; alias ;` or `} alias` aren't real patterns
+                                            // Check if alias is preceded by comparison: `=== alias`
+                                            var bp = check_pos;
+                                            while (bp > 0 and cc[bp - 1] == ' ') bp -= 1;
+                                            if (bp >= 2 and cc[bp - 1] == '=' and cc[bp - 2] == '=') continue;
+                                            if (bp >= 3 and cc[bp - 1] == '=' and cc[bp - 2] == '=' and cc[bp - 3] == '=') continue;
+                                            if (bp >= 2 and cc[bp - 1] == '=' and cc[bp - 2] == '!') continue;
+                                            safe = false;
+                                            break;
+                                        }
+                                        // Safe: ternary `alias ?` — tests truthiness, doesn't need object itself
+                                        if (sp3 < cc.len and cc[sp3] == '?') continue;
+                                        // Anything else: `return alias`, `fn(alias)`, `arr.push(alias)` — NOT safe
+                                        safe = false;
+                                        break;
+                                    }
+                                    // Other characters (&&, ||, etc.) — alias used as boolean, check next
+                                    if (after_alias + 1 < cc.len and
+                                        ((cc[after_alias] == '&' and cc[after_alias + 1] == '&') or
+                                        (cc[after_alias] == '|' and cc[after_alias + 1] == '|')))
+                                    {
+                                        // Boolean operators: `alias && x`, `alias || x` — tests truthiness, safe
+                                        continue;
+                                    }
+                                    // Other: reject to be conservative
+                                    safe = false;
+                                    break;
+                                }
+                                if (!safe) continue;
+                                // Allow same alias name in different scopes (different scope_start means different variable)
+                                var dup = false;
+                                for (alias_buf[0..alias_count]) |existing| {
+                                    if (std.mem.eql(u8, existing.alias_name, alias_name) and existing.assign_pos == ap) { dup = true; break; }
+                                }
+                                if (dup) continue;
+                                if (alias_count < alias_buf.len) {
+                                    alias_buf[alias_count] = .{
+                                        .alias_name = alias_name,
+                                        .prov_idx = pi,
+                                        .idx_expr = idx_expr,
+                                        .assign_pos = ap,
+                                        .scope_start = scope_start,
+                                        .scope_end = scope_end,
+                                    };
+                                    alias_map.put(allocator, alias_name, alias_count) catch {};
+                                    alias_count += 1;
+                                }
+                            }
+                            if (alias_count > 0) {
+                                std.debug.print("[soa] Detected {d} local variable aliases:\n", .{alias_count});
+                                for (alias_buf[0..alias_count]) |a| {
+                                    std.debug.print("[soa]   {s} = {s}[{s}] (prov={s})\n", .{
+                                        a.alias_name, provenance[a.prov_idx].var_name, a.idx_expr, provenance[a.prov_idx].var_name,
+                                    });
+                                }
+                            }
+                        }
+                        const aliases = alias_buf[0..alias_count];
+
+                        // === Inter-procedural parameter provenance ===
+                        // Detect call sites `funcName(PROV_VAR, ...)` where PROV_VAR is a provenance
+                        // container. Find the matching `function funcName(param, ...)` definition and
+                        // create synthetic provenance entries so that `param[expr].field` inside the
+                        // function body gets rewritten to `__col_field[__PROV_soa_base + (expr)]`.
+                        const ParamProv = struct {
+                            param_name: []const u8, // function parameter name
+                            prov_idx: usize, // index into provenance[] (which container was passed)
+                            func_body_start: usize, // position of '{' opening function body
+                            func_body_end: usize, // position of '}' closing function body
+                        };
+                        var param_prov_buf: [128]ParamProv = undefined;
+                        var param_prov_count: usize = 0;
+                        if (prov_count > 0) {
+                            // Step 1: Find call sites where provenance containers are passed as arguments
+                            // Pattern: funcName(PROV_VAR, ...) or funcName(..., PROV_VAR, ...)
+                            const CallSiteInfo = struct {
+                                func_name: []const u8,
+                                arg_pos: usize, // 0-indexed argument position
+                                prov_idx: usize, // which provenance entry
+                            };
+                            var call_sites_buf: [128]CallSiteInfo = undefined;
+                            var call_sites_count: usize = 0;
+
+                            var cs: usize = 0;
+                            while (cs + 2 < cc.len) : (cs += 1) {
+                                if (cc[cs] != '(') continue;
+                                // Find function name before '('
+                                const fn_end = cs;
+                                if (fn_end == 0 or !isIdentChar(cc[fn_end - 1])) continue;
+                                var fn_start = fn_end;
+                                while (fn_start > 0 and isIdentChar(cc[fn_start - 1])) fn_start -= 1;
+                                const func_name = cc[fn_start..fn_end];
+                                // Skip keywords and known non-function names
+                                if (std.mem.eql(u8, func_name, "if") or std.mem.eql(u8, func_name, "for") or
+                                    std.mem.eql(u8, func_name, "while") or std.mem.eql(u8, func_name, "switch") or
+                                    std.mem.eql(u8, func_name, "return") or std.mem.eql(u8, func_name, "function") or
+                                    std.mem.eql(u8, func_name, "typeof") or std.mem.eql(u8, func_name, "new") or
+                                    std.mem.eql(u8, func_name, "push") or std.mem.eql(u8, func_name, "set") or
+                                    std.mem.eql(u8, func_name, "get") or std.mem.eql(u8, func_name, "call") or
+                                    std.mem.eql(u8, func_name, "apply") or std.mem.eql(u8, func_name, "bind") or
+                                    std.mem.eql(u8, func_name, "catch") or std.mem.eql(u8, func_name, "require")) continue;
+                                // Skip method calls: something.funcName(
+                                if (fn_start > 0 and cc[fn_start - 1] == '.') continue;
+                                // Parse arguments: find each comma-separated arg
+                                var arg_start = cs + 1;
+                                while (arg_start < cc.len and cc[arg_start] == ' ') arg_start += 1;
+                                var arg_pos: usize = 0;
+                                var depth_cs: u32 = 1;
+                                var ap2 = arg_start;
+                                while (ap2 < cc.len and depth_cs > 0) {
+                                    if (cc[ap2] == '(' or cc[ap2] == '[') {
+                                        depth_cs += 1;
+                                        ap2 += 1;
+                                        continue;
+                                    }
+                                    if (cc[ap2] == ')' or cc[ap2] == ']') {
+                                        if (depth_cs == 1 and cc[ap2] == ')') {
+                                            // End of arguments — check final arg
+                                            var ae2 = ap2;
+                                            while (ae2 > arg_start and cc[ae2 - 1] == ' ') ae2 -= 1;
+                                            const arg_text = cc[arg_start..ae2];
+                                            // Check if arg is a provenance container name
+                                            for (provenance, 0..) |prov, pi| {
+                                                if (prov.decl_end == 0) continue;
+                                                if (std.mem.eql(u8, arg_text, prov.var_name)) {
+                                                    if (call_sites_count < call_sites_buf.len) {
+                                                        // Deduplicate: same func+arg_pos+prov
+                                                        var dup = false;
+                                                        for (call_sites_buf[0..call_sites_count]) |existing| {
+                                                            if (std.mem.eql(u8, existing.func_name, func_name) and
+                                                                existing.arg_pos == arg_pos and existing.prov_idx == pi)
+                                                            {
+                                                                dup = true;
+                                                                break;
+                                                            }
+                                                        }
+                                                        if (!dup) {
+                                                            call_sites_buf[call_sites_count] = .{
+                                                                .func_name = func_name,
+                                                                .arg_pos = arg_pos,
+                                                                .prov_idx = pi,
+                                                            };
+                                                            call_sites_count += 1;
+                                                        }
+                                                    }
+                                                    break;
+                                                }
+                                            }
+                                            break;
+                                        }
+                                        depth_cs -= 1;
+                                        ap2 += 1;
+                                        continue;
+                                    }
+                                    if (depth_cs == 1 and cc[ap2] == ',') {
+                                        // End of one argument
+                                        var ae2 = ap2;
+                                        while (ae2 > arg_start and cc[ae2 - 1] == ' ') ae2 -= 1;
+                                        const arg_text = cc[arg_start..ae2];
+                                        for (provenance, 0..) |prov, pi| {
+                                            if (prov.decl_end == 0) continue;
+                                            if (std.mem.eql(u8, arg_text, prov.var_name)) {
+                                                if (call_sites_count < call_sites_buf.len) {
+                                                    var dup = false;
+                                                    for (call_sites_buf[0..call_sites_count]) |existing| {
+                                                        if (std.mem.eql(u8, existing.func_name, func_name) and
+                                                            existing.arg_pos == arg_pos and existing.prov_idx == pi)
+                                                        {
+                                                            dup = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                    if (!dup) {
+                                                        call_sites_buf[call_sites_count] = .{
+                                                            .func_name = func_name,
+                                                            .arg_pos = arg_pos,
+                                                            .prov_idx = pi,
+                                                        };
+                                                        call_sites_count += 1;
+                                                    }
+                                                }
+                                                break;
+                                            }
+                                        }
+                                        // Move to next argument
+                                        arg_pos += 1;
+                                        ap2 += 1;
+                                        while (ap2 < cc.len and cc[ap2] == ' ') ap2 += 1;
+                                        arg_start = ap2;
+                                        continue;
+                                    }
+                                    ap2 += 1;
+                                }
+                            }
+
+                            // Step 2: For each call site, find the function definition and extract parameter name
+                            for (call_sites_buf[0..call_sites_count]) |csi| {
+                                // Search for `function funcName(` in source
+                                var fs: usize = 0;
+                                while (fs + 9 + csi.func_name.len < cc.len) : (fs += 1) {
+                                    if (!std.mem.startsWith(u8, cc[fs..], "function ")) continue;
+                                    var ns = fs + 9;
+                                    while (ns < cc.len and cc[ns] == ' ') ns += 1;
+                                    if (ns + csi.func_name.len >= cc.len) continue;
+                                    if (!std.mem.startsWith(u8, cc[ns..], csi.func_name)) continue;
+                                    const after_name = ns + csi.func_name.len;
+                                    // Skip whitespace to '('
+                                    var paren = after_name;
+                                    while (paren < cc.len and cc[paren] == ' ') paren += 1;
+                                    if (paren >= cc.len or cc[paren] != '(') continue;
+                                    // Verify word boundary (not funcNameExtra)
+                                    if (after_name < cc.len and isIdentChar(cc[after_name])) continue;
+                                    // Extract parameter at arg_pos
+                                    var param_start = paren + 1;
+                                    while (param_start < cc.len and cc[param_start] == ' ') param_start += 1;
+                                    var curr_arg: usize = 0;
+                                    var pp = param_start;
+                                    var pd: u32 = 1;
+                                    while (pp < cc.len and pd > 0) {
+                                        if (cc[pp] == '(') { pd += 1; pp += 1; continue; }
+                                        if (cc[pp] == ')') {
+                                            if (pd == 1) {
+                                                // End of params — extract current arg if matching
+                                                if (curr_arg == csi.arg_pos) {
+                                                    var pe = pp;
+                                                    while (pe > param_start and cc[pe - 1] == ' ') pe -= 1;
+                                                    const param_name = cc[param_start..pe];
+                                                    if (param_name.len > 0 and !std.mem.eql(u8, param_name, csi.func_name)) {
+                                                        // Find function body: skip to '{' and find matching '}'
+                                                        var body_open = pp + 1;
+                                                        while (body_open < cc.len and cc[body_open] != '{') body_open += 1;
+                                                        if (body_open < cc.len) {
+                                                            var bd: u32 = 1;
+                                                            var body_close = body_open + 1;
+                                                            while (body_close < cc.len and bd > 0) : (body_close += 1) {
+                                                                if (cc[body_close] == '{') bd += 1;
+                                                                if (cc[body_close] == '}') bd -= 1;
+                                                            }
+                                                            if (param_prov_count < param_prov_buf.len) {
+                                                                // Deduplicate
+                                                                var dup = false;
+                                                                for (param_prov_buf[0..param_prov_count]) |existing| {
+                                                                    if (std.mem.eql(u8, existing.param_name, param_name) and
+                                                                        existing.func_body_start == body_open)
+                                                                    {
+                                                                        dup = true;
+                                                                        break;
+                                                                    }
+                                                                }
+                                                                if (!dup) {
+                                                                    param_prov_buf[param_prov_count] = .{
+                                                                        .param_name = param_name,
+                                                                        .prov_idx = csi.prov_idx,
+                                                                        .func_body_start = body_open,
+                                                                        .func_body_end = body_close,
+                                                                    };
+                                                                    param_prov_count += 1;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                break;
+                                            }
+                                            pd -= 1;
+                                            pp += 1;
+                                            continue;
+                                        }
+                                        if (pd == 1 and cc[pp] == ',') {
+                                            // Check if current arg matches before moving to next
+                                            if (curr_arg == csi.arg_pos) {
+                                                var pe = pp;
+                                                while (pe > param_start and cc[pe - 1] == ' ') pe -= 1;
+                                                const param_name = cc[param_start..pe];
+                                                if (param_name.len > 0 and !std.mem.eql(u8, param_name, csi.func_name)) {
+                                                    // Find function body
+                                                    // First find the closing ')' of params
+                                                    var close_paren = pp + 1;
+                                                    var pd2: u32 = 1;
+                                                    while (close_paren < cc.len and pd2 > 0) : (close_paren += 1) {
+                                                        if (cc[close_paren] == '(') pd2 += 1;
+                                                        if (cc[close_paren] == ')') pd2 -= 1;
+                                                    }
+                                                    var body_open = close_paren;
+                                                    while (body_open < cc.len and cc[body_open] != '{') body_open += 1;
+                                                    if (body_open < cc.len) {
+                                                        var bd: u32 = 1;
+                                                        var body_close = body_open + 1;
+                                                        while (body_close < cc.len and bd > 0) : (body_close += 1) {
+                                                            if (cc[body_close] == '{') bd += 1;
+                                                            if (cc[body_close] == '}') bd -= 1;
+                                                        }
+                                                        if (param_prov_count < param_prov_buf.len) {
+                                                            var dup = false;
+                                                            for (param_prov_buf[0..param_prov_count]) |existing| {
+                                                                if (std.mem.eql(u8, existing.param_name, param_name) and
+                                                                    existing.func_body_start == body_open)
+                                                                {
+                                                                    dup = true;
+                                                                    break;
+                                                                }
+                                                            }
+                                                            if (!dup) {
+                                                                param_prov_buf[param_prov_count] = .{
+                                                                    .param_name = param_name,
+                                                                    .prov_idx = csi.prov_idx,
+                                                                    .func_body_start = body_open,
+                                                                    .func_body_end = body_close,
+                                                                };
+                                                                param_prov_count += 1;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                break; // found the match, done with this call site
+                                            }
+                                            curr_arg += 1;
+                                            pp += 1;
+                                            while (pp < cc.len and cc[pp] == ' ') pp += 1;
+                                            param_start = pp;
+                                            continue;
+                                        }
+                                        pp += 1;
+                                    }
+                                    break; // found the function definition
+                                }
+                            }
+
+                            if (param_prov_count > 0) {
+                                std.debug.print("[soa] Detected {d} inter-procedural parameter aliases:\n", .{param_prov_count});
+                                for (param_prov_buf[0..param_prov_count]) |pp2| {
+                                    std.debug.print("[soa]   param '{s}' ← {s} (scope {d}..{d})\n", .{
+                                        pp2.param_name, provenance[pp2.prov_idx].var_name,
+                                        pp2.func_body_start, pp2.func_body_end,
+                                    });
+                                }
+                            }
+                        }
+                        const param_provs = param_prov_buf[0..param_prov_count];
 
                         const rs_rewrite_count: u32 = 0;
 
@@ -2942,21 +3651,67 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         continue :char_loop;
                                     }
 
-                                    // Factory: replace body with column writes + return
-                                    w.writeAll(cc[src_pos .. scan + 1]) catch { w_errs += 1; };
-                                    w.writeAll("\n") catch { w_errs += 1; };
+                                    // Skip SOA for "init-block" factories: if >80% of calls
+                                    // are in a contiguous region (e.g., Diagnostics = {diag(...), ...}),
+                                    // the objects are static singletons — V8 handles these optimally.
+                                    {
+                                        var total_calls: usize = 0;
+                                        var first_call: usize = cc.len;
+                                        var last_call: usize = 0;
+                                        var cs: usize = 0;
+                                        while (cs + func_name.len + 1 < cc.len) : (cs += 1) {
+                                            if (cs > 0 and ident_char[cc[cs - 1]]) continue;
+                                            if (!std.mem.startsWith(u8, cc[cs..], func_name)) continue;
+                                            if (cs + func_name.len < cc.len and cc[cs + func_name.len] == '(') {
+                                                total_calls += 1;
+                                                if (cs < first_call) first_call = cs;
+                                                if (cs > last_call) last_call = cs;
+                                            }
+                                        }
+                                        if (total_calls >= 50) {
+                                            const span = if (last_call > first_call) last_call - first_call else 1;
+                                            const density = (total_calls * 100) / (span / 100 + 1);
+                                            // High density = many calls in small region = init block
+                                            if (density > 5) {
+                                                std.debug.print("[soa] Skip init-block factory: {s} ({d} calls in {d} bytes, density={d})\n", .{
+                                                    func_name, total_calls, span, density,
+                                                });
+                                                const body_end3 = skipJsFunctionBody(cc, scan);
+                                                w.writeAll(cc[src_pos..body_end3]) catch { w_errs += 1; };
+                                                src_pos = body_end3;
+                                                continue :char_loop;
+                                            }
+                                        }
+                                    }
 
-                                    w.writeAll("  const __idx = __col_idx++;\n") catch { w_errs += 1; };
-                                    for (site.field_names[0..site.field_count], 0..) |fname, fi| {
-                                        w.print("  __col_{s}[__idx] = {s};\n", .{ fname, param_names[fi] }) catch { w_errs += 1; };
+                                    // Check if this factory has provenance (container SOA)
+                                    var has_provenance = false;
+                                    for (provenance) |prov| {
+                                        if (prov.site_idx == site_idx) { has_provenance = true; break; }
                                     }
-                                    // Return plain object WITH __idx for SOA column reads
-                                    w.writeAll("  return {__idx, ") catch { w_errs += 1; };
-                                    for (site.field_names[0..site.field_count], 0..) |fname, fi| {
-                                        if (fi > 0) w.writeAll(", ") catch { w_errs += 1; };
-                                        w.print("{s}: {s}", .{ fname, param_names[fi] }) catch { w_errs += 1; };
+
+                                    if (has_provenance) {
+                                        // Container SOA: write to columns + return object with __idx
+                                        w.writeAll(cc[src_pos .. scan + 1]) catch { w_errs += 1; };
+                                        w.writeAll("\n") catch { w_errs += 1; };
+                                        w.writeAll("  const __idx = __col_idx++;\n") catch { w_errs += 1; };
+                                        for (site.field_names[0..site.field_count], 0..) |fname, fi| {
+                                            w.print("  __col_{s}[__idx] = {s};\n", .{ fname, param_names[fi] }) catch { w_errs += 1; };
+                                        }
+                                        w.writeAll("  return {__idx, ") catch { w_errs += 1; };
+                                        for (site.field_names[0..site.field_count], 0..) |fname, fi| {
+                                            if (fi > 0) w.writeAll(", ") catch { w_errs += 1; };
+                                            w.print("{s}: {s}", .{ fname, param_names[fi] }) catch { w_errs += 1; };
+                                        }
+                                        w.writeAll("};\n}\n") catch { w_errs += 1; };
+                                    } else {
+                                        // No container provenance — skip factory rewrite to avoid overhead
+                                        std.debug.print("[soa] Skip no-provenance factory: {s}\n", .{func_name});
+                                        const body_end4 = skipJsFunctionBody(cc, scan);
+                                        w.writeAll(cc[src_pos..body_end4]) catch { w_errs += 1; };
+                                        src_pos = body_end4;
+                                        continue :char_loop;
                                     }
-                                    w.writeAll("};\n}\n") catch { w_errs += 1; };
 
                                     // Skip the original function body
                                     const body_end = skipJsFunctionBody(cc, scan);
@@ -3450,6 +4205,112 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     }
                                 }
                                 if (prov_matched) continue :char_loop;
+                                // === Inter-procedural parameter provenance ===
+                                // Match `PARAM[expr].field` where PARAM is a function parameter
+                                // that receives a provenance container at the call site.
+                                // Rewrite to `__col_field[__CONTAINER_soa_base + (expr)]`
+                                if (param_provs.len > 0 and isIdentChar(cc[src_pos]) and
+                                    (src_pos == 0 or !isIdentChar(cc[src_pos - 1])))
+                                {
+                                    for (param_provs) |pp| {
+                                        // Scope check: src_pos must be within the function body
+                                        if (src_pos < pp.func_body_start or src_pos >= pp.func_body_end) continue;
+                                        if (src_pos + pp.param_name.len + 1 >= cc.len) continue;
+                                        if (!std.mem.startsWith(u8, cc[src_pos..], pp.param_name)) continue;
+                                        const after_param = src_pos + pp.param_name.len;
+                                        if (after_param >= cc.len or cc[after_param] != '[') continue;
+                                        // Verify word boundary
+                                        if (after_param < cc.len and isIdentChar(cc[after_param]) and cc[after_param] != '[') continue;
+                                        // Find matching ']'
+                                        var depth_pp: u32 = 1;
+                                        var k_pp = after_param + 1;
+                                        while (k_pp < cc.len and depth_pp > 0) : (k_pp += 1) {
+                                            if (cc[k_pp] == '[') depth_pp += 1;
+                                            if (cc[k_pp] == ']') depth_pp -= 1;
+                                        }
+                                        // Must be followed by '.field'
+                                        if (k_pp >= cc.len or cc[k_pp] != '.') continue;
+                                        const fstart_pp = k_pp + 1;
+                                        var fend_pp = fstart_pp;
+                                        while (fend_pp < cc.len and isIdentChar(cc[fend_pp])) fend_pp += 1;
+                                        if (fend_pp == fstart_pp) continue;
+                                        const fname_pp = cc[fstart_pp..fend_pp];
+                                        // Skip method calls and assignments
+                                        if (fend_pp < cc.len and cc[fend_pp] == '(') continue;
+                                        var eq_pp = fend_pp;
+                                        while (eq_pp < cc.len and cc[eq_pp] == ' ') eq_pp += 1;
+                                        if (eq_pp < cc.len and cc[eq_pp] == '=' and (eq_pp + 1 >= cc.len or cc[eq_pp + 1] != '=')) continue;
+                                        if (eq_pp + 1 < cc.len and cc[eq_pp + 1] == '=' and (cc[eq_pp] == '+' or cc[eq_pp] == '-' or cc[eq_pp] == '|' or cc[eq_pp] == '&')) continue;
+                                        // Verify it's a known SOA field
+                                        const prov_pp = provenance[pp.prov_idx];
+                                        const site_pp = alloc_sites.items[prov_pp.site_idx];
+                                        var field_match_pp = false;
+                                        for (site_pp.field_names[0..site_pp.field_count]) |sf| {
+                                            if (std.mem.eql(u8, sf, fname_pp)) { field_match_pp = true; break; }
+                                        }
+                                        if (!field_match_pp) continue;
+                                        // Emit: __col_field[__CONTAINER_soa_base + (expr)]
+                                        const idx_expr_pp = cc[after_param + 1 .. k_pp - 1];
+                                        w.print("__col_{s}[__{s}_soa_base + ({s})]", .{
+                                            fname_pp, prov_pp.var_name, idx_expr_pp,
+                                        }) catch { w_errs += 1; };
+                                        src_pos = fend_pp;
+                                        prov_matched = true;
+                                        break;
+                                    }
+                                }
+                                if (prov_matched) continue :char_loop;
+                                // === Local variable alias read-site transform ===
+                                // Match `ALIAS.field` where ALIAS was detected as `const ALIAS = PROV_VAR[expr]`
+                                // Transform to `__col_field[__PROV_soa_base + (expr)]`
+                                // Scope-aware: only match aliases whose scope contains src_pos
+                                if (aliases.len > 0 and isIdentChar(cc[src_pos]) and
+                                    (src_pos == 0 or !isIdentChar(cc[src_pos - 1])))
+                                {
+                                    // Extract identifier at src_pos
+                                    var ae = src_pos;
+                                    while (ae < cc.len and ident_char[cc[ae]]) ae += 1;
+                                    if (ae > src_pos and ae < cc.len and cc[ae] == '.') {
+                                        const candidate = cc[src_pos..ae];
+                                        // Search all aliases with this name (may exist in multiple scopes)
+                                        // Use linear scan since alias count is small (typically <128)
+                                        for (aliases) |alias| {
+                                            if (!std.mem.eql(u8, alias.alias_name, candidate)) continue;
+                                            // Scope check: src_pos must be within alias's scope
+                                            if (src_pos < alias.assign_pos or src_pos > alias.scope_end) continue;
+                                            const prov = provenance[alias.prov_idx];
+                                            // Read field name after '.'
+                                            const afs = ae + 1;
+                                            var afe = afs;
+                                            while (afe < cc.len and ident_char[cc[afe]]) afe += 1;
+                                            if (afe <= afs) continue;
+                                            const afname = cc[afs..afe];
+                                            // Skip method calls: alias.method(
+                                            if (afe < cc.len and cc[afe] == '(') continue;
+                                            // Verify it's a known SOA field
+                                            const asite = alloc_sites.items[prov.site_idx];
+                                            var af_match = false;
+                                            for (asite.field_names[0..asite.field_count]) |sf| {
+                                                if (std.mem.eql(u8, sf, afname)) { af_match = true; break; }
+                                            }
+                                            if (!af_match) continue;
+                                            // Skip assignment: alias.field = (not a read)
+                                            var aeq = afe;
+                                            while (aeq < cc.len and cc[aeq] == ' ') aeq += 1;
+                                            if (aeq < cc.len and cc[aeq] == '=' and (aeq + 1 >= cc.len or cc[aeq + 1] != '=')) continue;
+                                            // Skip compound assignment: alias.field += / |= / etc
+                                            if (aeq + 1 < cc.len and cc[aeq + 1] == '=' and (cc[aeq] == '+' or cc[aeq] == '-' or cc[aeq] == '|' or cc[aeq] == '&' or cc[aeq] == '*')) continue;
+                                            // Emit: __col_field[__PROV_soa_base + (idx_expr)]
+                                            w.print("__col_{s}[__{s}_soa_base + ({s})]", .{
+                                                afname, prov.var_name, alias.idx_expr,
+                                            }) catch { w_errs += 1; };
+                                            src_pos = afe;
+                                            prov_matched = true;
+                                            break;
+                                        }
+                                        if (prov_matched) continue :char_loop;
+                                    }
+                                }
                                 // No match — copy one character
                                 w.writeAll(cc[src_pos .. src_pos + 1]) catch { w_errs += 1; };
                                 src_pos += 1;

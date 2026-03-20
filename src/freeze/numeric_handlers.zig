@@ -1222,7 +1222,7 @@ pub fn detectAllocSites(instructions: anytype) ?AllocSiteInfo {
     var last_arg_idx: u8 = 0;
     var all_get_arg = true;
 
-    for (instructions) |instr| {
+    for (instructions, 0..) |instr, instr_idx| {
         if (instr.opcode == .object) {
             object_count += 1;
             if (object_count > 1) return null; // multiple object literals — bail
@@ -1263,9 +1263,21 @@ pub fn detectAllocSites(instructions: anytype) ?AllocSiteInfo {
                         else => { last_was_get_arg = false; },
                     }
                 },
-                // Call after object means object is consumed by another function — not a simple factory
+                // Calls between define_field ops compute field values — safe.
+                // Calls after ALL define_fields mean the object is consumed — bail.
                 .call0, .call1, .call2, .call3, .call, .call_method,
-                .tail_call, .tail_call_method, .call_constructor => return null,
+                .tail_call, .tail_call_method, .call_constructor => {
+                    // Look ahead: if another define_field follows, the call is
+                    // computing a field value (e.g. `{ x: new Map(), y: fn() }`).
+                    // If only return follows, the call consumes the object — bail.
+                    var has_more_fields = false;
+                    for (instructions[instr_idx + 1 ..]) |next| {
+                        if (next.opcode == .define_field) { has_more_fields = true; break; }
+                        if (next.opcode == .@"return" or next.opcode == .return_undef) break;
+                    }
+                    if (!has_more_fields) return null;
+                    last_was_get_arg = false;
+                },
                 else => { last_was_get_arg = false; },
             }
         }
