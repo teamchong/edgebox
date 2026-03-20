@@ -820,22 +820,23 @@ fn applyTscTransforms(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
             .needle = "if (source.flags & 524288 /* Object */ && target.flags & 524288 /* Object */) {\n      const related = relation.get(getRelationKey(",
             .replacement = "if (source.flags & 524288 && target.flags & 524288) {\n      if(typeof __pc_relKeys!=='undefined'){var __rk=source.id*32768+target.id+1,__rb=(__rk&0x7FFFF)*6;if(__pc_relKeys[__rb]===__rk){var __rr=__pc_relKeys[__rb+2];if(__rr)return !!(__rr&1);}else if(__pc_relKeys[__rb+3]===__rk){var __rr=__pc_relKeys[__rb+5];if(__rr)return !!(__rr&1);}}\n      const related = relation.get(getRelationKey(",
         },
-        // T17: write to SAB relation cache on succeeded
+        // T17: write FULL entry value to SAB relation cache on succeeded
+        // Only write to empty slots or same-key slots (never overwrite different keys)
         .{
             .needle = "relation.set(maybeKeys[i], 1 /* Succeeded */ | propagatingVarianceFlags);",
-            .replacement = "relation.set(maybeKeys[i], 1 | propagatingVarianceFlags);if(typeof __pc_relKeys!=='undefined'&&typeof maybeKeys[i]==='number'){var __wk=maybeKeys[i],__wb=(__wk&0x7FFFF)*6;if(!__pc_relKeys[__wb]||__pc_relKeys[__wb]===__wk){__pc_relKeys[__wb]=__wk;__pc_relKeys[__wb+2]=1;}else{__pc_relKeys[__wb+3]=__wk;__pc_relKeys[__wb+5]=1;}}",
+            .replacement = "{var __fv=1|propagatingVarianceFlags;relation.set(maybeKeys[i],__fv);if(typeof __pc_relKeys!=='undefined'&&typeof maybeKeys[i]==='number'){var __wk=maybeKeys[i],__wb=(__wk&0x7FFFF)*6;if(!__pc_relKeys[__wb]||__pc_relKeys[__wb]===__wk){__pc_relKeys[__wb]=__wk;__pc_relKeys[__wb+2]=__fv;}else if(!__pc_relKeys[__wb+3]||__pc_relKeys[__wb+3]===__wk){__pc_relKeys[__wb+3]=__wk;__pc_relKeys[__wb+5]=__fv;}}}",
         },
-        // T18: write to SAB relation cache on failure
+        // T18: write FULL entry value to SAB relation cache on failure
         .{
             .needle = "relation.set(id, 2 /* Failed */ | propagatingVarianceFlags);",
-            .replacement = "relation.set(id, 2 | propagatingVarianceFlags);if(typeof __pc_relKeys!=='undefined'&&typeof id==='number'){var __wk2=id,__wb2=(__wk2&0x7FFFF)*6;if(!__pc_relKeys[__wb2]||__pc_relKeys[__wb2]===__wk2){__pc_relKeys[__wb2]=__wk2;__pc_relKeys[__wb2+2]=2;}else{__pc_relKeys[__wb2+3]=__wk2;__pc_relKeys[__wb2+5]=2;}}",
+            .replacement = "{var __fv2=2|propagatingVarianceFlags;relation.set(id,__fv2);if(typeof __pc_relKeys!=='undefined'&&typeof id==='number'){var __wk2=id,__wb2=(__wk2&0x7FFFF)*6;if(!__pc_relKeys[__wb2]||__pc_relKeys[__wb2]===__wk2){__pc_relKeys[__wb2]=__wk2;__pc_relKeys[__wb2+2]=__fv2;}else if(!__pc_relKeys[__wb2+3]||__pc_relKeys[__wb2+3]===__wk2){__pc_relKeys[__wb2+3]=__wk2;__pc_relKeys[__wb2+5]=__fv2;}}}",
         },
-        // T19: removed — deep relation cache needs full entry flags (variance, overflow)
-        // SAB cache only stores 1/2 which loses ReportsMask and Overflow bits.
-        // T20: write overflow failures to SAB cache
+        // T19: deep relation cache disabled — relation-unaware key causes cross-relation
+        // contamination (identityRelation vs assignableRelation share same id key).
+        // T20: write overflow failures to SAB cache (safe write)
         .{
             .needle = "relation.set(id, 2 /* Failed */ | (relationCount <= 0 ? 32 /* ComplexityOverflow */ : 64 /* StackDepthOverflow */));",
-            .replacement = "relation.set(id, 2 | (relationCount <= 0 ? 32 : 64));if(typeof __pc_relKeys!=='undefined'&&typeof id==='number'){var __ok=id,__ob=((__ok)&0x7FFFF)*6;if(!__pc_relKeys[__ob]||__pc_relKeys[__ob]===__ok){__pc_relKeys[__ob]=__ok;__pc_relKeys[__ob+2]=2;}else{__pc_relKeys[__ob+3]=__ok;__pc_relKeys[__ob+5]=2;}}",
+            .replacement = "{var __ov=2|(relationCount<=0?32:64);relation.set(id,__ov);if(typeof __pc_relKeys!=='undefined'&&typeof id==='number'){var __ok=id,__ob=((__ok)&0x7FFFF)*6;if(!__pc_relKeys[__ob]||__pc_relKeys[__ob]===__ok){__pc_relKeys[__ob]=__ok;__pc_relKeys[__ob+2]=__ov;}else if(!__pc_relKeys[__ob+3]||__pc_relKeys[__ob+3]===__ok){__pc_relKeys[__ob+3]=__ok;__pc_relKeys[__ob+5]=__ov;}}}",
         },
         // T21: getObjectFlags → SOA column read (avoid object property access)
         .{
