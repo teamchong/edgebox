@@ -2035,7 +2035,20 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 pr += rc_get2_needle.len;
                                 continue;
                             }
-                            // P9: SOA flags read removed (type.flags is mutable)
+                            // P9: SOA flags read — type.flags is IMMUTABLE after createType!
+                            // Replace source.flags/target.flags with __typeFlags[id] in isSimpleTypeRelatedTo
+                            if (pr + 55 <= orig.len and
+                                std.mem.startsWith(u8, orig[pr..], "const s = source.flags;\n    const t = target.flags;"))
+                            {
+                                // type.flags is IMMUTABLE — __typeFlags[id] is always correct.
+                                // type.id is always > 0 (assigned by typeCount++ starting at 1).
+                                // __typeFlags[0] = 0 (safe fallback for id=0).
+                                const soa_fr = "const s = __typeFlags[source.id|0] || source.flags;\n    const t = __typeFlags[target.id|0] || target.flags;";
+                                @memcpy(buf[pw..][0..soa_fr.len], soa_fr);
+                                pw += soa_fr.len;
+                                pr += 55;
+                                continue;
+                            }
                             // P10: accessibleChainCache key → packed integer
                             if (pr + acc_needle.len <= orig.len and
                                 std.mem.startsWith(u8, orig[pr..], acc_needle))
