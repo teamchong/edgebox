@@ -3884,9 +3884,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         // Emit module-scope soa_base variable declarations
                         // These are `var` (not const) so they're hoisted to module scope
                         // and accessible from any function that receives the container.
-                        for (provenance) |prov| {
+                        for (provenance, 0..) |prov, pi| {
                             if (prov.decl_end > 0) {
-                                w.print("var __{s}_soa_base;\n", .{prov.var_name}) catch { w_errs += 1; };
+                                w.print("var __sb{d};\n", .{pi}) catch { w_errs += 1; };
                             }
                         }
 
@@ -3946,7 +3946,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             if (decl_end_set.get(src_pos)) |pi| {
                                 const prov = provenance[pi];
                                 // Assign module-scope soa_base variable (declared in header)
-                                w.print(";__{s}_soa_base = __col_idx", .{prov.var_name}) catch { w_errs += 1; };
+                                w.print(";__sb{d} = __col_idx", .{pi}) catch { w_errs += 1; };
                                 if (prov.raw_index) {
                                     w.print(";{s}.__soa={d}", .{ prov.var_name, prov.site_idx }) catch { w_errs += 1; };
                                 }
@@ -4295,14 +4295,16 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     }
 
                                     if (has_provenance) {
-                                        // Container SOA: write to columns + return object with __idx
+                                        // Container SOA: write to columns, return original object (no __idx)
+                                        // Don't add __idx to avoid polluting object shape (breaks
+                                        // type comparison when TSC enumerates properties).
                                         w.writeAll(cc[src_pos .. scan + 1]) catch { w_errs += 1; };
                                         w.writeAll("\n") catch { w_errs += 1; };
                                         w.writeAll("  const __idx = __col_idx++;\n") catch { w_errs += 1; };
                                         for (site.field_names[0..site.field_count], 0..) |fname, fi| {
                                             w.print("  __col_{s}[__idx] = {s};\n", .{ fname, param_names[fi] }) catch { w_errs += 1; };
                                         }
-                                        w.writeAll("  return {__idx, ") catch { w_errs += 1; };
+                                        w.writeAll("  return {") catch { w_errs += 1; };
                                         for (site.field_names[0..site.field_count], 0..) |fname, fi| {
                                             if (fi > 0) w.writeAll(", ") catch { w_errs += 1; };
                                             w.print("{s}: {s}", .{ fname, param_names[fi] }) catch { w_errs += 1; };
@@ -4720,7 +4722,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 if (provenance.len > 0 and isIdentChar(cc[src_pos]) and
                                     (src_pos == 0 or !isIdentChar(cc[src_pos - 1])))
                                 {
-                                    for (provenance) |prov| {
+                                    for (provenance, 0..) |prov, pi_r| {
                                         if (src_pos + prov.var_name.len + 1 >= cc.len) continue;
                                         if (!std.mem.startsWith(u8, cc[src_pos..], prov.var_name)) continue;
                                         const after_var = src_pos + prov.var_name.len;
@@ -4782,7 +4784,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                                 if (!if_match) continue;
                                                 const inner_idx = idx_expr[ia + 1 .. k3 - 1];
                                                 // Emit: __soa_N_field[__VAR_base + (__soa_M_innerfield[__IVAR_base + (inner_idx)])]
-                                                w.print("__col_{s}[__{s}_soa_base + (__col_{s}[__{s}_soa_base + ({s})])]", .{
+                                                w.print("__col_{s}[__sb{d} + (__col_{s}[__sb{d} + ({s})])\]", .{
                                                     fname, prov.var_name,
                                                     ifn, ip.var_name, inner_idx,
                                                 }) catch { w_errs += 1; };
@@ -4793,8 +4795,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         if (!inner_transformed) {
                                             if (prov.decl_end > 0) {
                                                 // Index-aligned: VAR[expr].field → __soa_N_field[__VAR_soa_base + (expr)]
-                                                w.print("__col_{s}[__{s}_soa_base + ({s})]", .{
-                                                    fname, prov.var_name, idx_expr,
+                                                w.print("__col_{s}[__sb{d} + ({s})]", .{
+                                                    fname, pi_r, idx_expr,
                                                 }) catch { w_errs += 1; };
                                             } else {
                                                 // SOA column read via __idx: VAR[expr].field → __soa_N_field[VAR[expr].__idx]
@@ -4863,8 +4865,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         // Emit: __col_field[__CONTAINER_soa_base + (expr)]
                                         // Use container name (module-scope var) not parameter name.
                                         const idx_expr_pp = cc[after_param + 1 .. k_pp - 1];
-                                        w.print("__col_{s}[__{s}_soa_base + ({s})]", .{
-                                            fname_pp, prov_pp.var_name, idx_expr_pp,
+                                        w.print("__col_{s}[__sb{d} + ({s})]", .{
+                                            fname_pp, pp.prov_idx, idx_expr_pp,
                                         }) catch { w_errs += 1; };
                                         src_pos = fend_pp;
                                         prov_matched = true;
@@ -4913,8 +4915,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             // Skip compound assignment: alias.field += / |= / etc
                                             if (aeq + 1 < cc.len and cc[aeq + 1] == '=' and (cc[aeq] == '+' or cc[aeq] == '-' or cc[aeq] == '|' or cc[aeq] == '&' or cc[aeq] == '*')) continue;
                                             // Emit: __col_field[PROV.__sb + (idx_expr)]
-                                            w.print("__col_{s}[__{s}_soa_base + ({s})]", .{
-                                                afname, prov.var_name, alias.idx_expr,
+                                            w.print("__col_{s}[__sb{d} + ({s})]", .{
+                                                afname, alias.prov_idx, alias.idx_expr,
                                             }) catch { w_errs += 1; };
                                             src_pos = afe;
                                             prov_matched = true;
