@@ -220,7 +220,7 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
     // Eliminates string allocation "N,N" on every type relation check
     if (patched_script != null or final_code.ptr != script_code.ptr) {
         const grk_needle = "return isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : `${source.id},${target.id}${postFix}`;";
-        const grk_replacement = "if(!postFix && !isTypeReferenceWithGenericArguments(source) && !isTypeReferenceWithGenericArguments(target) && source.id < 0x100000 && target.id < 0x100000) return (source.id << 20) | target.id; return isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : `${source.id},${target.id}${postFix}`;";
+        const grk_replacement = "if(!postFix && !isTypeReferenceWithGenericArguments(source) && !isTypeReferenceWithGenericArguments(target) && source.id > 0 && source.id < 0x100000 && target.id > 0 && target.id < 0x100000) return ((source.id << 20) | target.id) + 1; return isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : `${source.id},${target.id}${postFix}`;";
         if (std.mem.indexOf(u8, final_code, grk_needle)) |grk_pos| {
             const extra = grk_replacement.len - grk_needle.len + 1;
             var grk_buf = try alloc.alloc(u8, final_code.len + extra);
