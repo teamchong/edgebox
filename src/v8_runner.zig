@@ -716,10 +716,10 @@ fn applyTscTransforms(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     };
 
     const transforms = [_]Transform{
-        // T1: createType → populate __pc_typeFlags SOA column
+        // T1: createType → populate __pc_typeFlags + __pc_objectFlags SOA columns
         .{
             .needle = "typeCount++;\n    result.id = typeCount;",
-            .replacement = "typeCount++;\n    result.id = typeCount;\n    if(typeof __pc_typeFlags!=='undefined'&&typeCount<262144)__pc_typeFlags[typeCount]=result.flags;",
+            .replacement = "typeCount++;\n    result.id = typeCount;\n    if(typeof __pc_typeFlags!=='undefined'&&typeCount<262144){__pc_typeFlags[typeCount]=result.flags;if(result.objectFlags)__pc_objectFlags[typeCount]=result.objectFlags;}",
         },
         // T2: isSimpleTypeRelatedTo → read flags from SAB-backed SOA column
         .{
@@ -774,7 +774,12 @@ fn applyTscTransforms(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
             .needle = "function fileSystemEntryExists(path, entryKind) {\n      const stat = statSync(path);\n      if (!stat) {\n        return false;\n      }\n      switch (entryKind) {\n        case 0 /* File */:\n          return stat.isFile();\n        case 1 /* Directory */:\n          return stat.isDirectory();",
             .replacement = "function fileSystemEntryExists(path, entryKind) {\n      if(typeof __edgebox_file_exists==='function'){if(entryKind===0)return !!__edgebox_file_exists(path);if(entryKind===1)return !!__edgebox_dir_exists(path);}\n      const stat = statSync(path);\n      if (!stat) {\n        return false;\n      }\n      switch (entryKind) {\n        case 0 /* File */:\n          return stat.isFile();\n        case 1 /* Directory */:\n          return stat.isDirectory();",
         },
-        // T12: Parallel checkSourceFile sharding — when __EDGEBOX_SHARD is set,
+        // T12: getObjectFlags → SOA column read (avoid object property access)
+        .{
+            .needle = "function getObjectFlags(type) {\n    return type.flags & 3899393 /* ObjectFlagsType */ ? type.objectFlags : 0;\n  }",
+            .replacement = "function getObjectFlags(type) {\n    if(typeof __pc_objectFlags!=='undefined'&&type.id>0&&type.id<262144){var __of=__pc_objectFlags[type.id];if(__of)return __of;}return type.flags & 3899393 ? type.objectFlags : 0;\n  }",
+        },
+        // T13: Parallel checkSourceFile sharding — when __EDGEBOX_SHARD is set,
         // each worker only checks its portion of source files
         .{
             .needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));",

@@ -23,12 +23,14 @@ const max_threads = 8;
 // Buffer sizing: 256K types, 512K pairs max
 const MAX_TYPES: usize = 262144; // 256K type slots
 const MAX_PAIRS: usize = 524288; // 512K pair slots
-const TOTAL_I32 = MAX_TYPES + 2 * MAX_PAIRS + MAX_PAIRS;
+// Layout: [typeFlags 256K | objectFlags 256K | pairs 1M | results 512K]
+const TOTAL_I32 = MAX_TYPES * 2 + 2 * MAX_PAIRS + MAX_PAIRS;
 const TOTAL_BYTES = TOTAL_I32 * @sizeOf(i32);
 
 const TYPE_FLAGS_OFFSET: usize = 0;
-const PAIRS_OFFSET: usize = MAX_TYPES;
-const RESULTS_OFFSET: usize = MAX_TYPES + 2 * MAX_PAIRS;
+const OBJ_FLAGS_OFFSET: usize = MAX_TYPES;
+const PAIRS_OFFSET: usize = MAX_TYPES * 2;
+const RESULTS_OFFSET: usize = MAX_TYPES * 2 + 2 * MAX_PAIRS;
 
 // Zig-owned shared memory
 var shared_buffer: ?[*]align(4096) u8 = null;
@@ -43,6 +45,11 @@ fn getSharedBuffer() ?[*]align(4096) u8 {
 fn getTypeFlags() ?[*]i32 {
     const buf = getSharedBuffer() orelse return null;
     return @alignCast(@ptrCast(buf + TYPE_FLAGS_OFFSET * @sizeOf(i32)));
+}
+
+fn getObjFlags() ?[*]i32 {
+    const buf = getSharedBuffer() orelse return null;
+    return @alignCast(@ptrCast(buf + OBJ_FLAGS_OFFSET * @sizeOf(i32)));
 }
 
 fn getPairs() ?[*]i32 {
@@ -268,15 +275,17 @@ pub fn registerGlobals(isolate: *v8.Isolate, context: *const v8.Context) void {
     const sab_key = v8.StringApi.fromUtf8(isolate, "__pc_sab") orelse return;
     _ = v8.ObjectApi.set(global, context, @ptrCast(sab_key), sab);
 
-    var init_buf: [512]u8 = undefined;
+    var init_buf: [768]u8 = undefined;
     const init_js = std.fmt.bufPrint(&init_buf,
         "globalThis.__pc_typeFlags=new Int32Array(__pc_sab,0,{d});" ++
+        "globalThis.__pc_objectFlags=new Int32Array(__pc_sab,{d},{d});" ++
         "globalThis.__pc_pairs=new Int32Array(__pc_sab,{d},{d});" ++
         "globalThis.__pc_results=new Int32Array(__pc_sab,{d},{d});",
         .{
             MAX_TYPES,
-            MAX_TYPES * 4, MAX_PAIRS * 2,
-            (MAX_TYPES + MAX_PAIRS * 2) * 4, MAX_PAIRS,
+            MAX_TYPES * 4, MAX_TYPES,
+            MAX_TYPES * 2 * 4, MAX_PAIRS * 2,
+            (MAX_TYPES * 2 + MAX_PAIRS * 2) * 4, MAX_PAIRS,
         },
     ) catch return;
     _ = v8.eval(isolate, context, init_js, "pc_init.js") catch {};

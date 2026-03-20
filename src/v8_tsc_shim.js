@@ -11,6 +11,9 @@
   if (typeof globalThis.__pc_typeFlags === 'undefined') {
     globalThis.__pc_typeFlags = new Int32Array(262144);
   }
+  if (typeof globalThis.__pc_objectFlags === 'undefined') {
+    globalThis.__pc_objectFlags = new Int32Array(262144);
+  }
 
   // Source file cache for createSourceFile memoization
   // Populated by source transform that wraps createSourceFile

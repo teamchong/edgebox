@@ -68,7 +68,19 @@ pub fn registerGlobals(isolate: *v8.Isolate, context: *const v8.Context) void {
 }
 
 /// Fast readFile: path → string (no JSON serialize/parse overhead)
-/// Fast stdout write — no JSON
+/// Buffered stdout — reduce syscalls for TSC diagnostic output (14K+ lines)
+var stdout_buf: std.ArrayListUnmanaged(u8) = .{};
+const STDOUT_BUF_SIZE: usize = 65536; // 64KB buffer, flush when full
+
+fn flushStdout() void {
+    if (stdout_buf.items.len > 0) {
+        const stdout = std.fs.File.stdout();
+        stdout.writeAll(stdout_buf.items) catch {};
+        stdout_buf.clearRetainingCapacity();
+    }
+}
+
+/// Fast stdout write — buffered, no JSON
 pub fn writeStdoutFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
     const isolate = v8.CallbackInfoApi.getIsolate(info);
     if (v8.CallbackInfoApi.length(info) < 1) return;
@@ -79,17 +91,27 @@ pub fn writeStdoutFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c
     const len: usize = @intCast(v8.StringApi.utf8Length(str, isolate));
     if (len == 0) return;
 
+    // Ensure capacity in the buffer
+    stdout_buf.ensureTotalCapacity(alloc, stdout_buf.items.len + len) catch {
+        flushStdout();
+        stdout_buf.ensureTotalCapacity(alloc, len) catch return;
+    };
+
+    // Write directly into buffer
     var stack_buf: [4096]u8 = undefined;
     if (len <= stack_buf.len) {
         const written = v8.StringApi.writeUtf8(str, isolate, &stack_buf);
-        const stdout = std.fs.File.stdout();
-        stdout.writeAll(stack_buf[0..written]) catch {};
+        stdout_buf.appendSlice(alloc, stack_buf[0..written]) catch {};
     } else {
         const heap_buf = alloc.alloc(u8, len) catch return;
         defer alloc.free(heap_buf);
         const written = v8.StringApi.writeUtf8(str, isolate, heap_buf);
-        const stdout = std.fs.File.stdout();
-        stdout.writeAll(heap_buf[0..written]) catch {};
+        stdout_buf.appendSlice(alloc, heap_buf[0..written]) catch {};
+    }
+
+    // Flush when buffer is large enough
+    if (stdout_buf.items.len >= STDOUT_BUF_SIZE) {
+        flushStdout();
     }
 }
 
@@ -392,6 +414,7 @@ fn handleRequest(msg: []const u8) ![]const u8 {
         // Defer exit: save exit code, throw to unwind back to runner
         // so code cache can be saved before termination.
         deferred_exit_code = @intCast(code);
+        flushStdout(); // Flush buffered output before exit
         return "{\"ok\":true,\"deferred_exit\":true}";
     } else if (std.mem.eql(u8, req.op, "argv")) {
         return opArgv();
