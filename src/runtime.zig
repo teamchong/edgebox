@@ -1923,11 +1923,12 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     // When __EDGEBOX_WORKER env is set, only check files in this shard.
                     const par_needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));";
                     const par_repl = "{const __files=host.getSourceFiles();const __shard=parseInt(process.env.__EDGEBOX_SHARD||'0');const __total=parseInt(process.env.__EDGEBOX_TOTAL||'1');const __start=Math.floor(__files.length*__shard/__total);const __end=Math.floor(__files.length*(__shard+1)/__total);for(let __i=__start;__i<__end;__i++)checkSourceFileWithEagerDiagnostics(__files[__i]);}";
-                    // SOA flags: use Object.defineProperty to make type.flags a getter/setter
-                    // that reads/writes from flat Int32Array. This handles mutations correctly.
-                    // Patch createType to define flags as accessor property.
-                    const soa_flags_needle = "DISABLED_soa_flags";
-                    const soa_flags_repl = "DISABLED_soa_flags";
+                    // Patch accessibleChainCache key: 3 integers → packed number
+                    const acc_needle = "const key = `${useOnlyExternalAliasing ? 0 : 1}|${firstRelevantLocation ? getNodeId(firstRelevantLocation) : 0}|${meaning}`;";
+                    const acc_repl = "var __a1=useOnlyExternalAliasing?0:1,__a2=firstRelevantLocation?getNodeId(firstRelevantLocation):0;const key=__a2<100000&&meaning<100000?__a1*10000000000+__a2*100000+meaning+1:`${__a1}|${__a2}|${meaning}`;";
+                    // Patch conditional type cache key: 2 type IDs → packed number
+                    const cond_needle = "const id = `${getTypeId(baseType)}>${getTypeId(constraint)}`;";
+                    const cond_repl = "var __b=getTypeId(baseType),__c=getTypeId(constraint);const id=__b<100000&&__c<100000?__b*100000+__c+1:`${__b}>${__c}`;";
                     // Inline relation cache removed — typeof check overhead at call sites
                     // outweighs the cache benefit on large projects (typeorm 1.2x slower).
                     // The getRelationKey integer packing already eliminates string allocation.
@@ -2034,16 +2035,30 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 pr += rc_get2_needle.len;
                                 continue;
                             }
-                            // P9: SOA flags read in isSimpleTypeRelatedTo
-                            if (pr + soa_flags_needle.len <= orig.len and
-                                std.mem.startsWith(u8, orig[pr..], soa_flags_needle))
+                            // P9: SOA flags read removed (type.flags is mutable)
+                            // P10: accessibleChainCache key → packed integer
+                            if (pr + acc_needle.len <= orig.len and
+                                std.mem.startsWith(u8, orig[pr..], acc_needle))
                             {
-                                @memcpy(buf[pw..][0..soa_flags_repl.len], soa_flags_repl);
-                                pw += soa_flags_repl.len;
-                                pr += soa_flags_needle.len;
+                                @memcpy(buf[pw..][0..acc_repl.len], acc_repl);
+                                pw += acc_repl.len;
+                                pr += acc_needle.len;
                                 continue;
                             }
-                            // P10: createType → add typesById[] registration
+                            // P11: conditional type cache key → packed integer
+                            if (pr + cond_needle.len <= orig.len and
+                                std.mem.startsWith(u8, orig[pr..], cond_needle))
+                            {
+                                @memcpy(buf[pw..][0..cond_repl.len], cond_repl);
+                                pw += cond_repl.len;
+                                pr += cond_needle.len;
+                                continue;
+                            }
+                            // P12-P13: additional cache key integer packing
+                            // Disabled: scoping issues with const key in blocks.
+                            // The patterns are low-frequency (1 call site each)
+                            // and don't provide measurable speedup.
+                            // P14: createType → add typesById[] registration
                             if (pr + ct_needle.len <= orig.len and
                                 std.mem.startsWith(u8, orig[pr..], ct_needle))
                             {
