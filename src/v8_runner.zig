@@ -279,6 +279,14 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
 
         const parallel_init_js = @embedFile("v8_parallel_init.js");
         _ = v8.eval(isolate, context, parallel_init_js, "v8_parallel_init.js") catch {};
+    } else {
+        // For TSC: register only the precompute callback (no SAB allocation)
+        const v8_parallel_check = @import("v8_parallel_check.zig");
+        const global_obj = v8.ContextApi.global(context);
+        const pc_tmpl = v8.FunctionTemplateApi.create(isolate, &v8_parallel_check.precomputeCallback) orelse return;
+        const pc_func = v8.FunctionTemplateApi.getFunction(pc_tmpl, context) orelse return;
+        const pc_key = v8.StringApi.fromUtf8(isolate, "__edgebox_precompute_relations") orelse return;
+        _ = v8.ObjectApi.set(global_obj, context, @ptrCast(pc_key), @ptrCast(pc_func));
     }
 
     // For packed binaries: ensure process.argv has [exe, script, ...args] format
@@ -722,10 +730,10 @@ fn applyTscTransforms(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
             .needle = "typeCount++;\n    result.id = typeCount;",
             .replacement = "typeCount++;\n    result.id = typeCount;\n    if(typeof __pc_typeFlags!=='undefined'&&typeCount<262144){__pc_typeFlags[typeCount]=result.flags;if(result.objectFlags)__pc_objectFlags[typeCount]=result.objectFlags;}",
         },
-        // T2: isSimpleTypeRelatedTo → read flags from SAB-backed SOA column
+        // T2: isSimpleTypeRelatedTo → read from SOA column + flag table lookup
         .{
             .needle = "const s = source.flags;\n    const t = target.flags;",
-            .replacement = "const s = __pc_typeFlags[source.id|0] || source.flags;\n    const t = __pc_typeFlags[target.id|0] || target.flags;",
+            .replacement = "const s = __pc_typeFlags[source.id|0] || source.flags;\n    const t = __pc_typeFlags[target.id|0] || target.flags;\n    if(typeof __pc_flagTable!=='undefined'){const __ft=__pc_flagTable[(s&2047)*2048+(t&2047)];if(__ft===1)return true;if(__ft===2)return false;}",
         },
         // T3: getRelationKey → packed Smi integer (stays in V8 Smi range for IDs < 32768)
         // Key = source.id * 32768 + target.id (max 2^30 = Smi limit, no HeapNumber allocation)
@@ -802,11 +810,13 @@ fn applyTscTransforms(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
             .needle = "function getObjectFlags(type) {\n    return type.flags & 3899393 /* ObjectFlagsType */ ? type.objectFlags : 0;\n  }",
             .replacement = "function getObjectFlags(type) {\n    if(typeof __pc_objectFlags!=='undefined'&&type.id>0&&type.id<262144){var __of=__pc_objectFlags[type.id];if(__of)return __of;}return type.flags & 3899393 ? type.objectFlags : 0;\n  }",
         },
-        // T13: Parallel checkSourceFile sharding — when __EDGEBOX_SHARD is set,
-        // each worker only checks its portion of source files
+        // T13: Pre-compute flag table + checkSourceFile sharding
+        // Calls __edgebox_precompute_relations(typeCount) to build the flag-pair
+        // lookup table in SAB before type checking starts. Then isSimpleTypeRelatedTo
+        // can use __pc_flagTable[(s&0x7FF)*2048+(t&0x7FF)] for O(1) lookup.
         .{
             .needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));",
-            .replacement = "{const __files=host.getSourceFiles();const __shard=parseInt(process.env.__EDGEBOX_SHARD||'0');const __total=parseInt(process.env.__EDGEBOX_TOTAL||'1');const __start=Math.floor(__files.length*__shard/__total);const __end=Math.floor(__files.length*(__shard+1)/__total);for(let __i=__start;__i<__end;__i++)checkSourceFileWithEagerDiagnostics(__files[__i]);}",
+            .replacement = "{if(typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);const __files=host.getSourceFiles();const __shard=parseInt(process.env.__EDGEBOX_SHARD||'0');const __total=parseInt(process.env.__EDGEBOX_TOTAL||'1');const __start=Math.floor(__files.length*__shard/__total);const __end=Math.floor(__files.length*(__shard+1)/__total);for(let __i=__start;__i<__end;__i++)checkSourceFileWithEagerDiagnostics(__files[__i]);}",
         },
     };
 
