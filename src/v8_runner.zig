@@ -172,22 +172,19 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
 
     // Auto-inject zero-copy optimizations for TSC
     // Single-pass multi-pattern replacement to minimize scan overhead on 9MB source.
-    // Wrap script as CJS module with per-module require
+    // Set __filename and __dirname as globals (zero-copy — no wrapper needed)
     const dirname = std.fs.path.dirname(abs_path) orelse ".";
-    const prefix = "(function(__filename, __dirname) { var module = globalThis.module; var exports = module.exports; var require = globalThis._loadModule ? function(id) { return globalThis._loadModule(id, __dirname); } : globalThis.require;\n";
-    const suffix = try std.fmt.allocPrint(alloc,
-        "\n}})(\"{s}\", \"{s}\");",
+    const set_globals = try std.fmt.allocPrint(alloc,
+        "globalThis.__filename = \"{s}\"; globalThis.__dirname = \"{s}\";",
         .{ abs_path, dirname },
     );
-    defer alloc.free(suffix);
+    defer alloc.free(set_globals);
+    _ = v8.eval(isolate, context, set_globals, "globals.js") catch {};
 
-    const total_len = prefix.len + script_code.len + suffix.len;
-    const wrapped = try alloc.alloc(u8, total_len);
-    defer alloc.free(wrapped);
-
-    @memcpy(wrapped[0..prefix.len], prefix);
-    @memcpy(wrapped[prefix.len..][0..script_code.len], script_code);
-    @memcpy(wrapped[prefix.len + script_code.len ..][0..suffix.len], suffix);
+    // Skip CJS wrapping — execute script directly.
+    // This eliminates 9MB+ memcpy for large scripts like TSC.
+    // module.exports / require already set up in bootstrap.
+    const wrapped = script_code;
 
     // Compile with code cache
     var try_catch = v8.TryCatch.init(isolate);
