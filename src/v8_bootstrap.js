@@ -135,6 +135,24 @@
       if (!r.ok) { var err = new Error(r.error); throw err; }
     },
     statSync: function(path, options) {
+      // Fast path: use fileExists/dirExists callbacks when available
+      if (typeof __edgebox_file_exists === 'function') {
+        var p = String(path);
+        var isFile = !!__edgebox_file_exists(p);
+        var isDir = !isFile && !!__edgebox_dir_exists(p);
+        if (!isFile && !isDir) {
+          if (options && options.throwIfNoEntry === false) return undefined;
+          var err = new Error('ENOENT'); err.code = 'ENOENT'; throw err;
+        }
+        return {
+          isFile: function() { return isFile; },
+          isDirectory: function() { return isDir; },
+          isSymbolicLink: function() { return false; },
+          size: 0,
+          mtimeMs: Date.now(),
+          mtime: new Date()
+        };
+      }
       var r = _ioSync('stat', { path: String(path) });
       if (!r.ok) {
         if (options && options.throwIfNoEntry === false) return undefined;
