@@ -3863,6 +3863,77 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 wasm_name_map.put(allocator, wf_entry.name, wfi) catch {};
                             }
                         }
+                        // Pass 1: Pre-scan to identify which SOA columns have active reads.
+                        // Only factory columns with reads should be written — writing unused
+                        // columns can change object lifetimes (strong refs prevent GC).
+                        var active_cols = std.StringHashMapUnmanaged(void){};
+                        defer active_cols.deinit(allocator);
+                        for (provenance) |prov| {
+                            if (prov.decl_end == 0) continue;
+                            const site = alloc_sites.items[prov.site_idx];
+                            // Scan for VAR[expr].field patterns
+                            var sp: usize = 0;
+                            while (sp + prov.var_name.len + 2 < cc.len) : (sp += 1) {
+                                if (sp > 0 and isIdentChar(cc[sp - 1])) continue;
+                                if (!std.mem.startsWith(u8, cc[sp..], prov.var_name)) continue;
+                                const av = sp + prov.var_name.len;
+                                if (av >= cc.len or cc[av] != '[') continue;
+                                // Find ']'
+                                var d: u32 = 1;
+                                var j = av + 1;
+                                while (j < cc.len and d > 0) : (j += 1) {
+                                    if (cc[j] == '[') d += 1;
+                                    if (cc[j] == ']') d -= 1;
+                                }
+                                if (j >= cc.len or cc[j] != '.') continue;
+                                const fs = j + 1;
+                                var fe = fs;
+                                while (fe < cc.len and isIdentChar(cc[fe])) fe += 1;
+                                if (fe == fs) continue;
+                                const fn2 = cc[fs..fe];
+                                // Check if it's a known SOA field
+                                for (site.field_names[0..site.field_count]) |sf| {
+                                    if (std.mem.eql(u8, sf, fn2)) {
+                                        active_cols.put(allocator, sf, {}) catch {};
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        // Also check inter-procedural and alias patterns
+                        for (param_provs) |pp| {
+                            const prov = provenance[pp.prov_idx];
+                            const site = alloc_sites.items[prov.site_idx];
+                            var sp: usize = pp.func_body_start;
+                            while (sp + pp.param_name.len + 2 < pp.func_body_end) : (sp += 1) {
+                                if (sp > 0 and isIdentChar(cc[sp - 1])) continue;
+                                if (!std.mem.startsWith(u8, cc[sp..], pp.param_name)) continue;
+                                const av = sp + pp.param_name.len;
+                                if (av >= cc.len or cc[av] != '[') continue;
+                                var d: u32 = 1;
+                                var j = av + 1;
+                                while (j < cc.len and d > 0) : (j += 1) {
+                                    if (cc[j] == '[') d += 1;
+                                    if (cc[j] == ']') d -= 1;
+                                }
+                                if (j >= cc.len or cc[j] != '.') continue;
+                                const fs = j + 1;
+                                var fe = fs;
+                                while (fe < cc.len and isIdentChar(cc[fe])) fe += 1;
+                                if (fe == fs) continue;
+                                const fn2 = cc[fs..fe];
+                                for (site.field_names[0..site.field_count]) |sf| {
+                                    if (std.mem.eql(u8, sf, fn2)) {
+                                        active_cols.put(allocator, sf, {}) catch {};
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (active_cols.count() > 0) {
+                            std.debug.print("[soa] Pass 1: {d} active columns with reads\n", .{active_cols.count()});
+                        }
+
                         // Build sorted arrays of special positions for O(1) next-position scan
                         // instead of per-byte HashMap lookups
                         var special_positions = std.ArrayListUnmanaged(u32){};
@@ -4080,10 +4151,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 if (matched_prov == null) break :inline_push;
                                 const prov = provenance[matched_prov.?];
                                 // Inline push rewrite replaces objects with integers in the array.
-                                // This is ONLY safe when reads also go through SOA columns.
-                                // Reads require decl_end > 0 (VAR = [] found → __sb assigned).
-                                // Without reads, push stores integers but reads expect objects.
-                                if (prov.decl_end == 0) break :inline_push;
+                                // This is ONLY safe when ALL reads go through SOA columns.
+                                // raw_index is true when every VAR[expr] is followed by .field.
+                                // Without this guarantee, some reads would get integers instead of objects.
+                                if (!prov.raw_index) break :inline_push;
                                 const site = alloc_sites.items[prov.site_idx];
                                 // Find the '{' after .push(
                                 var obj_start = ie + 6; // skip ".push("
@@ -4307,7 +4378,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         w.writeAll(cc[src_pos .. scan + 1]) catch { w_errs += 1; };
                                         w.writeAll("\n") catch { w_errs += 1; };
                                         w.writeAll("  const __idx = __col_idx++;\n") catch { w_errs += 1; };
+                                        // Only write columns that have active reads (Pass 1 result).
+                                        // Writing unused columns keeps object refs alive, preventing GC.
                                         for (site.field_names[0..site.field_count], 0..) |fname, fi| {
+                                            if (!active_cols.contains(fname)) continue;
                                             w.print("  __col_{s}[__idx] = {s};\n", .{ fname, param_names[fi] }) catch { w_errs += 1; };
                                         }
                                         w.writeAll("  return {") catch { w_errs += 1; };
@@ -4790,9 +4864,14 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                                 if (!if_match) continue;
                                                 const inner_idx = idx_expr[ia + 1 .. k3 - 1];
                                                 // Emit: __soa_N_field[__VAR_base + (__soa_M_innerfield[__IVAR_base + (inner_idx)])]
-                                                w.print("__col_{s}[__sb{d} + (__col_{s}[__sb{d} + ({s})])\]", .{
-                                                    fname, prov.var_name,
-                                                    ifn, ip.var_name, inner_idx,
+                                                // Find inner provenance index
+                                                var ip_idx: usize = 0;
+                                                for (provenance, 0..) |pp, ppi| {
+                                                    if (std.mem.eql(u8, pp.var_name, ip.var_name)) { ip_idx = ppi; break; }
+                                                }
+                                                w.print("__col_{s}[__sb{d} + (__col_{s}[__sb{d} + ({s})])]", .{
+                                                    fname, pi_r,
+                                                    ifn, ip_idx, inner_idx,
                                                 }) catch { w_errs += 1; };
                                                 inner_transformed = true;
                                                 break;
