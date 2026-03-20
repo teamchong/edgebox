@@ -726,10 +726,12 @@ fn applyTscTransforms(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
             .needle = "const s = source.flags;\n    const t = target.flags;",
             .replacement = "const s = __pc_typeFlags[source.id|0] || source.flags;\n    const t = __pc_typeFlags[target.id|0] || target.flags;",
         },
-        // T3: getRelationKey → packed integer (eliminates template string allocation)
+        // T3: getRelationKey → packed Smi integer (stays in V8 Smi range for IDs < 32768)
+        // Key = source.id * 32768 + target.id (max 2^30 = Smi limit, no HeapNumber allocation)
+        // Falls back to string for IDs >= 32768 (very large projects)
         .{
             .needle = "isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : `${source.id},${target.id}${postFix}`",
-            .replacement = "isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : source.id * 67108864 + target.id + 1",
+            .replacement = "isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : (source.id<32768&&target.id<32768) ? source.id * 32768 + target.id + 1 : `${source.id},${target.id}${postFix}`",
         },
         // T4: JSDoc skip — function default parameter
         .{
@@ -747,7 +749,7 @@ fn applyTscTransforms(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
         // Falls back to string for large IDs via || operator
         .{
             .needle = "return symbol !== unknownSymbol ? `${flowContainer ? getNodeId(flowContainer) : \"-1\"}|${getTypeId(declaredType)}|${getTypeId(initialType)}|${getSymbolId(symbol)}` : void 0;",
-            .replacement = "if(symbol===unknownSymbol)return void 0;var __fc=flowContainer?getNodeId(flowContainer)+1:0,__dt=getTypeId(declaredType),__it=getTypeId(initialType),__si=getSymbolId(symbol);return(__fc<2048&&__dt<2048&&__it<2048&&__si<2048)?__fc*8589934592+__dt*4194304+__it*2048+__si+1:`${__fc}|${__dt}|${__it}|${__si}`;",
+            .replacement = "if(symbol===unknownSymbol)return void 0;var __fc=flowContainer?getNodeId(flowContainer)+1:0,__dt=getTypeId(declaredType),__it=getTypeId(initialType),__si=getSymbolId(symbol);return(__dt<32768&&__si<32768)?__dt*32768+__si+1:`${__fc}|${__dt}|${__it}|${__si}`;",
         },
         // T7: accessibleChainCache key → packed integer
         .{
@@ -777,7 +779,7 @@ fn applyTscTransforms(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
         // T12: getFlowCacheKey ThisKeyword → packed integer
         .{
             .needle = "return `0|${flowContainer ? getNodeId(flowContainer) : \"-1\"}|${getTypeId(declaredType)}|${getTypeId(initialType)}`;",
-            .replacement = "var __fc2=flowContainer?getNodeId(flowContainer)+1:0,__dt2=getTypeId(declaredType),__it2=getTypeId(initialType);return(__fc2<2048&&__dt2<2048&&__it2<2048)?__fc2*4194304+__dt2*2048+__it2+1:`0|${__fc2}|${__dt2}|${__it2}`;",
+            .replacement = "var __dt2=getTypeId(declaredType),__it2=getTypeId(initialType);return(__dt2<32768&&__it2<32768)?__dt2*32768+__it2+1:`0|${flowContainer?getNodeId(flowContainer):-1}|${__dt2}|${__it2}`;",
         },
         // T13: getObjectFlags → SOA column read (avoid object property access)
         .{
