@@ -14,6 +14,8 @@
 
   // Module cache for user require() calls
   var _cache = {};
+  var _existsCache = Object.create(null); // JS-side cache for existsSync
+  var _realpathCache = Object.create(null); // JS-side cache for realpathSync
 
   // ====== Path module (minimal) ======
   var sep = '/';
@@ -168,12 +170,18 @@
       };
     },
     existsSync: function(path) {
-      // Fast path: direct V8 callback (no JSON)
+      var p = String(path);
+      // JS-side cache — avoids V8→Zig round trip for repeated checks
+      if (_existsCache[p] !== undefined) return _existsCache[p];
+      var result;
       if (typeof __edgebox_file_exists === 'function') {
-        return !!__edgebox_file_exists(String(path));
+        result = !!__edgebox_file_exists(p);
+      } else {
+        var r = _ioSync('exists', { path: p });
+        result = r.ok && r.exists;
       }
-      var r = _ioSync('exists', { path: String(path) });
-      return r.ok && r.exists;
+      _existsCache[p] = result;
+      return result;
     },
     readdirSync: function(path, options) {
       var r = _ioSync('readdir', { path: String(path) });
@@ -185,14 +193,19 @@
       });
     },
     realpathSync: function(path) {
+      var p = String(path);
+      if (_realpathCache[p] !== undefined) return _realpathCache[p];
+      var result;
       if (typeof __edgebox_realpath === 'function') {
-        var result = __edgebox_realpath(String(path));
+        result = __edgebox_realpath(p);
         if (result === undefined) { var err = new Error('ENOENT'); err.code = 'ENOENT'; throw err; }
-        return result;
+      } else {
+        var r = _ioSync('realpath', { path: p });
+        if (!r.ok) { var err = new Error(r.error); throw err; }
+        result = r.data;
       }
-      var r = _ioSync('realpath', { path: String(path) });
-      if (!r.ok) { var err = new Error(r.error); throw err; }
-      return r.data;
+      _realpathCache[p] = result;
+      return result;
     },
     mkdirSync: function(path, options) {
       var recursive = options && options.recursive;
