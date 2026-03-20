@@ -2511,11 +2511,12 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     }
                                 }
                             }
+                            // Column declarations deferred to after Pass 1 (active_cols filter)
+                            // Just build the unique field list + col_set here
                             for (unique_fields[0..unique_count]) |fname| {
-                                w.print("const __col_{s} = [];\n", .{fname}) catch { w_errs += 1; };
                                 col_set.put(fname, {}) catch { w_errs += 1; };
                             }
-                            std.debug.print("[soa] {d} global columns for {d} alloc sites\n", .{ unique_count, alloc_sites.items.len });
+                            std.debug.print("[soa] {d} unique fields for {d} alloc sites (declarations deferred)\n", .{ unique_count, alloc_sites.items.len });
                         }
                         // Declare soa_base variables at module scope (as var, not const)
                         // so they're accessible across function boundaries.
@@ -4037,8 +4038,30 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 }
                             }
                         }
+                        // Also mark columns as active for provenance entries with decl_end > 0
+                        // (these generate __sb reads in the char_loop even if Pass 1 didn't find them)
+                        for (provenance) |prov| {
+                            if (prov.decl_end > 0) {
+                                const site = alloc_sites.items[prov.site_idx];
+                                for (site.field_names[0..site.field_count]) |fname| {
+                                    if (fname.len > 0) active_cols.put(allocator, fname, {}) catch {};
+                                }
+                            }
+                        }
+                        std.debug.print("[soa] Pass 1: {d} active columns, {d} param_provs scanned\n", .{ active_cols.count(), param_provs.len });
+                        // Emit column declarations — ONLY for columns with active reads
                         if (active_cols.count() > 0) {
-                            std.debug.print("[soa] Pass 1: {d} active columns with reads\n", .{active_cols.count()});
+                            std.debug.print("[soa] Pass 1: {d} active columns (of {d} total)\n", .{ active_cols.count(), col_set.count() });
+                            var ac_iter = active_cols.iterator();
+                            while (ac_iter.next()) |entry| {
+                                w.print("const __col_{s} = [];\n", .{entry.key_ptr.*}) catch { w_errs += 1; };
+                            }
+                        } else {
+                            // No active reads — still declare all columns (needed for factory writes that passed active check)
+                            var cs_iter = col_set.iterator();
+                            while (cs_iter.next()) |entry| {
+                                w.print("const __col_{s} = [];\n", .{entry.key_ptr.*}) catch { w_errs += 1; };
+                            }
                         }
 
                         // Build sorted arrays of special positions for O(1) next-position scan
