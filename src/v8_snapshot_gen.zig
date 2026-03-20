@@ -74,6 +74,29 @@ pub fn main() !void {
                     if (key) |k| {
                         _ = v8.ObjectApi.set(global, ctx, @ptrCast(k), @ptrCast(str));
                         std.debug.print("[snapshot-gen] Pre-loaded TSC source ({d} bytes) into snapshot\n", .{src.len});
+
+                        // Also pre-compile TSC and generate V8 code cache
+                        // Eval TSC source without executing its main — use a wrapper
+                        // that returns the compiled module without running CLI
+                        const wrapper = std.fmt.allocPrint(alloc,
+                            "(function(module, exports, require, __filename, __dirname) {{\n{s}\n}});",
+                            .{src},
+                        ) catch null;
+                        if (wrapper) |w| {
+                            defer alloc.free(w);
+                            const w_str = v8.StringApi.fromExternalOneByte(isolate, w) orelse null;
+                            if (w_str) |ws| {
+                                var origin = v8.ScriptOrigin.init(@ptrCast(v8.StringApi.fromUtf8(isolate, "typescript.js") orelse return error.SnapshotCreationFailed));
+                                // Compile without executing — this populates V8's internal code cache
+                                var comp_src: v8.CompilerSource = .{};
+                                comp_src.initInPlace(ws, &origin, null);
+                                defer comp_src.deinit();
+                                const script = v8.ScriptCompilerApi.compile(ctx, &comp_src, v8.ScriptCompilerApi.kEagerCompile) orelse null;
+                                if (script != null) {
+                                    std.debug.print("[snapshot-gen] Pre-compiled TSC into V8 bytecode\n", .{});
+                                }
+                            }
+                        }
                     }
                 }
                 // Don't free src — external string references it
