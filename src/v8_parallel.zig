@@ -38,6 +38,23 @@ pub const WorkItem = struct {
     done: bool = false,
 };
 
+/// Embedded snapshot for fast worker isolate creation (~10ms instead of ~100ms)
+const embedded_snapshot = @embedFile("v8_bootstrap.snapshot");
+
+/// External references for snapshot (must match snapshot_gen order)
+var ext_refs: [3]usize = .{ 0, 0, 0 };
+var ext_refs_initialized = false;
+
+fn getExternalRefs() [*]const usize {
+    if (!ext_refs_initialized) {
+        ext_refs[0] = @intFromPtr(&v8_io.ioSyncCallback);
+        ext_refs[1] = @intFromPtr(&v8_io.ioBatchCallback);
+        ext_refs[2] = 0; // null terminator
+        ext_refs_initialized = true;
+    }
+    return &ext_refs;
+}
+
 /// Worker thread context
 const WorkerCtx = struct {
     items: []WorkItem,
@@ -96,8 +113,15 @@ pub fn executeParallel(items: []WorkItem) void {
 }
 
 fn workerFn(ctx: *WorkerCtx) void {
-    // Each worker creates a fresh V8 isolate (lazy — no pre-warming cost)
-    const isolate = v8.IsolateApi.create();
+    // Create isolate from snapshot (fast ~10ms) or fresh (slower ~100ms)
+    const isolate = if (embedded_snapshot.len > 0)
+        v8.SnapshotApi.createIsolateFromSnapshot(
+            embedded_snapshot.ptr,
+            @intCast(embedded_snapshot.len),
+            getExternalRefs(),
+        )
+    else
+        v8.IsolateApi.create();
     defer v8.IsolateApi.dispose(isolate);
     v8.IsolateApi.enter(isolate);
     defer v8.IsolateApi.exit(isolate);
@@ -108,11 +132,17 @@ fn workerFn(ctx: *WorkerCtx) void {
     v8.ContextApi.enter(context);
     defer v8.ContextApi.exit(context);
 
-    // Register IO bridge (workers may need filesystem access)
-    v8_io.registerGlobals(isolate, context);
-
-    // Bootstrap the worker isolate
-    _ = v8.eval(isolate, context, ctx.bootstrap_code, "v8_bootstrap.js") catch {};
+    if (embedded_snapshot.len > 0) {
+        // Snapshot has IO bridge via external_refs — just refresh env
+        _ = v8.eval(isolate, context,
+            "process.argv = typeof __original_argv !== 'undefined' ? __original_argv.slice() : ['edgebox-worker'];",
+            "worker_init.js",
+        ) catch {};
+    } else {
+        // No snapshot — register IO and bootstrap from source
+        v8_io.registerGlobals(isolate, context);
+        _ = v8.eval(isolate, context, ctx.bootstrap_code, "v8_bootstrap.js") catch {};
+    }
 
     // Execute each work item
     for (ctx.start_idx..ctx.end_idx) |i| {
