@@ -78,12 +78,51 @@ pub fn registerGlobals(isolate: *v8.Isolate, context: *const v8.Context) void {
 var stdout_buf: std.ArrayListUnmanaged(u8) = .{};
 const STDOUT_BUF_SIZE: usize = 65536; // 64KB buffer, flush when full
 
+/// Background stdout flush thread
+var stdout_flush_thread: ?std.Thread = null;
+var stdout_flush_data: ?[]u8 = null;
+var stdout_flush_mutex: std.Thread.Mutex = .{};
+
+fn flushStdoutWorker() void {
+    if (stdout_flush_data) |data| {
+        const stdout = std.fs.File.stdout();
+        stdout.writeAll(data) catch {};
+        alloc.free(data);
+        stdout_flush_mutex.lock();
+        stdout_flush_data = null;
+        stdout_flush_mutex.unlock();
+    }
+}
+
 fn flushStdout() void {
-    if (stdout_buf.items.len > 0) {
+    if (stdout_buf.items.len == 0) return;
+
+    // Wait for previous flush to complete
+    if (stdout_flush_thread) |t| { t.join(); stdout_flush_thread = null; }
+
+    // Move buffer to flush data (swap instead of copy)
+    stdout_flush_mutex.lock();
+    const data = alloc.dupe(u8, stdout_buf.items) catch {
+        stdout_flush_mutex.unlock();
+        // Fallback: sync write
         const stdout = std.fs.File.stdout();
         stdout.writeAll(stdout_buf.items) catch {};
         stdout_buf.clearRetainingCapacity();
-    }
+        return;
+    };
+    stdout_flush_data = data;
+    stdout_flush_mutex.unlock();
+    stdout_buf.clearRetainingCapacity();
+
+    // Flush on background thread
+    stdout_flush_thread = std.Thread.spawn(.{}, flushStdoutWorker, .{}) catch {
+        // Fallback: sync write
+        const stdout = std.fs.File.stdout();
+        stdout.writeAll(data) catch {};
+        alloc.free(data);
+        stdout_flush_data = null;
+        return;
+    };
 }
 
 /// Fast stdout write — buffered, no JSON
@@ -502,6 +541,8 @@ fn handleRequest(msg: []const u8) ![]const u8 {
         deferred_exit_code = @intCast(code);
         flushStdout();
         flushStderr();
+        // Wait for async stdout flush to complete before exit
+        if (stdout_flush_thread) |t| { t.join(); stdout_flush_thread = null; }
         return "{\"ok\":true,\"deferred_exit\":true}";
     } else if (std.mem.eql(u8, req.op, "argv")) {
         return opArgv();
