@@ -328,8 +328,19 @@ pub fn buildFlagTable(type_flags: [*]const i32, max_id: usize) void {
     }
 }
 
+/// Async flag table build state
+var async_build_thread: ?std.Thread = null;
+var async_build_max_id: usize = 0;
+var async_build_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+fn asyncBuildWorker() void {
+    const type_flags = getTypeFlags() orelse return;
+    buildFlagTable(type_flags, async_build_max_id);
+    async_build_done.store(true, .release);
+}
+
 /// V8 callback: __edgebox_precompute_relations(maxTypeId)
-/// Call after all types are created (end of bind phase).
+/// Builds the flag table — uses async result if available, else builds synchronously.
 pub fn precomputeCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
     const isolate: *v8.Isolate = v8.CallbackInfoApi.getIsolate(info);
     var rv = v8.CallbackInfoApi.getReturnValue(info);
@@ -344,11 +355,45 @@ pub fn precomputeCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) voi
         if (val > 0) max_id = @intCast(val);
     }
 
+    // If async build was started and has the same or larger max_id, wait for it
+    if (async_build_done.load(.acquire)) {
+        // Async build already completed — check if it covers enough types
+        if (async_build_max_id >= max_id) {
+            // Join the thread if still active
+            if (async_build_thread) |t| { t.join(); async_build_thread = null; }
+            rv.setInt32(1);
+            return;
+        }
+    }
+
+    // Join any pending async thread
+    if (async_build_thread) |t| { t.join(); async_build_thread = null; }
+
+    // Build synchronously (async didn't cover all types)
     const type_flags = getTypeFlags() orelse { rv.setInt32(0); return; };
     buildFlagTable(type_flags, max_id);
-
-    // Flag table is built in-place in the SAB
     rv.setInt32(1);
+}
+
+/// Trigger async flag table build from createType (called early during bind).
+/// Spawns a Zig thread that builds the table while V8 continues binding.
+pub fn triggerAsyncBuild(max_id: usize) void {
+    if (async_build_thread != null) return; // Already running
+    async_build_done.store(false, .release);
+    async_build_max_id = max_id;
+    async_build_thread = std.Thread.spawn(.{}, asyncBuildWorker, .{}) catch null;
+}
+
+/// V8 callback: __edgebox_trigger_build(typeCount)
+/// Called periodically from createType to trigger background build.
+pub fn triggerBuildCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
+    const isolate: *v8.Isolate = v8.CallbackInfoApi.getIsolate(info);
+    if (v8.CallbackInfoApi.length(info) < 1) return;
+    const arg = v8.CallbackInfoApi.get(info, 0) orelse return;
+    if (!v8.ValueApi.isInt32(arg)) return;
+    const context = v8.ContextApi.create(isolate);
+    const val = v8.ValueApi.int32Value(arg, context) orelse return;
+    if (val > 0) triggerAsyncBuild(@intCast(val));
 }
 
 /// Look up the flag-pair table result.

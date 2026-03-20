@@ -280,13 +280,20 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         const parallel_init_js = @embedFile("v8_parallel_init.js");
         _ = v8.eval(isolate, context, parallel_init_js, "v8_parallel_init.js") catch {};
     } else {
-        // For TSC: register only the precompute callback (no SAB allocation)
+        // For TSC: register precompute + trigger callbacks (no full SAB allocation)
         const v8_parallel_check = @import("v8_parallel_check.zig");
         const global_obj = v8.ContextApi.global(context);
+
         const pc_tmpl = v8.FunctionTemplateApi.create(isolate, &v8_parallel_check.precomputeCallback) orelse return;
         const pc_func = v8.FunctionTemplateApi.getFunction(pc_tmpl, context) orelse return;
         const pc_key = v8.StringApi.fromUtf8(isolate, "__edgebox_precompute_relations") orelse return;
         _ = v8.ObjectApi.set(global_obj, context, @ptrCast(pc_key), @ptrCast(pc_func));
+
+        // Trigger callback: called from createType to start async build
+        const tb_tmpl = v8.FunctionTemplateApi.create(isolate, &v8_parallel_check.triggerBuildCallback) orelse return;
+        const tb_func = v8.FunctionTemplateApi.getFunction(tb_tmpl, context) orelse return;
+        const tb_key = v8.StringApi.fromUtf8(isolate, "__edgebox_trigger_build") orelse return;
+        _ = v8.ObjectApi.set(global_obj, context, @ptrCast(tb_key), @ptrCast(tb_func));
     }
 
     // For packed binaries: ensure process.argv has [exe, script, ...args] format
@@ -725,10 +732,10 @@ fn applyTscTransforms(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     };
 
     const transforms = [_]Transform{
-        // T1: createType → populate __pc_typeFlags + __pc_objectFlags SOA columns
+        // T1: createType → populate SOA columns + trigger async flag table build
         .{
             .needle = "typeCount++;\n    result.id = typeCount;",
-            .replacement = "typeCount++;\n    result.id = typeCount;\n    if(typeof __pc_typeFlags!=='undefined'&&typeCount<262144){__pc_typeFlags[typeCount]=result.flags;if(result.objectFlags)__pc_objectFlags[typeCount]=result.objectFlags;}",
+            .replacement = "typeCount++;\n    result.id = typeCount;\n    if(typeof __pc_typeFlags!=='undefined'&&typeCount<262144){__pc_typeFlags[typeCount]=result.flags;if(result.objectFlags)__pc_objectFlags[typeCount]=result.objectFlags;if(typeCount===5000&&typeof __edgebox_trigger_build==='function')__edgebox_trigger_build(typeCount);}",
         },
         // T2: isSimpleTypeRelatedTo → read from SOA column + flag table lookup
         .{
