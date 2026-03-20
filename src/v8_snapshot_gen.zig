@@ -88,8 +88,11 @@ pub fn main() !void {
                             \\try {
                             \\  globalThis.__tsc_factory(__tsc_mod, __tsc_mod.exports, globalThis.require, '/snapshot/typescript.js', '/snapshot');
                             \\  globalThis.ts = __tsc_mod.exports;
+                            \\  // Free source string — ts module is initialized, source no longer needed
+                            \\  delete globalThis.__tsc_source;
+                            \\  delete globalThis.__tsc_factory;
                             \\} catch(e) {
-                            \\  // May fail during snapshot if IO is unavailable — factory still available
+                            \\  // May fail during snapshot if IO is unavailable — keep factory for runtime
                             \\}
                         ;
                         _ = v8.eval(isolate, ctx, init_code, "tsc_init.js") catch |err| {
