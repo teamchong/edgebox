@@ -2241,12 +2241,16 @@ pub fn build(b: *std.Build) void {
 
             // Step 3: Build edgebox with embedded snapshot
             // Usage: ./zig-out/bin/edgebox <script.js> [args...]
+            // Default to ReleaseFast for edgebox runner — Debug mode causes V8 GC
+            // segfaults (Zig safety checks interfere with V8's conservative stack scanning).
+            // Users can still override with -Doptimize=Debug if needed.
+            const v8_optimize = if (optimize == .Debug) .ReleaseFast else optimize;
             const v8_run_exe = b.addExecutable(.{
                 .name = "edgebox",
                 .root_module = b.createModule(.{
                     .root_source_file = b.path("src/v8_runner.zig"),
                     .target = target,
-                    .optimize = optimize,
+                    .optimize = v8_optimize,
                 }),
             });
             // Snapshot-gen must run before compiling edgebox
