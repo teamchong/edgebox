@@ -774,7 +774,12 @@ fn applyTscTransforms(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
             .needle = "function fileSystemEntryExists(path, entryKind) {\n      const stat = statSync(path);\n      if (!stat) {\n        return false;\n      }\n      switch (entryKind) {\n        case 0 /* File */:\n          return stat.isFile();\n        case 1 /* Directory */:\n          return stat.isDirectory();",
             .replacement = "function fileSystemEntryExists(path, entryKind) {\n      if(typeof __edgebox_file_exists==='function'){if(entryKind===0)return !!__edgebox_file_exists(path);if(entryKind===1)return !!__edgebox_dir_exists(path);}\n      const stat = statSync(path);\n      if (!stat) {\n        return false;\n      }\n      switch (entryKind) {\n        case 0 /* File */:\n          return stat.isFile();\n        case 1 /* Directory */:\n          return stat.isDirectory();",
         },
-        // T12: getObjectFlags → SOA column read (avoid object property access)
+        // T12: getFlowCacheKey ThisKeyword → packed integer
+        .{
+            .needle = "return `0|${flowContainer ? getNodeId(flowContainer) : \"-1\"}|${getTypeId(declaredType)}|${getTypeId(initialType)}`;",
+            .replacement = "var __fc2=flowContainer?getNodeId(flowContainer)+1:0,__dt2=getTypeId(declaredType),__it2=getTypeId(initialType);return(__fc2<2048&&__dt2<2048&&__it2<2048)?__fc2*4194304+__dt2*2048+__it2+1:`0|${__fc2}|${__dt2}|${__it2}`;",
+        },
+        // T13: getObjectFlags → SOA column read (avoid object property access)
         .{
             .needle = "function getObjectFlags(type) {\n    return type.flags & 3899393 /* ObjectFlagsType */ ? type.objectFlags : 0;\n  }",
             .replacement = "function getObjectFlags(type) {\n    if(typeof __pc_objectFlags!=='undefined'&&type.id>0&&type.id<262144){var __of=__pc_objectFlags[type.id];if(__of)return __of;}return type.flags & 3899393 ? type.objectFlags : 0;\n  }",
