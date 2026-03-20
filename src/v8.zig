@@ -122,9 +122,8 @@ pub const ScriptOrigin = struct {
 /// Initialize V8 platform and engine. Call once at startup.
 pub fn initPlatform() !*Platform {
     // Enable aggressive JIT optimization flags before V8 init
-    // No custom flags — let V8 use its defaults. Custom flags were causing
-    // TurboFan to not optimize properly (9x slowdown on integer loops).
-    const flags = "--max-old-space-size=4096";
+    // Enable concurrent recompilation + OSR for TurboFan optimization
+    const flags = "--max-old-space-size=4096 --concurrent-recompilation --use-osr";
     c.v8__V8__SetFlagsFromString(flags.ptr, flags.len);
 
     const platform = c.v8__Platform__NewDefaultPlatform(0, false) orelse

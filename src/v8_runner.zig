@@ -197,7 +197,6 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
 
     // Apply source transforms for large scripts (TSC optimization).
     // Single-pass scan replaces key patterns to enable SOA reads, integer packing, JSDoc skip.
-    // Only applies when script is large enough to be TSC (>5MB).
     var transformed: ?[]u8 = null;
     defer if (transformed) |t| alloc.free(t);
 
@@ -249,10 +248,7 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
     const compile_options: c_int = if (cached_data != null)
         v8.ScriptCompilerApi.kConsumeCodeCache
     else
-        // Eager compile: compile ALL functions upfront (not lazily).
-        // Creates a complete code cache that speeds up subsequent runs.
-        // First run is ~10% slower, but all subsequent runs benefit.
-        v8.ScriptCompilerApi.kEagerCompile;
+        v8.ScriptCompilerApi.kNoCompileOptions;
 
     const script = v8.ScriptCompilerApi.compile(context, &compiler_source, compile_options) orelse {
         reportException(&try_catch, isolate, context);
