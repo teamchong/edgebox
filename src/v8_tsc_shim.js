@@ -4,4 +4,6 @@
 (function() {
   'use strict';
   globalThis.__FastRelationCache = Map;
+  // Global type-by-ID array for O(1) type lookup (SOA for type objects)
+  globalThis.__typesById = [];
 })();

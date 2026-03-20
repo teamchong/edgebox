@@ -1931,6 +1931,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     const rc_get_repl = "DISABLED_rc_get";
                     const rc_get2_needle = "DISABLED_rc_get2";
                     const rc_get2_repl = "DISABLED_rc_get2";
+                    // Patch createType: add global typesById[] for O(1) type lookup by ID
+                    // This enables SOA columns to store type IDs instead of object refs
+                    const ct_needle = "typeCount++;\n    result.id = typeCount;";
+                    const ct_repl = "typeCount++;\n    result.id = typeCount;\n    if(typeof __typesById!=='undefined')__typesById[typeCount]=result;";
                     // getTypeOfSymbol cache disabled — type resolution is context-dependent.
                     // Caching breaks on deferred/instantiated types that vary during checking.
                     // TODO: implement safe caching with invalidation (two-pass approach).
@@ -2024,7 +2028,16 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 pr += rc_get2_needle.len;
                                 continue;
                             }
-                            // P9: parallel type checking — shard forEach loop
+                            // P9: createType → add typesById[] registration
+                            if (pr + ct_needle.len <= orig.len and
+                                std.mem.startsWith(u8, orig[pr..], ct_needle))
+                            {
+                                @memcpy(buf[pw..][0..ct_repl.len], ct_repl);
+                                pw += ct_repl.len;
+                                pr += ct_needle.len;
+                                continue;
+                            }
+                            // P10: parallel type checking — shard forEach loop
                             if (pr + par_needle.len <= orig.len and
                                 std.mem.startsWith(u8, orig[pr..], par_needle))
                             {
