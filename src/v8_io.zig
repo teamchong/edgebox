@@ -266,6 +266,9 @@ pub fn readdirFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) vo
     rv.set(@ptrCast(v8_str));
 }
 
+/// Raw realpath cache (for fast callback — stores resolved path strings)
+var raw_realpath_cache: std.StringHashMapUnmanaged([]const u8) = .{};
+
 /// Directory exists cache
 var dir_exists_cache: std.StringHashMapUnmanaged(bool) = .{};
 
@@ -319,16 +322,21 @@ pub fn realpathFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) v
     const written = v8.StringApi.writeUtf8(str, isolate, &path_buf);
     const path = path_buf[0..written];
 
-    // Check cache
-    if (realpath_cache.get(path)) |cached| {
-        // Extract the path from JSON: {"ok":true,"data":"<path>"}
-        // For fast callback, create V8 string directly from cached JSON
-        // Actually, we need the raw path, not the JSON. Let me use a separate cache.
-        _ = cached;
+    // Check raw realpath cache
+    if (raw_realpath_cache.get(path)) |cached_real| {
+        const v8_str = v8.StringApi.fromUtf8(isolate, cached_real) orelse { rv.setUndefined(); return; };
+        rv.set(@ptrCast(v8_str));
+        return;
     }
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const real = std.fs.cwd().realpath(path, &buf) catch { rv.setUndefined(); return; };
+
+    // Cache the raw result
+    const key = alloc.dupe(u8, path) catch path;
+    const val = alloc.dupe(u8, real) catch real;
+    raw_realpath_cache.put(alloc, key, val) catch {};
+
     const v8_str = v8.StringApi.fromUtf8(isolate, real) orelse { rv.setUndefined(); return; };
     rv.set(@ptrCast(v8_str));
 }
