@@ -2178,6 +2178,104 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     }
 
 
+                    // === Pre-scan for inline object literal push patterns ===
+                    // Detect VAR.push({ key: val, ... }) in source BEFORE column declarations,
+                    // so synthetic alloc sites are included in column generation.
+                    if (clean_content) |il_cc| {
+                        var isp: usize = 0;
+                        while (isp + 7 < il_cc.len) : (isp += 1) {
+                            if (!std.mem.startsWith(u8, il_cc[isp..], ".push(")) continue;
+                            var lp2 = isp + 6;
+                            while (lp2 < il_cc.len and il_cc[lp2] == ' ') lp2 += 1;
+                            if (lp2 >= il_cc.len or il_cc[lp2] != '{') continue;
+                            // Extract variable name before .push(
+                            const ve2 = isp;
+                            var vs2 = ve2;
+                            while (vs2 > 0 and isIdentChar(il_cc[vs2 - 1])) vs2 -= 1;
+                            if (vs2 >= ve2) continue;
+                            const vn2 = il_cc[vs2..ve2];
+                            // Skip known non-container names
+                            if (std.mem.eql(u8, vn2, "arguments") or std.mem.eql(u8, vn2, "result")) continue;
+                            // Skip if this variable already has an alloc site (named factory)
+                            var has_named = false;
+                            for (alloc_sites.items) |site| {
+                                if (std.mem.eql(u8, site.name, vn2)) { has_named = true; break; }
+                            }
+                            if (has_named) continue;
+                            // Extract field names from { key: val, key: val, ... }
+                            var il_field_names: [16][]const u8 = .{""} ** 16;
+                            var il_fc: u8 = 0;
+                            var il_fp = lp2 + 1;
+                            var il_depth: u32 = 1;
+                            while (il_fp < il_cc.len and il_depth > 0) {
+                                if (il_cc[il_fp] == '{') { il_depth += 1; il_fp += 1; continue; }
+                                if (il_cc[il_fp] == '}') { il_depth -= 1; il_fp += 1; continue; }
+                                if (il_depth > 1) { il_fp += 1; continue; }
+                                while (il_fp < il_cc.len and (il_cc[il_fp] == ' ' or il_cc[il_fp] == '\n' or il_cc[il_fp] == '\r')) il_fp += 1;
+                                if (il_fp >= il_cc.len or il_cc[il_fp] == '}') continue;
+                                const il_fks = il_fp;
+                                while (il_fp < il_cc.len and isIdentChar(il_cc[il_fp])) il_fp += 1;
+                                if (il_fp > il_fks and il_fp < il_cc.len) {
+                                    var il_cp = il_fp;
+                                    while (il_cp < il_cc.len and il_cc[il_cp] == ' ') il_cp += 1;
+                                    if (il_cp < il_cc.len and il_cc[il_cp] == ':' and (il_cp + 1 >= il_cc.len or il_cc[il_cp + 1] != ':')) {
+                                        if (il_fc < 16) {
+                                            il_field_names[il_fc] = il_cc[il_fks..il_fp];
+                                            il_fc += 1;
+                                        }
+                                        il_fp = il_cp + 1;
+                                        var il_vd: u32 = 0;
+                                        while (il_fp < il_cc.len) {
+                                            if (il_cc[il_fp] == '(' or il_cc[il_fp] == '[' or il_cc[il_fp] == '{') { il_vd += 1; il_fp += 1; continue; }
+                                            if (il_cc[il_fp] == ')' or il_cc[il_fp] == ']') { if (il_vd > 0) il_vd -= 1; il_fp += 1; continue; }
+                                            if (il_cc[il_fp] == '}') { if (il_vd > 0) { il_vd -= 1; il_fp += 1; continue; } break; }
+                                            if (il_cc[il_fp] == ',' and il_vd == 0) { il_fp += 1; break; }
+                                            il_fp += 1;
+                                        }
+                                        continue;
+                                    }
+                                }
+                                while (il_fp < il_cc.len and il_cc[il_fp] != ',' and il_cc[il_fp] != '}') il_fp += 1;
+                                if (il_fp < il_cc.len and il_cc[il_fp] == ',') il_fp += 1;
+                            }
+                            if (il_fc >= 3) {
+                                // Check if we already have a synthetic site for this variable
+                                var already_syn = false;
+                                for (alloc_sites.items) |site| {
+                                    if (std.mem.startsWith(u8, site.name, "__inline_")) {
+                                        // Check if same fields
+                                        if (site.field_count == il_fc) {
+                                            var same = true;
+                                            for (0..il_fc) |fi| {
+                                                if (!std.mem.eql(u8, site.field_names[fi], il_field_names[fi])) { same = false; break; }
+                                            }
+                                            if (same) { already_syn = true; break; }
+                                        }
+                                    }
+                                }
+                                if (!already_syn) {
+                                    const syn_name = std.fmt.allocPrint(allocator, "__inline_{d}", .{alloc_sites.items.len}) catch continue;
+                                    var syn_site = AllocSite{
+                                        .name = syn_name,
+                                        .line_num = 0,
+                                        .field_names = .{""} ** 16,
+                                        .field_count = il_fc,
+                                    };
+                                    for (0..il_fc) |fi| {
+                                        syn_site.field_names[fi] = allocator.dupe(u8, il_field_names[fi]) catch "";
+                                    }
+                                    alloc_sites.append(allocator, syn_site) catch continue;
+                                    std.debug.print("[soa] Pre-scan inline literal: .push({{ {d} fields: ", .{il_fc});
+                                    for (0..il_fc) |fi| {
+                                        if (fi > 0) std.debug.print(", ", .{});
+                                        std.debug.print("{s}", .{il_field_names[fi]});
+                                    }
+                                    std.debug.print(" }}) → {s}\n", .{syn_name});
+                                }
+                            }
+                        }
+                    }
+
                     // When no WASM trampolines, SOA can still help via factory-level SOA:
                     // factories with ≥5 calls get SOA pools, field reads rewritten.
                     // Only skip if there are truly no alloc sites at all.
@@ -2620,6 +2718,103 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         if (prov_count > 0) {
                             std.debug.print("[soa] Provenance: {d} containers from {d} alloc sites\n", .{ prov_count, alloc_sites.items.len });
                         }
+                        // === Inline object literal provenance (runs independently of alloc sites) ===
+                        // Scan source for VAR.push({ key: val, ... }) patterns and create synthetic alloc sites.
+                        // This runs even when bytecode analysis found no named factory functions.
+                        {
+                            var isp: usize = 0;
+                            while (isp + 7 < cc.len) : (isp += 1) {
+                                if (!std.mem.startsWith(u8, cc[isp..], ".push(")) continue;
+                                // Check for '{' after .push(
+                                var lp2 = isp + 6;
+                                while (lp2 < cc.len and cc[lp2] == ' ') lp2 += 1;
+                                if (lp2 >= cc.len or cc[lp2] != '{') continue;
+                                // Extract variable name before .push(
+                                const ve2 = isp;
+                                var vs2 = ve2;
+                                while (vs2 > 0 and isIdentChar(cc[vs2 - 1])) vs2 -= 1;
+                                if (vs2 >= ve2) continue;
+                                const vn2 = cc[vs2..ve2];
+                                // Skip if already has provenance for this variable
+                                var already = false;
+                                for (provenance_buf[0..prov_count]) |p| {
+                                    if (std.mem.eql(u8, p.var_name, vn2)) { already = true; break; }
+                                }
+                                if (already) continue;
+                                // Extract field names from { key: val, key: val, ... }
+                                var il_field_names: [16][]const u8 = .{""} ** 16;
+                                var il_fc: u8 = 0;
+                                var il_fp = lp2 + 1;
+                                var il_depth: u32 = 1;
+                                while (il_fp < cc.len and il_depth > 0) {
+                                    if (cc[il_fp] == '{') { il_depth += 1; il_fp += 1; continue; }
+                                    if (cc[il_fp] == '}') { il_depth -= 1; il_fp += 1; continue; }
+                                    if (il_depth > 1) { il_fp += 1; continue; }
+                                    while (il_fp < cc.len and (cc[il_fp] == ' ' or cc[il_fp] == '\n' or cc[il_fp] == '\r')) il_fp += 1;
+                                    if (il_fp >= cc.len or cc[il_fp] == '}') continue;
+                                    const il_fks = il_fp;
+                                    while (il_fp < cc.len and isIdentChar(cc[il_fp])) il_fp += 1;
+                                    if (il_fp > il_fks and il_fp < cc.len) {
+                                        var il_cp = il_fp;
+                                        while (il_cp < cc.len and cc[il_cp] == ' ') il_cp += 1;
+                                        if (il_cp < cc.len and cc[il_cp] == ':' and (il_cp + 1 >= cc.len or cc[il_cp + 1] != ':')) {
+                                            if (il_fc < 16) {
+                                                il_field_names[il_fc] = cc[il_fks..il_fp];
+                                                il_fc += 1;
+                                            }
+                                            il_fp = il_cp + 1;
+                                            var il_vd: u32 = 0;
+                                            while (il_fp < cc.len) {
+                                                if (cc[il_fp] == '(' or cc[il_fp] == '[' or cc[il_fp] == '{') { il_vd += 1; il_fp += 1; continue; }
+                                                if (cc[il_fp] == ')' or cc[il_fp] == ']') { if (il_vd > 0) il_vd -= 1; il_fp += 1; continue; }
+                                                if (cc[il_fp] == '}') { if (il_vd > 0) { il_vd -= 1; il_fp += 1; continue; } break; }
+                                                if (cc[il_fp] == ',' and il_vd == 0) { il_fp += 1; break; }
+                                                il_fp += 1;
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                    while (il_fp < cc.len and cc[il_fp] != ',' and cc[il_fp] != '}') il_fp += 1;
+                                    if (il_fp < cc.len and cc[il_fp] == ',') il_fp += 1;
+                                }
+                                if (il_fc >= 3 and prov_count < provenance_buf.len) {
+                                    // Find existing __inline_ alloc site with matching fields (created by pre-scan)
+                                    var existing_si: ?usize = null;
+                                    for (alloc_sites.items, 0..) |site, si| {
+                                        if (!std.mem.startsWith(u8, site.name, "__inline_")) continue;
+                                        if (site.field_count != il_fc) continue;
+                                        var same = true;
+                                        for (0..il_fc) |fi| {
+                                            if (!std.mem.eql(u8, site.field_names[fi], il_field_names[fi])) { same = false; break; }
+                                        }
+                                        if (same) { existing_si = si; break; }
+                                    }
+                                    const si = existing_si orelse blk: {
+                                        // No pre-scan match — create new (shouldn't happen normally)
+                                        const syn_name = std.fmt.allocPrint(allocator, "__inline_{d}", .{alloc_sites.items.len}) catch continue;
+                                        var syn_site = AllocSite{
+                                            .name = syn_name,
+                                            .line_num = 0,
+                                            .field_names = .{""} ** 16,
+                                            .field_count = il_fc,
+                                        };
+                                        for (0..il_fc) |fi| {
+                                            syn_site.field_names[fi] = allocator.dupe(u8, il_field_names[fi]) catch "";
+                                        }
+                                        alloc_sites.append(allocator, syn_site) catch continue;
+                                        break :blk alloc_sites.items.len - 1;
+                                    };
+                                    provenance_buf[prov_count] = .{
+                                        .var_name = vn2,
+                                        .site_idx = si,
+                                        .decl_end = 0,
+                                        .raw_index = false,
+                                    };
+                                    prov_count += 1;
+                                    std.debug.print("[soa] Inline literal provenance: {s} → site {d}\n", .{ vn2, si });
+                                }
+                            }
+                        }
                         // Find `VAR = []` declarations for each provenance entry (index alignment)
                         {
                             var pi: usize = 0;
@@ -3031,6 +3226,162 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 }
                             }
                         }
+                        // NOTE: aliases slice created after for...of detection (which adds entries)
+
+                        // === for...of SOA iteration detection ===
+                        // Detect: for (const/let/var IDENT of PROV_VAR) { IDENT.field... }
+                        // Create alias entries so IDENT.field → __col_field[__PROV_soa_base + __of_N]
+                        // and inject a counter variable at the for statement.
+                        const ForOfEntry = struct {
+                            iter_name: []const u8, // iterator variable (e.g. "item")
+                            prov_idx: usize, // index into provenance[]
+                            counter_name: []const u8, // generated counter name (e.g. "__of_0")
+                            for_pos: usize, // position of 'for' keyword in source
+                            of_pos: usize, // position of 'of' keyword in source
+                            body_start: usize, // position of '{' opening loop body
+                            body_end: usize, // position of '}' closing loop body
+                        };
+                        var forof_buf: [64]ForOfEntry = undefined;
+                        var forof_count: usize = 0;
+                        if (prov_count > 0) {
+                            var fop: usize = 0;
+                            while (fop + 10 < cc.len) : (fop += 1) {
+                                if (fop > 0 and isIdentChar(cc[fop - 1])) continue;
+                                if (!std.mem.startsWith(u8, cc[fop..], "for")) continue;
+                                if (fop + 3 >= cc.len or isIdentChar(cc[fop + 3])) continue; // forX — not for
+                                // Skip whitespace and find '('
+                                var p = fop + 3;
+                                while (p < cc.len and (cc[p] == ' ' or cc[p] == '\n')) p += 1;
+                                if (p >= cc.len or cc[p] != '(') continue;
+                                p += 1;
+                                while (p < cc.len and cc[p] == ' ') p += 1;
+                                // Check for const/let/var keyword
+                                var kw_len2: usize = 0;
+                                if (p + 6 < cc.len and std.mem.startsWith(u8, cc[p..], "const ")) kw_len2 = 6
+                                else if (p + 4 < cc.len and std.mem.startsWith(u8, cc[p..], "let ")) kw_len2 = 4
+                                else if (p + 4 < cc.len and std.mem.startsWith(u8, cc[p..], "var ")) kw_len2 = 4;
+                                if (kw_len2 == 0) continue;
+                                p += kw_len2;
+                                while (p < cc.len and cc[p] == ' ') p += 1;
+                                // Extract iterator variable name
+                                const iter_start = p;
+                                while (p < cc.len and isIdentChar(cc[p])) p += 1;
+                                if (p == iter_start) continue;
+                                const iter_name = cc[iter_start..p];
+                                // Skip whitespace and check for ' of '
+                                while (p < cc.len and cc[p] == ' ') p += 1;
+                                if (p + 2 >= cc.len or cc[p] != 'o' or cc[p + 1] != 'f' or (p + 2 < cc.len and isIdentChar(cc[p + 2]))) continue;
+                                const of_pos = p;
+                                p += 2;
+                                while (p < cc.len and cc[p] == ' ') p += 1;
+                                // Extract array name (the provenance container)
+                                const arr_start = p;
+                                while (p < cc.len and isIdentChar(cc[p])) p += 1;
+                                if (p == arr_start) continue;
+                                const arr_name = cc[arr_start..p];
+                                // Skip to ')' then '{'
+                                while (p < cc.len and cc[p] != ')') p += 1;
+                                if (p >= cc.len) continue;
+                                p += 1; // skip ')'
+                                while (p < cc.len and (cc[p] == ' ' or cc[p] == '\n')) p += 1;
+                                if (p >= cc.len or cc[p] != '{') continue;
+                                const body_start = p;
+                                // Find matching '}'
+                                const body_end = skipJsFunctionBody(cc, p);
+                                // Match array name against provenance containers
+                                var matched_pi2: ?usize = null;
+                                for (provenance, 0..) |prov, pi| {
+                                    if (prov.decl_end == 0) continue;
+                                    if (std.mem.eql(u8, prov.var_name, arr_name)) {
+                                        matched_pi2 = pi;
+                                        break;
+                                    }
+                                }
+                                if (matched_pi2 == null) continue;
+                                // Safety check: all uses of iter_name within loop body are .field reads
+                                const pi2 = matched_pi2.?;
+                                const site2 = alloc_sites.items[provenance[pi2].site_idx];
+                                var fo_safe = true;
+                                var check_p = body_start + 1;
+                                while (check_p + iter_name.len < body_end) : (check_p += 1) {
+                                    if (check_p > 0 and isIdentChar(cc[check_p - 1])) continue;
+                                    if (!std.mem.startsWith(u8, cc[check_p..], iter_name)) continue;
+                                    const after_it = check_p + iter_name.len;
+                                    if (after_it >= cc.len) continue;
+                                    if (isIdentChar(cc[after_it])) continue; // part of longer name
+                                    if (cc[after_it] == '.') {
+                                        // Field access — verify it's a known SOA field and not a method
+                                        const fs3 = after_it + 1;
+                                        var fe3 = fs3;
+                                        while (fe3 < cc.len and isIdentChar(cc[fe3])) fe3 += 1;
+                                        if (fe3 == fs3) { fo_safe = false; break; }
+                                        if (fe3 < cc.len and cc[fe3] == '(') { fo_safe = false; break; } // method call
+                                        const fn3 = cc[fs3..fe3];
+                                        // Check assignment
+                                        var eq3 = fe3;
+                                        while (eq3 < cc.len and cc[eq3] == ' ') eq3 += 1;
+                                        if (eq3 < cc.len and cc[eq3] == '=' and (eq3 + 1 >= cc.len or cc[eq3 + 1] != '=')) { fo_safe = false; break; }
+                                        // Verify SOA field
+                                        var fo_field_match = false;
+                                        for (site2.field_names[0..site2.field_count]) |sf| {
+                                            if (std.mem.eql(u8, sf, fn3)) { fo_field_match = true; break; }
+                                        }
+                                        if (!fo_field_match) { fo_safe = false; break; }
+                                        check_p = fe3;
+                                    } else if (cc[after_it] == ' ' or cc[after_it] == ')' or cc[after_it] == ';' or cc[after_it] == ',') {
+                                        // Bare reference in comparison context is OK
+                                        var sp3 = after_it;
+                                        while (sp3 < cc.len and cc[sp3] == ' ') sp3 += 1;
+                                        if (sp3 < cc.len and (cc[sp3] == '=' or cc[sp3] == '!') and sp3 + 1 < cc.len and cc[sp3 + 1] == '=') continue;
+                                        if (sp3 < cc.len and (cc[sp3] == ')' or cc[sp3] == ';' or cc[sp3] == ',')) {
+                                            var bp3 = check_p;
+                                            while (bp3 > 0 and cc[bp3 - 1] == ' ') bp3 -= 1;
+                                            if (bp3 >= 2 and cc[bp3 - 1] == '=' and cc[bp3 - 2] == '=') continue;
+                                            fo_safe = false; break;
+                                        }
+                                        fo_safe = false; break;
+                                    } else if (cc[after_it] == '[' or cc[after_it] == '(') {
+                                        fo_safe = false; break;
+                                    } else {
+                                        // &&, ||, ternary etc.
+                                        if (after_it + 1 < cc.len and ((cc[after_it] == '&' and cc[after_it + 1] == '&') or (cc[after_it] == '|' and cc[after_it + 1] == '|'))) continue;
+                                        if (cc[after_it] == '?' or cc[after_it] == ':') continue;
+                                    }
+                                }
+                                if (!fo_safe) continue;
+                                if (forof_count < forof_buf.len) {
+                                    const counter_name = std.fmt.allocPrint(allocator, "__of_{d}", .{forof_count}) catch continue;
+                                    forof_buf[forof_count] = .{
+                                        .iter_name = iter_name,
+                                        .prov_idx = pi2,
+                                        .counter_name = counter_name,
+                                        .for_pos = fop,
+                                        .of_pos = of_pos,
+                                        .body_start = body_start,
+                                        .body_end = body_end,
+                                    };
+                                    // Also create an alias entry for the iterator variable
+                                    if (alias_count < alias_buf.len) {
+                                        alias_buf[alias_count] = .{
+                                            .alias_name = iter_name,
+                                            .prov_idx = pi2,
+                                            .idx_expr = counter_name,
+                                            .assign_pos = body_start,
+                                            .scope_start = body_start,
+                                            .scope_end = body_end,
+                                        };
+                                        alias_map.put(allocator, iter_name, alias_count) catch {};
+                                        alias_count += 1;
+                                    }
+                                    forof_count += 1;
+                                    std.debug.print("[soa] for...of SOA: for ({s} of {s}) → counter {s}\n", .{
+                                        iter_name, arr_name, counter_name,
+                                    });
+                                }
+                            }
+                        }
+                        const forof_entries = forof_buf[0..forof_count];
+                        // Create aliases slice AFTER for...of detection (which may add entries)
                         const aliases = alias_buf[0..alias_count];
 
                         // === Inter-procedural parameter provenance ===
@@ -3420,6 +3771,18 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 special_positions.append(allocator, @intCast(prov.decl_end)) catch {};
                             }
                         }
+                        // Add for...of positions for counter injection
+                        var forof_start_set = std.AutoHashMap(usize, usize).init(allocator);
+                        defer forof_start_set.deinit();
+                        var forof_end_set = std.AutoHashMap(usize, usize).init(allocator);
+                        defer forof_end_set.deinit();
+                        for (forof_entries, 0..) |fo, fi| {
+                            forof_start_set.put(fo.for_pos, fi) catch {};
+                            // body_end is the position AFTER the closing '}', so inject before it
+                            if (fo.body_end > 0) forof_end_set.put(fo.body_end - 1, fi) catch {};
+                            special_positions.append(allocator, @intCast(fo.for_pos)) catch {};
+                            if (fo.body_end > 0) special_positions.append(allocator, @intCast(fo.body_end - 1)) catch {};
+                        }
                         std.sort.insertion(u32, special_positions.items, {}, std.sort.asc(u32));
                         var special_idx: usize = 0; // cursor into sorted special_positions
 
@@ -3466,6 +3829,17 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     w.print(";{s}.__soa={d}", .{ prov.var_name, prov.site_idx }) catch { w_errs += 1; };
                                 }
                             }
+                            // === for...of counter injection ===
+                            // At for_pos: emit `let __of_N = 0;` before the `for`
+                            if (forof_start_set.get(src_pos)) |fi| {
+                                const fo = forof_entries[fi];
+                                w.print("let {s} = 0;", .{fo.counter_name}) catch { w_errs += 1; };
+                            }
+                            // At body_end-1 (just before '}'): emit `__of_N++;`
+                            if (forof_end_set.get(src_pos)) |fi| {
+                                const fo = forof_entries[fi];
+                                w.print("{s}++;", .{fo.counter_name}) catch { w_errs += 1; };
+                            }
                             // === Batch struct detection ===
                             // Pattern: for (V = 0; V < ARR.length; V++) { ACC = (ACC + FN(ARR[V], ...) | 0; }
                             // where FN is a batch-eligible struct function.
@@ -3494,11 +3868,22 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             // Detect: for (...) { ARR.push({ fields... }); }
                             // Append after loop: materialize WASM pool from JS array
                             // so subsequent __batch_* calls hit the identity cache.
+                            // SKIP when the array has inline literal SOA provenance — let char_loop
+                            // handle the push rewrite character by character instead.
                             if (src_pos + 4 < cc.len and
                                 (std.mem.startsWith(u8, cc[src_pos..], "for ") or
                                 std.mem.startsWith(u8, cc[src_pos..], "for(")))
                             {
                                 if (detectPushLoop(cc, src_pos, wasm_func_list.items)) |push| {
+                                    // Check if this array has inline SOA provenance — if so, skip push-loop
+                                    // materialization so the char_loop can rewrite pushes to column writes
+                                    var has_inline_prov = false;
+                                    for (provenance) |prov2| {
+                                        if (!std.mem.eql(u8, prov2.var_name, push.arr_name)) continue;
+                                        const ps = alloc_sites.items[prov2.site_idx];
+                                        if (std.mem.startsWith(u8, ps.name, "__inline_")) { has_inline_prov = true; break; }
+                                    }
+                                    if (!has_inline_prov) {
                                     // Write the original push loop unchanged
                                     w.writeAll(cc[src_pos..push.loop_end]) catch { w_errs += 1; };
                                     // Append pool materialization for each matched struct function
@@ -3544,7 +3929,104 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     }
                                     src_pos = push.loop_end;
                                     continue;
+                                    }
                                 }
+                            }
+
+                            // === Inline object literal push → SOA column write ===
+                            // Detect: PROV_VAR.push({ key1: expr1, key2: expr2, ... })
+                            // Rewrite: __col_key1[__col_idx] = expr1; __col_key2[__col_idx] = expr2; PROV_VAR.push(__col_idx++)
+                            if (prov_count > 0 and src_pos + 6 < cc.len and isIdentChar(cc[src_pos]) and
+                                (src_pos == 0 or !isIdentChar(cc[src_pos - 1])))
+                            inline_push: {
+                                // Read identifier
+                                var ie = src_pos;
+                                while (ie < cc.len and ident_char[cc[ie]]) ie += 1;
+                                if (ie >= cc.len or !std.mem.startsWith(u8, cc[ie..], ".push(")) break :inline_push;
+                                const push_var = cc[src_pos..ie];
+                                // Check if this variable is a provenance container with an inline alloc site
+                                var matched_prov: ?usize = null;
+                                for (provenance, 0..) |prov, pi| {
+                                    if (!std.mem.eql(u8, prov.var_name, push_var)) continue;
+                                    // Only match inline sites (synthetic names start with __inline_)
+                                    const site2 = alloc_sites.items[prov.site_idx];
+                                    if (!std.mem.startsWith(u8, site2.name, "__inline_")) continue;
+                                    matched_prov = pi;
+                                    break;
+                                }
+                                if (matched_prov == null) break :inline_push;
+                                const prov = provenance[matched_prov.?];
+                                const site = alloc_sites.items[prov.site_idx];
+                                // Find the '{' after .push(
+                                var obj_start = ie + 6; // skip ".push("
+                                while (obj_start < cc.len and cc[obj_start] == ' ') obj_start += 1;
+                                if (obj_start >= cc.len or cc[obj_start] != '{') break :inline_push;
+                                // Parse the object literal: extract value expressions for each field
+                                var field_vals: [16][]const u8 = .{""} ** 16;
+                                var fv_count: u8 = 0;
+                                var fv_pos = obj_start + 1;
+                                var fv_depth: u32 = 1;
+                                while (fv_pos < cc.len and fv_depth > 0 and fv_count < site.field_count) {
+                                    if (cc[fv_pos] == '{') { fv_depth += 1; fv_pos += 1; continue; }
+                                    if (cc[fv_pos] == '}') { fv_depth -= 1; if (fv_depth == 0) break; fv_pos += 1; continue; }
+                                    if (fv_depth > 1) { fv_pos += 1; continue; }
+                                    // Skip whitespace
+                                    while (fv_pos < cc.len and (cc[fv_pos] == ' ' or cc[fv_pos] == '\n' or cc[fv_pos] == '\r')) fv_pos += 1;
+                                    if (fv_pos >= cc.len or cc[fv_pos] == '}') break;
+                                    // Read field name
+                                    const fk_start = fv_pos;
+                                    while (fv_pos < cc.len and isIdentChar(cc[fv_pos])) fv_pos += 1;
+                                    if (fv_pos <= fk_start) { fv_pos += 1; continue; }
+                                    const fk_name = cc[fk_start..fv_pos];
+                                    // Skip to ':'
+                                    while (fv_pos < cc.len and cc[fv_pos] == ' ') fv_pos += 1;
+                                    if (fv_pos >= cc.len or cc[fv_pos] != ':') break;
+                                    fv_pos += 1; // skip ':'
+                                    while (fv_pos < cc.len and cc[fv_pos] == ' ') fv_pos += 1;
+                                    // Read value expression (until ',' or '}' at depth 0)
+                                    const val_start = fv_pos;
+                                    var val_depth: u32 = 0;
+                                    while (fv_pos < cc.len) {
+                                        if (cc[fv_pos] == '(' or cc[fv_pos] == '[' or cc[fv_pos] == '{') { val_depth += 1; fv_pos += 1; continue; }
+                                        if (cc[fv_pos] == ')' or cc[fv_pos] == ']') {
+                                            if (val_depth > 0) val_depth -= 1;
+                                            fv_pos += 1;
+                                            continue;
+                                        }
+                                        if (cc[fv_pos] == '}') {
+                                            if (val_depth > 0) { val_depth -= 1; fv_pos += 1; continue; }
+                                            break;
+                                        }
+                                        if (cc[fv_pos] == ',' and val_depth == 0) { fv_pos += 1; break; }
+                                        fv_pos += 1;
+                                    }
+                                    // Trim trailing whitespace from value
+                                    var val_end = fv_pos;
+                                    if (val_end > val_start and (cc[val_end - 1] == ',' or cc[val_end - 1] == ' ' or cc[val_end - 1] == '\n')) val_end -= 1;
+                                    while (val_end > val_start and (cc[val_end - 1] == ' ' or cc[val_end - 1] == '\n')) val_end -= 1;
+                                    // Find which field index this key maps to
+                                    for (site.field_names[0..site.field_count], 0..) |sf, fi| {
+                                        if (std.mem.eql(u8, sf, fk_name)) {
+                                            field_vals[fi] = cc[val_start..val_end];
+                                            fv_count += 1;
+                                            break;
+                                        }
+                                    }
+                                }
+                                // All fields must have values
+                                if (fv_count < site.field_count) break :inline_push;
+                                // Find the closing ')' of .push(...)
+                                while (fv_pos < cc.len and cc[fv_pos] == '}') fv_pos += 1; // skip '}'
+                                while (fv_pos < cc.len and cc[fv_pos] == ' ') fv_pos += 1;
+                                if (fv_pos >= cc.len or cc[fv_pos] != ')') break :inline_push;
+                                fv_pos += 1; // skip ')'
+                                // Emit column writes + index push
+                                for (site.field_names[0..site.field_count], 0..) |fname, fi| {
+                                    w.print("__col_{s}[__col_idx] = {s}; ", .{ fname, field_vals[fi] }) catch { w_errs += 1; };
+                                }
+                                w.print("{s}.push(__col_idx++)", .{push_var}) catch { w_errs += 1; };
+                                src_pos = fv_pos;
+                                continue :char_loop;
                             }
 
                             // === SOA Transform: match factory functions and rewrite body ===
