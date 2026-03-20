@@ -123,10 +123,11 @@
     readFileSync: function(path, options) {
       var encoding = typeof options === 'string' ? options : (options && options.encoding);
       // Fast path: use direct V8 callback (no JSON serialize/parse overhead)
+      // Always return string (TSC always calls toString('utf8') on Buffers anyway)
       if (typeof __edgebox_read_file === 'function') {
         var data = __edgebox_read_file(String(path));
         if (data === undefined) { var err = new Error('ENOENT'); err.code = 'ENOENT'; throw err; }
-        return (encoding === 'utf8' || encoding === 'utf-8') ? data : Buffer.from(data);
+        return data;
       }
       var r = _ioSync('readFile', { path: String(path) });
       if (!r.ok) { var err = new Error(r.error || 'ENOENT'); err.code = r.code || 'ENOENT'; throw err; }

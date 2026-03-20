@@ -243,10 +243,16 @@ pub fn readFileFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) v
     };
 
     // Create V8 string directly — no JSON escaping needed!
-    // Use external string (zero-copy) for all files > 128 bytes.
-    // fromExternalOneByte is zero-copy: V8 reads directly from Zig's buffer.
-    // fromUtf8 copies the string (only for tiny files where copy is free).
-    const v8_str = if (content.len > 128)
+    // Use external string (zero-copy) for pure-ASCII files.
+    // Files with non-ASCII bytes MUST use fromUtf8 (copies, but handles UTF-8).
+    // fromExternalOneByte treats bytes as Latin-1, corrupting multi-byte UTF-8.
+    const is_ascii = blk: {
+        for (content) |byte| {
+            if (byte >= 0x80) break :blk false;
+        }
+        break :blk true;
+    };
+    const v8_str = if (is_ascii and content.len > 128)
         v8.StringApi.fromExternalOneByte(isolate, content)
     else
         v8.StringApi.fromUtf8(isolate, content);
