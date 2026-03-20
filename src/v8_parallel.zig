@@ -144,6 +144,10 @@ fn workerFn(ctx: *WorkerCtx) void {
         _ = v8.eval(isolate, context, ctx.bootstrap_code, "v8_bootstrap.js") catch {};
     }
 
+    // Register channel callbacks in worker (channels are Zig-global, shared across isolates)
+    const v8_channel = @import("v8_channel.zig");
+    v8_channel.registerGlobals(isolate, context);
+
     // Execute each work item
     for (ctx.start_idx..ctx.end_idx) |i| {
         const item = &ctx.items[i];
@@ -265,12 +269,63 @@ pub fn parallelCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void 
     rv.set(@ptrCast(result_str));
 }
 
-/// Register __edgebox_parallel as a global function.
-/// Called lazily — no cost at startup.
+/// V8 callback: __edgebox_spawn(codeString) — non-blocking, fire-and-forget
+/// Launches a single work item on a background thread.
+/// Used with channels for producer-consumer patterns.
+pub fn spawnCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
+    const isolate: *v8.Isolate = v8.CallbackInfoApi.getIsolate(info);
+    var rv = v8.CallbackInfoApi.getReturnValue(info);
+
+    if (v8.CallbackInfoApi.length(info) < 1) { rv.setUndefined(); return; }
+    const arg0 = v8.CallbackInfoApi.get(info, 0) orelse { rv.setUndefined(); return; };
+    if (!v8.ValueApi.isString(arg0)) { rv.setUndefined(); return; }
+
+    const str: *const v8.String = @ptrCast(arg0);
+    const len: usize = @intCast(v8.StringApi.utf8Length(str, isolate));
+    if (len == 0 or len > 16 * 1024 * 1024) { rv.setUndefined(); return; }
+
+    // Copy code to owned buffer (original may be freed when this callback returns)
+    const code = alloc.alloc(u8, len + 1) catch { rv.setUndefined(); return; };
+    _ = v8.StringApi.writeUtf8(str, isolate, code);
+
+    // Create a persistent work item
+    const item = alloc.create(WorkItem) catch { alloc.free(code); rv.setUndefined(); return; };
+    item.* = .{ .code = code[0..len], .arg = "" };
+
+    // Wrap in context
+    const ctx = alloc.create(WorkerCtx) catch { alloc.destroy(item); alloc.free(code); rv.setUndefined(); return; };
+    ctx.* = .{
+        .items = @as([*]WorkItem, @ptrCast(item))[0..1],
+        .start_idx = 0,
+        .end_idx = 1,
+        .bootstrap_code = @embedFile("v8_bootstrap.js"),
+    };
+
+    // Launch on background thread — fire and forget
+    _ = std.Thread.spawn(.{}, workerFn, .{ctx}) catch {
+        alloc.destroy(ctx);
+        alloc.destroy(item);
+        alloc.free(code);
+        rv.setUndefined();
+        return;
+    };
+
+    rv.set(@ptrCast(v8.StringApi.fromUtf8(isolate, "ok") orelse return));
+}
+
+/// Register __edgebox_parallel and __edgebox_spawn as global functions.
 pub fn registerGlobals(isolate: *v8.Isolate, context: *const v8.Context) void {
     const global = v8.ContextApi.global(context);
+
+    // __edgebox_parallel — blocking, returns results
     const tmpl = v8.FunctionTemplateApi.create(isolate, &parallelCallback) orelse return;
     const func = v8.FunctionTemplateApi.getFunction(tmpl, context) orelse return;
     const key = v8.StringApi.fromUtf8(isolate, "__edgebox_parallel") orelse return;
     _ = v8.ObjectApi.set(global, context, @ptrCast(key), @ptrCast(func));
+
+    // __edgebox_spawn — non-blocking, fire-and-forget (for channel producers)
+    const tmpl2 = v8.FunctionTemplateApi.create(isolate, &spawnCallback) orelse return;
+    const func2 = v8.FunctionTemplateApi.getFunction(tmpl2, context) orelse return;
+    const key2 = v8.StringApi.fromUtf8(isolate, "__edgebox_spawn") orelse return;
+    _ = v8.ObjectApi.set(global, context, @ptrCast(key2), @ptrCast(func2));
 }

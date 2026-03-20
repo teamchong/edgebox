@@ -66,5 +66,66 @@
     return result;
   };
 
+  // edgebox.channel — Go-like channels for worker communication
+  // Usage:
+  //   const ch = edgebox.channel(10);  // buffered channel
+  //   ch.send(value);                  // blocks if full
+  //   const val = ch.recv();           // blocks if empty, null when closed
+  //   ch.close();                      // signal no more values
+  if (typeof __edgebox_chan_create === 'function') {
+    e.channel = function(capacity) {
+      var id = __edgebox_chan_create(capacity || 1);
+      if (id < 0) throw new Error('Failed to create channel');
+      return {
+        id: id,
+        send: function(value) {
+          return __edgebox_chan_send(id, JSON.stringify(value));
+        },
+        recv: function() {
+          var json = __edgebox_chan_recv(id);
+          return json !== null ? JSON.parse(json) : null;
+        },
+        close: function() {
+          __edgebox_chan_close(id);
+        },
+        // Iterator protocol: for (const val of ch) { ... }
+        [Symbol.iterator]: function() {
+          var self = this;
+          return {
+            next: function() {
+              var val = self.recv();
+              if (val === null) return { done: true };
+              return { value: val, done: false };
+            }
+          };
+        }
+      };
+    };
+
+    // edgebox.spawn — launch a function on a worker isolate (non-blocking)
+    // The function receives channel wrappers as arguments
+    e.spawn = function(fn, channels) {
+      var chanIds = [];
+      if (channels) {
+        if (Array.isArray(channels)) {
+          chanIds = channels.map(function(ch) { return ch.id !== undefined ? ch.id : ch; });
+        } else if (channels.id !== undefined) {
+          chanIds = [channels.id];
+        }
+      }
+      var code = 'var __chIds = ' + JSON.stringify(chanIds) + ';\n' +
+        'var __chs = __chIds.map(function(id) { return { id: id, ' +
+        'send: function(v) { return __edgebox_chan_send(String(id), JSON.stringify(v)) === "true"; }, ' +
+        'recv: function() { var j = __edgebox_chan_recv(String(id)); return j !== null ? JSON.parse(j) : null; }, ' +
+        'close: function() { __edgebox_chan_close(String(id)); } }; });\n' +
+        '(' + fn.toString() + ').apply(null, __chs)';
+      if (typeof __edgebox_spawn === 'function') {
+        __edgebox_spawn(code);
+      } else {
+        __edgebox_parallel(JSON.stringify([code]));
+      }
+    };
+  }
+
   globalThis.edgebox = e;
 })();

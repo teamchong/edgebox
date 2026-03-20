@@ -150,7 +150,11 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
     const v8_parallel = @import("v8_parallel.zig");
     v8_parallel.registerGlobals(isolate, context);
 
-    // Create JS-friendly wrappers: edgebox.parallel, edgebox.map, edgebox.reduce
+    // Register channel API (Go-like channels for inter-worker communication)
+    const v8_channel = @import("v8_channel.zig");
+    v8_channel.registerGlobals(isolate, context);
+
+    // Create JS-friendly wrappers: edgebox.parallel, edgebox.map, edgebox.reduce, edgebox.channel
     const parallel_init_js = @embedFile("v8_parallel_init.js");
     _ = v8.eval(isolate, context, parallel_init_js, "v8_parallel_init.js") catch {};
 
