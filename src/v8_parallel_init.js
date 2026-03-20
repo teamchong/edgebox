@@ -127,5 +127,64 @@
     };
   }
 
+  // edgebox.sharedChannel — zero-copy channel using SharedArrayBuffer
+  // Data passes through Zig-managed shared memory without serialization.
+  // Layout: [head:i32][tail:i32][closed:i32][pad:i32][data:f64 × capacity]
+  // Uses Atomics for lock-free synchronization.
+  if (typeof __edgebox_chan_shared === 'function') {
+    e.sharedChannel = function(capacity) {
+      capacity = capacity || 1024;
+      var sab = __edgebox_chan_shared(String(capacity));
+      if (!sab) throw new Error('Failed to create shared channel');
+      var header = new Int32Array(sab, 0, 4); // [head, tail, closed, channelId]
+      var data = new Float64Array(sab, 16);    // f64 slots after header
+      var cap = data.length;
+      // Store channel ID in header[3] for workers to look up
+      var chId = Atomics.load(header, 3); // set by Zig
+      return {
+        sab: sab,
+        send: function(value) {
+          while (true) {
+            var tail = Atomics.load(header, 1);
+            var head = Atomics.load(header, 0);
+            var count = (tail - head + cap) % cap;
+            if (count >= cap - 1) {
+              // Buffer full — spin wait (could use Atomics.wait but needs i32 view)
+              continue;
+            }
+            data[tail % cap] = value;
+            Atomics.store(header, 1, (tail + 1) % cap);
+            Atomics.notify(header, 0, 1); // wake receiver
+            return true;
+          }
+        },
+        recv: function() {
+          while (true) {
+            var head = Atomics.load(header, 0);
+            var tail = Atomics.load(header, 1);
+            if (head === tail) {
+              if (Atomics.load(header, 2) === 1) return null; // closed
+              Atomics.wait(header, 0, head, 1); // wait 1ms then retry
+              continue;
+            }
+            var value = data[head % cap];
+            Atomics.store(header, 0, (head + 1) % cap);
+            Atomics.notify(header, 1, 1); // wake sender
+            return value;
+          }
+        },
+        close: function() {
+          Atomics.store(header, 2, 1);
+          Atomics.notify(header, 0, 1);
+        },
+        get length() {
+          var t = Atomics.load(header, 1);
+          var h = Atomics.load(header, 0);
+          return (t - h + cap) % cap;
+        }
+      };
+    };
+  }
+
   globalThis.edgebox = e;
 })();

@@ -101,4 +101,18 @@ size_t edgebox_v8_snapshot_creator_sizeof() {
   return sizeof(v8::SnapshotCreator);
 }
 
+// --- SharedArrayBuffer from external memory (zero-copy) ---
+// Calls the rusty_v8 binding which handles the shared_ptr conversion.
+extern const v8::SharedArrayBuffer* v8__SharedArrayBuffer__New__with_backing_store(
+    v8::Isolate* isolate,
+    const std::shared_ptr<v8::BackingStore>& backing_store);
+
+const v8::Value* edgebox_v8_shared_array_buffer_from_backing_store(
+    v8::Isolate* isolate, v8::BackingStore* raw_bs) {
+  // Wrap raw pointer in shared_ptr (takes ownership)
+  std::shared_ptr<v8::BackingStore> bs(raw_bs);
+  return reinterpret_cast<const v8::Value*>(
+    v8__SharedArrayBuffer__New__with_backing_store(isolate, bs));
+}
+
 } // extern "C"

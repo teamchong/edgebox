@@ -18,6 +18,24 @@ const alloc = std.heap.page_allocator;
 const max_channels = 64;
 const max_buffer_size = 4096;
 
+// === Zero-copy shared buffer channel ===
+// Uses a flat mmap'd buffer visible to both isolates as SharedArrayBuffer.
+// Layout: [head:i32][tail:i32][closed:i32][padding:i32][data:f64 × capacity]
+// JS code uses Atomics for lock-free send/recv on the Int32Array header.
+const HEADER_BYTES = 16; // 4 × i32: head, tail, closed, padding
+
+/// Allocate a shared buffer for a zero-copy channel
+fn allocSharedBuffer(capacity: usize) ?[*]u8 {
+    const total = HEADER_BYTES + capacity * 8; // 8 bytes per f64 slot
+    const buf = alloc.alloc(u8, total) catch return null;
+    @memset(buf, 0);
+    return buf.ptr;
+}
+
+/// Global shared buffers (indexed by channel ID)
+var shared_buffers: [max_channels]?[*]u8 = .{null} ** max_channels;
+var shared_buffer_sizes: [max_channels]usize = .{0} ** max_channels;
+
 /// Ring buffer channel with mutex synchronization
 const Channel = struct {
     buffer: []?[]const u8,
@@ -213,6 +231,88 @@ pub fn chanCloseCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void
     channels[id].close();
 }
 
+/// V8 callback: __edgebox_chan_shared(capacityStr) → SharedArrayBuffer
+/// Creates a zero-copy channel backed by Zig-managed shared memory.
+/// Both the caller and any worker isolate can create views into the same buffer.
+pub fn chanSharedCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
+    const isolate: *v8.Isolate = v8.CallbackInfoApi.getIsolate(info);
+    var rv = v8.CallbackInfoApi.getReturnValue(info);
+
+    var capacity: usize = 1024;
+    if (v8.CallbackInfoApi.length(info) >= 1) {
+        if (v8.CallbackInfoApi.get(info, 0)) |arg| {
+            if (v8.ValueApi.isString(arg)) {
+                const str: *const v8.String = @ptrCast(arg);
+                const len: usize = @intCast(v8.StringApi.utf8Length(str, isolate));
+                if (len > 0 and len < 32) {
+                    var buf: [32]u8 = undefined;
+                    _ = v8.StringApi.writeUtf8(str, isolate, &buf);
+                    capacity = std.fmt.parseInt(usize, buf[0..len], 10) catch 1024;
+                }
+            }
+        }
+    }
+
+    // Allocate shared buffer
+    registry_mutex.lock();
+    const id = channel_count;
+    if (id >= max_channels) {
+        registry_mutex.unlock();
+        rv.setNull();
+        return;
+    }
+    const buf_ptr = allocSharedBuffer(capacity) orelse {
+        registry_mutex.unlock();
+        rv.setNull();
+        return;
+    };
+    const total_size = HEADER_BYTES + capacity * 8;
+    shared_buffers[id] = buf_ptr;
+    shared_buffer_sizes[id] = total_size;
+
+    // Also create a regular channel for the mutex-based fallback
+    channels[id] = Channel.init(1) catch {
+        registry_mutex.unlock();
+        rv.setNull();
+        return;
+    };
+    channel_count += 1;
+    registry_mutex.unlock();
+
+    // Create SharedArrayBuffer backed by this memory
+    const sab = v8.SharedArrayBufferApi.fromExternalMemory(isolate, buf_ptr, total_size) orelse {
+        rv.setNull();
+        return;
+    };
+    rv.set(sab);
+}
+
+/// V8 callback: __edgebox_chan_get_shared(channelIdStr) → SharedArrayBuffer
+/// Returns the SharedArrayBuffer for an existing channel (for worker isolates).
+pub fn chanGetSharedCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
+    const isolate: *v8.Isolate = v8.CallbackInfoApi.getIsolate(info);
+    var rv = v8.CallbackInfoApi.getReturnValue(info);
+
+    if (v8.CallbackInfoApi.length(info) < 1) { rv.setNull(); return; }
+    const arg0 = v8.CallbackInfoApi.get(info, 0) orelse { rv.setNull(); return; };
+    if (!v8.ValueApi.isString(arg0)) { rv.setNull(); return; }
+    const id_s: *const v8.String = @ptrCast(arg0);
+    const id_len: usize = @intCast(v8.StringApi.utf8Length(id_s, isolate));
+    var id_buf: [16]u8 = undefined;
+    _ = v8.StringApi.writeUtf8(id_s, isolate, &id_buf);
+    const id = std.fmt.parseInt(usize, id_buf[0..id_len], 10) catch { rv.setNull(); return; };
+
+    if (id >= channel_count) { rv.setNull(); return; }
+    const buf_ptr = shared_buffers[id] orelse { rv.setNull(); return; };
+    const total_size = shared_buffer_sizes[id];
+
+    const sab = v8.SharedArrayBufferApi.fromExternalMemory(isolate, buf_ptr, total_size) orelse {
+        rv.setNull();
+        return;
+    };
+    rv.set(sab);
+}
+
 /// Register channel callbacks as V8 globals
 pub fn registerGlobals(isolate: *v8.Isolate, context: *const v8.Context) void {
     const global = v8.ContextApi.global(context);
@@ -220,6 +320,8 @@ pub fn registerGlobals(isolate: *v8.Isolate, context: *const v8.Context) void {
     registerOne(isolate, context, global, "__edgebox_chan_send", &chanSendCallback);
     registerOne(isolate, context, global, "__edgebox_chan_recv", &chanRecvCallback);
     registerOne(isolate, context, global, "__edgebox_chan_close", &chanCloseCallback);
+    registerOne(isolate, context, global, "__edgebox_chan_shared", &chanSharedCallback);
+    registerOne(isolate, context, global, "__edgebox_chan_get_shared", &chanGetSharedCallback);
 }
 
 fn registerOne(isolate: *v8.Isolate, context: *const v8.Context, global: *const v8.Object, name: []const u8, cb: *const fn (*const v8.FunctionCallbackInfo) callconv(.c) void) void {

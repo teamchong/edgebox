@@ -316,11 +316,13 @@ pub const SharedArrayBufferApi = struct {
     /// The memory is NOT owned by V8 — Zig manages its lifetime.
     /// Multiple isolates can create views into the same buffer.
     pub fn fromExternalMemory(isolate: *Isolate, data: [*]u8, byte_length: usize) ?*const Value {
+        // Create a BackingStore wrapping our Zig memory (no-op deleter — Zig owns it)
         const backing_store = c.v8__SharedArrayBuffer__NewBackingStore__with_data(
             @ptrCast(data), byte_length,
             &noopDeleter, null,
         ) orelse return null;
-        return c.v8__SharedArrayBuffer__New__with_backing_store(isolate, backing_store);
+        // Use C++ bridge to convert raw BackingStore* → shared_ptr → SharedArrayBuffer
+        return bridge.edgebox_v8_shared_array_buffer_from_backing_store(isolate, backing_store);
     }
 
     /// Create a new SharedArrayBuffer with V8-allocated memory.
@@ -785,8 +787,7 @@ const c = struct {
         data: ?*anyopaque, byte_length: usize,
         deleter: ?*const fn (?*anyopaque, usize, ?*anyopaque) callconv(.c) void,
         deleter_data: ?*anyopaque,
-    ) ?*anyopaque; // returns BackingStore*
-    extern fn v8__SharedArrayBuffer__New__with_backing_store(isolate: *Isolate, backing_store: *anyopaque) ?*const Value;
+    ) ?*anyopaque; // returns BackingStore* (raw, from unique_ptr.release())
     extern fn v8__SharedArrayBuffer__ByteLength(sab: *const Value) usize;
 
     // ScriptCompiler
@@ -821,6 +822,10 @@ const bridge = struct {
         snapshot_len: i32,
         external_refs: ?[*]const usize,
     ) *Isolate;
+    extern fn edgebox_v8_shared_array_buffer_from_backing_store(
+        isolate: *Isolate,
+        raw_bs: *anyopaque,
+    ) ?*const Value;
     extern fn edgebox_v8_snapshot_creator_new(
         buf: *[SnapshotCreator.max_size]u8,
         external_refs: ?[*]const usize,
