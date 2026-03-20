@@ -16,13 +16,15 @@ const v8_io = @import("v8_io.zig");
 /// External references for V8 snapshot — function pointers that V8 needs
 /// to serialize/deserialize. Must be null-terminated and consistent between
 /// snapshot creation (here) and snapshot loading (v8_runner.zig).
-/// Order: [ioSyncCallback, ioBatchCallback, 0 (null terminator)]
-var external_refs: [3]usize = .{ 0, 0, 0 };
+/// Order: [ioSyncCallback, ioBatchCallback, readFileFastCallback, fileExistsFastCallback, 0]
+var external_refs: [5]usize = .{ 0, 0, 0, 0, 0 };
 
-fn getExternalRefs() *const [3]usize {
+fn getExternalRefs() *const [5]usize {
     if (external_refs[0] == 0) {
         external_refs[0] = @intFromPtr(&v8_io.ioSyncCallback);
         external_refs[1] = @intFromPtr(&v8_io.ioBatchCallback);
+        external_refs[2] = @intFromPtr(&v8_io.readFileFastCallback);
+        external_refs[3] = @intFromPtr(&v8_io.fileExistsFastCallback);
     }
     return &external_refs;
 }

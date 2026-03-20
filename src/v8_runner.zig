@@ -88,6 +88,32 @@ pub fn main() !void {
         disk_cache = std.fs.cwd().readFileAlloc(alloc, cp, 128 * 1024 * 1024) catch null;
     }
 
+    // Prefetch source files in parallel if running TSC with -p <tsconfig>
+    // This reads all .ts/.tsx/.js files into the IO cache using Zig threads
+    // BEFORE TSC starts, so all readFile calls hit cache instantly.
+    if (std.mem.endsWith(u8, script_path, "tsc.js") or std.mem.endsWith(u8, script_path, "_tsc.js")) {
+        // Always prefetch TypeScript lib.d.ts files (TSC always reads these)
+        const ts_lib_dir = std.fs.path.dirname(abs_path) orelse ".";
+        v8_io.prefetchDirectory(ts_lib_dir);
+
+        // Find -p <path> in remaining args and prefetch project directory
+        var peek_args = try std.process.argsWithAllocator(alloc);
+        defer peek_args.deinit();
+        var found_p = false;
+        while (peek_args.next()) |arg| {
+            if (found_p) {
+                var tsconfig_abs: [std.fs.max_path_bytes]u8 = undefined;
+                const tsconfig_real = std.fs.cwd().realpath(arg, &tsconfig_abs) catch arg;
+                const project_dir = std.fs.path.dirname(tsconfig_real) orelse ".";
+                v8_io.prefetchDirectory(project_dir);
+                break;
+            }
+            if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--project")) {
+                found_p = true;
+            }
+        }
+    }
+
     return runScript(alloc, script_code, disk_cache, abs_path, script_path, false);
 }
 
@@ -98,13 +124,15 @@ const embedded_snapshot = @embedFile("v8_bootstrap.snapshot");
 
 /// External references for V8 snapshot deserialization — must match the array
 /// used during snapshot creation (in v8_snapshot_gen.zig).
-/// Order: [ioSyncCallback, ioBatchCallback, 0 (null terminator)]
-var external_refs: [3]usize = .{ 0, 0, 0 };
+/// Order: [ioSyncCallback, ioBatchCallback, readFileFastCallback, fileExistsFastCallback, 0]
+var external_refs: [5]usize = .{ 0, 0, 0, 0, 0 };
 
-fn getExternalRefs() *const [3]usize {
+fn getExternalRefs() *const [5]usize {
     if (external_refs[0] == 0) {
         external_refs[0] = @intFromPtr(&v8_io.ioSyncCallback);
         external_refs[1] = @intFromPtr(&v8_io.ioBatchCallback);
+        external_refs[2] = @intFromPtr(&v8_io.readFileFastCallback);
+        external_refs[3] = @intFromPtr(&v8_io.fileExistsFastCallback);
     }
     return &external_refs;
 }

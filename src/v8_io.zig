@@ -14,7 +14,7 @@ const alloc = std.heap.page_allocator;
 /// Allows code cache to be saved before termination.
 pub var deferred_exit_code: ?u8 = null;
 
-/// Register __edgebox_io_sync and __edgebox_io_batch as global functions.
+/// Register __edgebox_io_sync, __edgebox_io_batch, and fast-path callbacks.
 pub fn registerGlobals(isolate: *v8.Isolate, context: *const v8.Context) void {
     const global = v8.ContextApi.global(context);
 
@@ -29,6 +29,99 @@ pub fn registerGlobals(isolate: *v8.Isolate, context: *const v8.Context) void {
     const batch_func = v8.FunctionTemplateApi.getFunction(batch_tmpl, context) orelse return;
     const batch_key = v8.StringApi.fromUtf8(isolate, "__edgebox_io_batch") orelse return;
     _ = v8.ObjectApi.set(global, context, @ptrCast(batch_key), @ptrCast(batch_func));
+
+    // __edgebox_read_file(path) → string|undefined (fast path, no JSON)
+    const rf_tmpl = v8.FunctionTemplateApi.create(isolate, &readFileFastCallback) orelse return;
+    const rf_func = v8.FunctionTemplateApi.getFunction(rf_tmpl, context) orelse return;
+    const rf_key = v8.StringApi.fromUtf8(isolate, "__edgebox_read_file") orelse return;
+    _ = v8.ObjectApi.set(global, context, @ptrCast(rf_key), @ptrCast(rf_func));
+
+    // __edgebox_file_exists(path) → boolean (fast path, no JSON)
+    const fe_tmpl = v8.FunctionTemplateApi.create(isolate, &fileExistsFastCallback) orelse return;
+    const fe_func = v8.FunctionTemplateApi.getFunction(fe_tmpl, context) orelse return;
+    const fe_key = v8.StringApi.fromUtf8(isolate, "__edgebox_file_exists") orelse return;
+    _ = v8.ObjectApi.set(global, context, @ptrCast(fe_key), @ptrCast(fe_func));
+}
+
+/// Fast readFile: path → string (no JSON serialize/parse overhead)
+pub fn readFileFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
+    const isolate = v8.CallbackInfoApi.getIsolate(info);
+    var rv = v8.CallbackInfoApi.getReturnValue(info);
+
+    if (v8.global_platform) |platform| {
+        while (v8.pumpMessageLoop(platform, isolate)) {}
+    }
+
+    if (v8.CallbackInfoApi.length(info) < 1) { rv.setUndefined(); return; }
+    const arg0 = v8.CallbackInfoApi.get(info, 0) orelse { rv.setUndefined(); return; };
+    if (!v8.ValueApi.isString(arg0)) { rv.setUndefined(); return; }
+
+    const str: *const v8.String = @ptrCast(arg0);
+    const len: usize = @intCast(v8.StringApi.utf8Length(str, isolate));
+    if (len == 0 or len > 4096) { rv.setUndefined(); return; }
+
+    var path_buf: [4096]u8 = undefined;
+    const written = v8.StringApi.writeUtf8(str, isolate, &path_buf);
+    const path = path_buf[0..written];
+
+    // Read file content (uses cache if available)
+    const file = std.fs.cwd().openFile(path, .{}) catch { rv.setUndefined(); return; };
+    defer file.close();
+    const content = file.readToEndAlloc(alloc, 64 * 1024 * 1024) catch { rv.setUndefined(); return; };
+
+    // Create V8 string directly from file content — no JSON escaping needed!
+    // For large files, use external string (zero-copy from Zig buffer to V8)
+    const v8_str = if (content.len > 65536)
+        v8.StringApi.fromExternalOneByte(isolate, content)
+    else blk: {
+        defer alloc.free(content);
+        break :blk v8.StringApi.fromUtf8(isolate, content);
+    };
+
+    if (v8_str) |s| {
+        rv.set(@ptrCast(s));
+    } else {
+        rv.setUndefined();
+    }
+}
+
+/// Fast fileExists: path → boolean (no JSON)
+pub fn fileExistsFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
+    const isolate = v8.CallbackInfoApi.getIsolate(info);
+    var rv = v8.CallbackInfoApi.getReturnValue(info);
+
+    if (v8.global_platform) |platform| {
+        while (v8.pumpMessageLoop(platform, isolate)) {}
+    }
+
+    if (v8.CallbackInfoApi.length(info) < 1) { rv.setUndefined(); return; }
+    const arg0 = v8.CallbackInfoApi.get(info, 0) orelse { rv.setUndefined(); return; };
+    if (!v8.ValueApi.isString(arg0)) { rv.setUndefined(); return; }
+
+    const str: *const v8.String = @ptrCast(arg0);
+    const len: usize = @intCast(v8.StringApi.utf8Length(str, isolate));
+    if (len == 0 or len > 4096) { rv.setUndefined(); return; }
+
+    var path_buf: [4096]u8 = undefined;
+    const written = v8.StringApi.writeUtf8(str, isolate, &path_buf);
+    const path = path_buf[0..written];
+
+    // Check cache first
+    if (exists_cache.get(path)) |exists| {
+        // Return 1 for true, 0 for false (JS treats both as truthy/falsy correctly)
+        rv.setInt32(if (exists) 1 else 0);
+        return;
+    }
+
+    const exists = blk: {
+        _ = std.fs.cwd().statFile(path) catch break :blk false;
+        break :blk true;
+    };
+
+    const key = alloc.dupe(u8, path) catch path;
+    exists_cache.put(alloc, key, exists) catch {};
+
+    rv.setInt32(if (exists) 1 else 0);
 }
 
 /// The V8 callback for __edgebox_io_sync(jsonString) → jsonString
@@ -156,6 +249,139 @@ fn handleRequest(msg: []const u8) ![]const u8 {
     }
 
     return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"unknown op: {s}\"}}", .{req.op});
+}
+
+// ============================================================
+// Parallel file prefetch — pre-read all source files into cache
+// ============================================================
+
+const max_prefetch_threads = 8;
+
+/// Walk a directory tree and collect all .ts/.tsx/.js/.jsx/.d.ts files
+fn collectSourceFiles(dir_path: []const u8, paths: *std.ArrayListUnmanaged([]const u8)) void {
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        const name = entry.name;
+        if (entry.kind == .directory) {
+            if (std.mem.eql(u8, name, "node_modules") or
+                std.mem.eql(u8, name, ".git") or
+                std.mem.eql(u8, name, "dist") or
+                std.mem.eql(u8, name, "build"))
+                continue;
+            const sub_path = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_path, name }) catch continue;
+            collectSourceFiles(sub_path, paths);
+        } else if (entry.kind == .file) {
+            const is_source = std.mem.endsWith(u8, name, ".ts") or
+                std.mem.endsWith(u8, name, ".tsx") or
+                std.mem.endsWith(u8, name, ".js") or
+                std.mem.endsWith(u8, name, ".jsx") or
+                std.mem.endsWith(u8, name, ".d.ts") or
+                std.mem.endsWith(u8, name, ".json");
+            if (is_source) {
+                const full = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_path, name }) catch continue;
+                paths.append(alloc, full) catch {};
+            }
+        }
+    }
+}
+
+/// Read a single file and populate the cache (thread-safe: each path is unique)
+fn prefetchWorker(paths: []const []const u8, start: usize, end: usize) void {
+    for (start..end) |i| {
+        const path = paths[i];
+
+        // Read file
+        const file = std.fs.cwd().openFile(path, .{}) catch continue;
+        defer file.close();
+        const content = file.readToEndAlloc(alloc, 64 * 1024 * 1024) catch continue;
+
+        // JSON-escape (same logic as opReadFile)
+        var escape_count: usize = 0;
+        var control_count: usize = 0;
+        for (content) |byte| {
+            switch (byte) {
+                '"', '\\' => escape_count += 1,
+                '\n', '\r', '\t' => escape_count += 1,
+                else => if (byte < 0x20) { control_count += 1; },
+            }
+        }
+
+        const prefix = "{\"ok\":true,\"data\":\"";
+        const suffix = "\"}";
+        const total_len = prefix.len + content.len + escape_count + control_count * 5 + suffix.len;
+        const result = alloc.alloc(u8, total_len) catch continue;
+
+        @memcpy(result[0..prefix.len], prefix);
+        var pw: usize = prefix.len;
+
+        for (content) |byte| {
+            switch (byte) {
+                '"' => { result[pw] = '\\'; result[pw + 1] = '"'; pw += 2; },
+                '\\' => { result[pw] = '\\'; result[pw + 1] = '\\'; pw += 2; },
+                '\n' => { result[pw] = '\\'; result[pw + 1] = 'n'; pw += 2; },
+                '\r' => { result[pw] = '\\'; result[pw + 1] = 'r'; pw += 2; },
+                '\t' => { result[pw] = '\\'; result[pw + 1] = 't'; pw += 2; },
+                else => {
+                    if (byte < 0x20) {
+                        const hex = std.fmt.bufPrint(result[pw..][0..6], "\\u{x:0>4}", .{byte}) catch unreachable;
+                        pw += hex.len;
+                    } else {
+                        result[pw] = byte;
+                        pw += 1;
+                    }
+                },
+            }
+        }
+
+        @memcpy(result[pw..][0..suffix.len], suffix);
+        pw += suffix.len;
+
+        alloc.free(content);
+        const final = result[0..pw];
+
+        // Cache (using mutex for thread safety)
+        prefetch_mutex.lock();
+        defer prefetch_mutex.unlock();
+        const key = alloc.dupe(u8, path) catch continue;
+        file_cache.put(alloc, key, final) catch {};
+
+        // Also cache exists=true
+        exists_cache.put(alloc, key, true) catch {};
+    }
+}
+
+var prefetch_mutex: std.Thread.Mutex = .{};
+
+/// Prefetch all source files in a directory tree using parallel Zig threads.
+/// Call before TSC starts to pre-populate the IO cache.
+pub fn prefetchDirectory(dir_path: []const u8) void {
+    var paths: std.ArrayListUnmanaged([]const u8) = .{};
+    collectSourceFiles(dir_path, &paths);
+
+    if (paths.items.len == 0) return;
+
+    const cpu_count = std.Thread.getCpuCount() catch 4;
+    const thread_count = @min(@min(paths.items.len, cpu_count), max_prefetch_threads);
+    const per_thread = (paths.items.len + thread_count - 1) / thread_count;
+
+    var threads: [max_prefetch_threads]?std.Thread = .{null} ** max_prefetch_threads;
+
+    for (0..thread_count) |i| {
+        const start = i * per_thread;
+        const end = @min(start + per_thread, paths.items.len);
+        if (start >= end) break;
+        threads[i] = std.Thread.spawn(.{}, prefetchWorker, .{ paths.items, start, end }) catch null;
+    }
+
+    for (&threads) |*t| {
+        if (t.*) |thread| {
+            thread.join();
+            t.* = null;
+        }
+    }
 }
 
 // ============================================================

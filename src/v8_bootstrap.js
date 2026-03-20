@@ -120,6 +120,12 @@
   var _fs = {
     readFileSync: function(path, options) {
       var encoding = typeof options === 'string' ? options : (options && options.encoding);
+      // Fast path: use direct V8 callback (no JSON serialize/parse overhead)
+      if (typeof __edgebox_read_file === 'function') {
+        var data = __edgebox_read_file(String(path));
+        if (data === undefined) { var err = new Error('ENOENT'); err.code = 'ENOENT'; throw err; }
+        return (encoding === 'utf8' || encoding === 'utf-8') ? data : Buffer.from(data);
+      }
       var r = _ioSync('readFile', { path: String(path) });
       if (!r.ok) { var err = new Error(r.error || 'ENOENT'); err.code = r.code || 'ENOENT'; throw err; }
       return (encoding === 'utf8' || encoding === 'utf-8' || encoding === 'utf8') ? r.data : Buffer.from(r.data);
@@ -144,6 +150,10 @@
       };
     },
     existsSync: function(path) {
+      // Fast path: direct V8 callback (no JSON)
+      if (typeof __edgebox_file_exists === 'function') {
+        return !!__edgebox_file_exists(String(path));
+      }
       var r = _ioSync('exists', { path: String(path) });
       return r.ok && r.exists;
     },
