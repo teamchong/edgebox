@@ -4038,13 +4038,30 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 }
                             }
                         }
-                        // Also mark columns as active for provenance entries with decl_end > 0
-                        // (these generate __sb reads in the char_loop even if Pass 1 didn't find them)
-                        for (provenance) |prov| {
-                            if (prov.decl_end > 0) {
-                                const site = alloc_sites.items[prov.site_idx];
-                                for (site.field_names[0..site.field_count]) |fname| {
-                                    if (fname.len > 0) active_cols.put(allocator, fname, {}) catch {};
+                        // Also scan for-of alias patterns which generate __sb reads
+                        for (aliases) |alias| {
+                            // The alias rewrite emits __col_FIELD[__sb + idx]
+                            // We need to find which FIELD it accesses
+                            const prov = provenance[alias.prov_idx];
+                            if (prov.decl_end == 0) continue;
+                            const asite = alloc_sites.items[prov.site_idx];
+                            // Scan alias uses: ALIAS.field within scope
+                            var asp: usize = alias.assign_pos;
+                            while (asp + alias.alias_name.len + 2 < alias.scope_end) : (asp += 1) {
+                                if (asp > 0 and isIdentChar(cc[asp - 1])) continue;
+                                if (!std.mem.startsWith(u8, cc[asp..], alias.alias_name)) continue;
+                                const aav = asp + alias.alias_name.len;
+                                if (aav >= cc.len or cc[aav] != '.') continue;
+                                const afs = aav + 1;
+                                var afe = afs;
+                                while (afe < cc.len and isIdentChar(cc[afe])) afe += 1;
+                                if (afe == afs) continue;
+                                const afn = cc[afs..afe];
+                                for (asite.field_names[0..asite.field_count]) |sf| {
+                                    if (std.mem.eql(u8, sf, afn)) {
+                                        active_cols.put(allocator, sf, {}) catch {};
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -4519,8 +4536,22 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         w.writeAll(cc[src_pos .. scan + 1]) catch { w_errs += 1; };
                                         w.writeAll("\n") catch { w_errs += 1; };
                                         w.writeAll("  const __idx = __col_idx++;\n") catch { w_errs += 1; };
+                                        // Only write primitive fields to columns.
+                                        // Object references in columns prevent GC and change
+                                        // type resolution behavior (causes false positive errors).
+                                        // Skip fields that are likely objects (Type, Symbol, Node).
                                         for (site.field_names[0..site.field_count], 0..) |fname, fi| {
                                             if (!active_cols.contains(fname)) continue;
+                                            // Skip known object fields
+                                            if (std.mem.eql(u8, fname, "type") or
+                                                std.mem.eql(u8, fname, "keyType") or
+                                                std.mem.eql(u8, fname, "declaration") or
+                                                std.mem.eql(u8, fname, "components") or
+                                                std.mem.eql(u8, fname, "symbol") or
+                                                std.mem.eql(u8, fname, "parent") or
+                                                std.mem.eql(u8, fname, "original") or
+                                                std.mem.eql(u8, fname, "node"))
+                                                continue;
                                             w.print("  __col_{s}[__idx] = {s};\n", .{ fname, param_names[fi] }) catch { w_errs += 1; };
                                         }
                                         w.writeAll("  return {") catch { w_errs += 1; };
