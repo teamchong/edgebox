@@ -81,12 +81,9 @@ pub fn main() !void {
     };
     defer alloc.free(script_code);
 
-    // Try to load code cache from disk
-    const cache_path = getCachePath(alloc, script_code) catch null;
-    var disk_cache: ?[]u8 = null;
-    if (cache_path) |cp| {
-        disk_cache = std.fs.cwd().readFileAlloc(alloc, cp, 128 * 1024 * 1024) catch null;
-    }
+    // Code cache is now loaded inside runScript using the TRANSFORMED source hash.
+    // This ensures the cache matches what V8 actually compiles.
+    const disk_cache: ?[]u8 = null;
 
     // Prefetch source files in parallel if running TSC with -p <tsconfig>
     // This reads all .ts/.tsx/.js files into the IO cache using Zig threads
@@ -224,6 +221,7 @@ fn getExternalRefs() *const [7]usize {
 /// Core script execution: initialize V8, load bootstrap, compile + run script.
 fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]const u8, abs_path: []const u8, display_name: []const u8, is_embedded: bool) !void {
     _ = display_name;
+    _ = cache_bytes;
 
     // Detect TSC early for optimized path selection
     const is_tsc = std.mem.endsWith(u8, abs_path, "_tsc.js") or
@@ -308,12 +306,48 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
     _ = v8.eval(isolate, context, set_globals, "globals.js") catch {};
 
     // Apply source transforms for large scripts (TSC optimization).
-    // Single-pass scan replaces key patterns to enable SOA reads, integer packing, JSDoc skip.
+    // Cache the transformed source to avoid re-transforming on every run.
     var transformed: ?[]u8 = null;
     defer if (transformed) |t| alloc.free(t);
 
     if (script_code.len > 5 * 1024 * 1024) {
-        transformed = applyTscTransforms(alloc, script_code) catch null;
+        // Try to load cached transformed source
+        const transform_cache_path = getCachePath(alloc, script_code) catch null;
+        var cached_transform: ?[]u8 = null;
+        if (transform_cache_path) |tcp| {
+            // Replace .codecache with .transformed
+            if (std.mem.endsWith(u8, tcp, ".codecache")) {
+                const base = tcp[0 .. tcp.len - ".codecache".len];
+                const tfm_path = std.fmt.allocPrint(alloc, "{s}.transformed", .{base}) catch null;
+                if (tfm_path) |tp| {
+                    cached_transform = std.fs.cwd().readFileAlloc(alloc, tp, 64 * 1024 * 1024) catch null;
+                }
+            }
+        }
+
+        if (cached_transform) |ct| {
+            transformed = ct;
+        } else {
+            transformed = applyTscTransforms(alloc, script_code) catch null;
+            // Save transformed source for next run
+            if (transformed) |t| {
+                if (transform_cache_path) |tcp| {
+                    if (std.mem.endsWith(u8, tcp, ".codecache")) {
+                        const base = tcp[0 .. tcp.len - ".codecache".len];
+                        const tfm_path = std.fmt.allocPrint(alloc, "{s}.transformed", .{base}) catch null;
+                        if (tfm_path) |tp| {
+                            if (std.fs.path.dirname(tp)) |dir| {
+                                std.fs.cwd().makePath(dir) catch {};
+                            }
+                            if (std.fs.cwd().createFile(tp, .{})) |f| {
+                                defer f.close();
+                                f.writeAll(t) catch {};
+                            } else |_| {}
+                        }
+                    }
+                }
+            }
+        }
     }
 
     const wrapped = transformed orelse script_code;
@@ -341,13 +375,20 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
     };
     var origin = v8.ScriptOrigin.init(@ptrCast(name_str));
 
-    // Load code cache into V8's CachedData if available
+    // Load code cache for the TRANSFORMED source (not the original).
+    // The cache must match what V8 compiles — the transformed source.
     var cached_data: ?*v8.CachedData = null;
-    if (cache_bytes) |cb| {
-        if (cb.len > 0) {
-            // V8 requires the buffer to outlive compilation, and CachedData is
-            // created with BufferNotOwned so we keep ownership of cache_bytes.
-            cached_data = v8.ScriptCompilerApi.createCachedData(cb.ptr, @intCast(cb.len));
+    var transformed_cache_bytes: ?[]u8 = null;
+    {
+        const cache_key_source = wrapped; // Use transformed source for cache key
+        const tfm_cache_path = getCachePath(alloc, cache_key_source) catch null;
+        if (tfm_cache_path) |tcp| {
+            transformed_cache_bytes = std.fs.cwd().readFileAlloc(alloc, tcp, 128 * 1024 * 1024) catch null;
+        }
+        if (transformed_cache_bytes) |cb| {
+            if (cb.len > 0) {
+                cached_data = v8.ScriptCompilerApi.createCachedData(cb.ptr, @intCast(cb.len));
+            }
         }
     }
 
@@ -401,7 +442,8 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
     // gets top-level code. After a full type-check run, all hot functions
     // are compiled and the cache is much more complete.
     if (!cache_was_used and !is_embedded) {
-        const save_cache_path = getCachePath(alloc, script_code) catch null;
+        // Save cache keyed by the TRANSFORMED source (what V8 actually compiled)
+        const save_cache_path = getCachePath(alloc, wrapped) catch null;
         if (save_cache_path) |cp| {
             const unbound = v8.ScriptExtApi.getUnboundScript(script);
             const new_cache = v8.UnboundScriptApi.createCodeCache(unbound);
