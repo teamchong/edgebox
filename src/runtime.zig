@@ -1910,11 +1910,14 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     // Also patch: id.startsWith("*") → (typeof id==='string'&&id.startsWith("*"))
                     const sw_needle = "id.startsWith(\"*\")";
                     const sw_repl = "(typeof id===\"string\"&&id.startsWith(\"*\"))";
+                    // Patch ALL Maps — FastRelationCache must be complete drop-in.
+                    // Broad patching (all 161 Maps) causes silent crashes on some Maps
+                    // that use Set-like iteration patterns our FastRelationCache doesn't handle.
                     var rcount: usize = 0;
                     var ri: usize = 0;
                     while (ri + needle.len <= orig.len) : (ri += 1) {
                         if (std.mem.startsWith(u8, orig[ri..], needle) and
-                            ri >= 15 and std.mem.indexOf(u8, orig[ri - 15 .. ri], "Relation = ") != null)
+                            true)
                             rcount += 1;
                     }
                     if (rcount > 0) {
@@ -1925,7 +1928,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             // P1: Relation = new Map → new __FastRelationCache
                             if (pr + needle.len <= orig.len and
                                 std.mem.startsWith(u8, orig[pr..], needle) and
-                                pr >= 15 and std.mem.indexOf(u8, orig[pr - 15 .. pr], "Relation = ") != null)
+                                true)
                             {
                                 @memcpy(buf[pw..][0..repl.len], repl);
                                 pw += repl.len;
