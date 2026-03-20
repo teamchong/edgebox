@@ -146,6 +146,10 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         };
     }
 
+    // Register parallel execution API (lazy — no cold-start cost)
+    const v8_parallel = @import("v8_parallel.zig");
+    v8_parallel.registerGlobals(isolate, context);
+
     // For packed binaries: ensure process.argv has [exe, script, ...args] format
     // TSC uses process.argv.slice(2), so we need argv[1] to be the script path.
     // In embedded mode, OS argv is [binary, ...args] — insert synthetic script path.
