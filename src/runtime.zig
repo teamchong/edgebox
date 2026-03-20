@@ -4095,14 +4095,34 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         }
                         std.debug.print("[soa] Pass 1: {d} active columns, {d} param_provs scanned\n", .{ active_cols.count(), param_provs.len });
                         // Emit column declarations — ONLY for columns with active reads
+                        // Declare SOA columns — use SharedArrayBuffer when available for parallel sharing
+                        // For now, use plain arrays (SharedArrayBuffer requires Zig-side allocation)
+                        // TODO: replace with SAB-backed columns for zero-copy parallel
                         if (active_cols.count() > 0) {
                             std.debug.print("[soa] Pass 1: {d} active columns (of {d} total)\n", .{ active_cols.count(), col_set.count() });
+                            // Emit SharedArrayBuffer allocation for SOA columns
+                            w.writeAll("var __soa_sab = typeof __edgebox_chan_shared === 'function' ? __edgebox_chan_shared('65536') : null;\n") catch { w_errs += 1; };
+                            var col_offset: usize = 16; // skip SAB header
                             var ac_iter = active_cols.iterator();
                             while (ac_iter.next()) |entry| {
-                                w.print("const __col_{s} = [];\n", .{entry.key_ptr.*}) catch { w_errs += 1; };
+                                const fname = entry.key_ptr.*;
+                                // Use Int32Array for known primitive fields, plain Array for objects
+                                const is_primitive = std.mem.eql(u8, fname, "isReadonly") or
+                                    std.mem.eql(u8, fname, "flags") or
+                                    std.mem.eql(u8, fname, "kind") or
+                                    std.mem.eql(u8, fname, "pos") or
+                                    std.mem.eql(u8, fname, "end") or
+                                    std.mem.eql(u8, fname, "id") or
+                                    std.mem.eql(u8, fname, "transformFlags") or
+                                    std.mem.eql(u8, fname, "modifierFlagsCache");
+                                if (is_primitive and col_offset + 65536 * 4 <= 65536 * 8 + 16) {
+                                    w.print("const __col_{s} = __soa_sab ? new Int32Array(__soa_sab, {d}, 16384) : [];\n", .{ fname, col_offset }) catch { w_errs += 1; };
+                                    col_offset += 16384 * 4; // 16K entries × 4 bytes
+                                } else {
+                                    w.print("const __col_{s} = [];\n", .{fname}) catch { w_errs += 1; };
+                                }
                             }
                         } else {
-                            // No active reads — still declare all columns (needed for factory writes that passed active check)
                             var cs_iter = col_set.iterator();
                             while (cs_iter.next()) |entry| {
                                 w.print("const __col_{s} = [];\n", .{entry.key_ptr.*}) catch { w_errs += 1; };
