@@ -2054,9 +2054,32 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 pr += cond_needle.len;
                                 continue;
                             }
-                            // P12-P13: additional cache key integer packing
-                            // Disabled: scoping issues with const key in blocks.
-                            // The patterns are low-frequency (1 call site each)
+                            // P12: createSourceFile memoization — cache parsed files
+                    const csf_needle = "function createSourceFile(fileName, sourceText, languageVersionOrOptions, setParentNodes = false, scriptKind) {";
+                    const csf_repl = "function createSourceFile(fileName, sourceText, languageVersionOrOptions, setParentNodes = false, scriptKind) {var __ck=fileName+':'+sourceText.length;if(typeof __sfCache!=='undefined'&&__sfCache[__ck])return __sfCache[__ck];";
+                    // P13: cache createSourceFile result before return
+                    const csf_ret_needle = "(_b = tracing) == null || _b.pop();\n  return result;\n}\nfunction parseIsolatedEntityName";
+                    const csf_ret_repl = "(_b = tracing) == null || _b.pop();\n  if(typeof __sfCache!=='undefined')__sfCache[__ck]=result;\n  return result;\n}\nfunction parseIsolatedEntityName";
+
+                            // P14: createSourceFile memoization entry
+                            if (pr + csf_needle.len <= orig.len and
+                                std.mem.startsWith(u8, orig[pr..], csf_needle))
+                            {
+                                @memcpy(buf[pw..][0..csf_repl.len], csf_repl);
+                                pw += csf_repl.len;
+                                pr += csf_needle.len;
+                                continue;
+                            }
+                            // P15: createSourceFile result caching
+                            if (pr + csf_ret_needle.len <= orig.len and
+                                std.mem.startsWith(u8, orig[pr..], csf_ret_needle))
+                            {
+                                @memcpy(buf[pw..][0..csf_ret_repl.len], csf_ret_repl);
+                                pw += csf_ret_repl.len;
+                                pr += csf_ret_needle.len;
+                                continue;
+                            }
+                            // P16: additional cache key integer packing (disabled)
                             // and don't provide measurable speedup.
                             // P14: createType → add typesById[] registration
                             if (pr + ct_needle.len <= orig.len and
