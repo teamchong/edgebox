@@ -1889,11 +1889,53 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             defer if (patch_manifest) |pm| allocator.free(pm);
 
             // Read clean bundle
-            var clean_content: ?[]const u8 = null;
+            var clean_content_orig: ?[]u8 = null;
             if (clean_bundle_path) |cbp| {
-                clean_content = std.fs.cwd().readFileAlloc(allocator, cbp, 50 * 1024 * 1024) catch null;
+                clean_content_orig = std.fs.cwd().readFileAlloc(allocator, cbp, 50 * 1024 * 1024) catch null;
             }
-            defer if (clean_content) |cc| allocator.free(cc);
+            defer if (clean_content_orig) |cc| allocator.free(cc);
+
+            // TSC source patching: replace relation cache Maps with FastRelationCache
+            var clean_content_patched: ?[]u8 = null;
+            defer if (clean_content_patched) |p| allocator.free(p);
+
+            const clean_content: ?[]const u8 = if (clean_content_orig) |orig| blk: {
+                if (std.mem.indexOf(u8, orig, "var assignableRelation") != null) {
+                    // Bun bundler outputs "new Map;" (no parens), original TSC has "new Map()"
+                    const needle = "/* @__PURE__ */ new Map;";
+                    const repl = "new __FastRelationCache;";
+                    var rcount: usize = 0;
+                    var ri: usize = 0;
+                    while (ri + needle.len <= orig.len) : (ri += 1) {
+                        if (std.mem.startsWith(u8, orig[ri..], needle) and
+                            ri >= 15 and std.mem.indexOf(u8, orig[ri - 15 .. ri], "Relation = ") != null)
+                            rcount += 1;
+                    }
+                    if (rcount > 0) {
+                        var buf = allocator.alloc(u8, orig.len + rcount * repl.len) catch break :blk @as(?[]const u8, orig);
+                        var pw: usize = 0;
+                        var pr: usize = 0;
+                        while (pr < orig.len) {
+                            if (pr + needle.len <= orig.len and
+                                std.mem.startsWith(u8, orig[pr..], needle) and
+                                pr >= 15 and std.mem.indexOf(u8, orig[pr - 15 .. pr], "Relation = ") != null)
+                            {
+                                @memcpy(buf[pw..][0..repl.len], repl);
+                                pw += repl.len;
+                                pr += needle.len;
+                            } else {
+                                buf[pw] = orig[pr];
+                                pw += 1;
+                                pr += 1;
+                            }
+                        }
+                        clean_content_patched = buf[0..pw];
+                        std.debug.print("[soa] Patched {d} relation caches → FastRelationCache in source\n", .{rcount});
+                        break :blk @as(?[]const u8, clean_content_patched.?);
+                    }
+                }
+                break :blk @as(?[]const u8, orig);
+            } else null;
 
             var wasm_fn_buf: [256]u8 = undefined;
             const wasm_filename = std.fmt.bufPrint(&wasm_fn_buf, "{s}-standalone.wasm", .{output_base}) catch "standalone.wasm";
@@ -2054,6 +2096,16 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     } else {
                         std.debug.print("[build] No WASM trampolines needed — skipping WASM loading in module\n", .{});
                         w.writeAll("// EdgeBox AOT+JIT (auto-generated, no WASM trampolines)\n") catch { w_errs += 1; };
+
+                        // Inject FastRelationCache for TSC — zero-copy Map replacement
+                        // Detects TSC by checking for assignableRelation in source
+                        if (clean_content) |detect_cc| {
+                            if (std.mem.indexOf(u8, detect_cc, "var assignableRelation") != null) {
+                                w.writeAll(@embedFile("v8_tsc_shim.js")) catch { w_errs += 1; };
+                                w.writeAll("\n") catch { w_errs += 1; };
+                                std.debug.print("[soa] Injected FastRelationCache shim into compiled worker\n", .{});
+                            }
+                        }
                     }
 
                     if (has_array_funcs and any_trampolined) {
