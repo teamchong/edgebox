@@ -1923,6 +1923,11 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     // When __EDGEBOX_WORKER env is set, only check files in this shard.
                     const par_needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));";
                     const par_repl = "{const __files=host.getSourceFiles();const __shard=parseInt(process.env.__EDGEBOX_SHARD||'0');const __total=parseInt(process.env.__EDGEBOX_TOTAL||'1');const __start=Math.floor(__files.length*__shard/__total);const __end=Math.floor(__files.length*(__shard+1)/__total);for(let __i=__start;__i<__end;__i++)checkSourceFileWithEagerDiagnostics(__files[__i]);}";
+                    // SOA flags: use Object.defineProperty to make type.flags a getter/setter
+                    // that reads/writes from flat Int32Array. This handles mutations correctly.
+                    // Patch createType to define flags as accessor property.
+                    const soa_flags_needle = "DISABLED_soa_flags";
+                    const soa_flags_repl = "DISABLED_soa_flags";
                     // Inline relation cache removed — typeof check overhead at call sites
                     // outweighs the cache benefit on large projects (typeorm 1.2x slower).
                     // The getRelationKey integer packing already eliminates string allocation.
@@ -1933,6 +1938,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     const rc_get2_repl = "DISABLED_rc_get2";
                     // Patch createType: add global typesById[] for O(1) type lookup by ID
                     // This enables SOA columns to store type IDs instead of object refs
+                    // Patch createType: store in typesById (accessor approach reverted — 1.24x slower)
                     const ct_needle = "typeCount++;\n    result.id = typeCount;";
                     const ct_repl = "typeCount++;\n    result.id = typeCount;\n    if(typeof __typesById!=='undefined')__typesById[typeCount]=result;";
                     // getTypeOfSymbol cache disabled — type resolution is context-dependent.
@@ -2028,7 +2034,16 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 pr += rc_get2_needle.len;
                                 continue;
                             }
-                            // P9: createType → add typesById[] registration
+                            // P9: SOA flags read in isSimpleTypeRelatedTo
+                            if (pr + soa_flags_needle.len <= orig.len and
+                                std.mem.startsWith(u8, orig[pr..], soa_flags_needle))
+                            {
+                                @memcpy(buf[pw..][0..soa_flags_repl.len], soa_flags_repl);
+                                pw += soa_flags_repl.len;
+                                pr += soa_flags_needle.len;
+                                continue;
+                            }
+                            // P10: createType → add typesById[] registration
                             if (pr + ct_needle.len <= orig.len and
                                 std.mem.startsWith(u8, orig[pr..], ct_needle))
                             {

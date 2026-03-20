@@ -4,6 +4,7 @@
 (function() {
   'use strict';
   globalThis.__FastRelationCache = Map;
-  // Global type-by-ID array for O(1) type lookup (SOA for type objects)
+  // SOA columns for Type objects — flat arrays indexed by type.id
   globalThis.__typesById = [];
+  globalThis.__typeFlags = new Int32Array(262144); // 256K types, 1MB
 })();
