@@ -170,105 +170,62 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         _ = v8.eval(isolate, context, argv_fix, "argv_fix.js") catch {};
     }
 
-    // Auto-inject zero-copy relation cache for TSC
-    // Patches TSC's 5 relation caches from Map → Int32Array hash table
+    // Auto-inject zero-copy optimizations for TSC
+    // Single-pass multi-pattern replacement to minimize scan overhead on 9MB source.
     var patched_script: ?[]u8 = null;
     defer if (patched_script) |ps| alloc.free(ps);
     var final_code = script_code;
 
-    if (std.mem.indexOf(u8, script_code, "var assignableRelation") != null and
-        std.mem.indexOf(u8, script_code, "var identityRelation") != null)
+    // TSC auto-patching disabled — causes correctness issues on large projects
+    if (std.mem.indexOf(u8, script_code, "DISABLED_assignableRelation") != null)
     {
         const tsc_shim = @embedFile("v8_tsc_shim.js");
         _ = v8.eval(isolate, context, tsc_shim, "v8_tsc_shim.js") catch {};
 
-        // Patch only relation caches: "Relation = /* @__PURE__ */ new Map()"
-        // Broad patching (all 254 Maps) breaks on large projects like playwright.
-        // Relation caches are the verified-safe subset.
-        const needle = "/* @__PURE__ */ new Map()";
-        const replacement = "new __FastRelationCache()";
-        var buf = try alloc.alloc(u8, script_code.len + 512);
+        // Three patches in a single pass:
+        // 1. Relation caches: "Relation = /* @__PURE__ */ new Map()" → FastRelationCache
+        // 2. getRelationKey: return packed integer for simple type pairs
+        // 3. createType SOA: store flags in Int32Array column
+        const P1_NEEDLE = "/* @__PURE__ */ new Map()";
+        const P1_REPL = "new __FastRelationCache()";
+        const P2_NEEDLE = "return isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : `${source.id},${target.id}${postFix}`;";
+        const P2_REPL = "if(!postFix && !isTypeReferenceWithGenericArguments(source) && !isTypeReferenceWithGenericArguments(target) && source.id > 0 && source.id < 0x100000 && target.id > 0 && target.id < 0x100000) return ((source.id << 20) | target.id) + 1; return isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : `${source.id},${target.id}${postFix}`;";
+        const P3_NEEDLE = "result.id = typeCount;";
+        const P3_REPL = "result.id = typeCount; if(typeof __type_flags !== 'undefined' && typeCount < 262144) __type_flags[typeCount] = flags;";
+
+        // Allocate output buffer with room for expansions
+        const max_extra = 10 * (P1_REPL.len) + P2_REPL.len + 5 * P3_REPL.len;
+        var buf = try alloc.alloc(u8, script_code.len + max_extra);
         var wi: usize = 0;
         var ri: usize = 0;
+        var patches: usize = 0;
+
         while (ri < script_code.len) {
-            if (ri + needle.len <= script_code.len and
-                std.mem.startsWith(u8, script_code[ri..], needle) and
+            // P1: Relation = /* @__PURE__ */ new Map() → new __FastRelationCache()
+            if (ri + P1_NEEDLE.len <= script_code.len and
+                std.mem.startsWith(u8, script_code[ri..], P1_NEEDLE) and
                 ri >= 15 and std.mem.indexOf(u8, script_code[ri - 15 .. ri], "Relation = ") != null)
             {
-                @memcpy(buf[wi..][0..replacement.len], replacement);
-                wi += replacement.len;
-                ri += needle.len;
-            } else {
-                buf[wi] = script_code[ri];
-                wi += 1;
-                ri += 1;
+                @memcpy(buf[wi..][0..P1_REPL.len], P1_REPL);
+                wi += P1_REPL.len;
+                ri += P1_NEEDLE.len;
+                patches += 1;
+                continue;
             }
+            // P2: getRelationKey return → packed integer fast path
+            // Disabled: overflows on large projects (>1M types).
+            // TODO: use wider packing or fallback for large IDs.
+            // P3: createType SOA flag write
+            // Disabled until read-side patches are implemented.
+            buf[wi] = script_code[ri];
+            wi += 1;
+            ri += 1;
         }
-        if (wi != script_code.len) {
+        if (patches > 0) {
             patched_script = buf[0..wi];
             final_code = patched_script.?;
         } else {
             alloc.free(buf);
-        }
-    }
-
-    // Patch getRelationKey to return packed integer for simple cases
-    // Eliminates string allocation "N,N" on every type relation check
-    if (patched_script != null or final_code.ptr != script_code.ptr) {
-        const grk_needle = "return isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : `${source.id},${target.id}${postFix}`;";
-        const grk_replacement = "if(!postFix && !isTypeReferenceWithGenericArguments(source) && !isTypeReferenceWithGenericArguments(target) && source.id > 0 && source.id < 0x100000 && target.id > 0 && target.id < 0x100000) return ((source.id << 20) | target.id) + 1; return isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : `${source.id},${target.id}${postFix}`;";
-        if (std.mem.indexOf(u8, final_code, grk_needle)) |grk_pos| {
-            const extra = grk_replacement.len - grk_needle.len + 1;
-            var grk_buf = try alloc.alloc(u8, final_code.len + extra);
-            @memcpy(grk_buf[0..grk_pos], final_code[0..grk_pos]);
-            @memcpy(grk_buf[grk_pos..][0..grk_replacement.len], grk_replacement);
-            @memcpy(grk_buf[grk_pos + grk_replacement.len ..][0 .. final_code.len - grk_pos - grk_needle.len], final_code[grk_pos + grk_needle.len ..]);
-            const grk_total = grk_pos + grk_replacement.len + (final_code.len - grk_pos - grk_needle.len);
-            if (patched_script) |ps| alloc.free(ps);
-            patched_script = grk_buf[0..grk_total];
-            final_code = patched_script.?;
-        }
-    }
-
-    // Additional TSC source patches: SOA columns for type flags
-    // Patch "result.id = typeCount" → "result.id = typeCount; __type_flags[typeCount] = flags"
-    // This stores type flags in a flat Int32Array for O(1) access in hot paths.
-    if (patched_script != null or final_code.ptr != script_code.ptr) {
-        // Already have a mutable buffer — check if we can add SOA patches
-        const soa_needle = "result.id = typeCount;";
-        const soa_replacement = "result.id = typeCount; if(typeof __type_flags !== 'undefined' && typeCount < 262144) __type_flags[typeCount] = flags;";
-        if (std.mem.indexOf(u8, final_code, soa_needle)) |_| {
-            // Need to re-patch with SOA additions
-            var soa_count: usize = 0;
-            {
-                var si: usize = 0;
-                while (si + soa_needle.len <= final_code.len) : (si += 1) {
-                    if (std.mem.startsWith(u8, final_code[si..], soa_needle)) soa_count += 1;
-                }
-            }
-            if (soa_count > 0) {
-                const extra = soa_count * (soa_replacement.len - soa_needle.len + 1);
-                var soa_buf = try alloc.alloc(u8, final_code.len + extra);
-                var sw: usize = 0;
-                var sr: usize = 0;
-                while (sr < final_code.len) {
-                    if (sr + soa_needle.len <= final_code.len and
-                        std.mem.startsWith(u8, final_code[sr..], soa_needle))
-                    {
-                        @memcpy(soa_buf[sw..][0..soa_replacement.len], soa_replacement);
-                        sw += soa_replacement.len;
-                        sr += soa_needle.len;
-                    } else {
-                        soa_buf[sw] = final_code[sr];
-                        sw += 1;
-                        sr += 1;
-                    }
-                }
-                // Free old patched buffer if we own it
-                if (patched_script) |ps| alloc.free(ps);
-                patched_script = soa_buf[0..sw];
-                final_code = patched_script.?;
-            }
         }
     }
 
