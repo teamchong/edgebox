@@ -1923,6 +1923,13 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     // When __EDGEBOX_WORKER env is set, only check files in this shard.
                     const par_needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));";
                     const par_repl = "{const __files=host.getSourceFiles();const __shard=parseInt(process.env.__EDGEBOX_SHARD||'0');const __total=parseInt(process.env.__EDGEBOX_TOTAL||'1');const __start=Math.floor(__files.length*__shard/__total);const __end=Math.floor(__files.length*(__shard+1)/__total);for(let __i=__start;__i<__end;__i++)checkSourceFileWithEagerDiagnostics(__files[__i]);}";
+                    // Inline relation cache: Int32Array fast-path at call sites
+                    // Instead of wrapping Map (adds overhead), inject the cache lookup
+                    // directly where relation.get(key) is called. Zero-copy: no wrapper.
+                    const rc_get_needle = "const related = relation.get(getRelationKey(source, target, 0, relation, false));";
+                    const rc_get_repl = "var __rk=getRelationKey(source,target,0,relation,false),__rh,related;if(typeof __rk==='number'&&relation._ck&&relation._ck[__rh=(((__rk*2654435761)|0)&0x7FFFFFFF)&131071]===__rk){related=relation._cv[__rh];}else{related=relation.get(__rk);}";
+                    const rc_get2_needle = "const entry = relation.get(id);";
+                    const rc_get2_repl = "var __rh2,entry;if(typeof id==='number'&&relation._ck&&relation._ck[__rh2=(((id*2654435761)|0)&0x7FFFFFFF)&131071]===id){entry=relation._cv[__rh2];}else{entry=relation.get(id);}";
                     // getTypeOfSymbol cache disabled — type resolution is context-dependent.
                     // Caching breaks on deferred/instantiated types that vary during checking.
                     // TODO: implement safe caching with invalidation (two-pass approach).
@@ -1998,7 +2005,25 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 pr += fck3_needle.len;
                                 continue;
                             }
-                            // P7: parallel type checking — shard forEach loop
+                            // P7: inline relation cache get (fast path)
+                            if (pr + rc_get_needle.len <= orig.len and
+                                std.mem.startsWith(u8, orig[pr..], rc_get_needle))
+                            {
+                                @memcpy(buf[pw..][0..rc_get_repl.len], rc_get_repl);
+                                pw += rc_get_repl.len;
+                                pr += rc_get_needle.len;
+                                continue;
+                            }
+                            // P8: inline relation cache get (entry pattern)
+                            if (pr + rc_get2_needle.len <= orig.len and
+                                std.mem.startsWith(u8, orig[pr..], rc_get2_needle))
+                            {
+                                @memcpy(buf[pw..][0..rc_get2_repl.len], rc_get2_repl);
+                                pw += rc_get2_repl.len;
+                                pr += rc_get2_needle.len;
+                                continue;
+                            }
+                            // P9: parallel type checking — shard forEach loop
                             if (pr + par_needle.len <= orig.len and
                                 std.mem.startsWith(u8, orig[pr..], par_needle))
                             {
