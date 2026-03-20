@@ -75,27 +75,19 @@ pub fn main() !void {
                         _ = v8.ObjectApi.set(global, ctx, @ptrCast(k), @ptrCast(str));
                         std.debug.print("[snapshot-gen] Pre-loaded TSC source ({d} bytes) into snapshot\n", .{src.len});
 
-                        // Also pre-compile TSC and generate V8 code cache
-                        // Eval TSC source without executing its main — use a wrapper
-                        // that returns the compiled module without running CLI
-                        const wrapper = std.fmt.allocPrint(alloc,
-                            "(function(module, exports, require, __filename, __dirname) {{\n{s}\n}});",
-                            .{src},
+                        // Pre-compile TSC wrapper and store as global function.
+                        // Workers can call __tsc_factory(module, exports, require, fn, dir)
+                        // instead of eval(__tsc_source) — reuses compiled bytecode from snapshot.
+                        const eval_code = std.fmt.allocPrint(alloc,
+                            "globalThis.__tsc_factory = new Function('module', 'exports', 'require', '__filename', '__dirname', globalThis.__tsc_source);",
+                            .{},
                         ) catch null;
-                        if (wrapper) |w| {
-                            defer alloc.free(w);
-                            const w_str = v8.StringApi.fromExternalOneByte(isolate, w) orelse null;
-                            if (w_str) |ws| {
-                                var origin = v8.ScriptOrigin.init(@ptrCast(v8.StringApi.fromUtf8(isolate, "typescript.js") orelse return error.SnapshotCreationFailed));
-                                // Compile without executing — this populates V8's internal code cache
-                                var comp_src: v8.CompilerSource = .{};
-                                comp_src.initInPlace(ws, &origin, null);
-                                defer comp_src.deinit();
-                                const script = v8.ScriptCompilerApi.compile(ctx, &comp_src, v8.ScriptCompilerApi.kEagerCompile) orelse null;
-                                if (script != null) {
-                                    std.debug.print("[snapshot-gen] Pre-compiled TSC into V8 bytecode\n", .{});
-                                }
-                            }
+                        if (eval_code) |ec| {
+                            defer alloc.free(ec);
+                            _ = v8.eval(isolate, ctx, ec, "tsc_factory_init.js") catch |err| {
+                                std.debug.print("[snapshot-gen] WARNING: TSC factory creation failed: {}\n", .{err});
+                            };
+                            std.debug.print("[snapshot-gen] Pre-compiled TSC factory function into snapshot\n", .{});
                         }
                     }
                 }
