@@ -170,6 +170,42 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         _ = v8.eval(isolate, context, argv_fix, "argv_fix.js") catch {};
     }
 
+    // Auto-inject zero-copy relation cache for TSC
+    // Patches TSC's 5 relation caches from Map → Int32Array hash table
+    var patched_script: ?[]u8 = null;
+    defer if (patched_script) |ps| alloc.free(ps);
+    var final_code = script_code;
+
+    if (std.mem.indexOf(u8, script_code, "var assignableRelation") != null and
+        std.mem.indexOf(u8, script_code, "var identityRelation") != null)
+    {
+        const tsc_shim = @embedFile("v8_tsc_shim.js");
+        _ = v8.eval(isolate, context, tsc_shim, "v8_tsc_shim.js") catch {};
+
+        // Patch: "Relation = /* @__PURE__ */ new Map()" → "Relation = new __FastRelationCache()"
+        const needle = "/* @__PURE__ */ new Map()";
+        const replacement = "new __FastRelationCache()";
+        var buf = try alloc.alloc(u8, script_code.len + 256);
+        var wi: usize = 0;
+        var ri: usize = 0;
+        while (ri < script_code.len) {
+            if (ri + needle.len <= script_code.len and
+                std.mem.startsWith(u8, script_code[ri..], needle) and
+                ri >= 12 and std.mem.indexOf(u8, script_code[ri - 12 .. ri], "Relation = ") != null)
+            {
+                @memcpy(buf[wi..][0..replacement.len], replacement);
+                wi += replacement.len;
+                ri += needle.len;
+            } else {
+                buf[wi] = script_code[ri];
+                wi += 1;
+                ri += 1;
+            }
+        }
+        patched_script = buf[0..wi];
+        final_code = patched_script.?;
+    }
+
     // Wrap script as CJS module with per-module require
     const dirname = std.fs.path.dirname(abs_path) orelse ".";
     const prefix = "(function(__filename, __dirname) { var module = globalThis.module; var exports = module.exports; var require = globalThis._loadModule ? function(id) { return globalThis._loadModule(id, __dirname); } : globalThis.require;\n";
@@ -179,13 +215,13 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
     );
     defer alloc.free(suffix);
 
-    const total_len = prefix.len + script_code.len + suffix.len;
+    const total_len = prefix.len + final_code.len + suffix.len;
     const wrapped = try alloc.alloc(u8, total_len);
     defer alloc.free(wrapped);
 
     @memcpy(wrapped[0..prefix.len], prefix);
-    @memcpy(wrapped[prefix.len..][0..script_code.len], script_code);
-    @memcpy(wrapped[prefix.len + script_code.len ..][0..suffix.len], suffix);
+    @memcpy(wrapped[prefix.len..][0..final_code.len], final_code);
+    @memcpy(wrapped[prefix.len + final_code.len ..][0..suffix.len], suffix);
 
     // Compile with code cache
     var try_catch = v8.TryCatch.init(isolate);
