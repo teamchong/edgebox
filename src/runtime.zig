@@ -1923,13 +1923,14 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     // When __EDGEBOX_WORKER env is set, only check files in this shard.
                     const par_needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));";
                     const par_repl = "{const __files=host.getSourceFiles();const __shard=parseInt(process.env.__EDGEBOX_SHARD||'0');const __total=parseInt(process.env.__EDGEBOX_TOTAL||'1');const __start=Math.floor(__files.length*__shard/__total);const __end=Math.floor(__files.length*(__shard+1)/__total);for(let __i=__start;__i<__end;__i++)checkSourceFileWithEagerDiagnostics(__files[__i]);}";
-                    // Inline relation cache: Int32Array fast-path at call sites
-                    // Instead of wrapping Map (adds overhead), inject the cache lookup
-                    // directly where relation.get(key) is called. Zero-copy: no wrapper.
-                    const rc_get_needle = "const related = relation.get(getRelationKey(source, target, 0, relation, false));";
-                    const rc_get_repl = "var __rk=getRelationKey(source,target,0,relation,false),__rh,related;if(typeof __rk==='number'&&relation._ck&&relation._ck[__rh=(((__rk*2654435761)|0)&0x7FFFFFFF)&131071]===__rk){related=relation._cv[__rh];}else{related=relation.get(__rk);}";
-                    const rc_get2_needle = "const entry = relation.get(id);";
-                    const rc_get2_repl = "var __rh2,entry;if(typeof id==='number'&&relation._ck&&relation._ck[__rh2=(((id*2654435761)|0)&0x7FFFFFFF)&131071]===id){entry=relation._cv[__rh2];}else{entry=relation.get(id);}";
+                    // Inline relation cache removed — typeof check overhead at call sites
+                    // outweighs the cache benefit on large projects (typeorm 1.2x slower).
+                    // The getRelationKey integer packing already eliminates string allocation.
+                    // Map.get() with integer keys is fast enough without a cache layer.
+                    const rc_get_needle = "DISABLED_rc_get";
+                    const rc_get_repl = "DISABLED_rc_get";
+                    const rc_get2_needle = "DISABLED_rc_get2";
+                    const rc_get2_repl = "DISABLED_rc_get2";
                     // getTypeOfSymbol cache disabled — type resolution is context-dependent.
                     // Caching breaks on deferred/instantiated types that vary during checking.
                     // TODO: implement safe caching with invalidation (two-pass approach).
