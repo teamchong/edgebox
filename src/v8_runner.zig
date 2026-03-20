@@ -114,7 +114,89 @@ pub fn main() !void {
         }
     }
 
+    // Note: parallel process spawning was tested but each worker repeats
+    // the full TSC init (parse+bind 6.2MB), making it slower than single-process.
+    // True parallelism requires shared-memory type checking (Zig threads on SAB).
+
     return runScript(alloc, script_code, disk_cache, abs_path, script_path, false);
+}
+
+/// Run TSC with parallel checkSourceFile sharding.
+/// Spawns N worker processes, each checking a subset of source files.
+fn runParallelTsc(alloc_: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]const u8, abs_path: []const u8, script_path: []const u8) !void {
+    _ = cache_bytes;
+    _ = script_code;
+
+    const cpu_count = std.Thread.getCpuCount() catch 4;
+    const num_workers = @min(cpu_count, 4); // Cap at 4 workers for TSC
+
+    // Get our own executable path
+    var self_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const self_path = std.fs.selfExePath(&self_path_buf) catch {
+        // Fallback to single-threaded
+        return runScript(alloc_, @constCast(std.fs.cwd().readFileAlloc(alloc_, script_path, 64 * 1024 * 1024) catch return error.ReadFailed), null, abs_path, script_path, false);
+    };
+
+    // Build the argv: [edgebox, _tsc.js, ...remaining args]
+    var original_args = try std.process.argsWithAllocator(alloc_);
+    defer original_args.deinit();
+    var argv_list: std.ArrayListUnmanaged([]const u8) = .{};
+    // Skip argv[0] (binary name)
+    _ = original_args.next();
+    // Collect all remaining args
+    while (original_args.next()) |arg| {
+        try argv_list.append(alloc_, arg);
+    }
+
+    // Spawn workers
+    var workers: [4]?std.process.Child = .{ null, null, null, null };
+
+    for (0..num_workers) |i| {
+        var env_map = std.process.EnvMap.init(alloc_);
+        // Copy existing env
+        const environ = std.process.getEnvMap(alloc_) catch continue;
+        var env_iter = environ.iterator();
+        while (env_iter.next()) |entry| {
+            env_map.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+        }
+
+        // Set shard env vars
+        var shard_buf: [8]u8 = undefined;
+        var total_buf: [8]u8 = undefined;
+        const shard_str = std.fmt.bufPrint(&shard_buf, "{d}", .{i}) catch continue;
+        const total_str = std.fmt.bufPrint(&total_buf, "{d}", .{num_workers}) catch continue;
+        env_map.put("__EDGEBOX_SHARD", shard_str) catch continue;
+        env_map.put("__EDGEBOX_TOTAL", total_str) catch continue;
+
+        // Build full argv: [self_path, ...original_args]
+        var full_argv: std.ArrayListUnmanaged([]const u8) = .{};
+        full_argv.append(alloc_, self_path) catch continue;
+        for (argv_list.items) |a| full_argv.append(alloc_, a) catch {};
+
+        var child = std.process.Child.init(full_argv.items, alloc_);
+        child.env_map = &env_map;
+        child.stderr_behavior = .Inherit;
+        child.stdout_behavior = .Inherit;
+
+        child.spawn() catch continue;
+        workers[i] = child;
+    }
+
+    // Wait for all workers
+    var exit_code: u8 = 0;
+    for (&workers) |*w| {
+        if (w.*) |*child| {
+            const result = child.wait() catch continue;
+            if (result.Exited != 0 and exit_code == 0) {
+                exit_code = @intCast(result.Exited);
+            }
+            w.* = null;
+        }
+    }
+
+    if (exit_code != 0) {
+        std.process.exit(exit_code);
+    }
 }
 
 /// Embedded V8 snapshot of the bootstrap context — generated at build time
@@ -612,6 +694,12 @@ fn applyTscTransforms(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
         .{
             .needle = "id.startsWith(\"*\")",
             .replacement = "(typeof id === \"string\" && id.startsWith(\"*\"))",
+        },
+        // T6: Parallel checkSourceFile sharding — when __EDGEBOX_SHARD is set,
+        // each worker only checks its portion of source files
+        .{
+            .needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));",
+            .replacement = "{const __files=host.getSourceFiles();const __shard=parseInt(process.env.__EDGEBOX_SHARD||'0');const __total=parseInt(process.env.__EDGEBOX_TOTAL||'1');const __start=Math.floor(__files.length*__shard/__total);const __end=Math.floor(__files.length*(__shard+1)/__total);for(let __i=__start;__i<__end;__i++)checkSourceFileWithEagerDiagnostics(__files[__i]);}",
         },
     };
 
