@@ -1906,7 +1906,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     const needle = "/* @__PURE__ */ new Map;";
                     const repl = "new __FastRelationCache;";
                     const grk_needle = "return isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : `${source.id},${target.id}${postFix}`;";
-                    const grk_repl = "if(!postFix&&!isTypeReferenceWithGenericArguments(source)&&!isTypeReferenceWithGenericArguments(target)&&source.id>0&&source.id<1048576&&target.id>0&&target.id<1048576)return((source.id<<20)|target.id)+1;return isTypeReferenceWithGenericArguments(source)&&isTypeReferenceWithGenericArguments(target)?getGenericTypeReferenceRelationKey(source,target,postFix,ignoreConstraints):`${source.id},${target.id}${postFix}`;";
+                    const grk_repl = "if(!postFix&&!isTypeReferenceWithGenericArguments(source)&&!isTypeReferenceWithGenericArguments(target)&&source.id>0&&source.id<67108864&&target.id>0&&target.id<67108864)return source.id*67108864+target.id+1;return isTypeReferenceWithGenericArguments(source)&&isTypeReferenceWithGenericArguments(target)?getGenericTypeReferenceRelationKey(source,target,postFix,ignoreConstraints):`${source.id},${target.id}${postFix}`;";
+                    // Also patch: id.startsWith("*") → (typeof id==='string'&&id.startsWith("*"))
+                    const sw_needle = "id.startsWith(\"*\")";
+                    const sw_repl = "(typeof id===\"string\"&&id.startsWith(\"*\"))";
                     var rcount: usize = 0;
                     var ri: usize = 0;
                     while (ri + needle.len <= orig.len) : (ri += 1) {
@@ -1915,7 +1918,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             rcount += 1;
                     }
                     if (rcount > 0) {
-                        var buf = allocator.alloc(u8, orig.len + rcount * repl.len + grk_repl.len) catch break :blk @as(?[]const u8, orig);
+                        var buf = allocator.alloc(u8, orig.len + rcount * repl.len + grk_repl.len + 10 * sw_repl.len) catch break :blk @as(?[]const u8, orig);
                         var pw: usize = 0;
                         var pr: usize = 0;
                         while (pr < orig.len) {
@@ -1936,6 +1939,15 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 @memcpy(buf[pw..][0..grk_repl.len], grk_repl);
                                 pw += grk_repl.len;
                                 pr += grk_needle.len;
+                                continue;
+                            }
+                            // P3: id.startsWith("*") → typeof guard for numeric keys
+                            if (pr + sw_needle.len <= orig.len and
+                                std.mem.startsWith(u8, orig[pr..], sw_needle))
+                            {
+                                @memcpy(buf[pw..][0..sw_repl.len], sw_repl);
+                                pw += sw_repl.len;
+                                pr += sw_needle.len;
                                 continue;
                             }
                             buf[pw] = orig[pr];
@@ -3414,6 +3426,26 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     }
                                 }
                                 if (!fo_safe) continue;
+                                // Scope check: __CONTAINER_soa_base must be accessible from this for...of.
+                                // If decl_end is outside the enclosing function, skip.
+                                {
+                                    const prov_fo = provenance[pi2];
+                                    if (prov_fo.decl_end > 0) {
+                                        // Find enclosing function of the for loop
+                                        var fn_start: usize = fop;
+                                        var fn_depth: i32 = 0;
+                                        while (fn_start > 0) {
+                                            fn_start -= 1;
+                                            if (cc[fn_start] == '}') fn_depth += 1;
+                                            if (cc[fn_start] == '{') {
+                                                if (fn_depth == 0) break;
+                                                fn_depth -= 1;
+                                            }
+                                        }
+                                        // If decl_end is before the enclosing function start, skip
+                                        if (prov_fo.decl_end < fn_start or prov_fo.decl_end > body_end) continue;
+                                    }
+                                }
                                 if (forof_count < forof_buf.len) {
                                     const counter_name = std.fmt.allocPrint(allocator, "__of_{d}", .{forof_count}) catch continue;
                                     forof_buf[forof_count] = .{
@@ -3729,6 +3761,25 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             }
                         }
                         const param_provs = param_prov_buf[0..param_prov_count];
+
+                        // Safety: disable soa_base for provenance entries that have inter-procedural
+                        // aliases. When a container is passed to other functions, the soa_base
+                        // variable defined at the declaration site is NOT in scope in the callees.
+                        // Disabling decl_end prevents index-aligned rewrites that would reference
+                        // an undefined soa_base. The provenance still works for non-indexed access.
+                        if (param_prov_count > 0) {
+                            for (param_provs) |pp_check| {
+                                var prov_entry = &provenance_buf[pp_check.prov_idx];
+                                if (prov_entry.decl_end > 0 and
+                                    (prov_entry.decl_end < pp_check.func_body_start or
+                                    prov_entry.decl_end >= pp_check.func_body_end))
+                                {
+                                    std.debug.print("[soa] Disabled soa_base for '{s}' (inter-procedural scope leak)\n", .{prov_entry.var_name});
+                                    prov_entry.decl_end = 0;
+                                    prov_entry.raw_index = false;
+                                }
+                            }
+                        }
 
                         const rs_rewrite_count: u32 = 0;
 
@@ -4762,6 +4813,13 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                     for (param_provs) |pp| {
                                         // Scope check: src_pos must be within the function body
                                         if (src_pos < pp.func_body_start or src_pos >= pp.func_body_end) continue;
+                                        // Scope check: __CONTAINER_soa_base must be defined.
+                                        // It's defined at decl_end. If decl_end is outside this function body,
+                                        // the soa_base variable won't be in scope → skip.
+                                        const prov_pp_check = provenance[pp.prov_idx];
+                                        if (prov_pp_check.decl_end > 0 and
+                                            (prov_pp_check.decl_end < pp.func_body_start or prov_pp_check.decl_end >= pp.func_body_end))
+                                            continue;
                                         if (src_pos + pp.param_name.len + 1 >= cc.len) continue;
                                         if (!std.mem.startsWith(u8, cc[src_pos..], pp.param_name)) continue;
                                         const after_param = src_pos + pp.param_name.len;
@@ -4796,6 +4854,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             if (std.mem.eql(u8, sf, fname_pp)) { field_match_pp = true; break; }
                                         }
                                         if (!field_match_pp) continue;
+                                        // Only emit soa_base rewrite if decl_end is valid (in scope)
+                                        if (prov_pp.decl_end == 0) continue;
                                         // Emit: __col_field[__CONTAINER_soa_base + (expr)]
                                         const idx_expr_pp = cc[after_param + 1 .. k_pp - 1];
                                         w.print("__col_{s}[__{s}_soa_base + ({s})]", .{
@@ -4847,6 +4907,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             if (aeq < cc.len and cc[aeq] == '=' and (aeq + 1 >= cc.len or cc[aeq + 1] != '=')) continue;
                                             // Skip compound assignment: alias.field += / |= / etc
                                             if (aeq + 1 < cc.len and cc[aeq + 1] == '=' and (cc[aeq] == '+' or cc[aeq] == '-' or cc[aeq] == '|' or cc[aeq] == '&' or cc[aeq] == '*')) continue;
+                                            // Skip if soa_base disabled (inter-procedural scope leak)
+                                            if (prov.decl_end == 0) continue;
                                             // Emit: __col_field[__PROV_soa_base + (idx_expr)]
                                             w.print("__col_{s}[__{s}_soa_base + ({s})]", .{
                                                 afname, prov.var_name, alias.idx_expr,
