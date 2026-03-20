@@ -121,6 +121,10 @@ pub const ScriptOrigin = struct {
 
 /// Initialize V8 platform and engine. Call once at startup.
 pub fn initPlatform() !*Platform {
+    // Enable aggressive JIT optimization flags before V8 init
+    const flags = "--maglev --turbofan --max-maglev-inline-depth=4 --max-maglev-hard-inline-depth=16";
+    c.v8__V8__SetFlagsFromString(flags.ptr, flags.len);
+
     const platform = c.v8__Platform__NewDefaultPlatform(0, false) orelse
         return error.V8PlatformFailed;
     c.v8__V8__InitializePlatform(platform);
@@ -674,6 +678,7 @@ const c = struct {
     // Platform + Engine
     extern fn v8__V8__GetVersion() [*:0]const u8;
     extern fn v8__Platform__NewDefaultPlatform(thread_pool_size: c_int, idle_task_support: bool) ?*Platform;
+    extern fn v8__V8__SetFlagsFromString(str: [*]const u8, length: usize) void;
     extern fn v8__V8__InitializePlatform(platform: *Platform) void;
     extern fn v8__V8__Initialize() void;
     extern fn v8__V8__Dispose() bool;
