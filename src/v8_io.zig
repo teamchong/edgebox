@@ -232,6 +232,7 @@ pub fn readFileFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) v
     const isolate = v8.CallbackInfoApi.getIsolate(info);
     var rv = v8.CallbackInfoApi.getReturnValue(info);
 
+    // Pump V8 message loop — critical for TurboFan background compilation
     if (v8.global_platform) |platform| {
         while (v8.pumpMessageLoop(platform, isolate)) {}
     }
