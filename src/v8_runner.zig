@@ -781,7 +781,22 @@ fn applyTscTransforms(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
             .needle = "return `0|${flowContainer ? getNodeId(flowContainer) : \"-1\"}|${getTypeId(declaredType)}|${getTypeId(initialType)}`;",
             .replacement = "var __dt2=getTypeId(declaredType),__it2=getTypeId(initialType);return(__dt2<32768&&__it2<32768)?__dt2*32768+__it2+1:`0|${flowContainer?getNodeId(flowContainer):-1}|${__dt2}|${__it2}`;",
         },
-        // T13: getObjectFlags → SOA column read (avoid object property access)
+        // T13: invokeOnce key → Smi integer (inference engine hot path)
+        .{
+            .needle = "function invokeOnce(source, target, action) {\n      const key = source.id + \",\" + target.id;",
+            .replacement = "function invokeOnce(source, target, action) {\n      const key = (source.id<32768&&target.id<32768)?source.id*32768+target.id+1:source.id+\",\"+target.id;",
+        },
+        // T14: enumRelation key → Smi integer
+        .{
+            .needle = "const id = getSymbolId(sourceSymbol) + \",\" + getSymbolId(targetSymbol);",
+            .replacement = "const __ss=getSymbolId(sourceSymbol),__ts=getSymbolId(targetSymbol);const id=(__ss<32768&&__ts<32768)?__ss*32768+__ts+1:__ss+\",\"+__ts;",
+        },
+        // T15: inferTypeForHomomorphicMappedType key → Smi
+        .{
+            .needle = "const cacheKey = source.id + \",\" + target.id + \",\" + constraint.id;",
+            .replacement = "const cacheKey = (source.id<1024&&target.id<1024&&constraint.id<1024)?(source.id<<20|target.id<<10|constraint.id)+1:source.id+\",\"+target.id+\",\"+constraint.id;",
+        },
+        // T16: getObjectFlags → SOA column read (avoid object property access)
         .{
             .needle = "function getObjectFlags(type) {\n    return type.flags & 3899393 /* ObjectFlagsType */ ? type.objectFlags : 0;\n  }",
             .replacement = "function getObjectFlags(type) {\n    if(typeof __pc_objectFlags!=='undefined'&&type.id>0&&type.id<262144){var __of=__pc_objectFlags[type.id];if(__of)return __of;}return type.flags & 3899393 ? type.objectFlags : 0;\n  }",
