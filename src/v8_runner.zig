@@ -742,12 +742,12 @@ fn applyTscTransforms(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
             .needle = "const s = source.flags;\n    const t = target.flags;",
             .replacement = "const s = __pc_typeFlags[source.id|0] || source.flags;\n    const t = __pc_typeFlags[target.id|0] || target.flags;\n    if(typeof __pc_flagTable!=='undefined'){const __ft=__pc_flagTable[(s&2047)*2048+(t&2047)];if(__ft===1)return true;if(__ft===2)return false;}",
         },
-        // T3: getRelationKey → packed Smi integer (stays in V8 Smi range for IDs < 32768)
-        // Key = source.id * 32768 + target.id (max 2^30 = Smi limit, no HeapNumber allocation)
-        // Falls back to string for IDs >= 32768 (very large projects)
+        // T3: getRelationKey → packed Smi integer when intersectionState is 0
+        // Includes postFix check: only use Smi when postFix is empty (state=0)
+        // Falls back to string for non-zero intersectionState or large IDs
         .{
             .needle = "isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : `${source.id},${target.id}${postFix}`",
-            .replacement = "isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : (source.id<32768&&target.id<32768) ? source.id * 32768 + target.id + 1 : `${source.id},${target.id}${postFix}`",
+            .replacement = "isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : (!postFix&&source.id<32768&&target.id<32768) ? source.id * 32768 + target.id + 1 : `${source.id},${target.id}${postFix}`",
         },
         // T4: JSDoc skip — function default parameter
         .{

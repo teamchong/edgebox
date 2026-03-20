@@ -102,7 +102,7 @@ pub fn main() !void {
                             \\// T4: getRelationKey → packed integer (eliminates string+template allocation)
                             \\globalThis.__tsc_source = globalThis.__tsc_source.replace(
                             \\  'isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : `${source.id},${target.id}${postFix}`',
-                            \\  'isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : (source.id<32768&&target.id<32768)?source.id*32768+target.id+1:`${source.id},${target.id}${postFix}`'
+                            \\  'isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : (!postFix&&source.id<32768&&target.id<32768)?source.id*32768+target.id+1:`${source.id},${target.id}${postFix}`'
                             \\);
                             \\// T5: typeof guard for packed integer key (id.startsWith crashes on number)
                             \\globalThis.__tsc_source = globalThis.__tsc_source.replace(
