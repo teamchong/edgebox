@@ -2105,7 +2105,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 pr += 24;
                                 continue;
                             }
-                            // P17: additional cache key integer packing (disabled)
+                            // Tracing elimination reverted — broke correctness.
+                            // Focus on SOA, zero-copy, parallel instead of TSC-specific patches.
                             // and don't provide measurable speedup.
                             // P14: createType → add typesById[] registration
                             if (pr + ct_needle.len <= orig.len and
