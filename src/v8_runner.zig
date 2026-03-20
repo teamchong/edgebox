@@ -170,6 +170,57 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         _ = v8.eval(isolate, context, argv_fix, "argv_fix.js") catch {};
     }
 
+    // Auto-inject zero-copy shims for known workloads (e.g., TSC)
+    // Detect TSC by looking for relation cache pattern in script
+    var patched_code: ?[]u8 = null;
+    defer if (patched_code) |pc| alloc.free(pc);
+    var effective_code = script_code;
+
+    if (std.mem.indexOf(u8, script_code, "assignableRelation") != null and
+        std.mem.indexOf(u8, script_code, "identityRelation") != null)
+    {
+        // Inject FastRelationCache shim
+        const tsc_shim = @embedFile("v8_tsc_shim.js");
+        _ = v8.eval(isolate, context, tsc_shim, "v8_tsc_shim.js") catch {};
+
+        // Patch relation cache initialization: new Map() → new __FastRelationCache()
+        // The pattern is 5 consecutive lines like:
+        //   var subtypeRelation = /* @__PURE__ */ new Map();
+        const needle = "/* @__PURE__ */ new Map()";
+        const replacement = "new __FastRelationCache()";
+        // Only patch the 5 relation caches (look for "Relation = " prefix)
+        var pc = try alloc.alloc(u8, script_code.len + 5 * (replacement.len - needle.len + 20));
+        var wi: usize = 0;
+        var ri: usize = 0;
+        while (ri < script_code.len) {
+            // Look for "Relation = /* @__PURE__ */ new Map()"
+            if (ri + needle.len < script_code.len and
+                std.mem.startsWith(u8, script_code[ri..], needle))
+            {
+                // Check if preceded by "Relation = " (within 30 chars back)
+                var is_relation = false;
+                if (ri >= 12) {
+                    const before = script_code[ri - 12 .. ri];
+                    if (std.mem.indexOf(u8, before, "Relation = ") != null) {
+                        is_relation = true;
+                    }
+                }
+                if (is_relation) {
+                    @memcpy(pc[wi..][0..replacement.len], replacement);
+                    wi += replacement.len;
+                    ri += needle.len;
+                    continue;
+                }
+            }
+            pc[wi] = script_code[ri];
+            wi += 1;
+            ri += 1;
+        }
+        patched_code = pc[0..wi];
+        effective_code = patched_code.?;
+        std.debug.print("[tsc-shim] Patched relation caches to zero-copy Int32Array\n", .{});
+    }
+
     // Wrap script as CJS module with per-module require
     const dirname = std.fs.path.dirname(abs_path) orelse ".";
     const prefix = "(function(__filename, __dirname) { var module = globalThis.module; var exports = module.exports; var require = globalThis._loadModule ? function(id) { return globalThis._loadModule(id, __dirname); } : globalThis.require;\n";
@@ -179,13 +230,13 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
     );
     defer alloc.free(suffix);
 
-    const total_len = prefix.len + script_code.len + suffix.len;
+    const total_len = prefix.len + effective_code.len + suffix.len;
     const wrapped = try alloc.alloc(u8, total_len);
     defer alloc.free(wrapped);
 
     @memcpy(wrapped[0..prefix.len], prefix);
-    @memcpy(wrapped[prefix.len..][0..script_code.len], script_code);
-    @memcpy(wrapped[prefix.len + script_code.len ..][0..suffix.len], suffix);
+    @memcpy(wrapped[prefix.len..][0..effective_code.len], effective_code);
+    @memcpy(wrapped[prefix.len + effective_code.len ..][0..suffix.len], suffix);
 
     // Compile with code cache
     var try_catch = v8.TryCatch.init(isolate);
