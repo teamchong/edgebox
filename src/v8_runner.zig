@@ -820,14 +820,30 @@ fn applyTscTransforms(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
             .needle = "if (source.flags & 524288 /* Object */ && target.flags & 524288 /* Object */) {\n      const related = relation.get(getRelationKey(",
             .replacement = "if (source.flags & 524288 && target.flags & 524288) {\n      if(typeof __pc_relKeys!=='undefined'){var __rk=source.id*32768+target.id+1,__rb=(__rk&0x7FFFF)*6;if(__pc_relKeys[__rb]===__rk){var __rr=__pc_relKeys[__rb+2];if(__rr)return !!(__rr&1);}else if(__pc_relKeys[__rb+3]===__rk){var __rr=__pc_relKeys[__rb+5];if(__rr)return !!(__rr&1);}}\n      const related = relation.get(getRelationKey(",
         },
-        // T17-T18: removed — deep cache writes disabled (see T19-T20 note).
-        // T19-T20: deep relation cache disabled — getRelationKey packing (T3)
-        // drops intersectionState, so different intersection states share keys.
-        // Safe deep cache requires full (source, target, intersectionState, relation) key.
-        // T20: write overflow failures to SAB cache (safe write)
+        // T17: write to deep cache on succeeded (2-word key)
+        .{
+            .needle = "relation.set(maybeKeys[i], 1 /* Succeeded */ | propagatingVarianceFlags);",
+            .replacement = "{var __sv=1|propagatingVarianceFlags;relation.set(maybeKeys[i],__sv);if(typeof __pc_relKeys!=='undefined'&&relation.__rid){var __sh=source2.id|(relation.__rid<<20),__sl=target2.id|(intersectionState<<20),__sb=((source2.id*32768+target2.id)&0x7FFFF)*6;if((!__pc_relKeys[__sb]&&!__pc_relKeys[__sb+1])||(__pc_relKeys[__sb]===__sh&&__pc_relKeys[__sb+1]===__sl)){__pc_relKeys[__sb]=__sh;__pc_relKeys[__sb+1]=__sl;__pc_relKeys[__sb+2]=__sv;}else if((!__pc_relKeys[__sb+3]&&!__pc_relKeys[__sb+4])||(__pc_relKeys[__sb+3]===__sh&&__pc_relKeys[__sb+4]===__sl)){__pc_relKeys[__sb+3]=__sh;__pc_relKeys[__sb+4]=__sl;__pc_relKeys[__sb+5]=__sv;}}}",
+        },
+        // T18: write to deep cache on failure (2-word key)
+        .{
+            .needle = "relation.set(id, 2 /* Failed */ | propagatingVarianceFlags);",
+            .replacement = "{var __fv=2|propagatingVarianceFlags;relation.set(id,__fv);if(typeof __pc_relKeys!=='undefined'&&relation.__rid){var __fh=source2.id|(relation.__rid<<20),__fl=target2.id|(intersectionState<<20),__fb=((source2.id*32768+target2.id)&0x7FFFF)*6;if((!__pc_relKeys[__fb]&&!__pc_relKeys[__fb+1])||(__pc_relKeys[__fb]===__fh&&__pc_relKeys[__fb+1]===__fl)){__pc_relKeys[__fb]=__fh;__pc_relKeys[__fb+1]=__fl;__pc_relKeys[__fb+2]=__fv;}else if((!__pc_relKeys[__fb+3]&&!__pc_relKeys[__fb+4])||(__pc_relKeys[__fb+3]===__fh&&__pc_relKeys[__fb+4]===__fl)){__pc_relKeys[__fb+3]=__fh;__pc_relKeys[__fb+4]=__fl;__pc_relKeys[__fb+5]=__fv;}}}",
+        },
+        // T19: tag relation Maps with __rid for cache discrimination
+        .{
+            .needle = "var subtypeRelation = /* @__PURE__ */ new Map();\n  var strictSubtypeRelation = /* @__PURE__ */ new Map();\n  var assignableRelation = /* @__PURE__ */ new Map();\n  var comparableRelation = /* @__PURE__ */ new Map();\n  var identityRelation = /* @__PURE__ */ new Map();",
+            .replacement = "var subtypeRelation = /* @__PURE__ */ new Map();subtypeRelation.__rid=1;\n  var strictSubtypeRelation = /* @__PURE__ */ new Map();strictSubtypeRelation.__rid=2;\n  var assignableRelation = /* @__PURE__ */ new Map();assignableRelation.__rid=3;\n  var comparableRelation = /* @__PURE__ */ new Map();comparableRelation.__rid=4;\n  var identityRelation = /* @__PURE__ */ new Map();identityRelation.__rid=5;",
+        },
+        // T20: deep relation cache — 2-word key (relation+intersection+source+target)
+        .{
+            .needle = "const entry = relation.get(id);\n      if (entry !== void 0) {",
+            .replacement = "var entry;if(typeof __pc_relKeys!=='undefined'&&relation.__rid){var __kh=source2.id|(relation.__rid<<20),__kl=target2.id|(intersectionState<<20),__bi=((source2.id*32768+target2.id)&0x7FFFF)*6;if(__pc_relKeys[__bi]===__kh&&__pc_relKeys[__bi+1]===__kl){entry=__pc_relKeys[__bi+2];}else if(__pc_relKeys[__bi+3]===__kh&&__pc_relKeys[__bi+4]===__kl){entry=__pc_relKeys[__bi+5];}}if(entry===void 0||entry===0)entry=relation.get(id);\n      if (entry !== void 0) {",
+        },
+        // T20: write overflow failures to deep cache (2-word key)
         .{
             .needle = "relation.set(id, 2 /* Failed */ | (relationCount <= 0 ? 32 /* ComplexityOverflow */ : 64 /* StackDepthOverflow */));",
-            .replacement = "{var __ov=2|(relationCount<=0?32:64);relation.set(id,__ov);if(typeof __pc_relKeys!=='undefined'&&typeof id==='number'){var __ok=id,__ob=((__ok)&0x7FFFF)*6;if(!__pc_relKeys[__ob]||__pc_relKeys[__ob]===__ok){__pc_relKeys[__ob]=__ok;__pc_relKeys[__ob+2]=__ov;}else if(!__pc_relKeys[__ob+3]||__pc_relKeys[__ob+3]===__ok){__pc_relKeys[__ob+3]=__ok;__pc_relKeys[__ob+5]=__ov;}}}",
+            .replacement = "{var __ov=2|(relationCount<=0?32:64);relation.set(id,__ov);if(typeof __pc_relKeys!=='undefined'&&relation.__rid){var __oh=source2.id|(relation.__rid<<20),__ol=target2.id|(intersectionState<<20),__ob=((source2.id*32768+target2.id)&0x7FFFF)*6;if((!__pc_relKeys[__ob]&&!__pc_relKeys[__ob+1])||(__pc_relKeys[__ob]===__oh&&__pc_relKeys[__ob+1]===__ol)){__pc_relKeys[__ob]=__oh;__pc_relKeys[__ob+1]=__ol;__pc_relKeys[__ob+2]=__ov;}else if((!__pc_relKeys[__ob+3]&&!__pc_relKeys[__ob+4])||(__pc_relKeys[__ob+3]===__oh&&__pc_relKeys[__ob+4]===__ol)){__pc_relKeys[__ob+3]=__oh;__pc_relKeys[__ob+4]=__ol;__pc_relKeys[__ob+5]=__ov;}}}",
         },
         // T21: getObjectFlags → SOA column read (avoid object property access)
         .{
