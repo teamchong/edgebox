@@ -1,123 +1,227 @@
-// v8_tsc_shim.js — Zero-copy optimizations for TypeScript compiler
+// v8_tsc_shim.js — Zero-copy adaptive Map for TypeScript compiler
 //
-// Replaces TSC's Map-based caches with flat Int32Array hash tables.
-// Eliminates: string key allocation, Map hashing, GC pressure.
+// Provides FastMap: a Map replacement that auto-promotes to Int32Array
+// when it detects numeric "N,N" key patterns (type ID pairs).
+// Falls back to regular Map for string/complex keys.
 //
-// Injected before TSC loads. Monkey-patches Map to intercept
-// relation cache operations.
+// Zero-copy principle: avoid string allocation for numeric lookups.
+// The Int32Array is Zig-managed memory in the real implementation;
+// here we use JS arrays as the proof-of-concept.
 
 (function() {
   'use strict';
 
-  // Fast integer hash map — replaces Map<string, number> for relation caches
-  // Key: two type IDs (source.id, target.id)
-  // Value: relation result (small integer: 1=Succeeded, 2=Failed, etc.)
-  var CACHE_BITS = 20; // 1M slots = 8MB
-  var CACHE_SIZE = 1 << CACHE_BITS;
-  var CACHE_MASK = CACHE_SIZE - 1;
+  var INITIAL_BITS = 14; // 16K slots initially (128KB)
+  var MAX_BITS = 20;     // grow up to 1M slots (8MB)
 
-  function FastRelationCache() {
-    // Parallel arrays: keys store packed (sourceId << 20 | targetId), values store result
-    // Using two Int32Arrays for key+value instead of interleaved for better cache locality
-    this._keys = new Int32Array(CACHE_SIZE);
-    this._vals = new Int32Array(CACHE_SIZE);
-    this._size = 0;
-    this._fallback = new Map(); // for complex keys (intersection state, generic refs)
+  function FastMap() {
+    this._map = new Map();
+    this._keys = null; // lazy: Int32Array (allocated on first numeric hit)
+    this._vals = null;
+    this._bits = 0;
+    this._mask = 0;
+    this._numericCount = 0;
+    this._promoted = false;
   }
 
-  FastRelationCache.prototype.get = function(key) {
-    // Fast path: simple "sourceId,targetId" key
+  // Parse "N,N" or "N,N:S" key → packed integer, or -1 if not numeric
+  function parseNumericKey(key) {
     var comma = key.indexOf(',');
-    if (comma > 0) {
-      var colon = key.indexOf(':', comma);
-      if (colon === -1) {
-        // Simple key: "sourceId,targetId" → integer hash
-        var srcId = +key.substring(0, comma);
-        var tgtId = +key.substring(comma + 1);
-        if (srcId === (srcId | 0) && tgtId === (tgtId | 0) && srcId < 0x100000 && tgtId < 0x100000) {
-          var packed = (srcId << 20) | tgtId;
-          var hash = ((srcId * 2654435761) ^ tgtId) & CACHE_MASK;
-          // Linear probe (max 4 steps)
-          for (var i = 0; i < 4; i++) {
-            var slot = (hash + i) & CACHE_MASK;
-            if (this._keys[slot] === packed) return this._vals[slot];
-            if (this._keys[slot] === 0) return undefined;
-          }
-          return undefined;
-        }
+    if (comma <= 0 || comma > 8) return -1;
+    var colon = key.indexOf(':', comma);
+    // Only handle simple "N,N" keys (no postfix) for the fast path
+    if (colon !== -1) return -1;
+    // Parse both IDs
+    var a = 0, b = 0;
+    for (var i = 0; i < comma; i++) {
+      var c = key.charCodeAt(i) - 48;
+      if (c < 0 || c > 9) return -1;
+      a = a * 10 + c;
+    }
+    for (var j = comma + 1; j < key.length; j++) {
+      var d = key.charCodeAt(j) - 48;
+      if (d < 0 || d > 9) return -1;
+      b = b * 10 + d;
+    }
+    if (a >= 0x100000 || b >= 0x100000) return -1;
+    return (a << 20) | b;
+  }
+
+  function promote(self) {
+    self._bits = INITIAL_BITS;
+    self._mask = (1 << self._bits) - 1;
+    self._keys = new Int32Array(1 << self._bits);
+    self._vals = new Int32Array(1 << self._bits);
+    self._promoted = true;
+    // Migrate existing numeric entries from Map
+    self._map.forEach(function(val, key) {
+      var packed = parseNumericKey(key);
+      if (packed >= 0) {
+        fastSet(self, packed, val);
+        self._map.delete(key);
+      }
+    });
+  }
+
+  function grow(self) {
+    if (self._bits >= MAX_BITS) return;
+    var oldKeys = self._keys;
+    var oldVals = self._vals;
+    var oldSize = 1 << self._bits;
+    self._bits += 2;
+    self._mask = (1 << self._bits) - 1;
+    self._keys = new Int32Array(1 << self._bits);
+    self._vals = new Int32Array(1 << self._bits);
+    // Rehash
+    for (var i = 0; i < oldSize; i++) {
+      if (oldKeys[i] !== 0) {
+        fastSet(self, oldKeys[i], oldVals[i]);
       }
     }
-    // Slow path: complex key
-    return this._fallback.get(key);
+  }
+
+  function fastSet(self, packed, value) {
+    var hash = ((packed * 2654435761) >>> 0) & self._mask;
+    for (var i = 0; i < 8; i++) {
+      var slot = (hash + i) & self._mask;
+      if (self._keys[slot] === packed || self._keys[slot] === 0) {
+        self._keys[slot] = packed;
+        self._vals[slot] = value;
+        return;
+      }
+    }
+    // All 8 probe slots full — grow and retry
+    grow(self);
+    fastSet(self, packed, value);
+  }
+
+  function fastGet(self, packed) {
+    var hash = ((packed * 2654435761) >>> 0) & self._mask;
+    for (var i = 0; i < 8; i++) {
+      var slot = (hash + i) & self._mask;
+      if (self._keys[slot] === packed) return self._vals[slot];
+      if (self._keys[slot] === 0) return undefined;
+    }
+    return undefined;
+  }
+
+  FastMap.prototype.get = function(key) {
+    if (this._promoted && typeof key === 'string') {
+      var packed = parseNumericKey(key);
+      if (packed >= 0) {
+        var v = fastGet(this, packed);
+        if (v !== undefined) return v;
+        // Could be a hash collision miss — check Map fallback
+      }
+    }
+    return this._map.get(key);
   };
 
-  FastRelationCache.prototype.set = function(key, value) {
-    var comma = key.indexOf(',');
-    if (comma > 0) {
-      var colon = key.indexOf(':', comma);
-      if (colon === -1) {
-        var srcId = +key.substring(0, comma);
-        var tgtId = +key.substring(comma + 1);
-        if (srcId === (srcId | 0) && tgtId === (tgtId | 0) && srcId < 0x100000 && tgtId < 0x100000) {
-          var packed = (srcId << 20) | tgtId;
-          var hash = ((srcId * 2654435761) ^ tgtId) & CACHE_MASK;
-          for (var i = 0; i < 4; i++) {
-            var slot = (hash + i) & CACHE_MASK;
-            if (this._keys[slot] === packed || this._keys[slot] === 0) {
-              this._keys[slot] = packed;
-              this._vals[slot] = value;
-              this._size++;
-              return this;
-            }
+  FastMap.prototype.set = function(key, value) {
+    if (typeof key === 'string') {
+      var packed = parseNumericKey(key);
+      if (packed >= 0) {
+        if (!this._promoted) {
+          this._numericCount++;
+          if (this._numericCount >= 16) {
+            promote(this);
           }
-          // All 4 probe slots full — evict first
-          this._keys[hash] = packed;
-          this._vals[hash] = value;
+        }
+        if (this._promoted) {
+          fastSet(this, packed, value);
           return this;
         }
       }
     }
-    this._fallback.set(key, value);
+    this._map.set(key, value);
     return this;
   };
 
-  FastRelationCache.prototype.has = function(key) {
-    return this.get(key) !== undefined;
+  FastMap.prototype.has = function(key) {
+    if (this._promoted && typeof key === 'string') {
+      var packed = parseNumericKey(key);
+      if (packed >= 0 && fastGet(this, packed) !== undefined) return true;
+    }
+    return this._map.has(key);
   };
 
-  FastRelationCache.prototype.delete = function(key) {
-    this._fallback.delete(key);
-    return true;
+  FastMap.prototype.delete = function(key) {
+    return this._map.delete(key);
   };
 
-  FastRelationCache.prototype.clear = function() {
-    this._keys.fill(0);
-    this._vals.fill(0);
-    this._size = 0;
-    this._fallback.clear();
+  FastMap.prototype.clear = function() {
+    this._map.clear();
+    if (this._promoted) {
+      this._keys.fill(0);
+      this._vals.fill(0);
+    }
   };
 
-  FastRelationCache.prototype.forEach = function(cb) {
-    // Iterate non-zero entries
-    for (var i = 0; i < CACHE_SIZE; i++) {
-      if (this._keys[i] !== 0) {
-        var srcId = this._keys[i] >>> 20;
-        var tgtId = this._keys[i] & 0xFFFFF;
-        cb(this._vals[i], srcId + ',' + tgtId, this);
+  FastMap.prototype.forEach = function(cb) {
+    if (this._promoted) {
+      var size = 1 << this._bits;
+      for (var i = 0; i < size; i++) {
+        if (this._keys[i] !== 0) {
+          var a = this._keys[i] >>> 20;
+          var b = this._keys[i] & 0xFFFFF;
+          cb(this._vals[i], a + ',' + b, this);
+        }
       }
     }
-    this._fallback.forEach(cb);
+    this._map.forEach(cb);
   };
 
-  Object.defineProperty(FastRelationCache.prototype, 'size', {
-    get: function() { return this._size + this._fallback.size; }
+  Object.defineProperty(FastMap.prototype, 'size', {
+    get: function() { return this._map.size + (this._promoted ? this._numericCount : 0); }
   });
 
-  // Make it iterable
-  FastRelationCache.prototype[Symbol.iterator] = function() {
-    return this._fallback[Symbol.iterator]();
+  // entries/keys/values — delegate to Map (numeric entries reconstructed)
+  FastMap.prototype.entries = function() {
+    // Merge numeric entries back into Map for iteration
+    if (this._promoted) {
+      var size = 1 << this._bits;
+      for (var i = 0; i < size; i++) {
+        if (this._keys[i] !== 0) {
+          var a = this._keys[i] >>> 20;
+          var b = this._keys[i] & 0xFFFFF;
+          this._map.set(a + ',' + b, this._vals[i]);
+        }
+      }
+    }
+    return this._map.entries();
   };
 
-  // Store for injection
-  globalThis.__FastRelationCache = FastRelationCache;
+  FastMap.prototype.keys = function() {
+    if (this._promoted) {
+      var size = 1 << this._bits;
+      for (var i = 0; i < size; i++) {
+        if (this._keys[i] !== 0) {
+          var a = this._keys[i] >>> 20;
+          var b = this._keys[i] & 0xFFFFF;
+          if (!this._map.has(a + ',' + b)) this._map.set(a + ',' + b, this._vals[i]);
+        }
+      }
+    }
+    return this._map.keys();
+  };
+
+  FastMap.prototype.values = function() {
+    if (this._promoted) {
+      var size = 1 << this._bits;
+      for (var i = 0; i < size; i++) {
+        if (this._keys[i] !== 0) {
+          var a = this._keys[i] >>> 20;
+          var b = this._keys[i] & 0xFFFFF;
+          if (!this._map.has(a + ',' + b)) this._map.set(a + ',' + b, this._vals[i]);
+        }
+      }
+    }
+    return this._map.values();
+  };
+
+  FastMap.prototype[Symbol.iterator] = function() {
+    return this.entries();
+  };
+
+  globalThis.__FastRelationCache = FastMap;
 })();
