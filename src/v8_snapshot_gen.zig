@@ -57,6 +57,31 @@ pub fn main() !void {
             return err;
         };
 
+        // Pre-load TSC source into V8 heap at snapshot-build time.
+        // Workers can access it via globalThis.__tsc_source without disk IO.
+        // Use external one-byte string (zero-copy from Zig buffer to V8).
+        {
+            const alloc = std.heap.page_allocator;
+            const tsc_source = std.fs.cwd().readFileAlloc(alloc, "node_modules/typescript/lib/typescript.js", 20 * 1024 * 1024) catch null;
+            if (tsc_source) |src| {
+                // Create V8 string from TSC source (external, zero-copy)
+                const v8_str = v8.StringApi.fromExternalOneByte(isolate, src) orelse
+                    v8.StringApi.fromUtf8(isolate, src);
+                if (v8_str) |str| {
+                    // Set as global: globalThis.__tsc_source = <string>
+                    const global = v8.ContextApi.global(ctx);
+                    const key = v8.StringApi.fromUtf8(isolate, "__tsc_source") orelse null;
+                    if (key) |k| {
+                        _ = v8.ObjectApi.set(global, ctx, @ptrCast(k), @ptrCast(str));
+                        std.debug.print("[snapshot-gen] Pre-loaded TSC source ({d} bytes) into snapshot\n", .{src.len});
+                    }
+                }
+                // Don't free src — external string references it
+            } else {
+                std.debug.print("[snapshot-gen] TSC source not found (workers will load from disk)\n", .{});
+            }
+        }
+
         v8.ContextApi.exit(ctx);
         creator.setDefaultContext(ctx);
     }
