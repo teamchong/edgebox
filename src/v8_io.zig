@@ -167,8 +167,8 @@ var stderr_buf: std.ArrayListUnmanaged(u8) = .{};
 pub fn flushAll() void {
     flushStdout();
     flushStderr();
-    // Wait for async stdout flush thread
     if (stdout_flush_thread) |t| { t.join(); stdout_flush_thread = null; }
+    if (prefetch_thread) |t| { t.join(); prefetch_thread = null; }
 }
 
 fn flushStderr() void {
@@ -333,6 +333,42 @@ pub fn realpathFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) v
     rv.set(@ptrCast(v8_str));
 }
 
+// ============================================================
+// Speculative prefetch — predictive file read
+// When fileExists returns true, spawn a Zig thread to pre-read
+// the file content so readFile hits cache on the next call.
+// ============================================================
+
+var prefetch_thread: ?std.Thread = null;
+var prefetch_path_buf: [4096]u8 = undefined;
+var prefetch_path_len: usize = 0;
+
+fn speculativePrefetchWorker() void {
+    const path = prefetch_path_buf[0..prefetch_path_len];
+    if (raw_file_cache.get(path) != null) return; // Already cached
+
+    const file = std.fs.cwd().openFile(path, .{}) catch return;
+    defer file.close();
+    const data = file.readToEndAlloc(alloc, 64 * 1024 * 1024) catch return;
+
+    prefetch_mutex.lock();
+    defer prefetch_mutex.unlock();
+    const key = alloc.dupe(u8, path) catch return;
+    raw_file_cache.put(alloc, key, data) catch {};
+}
+
+fn triggerSpeculativePrefetch(path: []const u8) void {
+    // Join previous prefetch if still running
+    if (prefetch_thread) |t| { t.join(); prefetch_thread = null; }
+
+    // Start new prefetch
+    if (path.len <= prefetch_path_buf.len) {
+        @memcpy(prefetch_path_buf[0..path.len], path);
+        prefetch_path_len = path.len;
+        prefetch_thread = std.Thread.spawn(.{}, speculativePrefetchWorker, .{}) catch null;
+    }
+}
+
 /// Raw file content cache (no JSON escaping — for fast callback)
 var raw_file_cache: std.StringHashMapUnmanaged([]const u8) = .{};
 
@@ -356,6 +392,9 @@ pub fn readFileFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) v
     var path_buf: [4096]u8 = undefined;
     const written = v8.StringApi.writeUtf8(str, isolate, &path_buf);
     const path = path_buf[0..written];
+
+    // Wait for speculative prefetch to complete (may have pre-read this file)
+    if (prefetch_thread) |t| { t.join(); prefetch_thread = null; }
 
     // Check raw content cache first
     const cached_content = raw_file_cache.get(path);
@@ -426,6 +465,18 @@ pub fn fileExistsFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c)
 
     const key = alloc.dupe(u8, path) catch path;
     exists_cache.put(alloc, key, exists) catch {};
+
+    // Speculative prefetch: if file exists and is a source file,
+    // start reading it on a background Zig thread.
+    // TSC pattern: fileExists(path) → true → readFile(path)
+    if (exists and (std.mem.endsWith(u8, path, ".ts") or
+        std.mem.endsWith(u8, path, ".tsx") or
+        std.mem.endsWith(u8, path, ".d.ts") or
+        std.mem.endsWith(u8, path, ".js") or
+        std.mem.endsWith(u8, path, ".json")))
+    {
+        triggerSpeculativePrefetch(path);
+    }
 
     rv.setInt32(if (exists) 1 else 0);
 }
