@@ -115,7 +115,18 @@ pub fn writeStdoutFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c
     }
 }
 
-/// Fast stderr write — no JSON
+/// Buffered stderr — TSC outputs diagnostics to stderr
+var stderr_buf: std.ArrayListUnmanaged(u8) = .{};
+
+fn flushStderr() void {
+    if (stderr_buf.items.len > 0) {
+        const stderr = std.fs.File.stderr();
+        stderr.writeAll(stderr_buf.items) catch {};
+        stderr_buf.clearRetainingCapacity();
+    }
+}
+
+/// Fast stderr write — buffered, no JSON
 pub fn writeStderrFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
     const isolate = v8.CallbackInfoApi.getIsolate(info);
     if (v8.CallbackInfoApi.length(info) < 1) return;
@@ -126,17 +137,24 @@ pub fn writeStderrFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c
     const len: usize = @intCast(v8.StringApi.utf8Length(str, isolate));
     if (len == 0) return;
 
+    stderr_buf.ensureTotalCapacity(alloc, stderr_buf.items.len + len) catch {
+        flushStderr();
+        stderr_buf.ensureTotalCapacity(alloc, len) catch return;
+    };
+
     var stack_buf: [4096]u8 = undefined;
     if (len <= stack_buf.len) {
         const written = v8.StringApi.writeUtf8(str, isolate, &stack_buf);
-        const stderr = std.fs.File.stderr();
-        stderr.writeAll(stack_buf[0..written]) catch {};
+        stderr_buf.appendSlice(alloc, stack_buf[0..written]) catch {};
     } else {
         const heap_buf = alloc.alloc(u8, len) catch return;
         defer alloc.free(heap_buf);
         const written = v8.StringApi.writeUtf8(str, isolate, heap_buf);
-        const stderr = std.fs.File.stderr();
-        stderr.writeAll(heap_buf[0..written]) catch {};
+        stderr_buf.appendSlice(alloc, heap_buf[0..written]) catch {};
+    }
+
+    if (stderr_buf.items.len >= STDOUT_BUF_SIZE) {
+        flushStderr();
     }
 }
 
@@ -420,7 +438,8 @@ fn handleRequest(msg: []const u8) ![]const u8 {
         // Defer exit: save exit code, throw to unwind back to runner
         // so code cache can be saved before termination.
         deferred_exit_code = @intCast(code);
-        flushStdout(); // Flush buffered output before exit
+        flushStdout();
+        flushStderr();
         return "{\"ok\":true,\"deferred_exit\":true}";
     } else if (std.mem.eql(u8, req.op, "argv")) {
         return opArgv();
