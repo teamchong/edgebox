@@ -306,6 +306,34 @@ pub const ValueApi = struct {
 };
 
 // ============================================================
+// SharedArrayBuffer API (zero-copy cross-isolate memory)
+// ============================================================
+
+fn noopDeleter(_: ?*anyopaque, _: usize, _: ?*anyopaque) callconv(.c) void {}
+
+pub const SharedArrayBufferApi = struct {
+    /// Create a SharedArrayBuffer backed by existing Zig memory (zero-copy).
+    /// The memory is NOT owned by V8 — Zig manages its lifetime.
+    /// Multiple isolates can create views into the same buffer.
+    pub fn fromExternalMemory(isolate: *Isolate, data: [*]u8, byte_length: usize) ?*const Value {
+        const backing_store = c.v8__SharedArrayBuffer__NewBackingStore__with_data(
+            @ptrCast(data), byte_length,
+            &noopDeleter, null,
+        ) orelse return null;
+        return c.v8__SharedArrayBuffer__New__with_backing_store(isolate, backing_store);
+    }
+
+    /// Create a new SharedArrayBuffer with V8-allocated memory.
+    pub fn create(isolate: *Isolate, byte_length: usize) ?*const Value {
+        return c.v8__SharedArrayBuffer__New__with_byte_length(isolate, byte_length);
+    }
+
+    pub fn byteLength(sab: *const Value) usize {
+        return c.v8__SharedArrayBuffer__ByteLength(sab);
+    }
+};
+
+// ============================================================
 // FunctionCallbackInfo + ReturnValue API
 // ============================================================
 
@@ -750,6 +778,16 @@ const c = struct {
     // Object
     extern fn v8__Object__Set(obj: *const Object, context: *const Context, key: *const Value, value: *const Value) u8;
     extern fn v8__Object__Get(obj: *const Object, context: *const Context, key: *const Value) ?*const Value;
+
+    // SharedArrayBuffer (zero-copy cross-isolate memory)
+    extern fn v8__SharedArrayBuffer__New__with_byte_length(isolate: *Isolate, byte_length: usize) ?*const Value;
+    extern fn v8__SharedArrayBuffer__NewBackingStore__with_data(
+        data: ?*anyopaque, byte_length: usize,
+        deleter: ?*const fn (?*anyopaque, usize, ?*anyopaque) callconv(.c) void,
+        deleter_data: ?*anyopaque,
+    ) ?*anyopaque; // returns BackingStore*
+    extern fn v8__SharedArrayBuffer__New__with_backing_store(isolate: *Isolate, backing_store: *anyopaque) ?*const Value;
+    extern fn v8__SharedArrayBuffer__ByteLength(sab: *const Value) usize;
 
     // ScriptCompiler
     extern fn v8__ScriptCompiler__Source__CONSTRUCT(buf: *[CompilerSource.max_size]u8, source: *const String, origin: *const [ScriptOrigin.max_size]u8, cached_data: ?*CachedData) void;
