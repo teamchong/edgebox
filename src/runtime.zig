@@ -2410,6 +2410,11 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             }
                             std.debug.print("[soa] {d} global columns for {d} alloc sites\n", .{ unique_count, alloc_sites.items.len });
                         }
+                        // Declare soa_base variables at module scope (as var, not const)
+                        // so they're accessible across function boundaries.
+                        // They get assigned at the `VAR = []` declaration site in the char_loop.
+                        // This must happen AFTER provenance detection runs (below).
+                        // We defer this declaration until we know which provenance entries exist.
                         // Compute polyfill line offset: patches use full-bundle line numbers
                         // but cc (clean_content) doesn't include polyfill lines
                         var bundle_line_count: u32 = 1;
@@ -3767,19 +3772,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         // variable defined at the declaration site is NOT in scope in the callees.
                         // Disabling decl_end prevents index-aligned rewrites that would reference
                         // an undefined soa_base. The provenance still works for non-indexed access.
-                        if (param_prov_count > 0) {
-                            for (param_provs) |pp_check| {
-                                var prov_entry = &provenance_buf[pp_check.prov_idx];
-                                if (prov_entry.decl_end > 0 and
-                                    (prov_entry.decl_end < pp_check.func_body_start or
-                                    prov_entry.decl_end >= pp_check.func_body_end))
-                                {
-                                    std.debug.print("[soa] Disabled soa_base for '{s}' (inter-procedural scope leak)\n", .{prov_entry.var_name});
-                                    prov_entry.decl_end = 0;
-                                    prov_entry.raw_index = false;
-                                }
-                            }
-                        }
+                        // soa_base now stored as VAR.__sb (property on array), not scoped variable.
+                        // No need to disable for inter-procedural leaks — .__sb travels with the array.
 
                         const rs_rewrite_count: u32 = 0;
 
@@ -3887,6 +3881,15 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 special_positions.append(allocator, @intCast(prov.decl_end)) catch {};
                             }
                         }
+                        // Emit module-scope soa_base variable declarations
+                        // These are `var` (not const) so they're hoisted to module scope
+                        // and accessible from any function that receives the container.
+                        for (provenance) |prov| {
+                            if (prov.decl_end > 0) {
+                                w.print("var __{s}_soa_base;\n", .{prov.var_name}) catch { w_errs += 1; };
+                            }
+                        }
+
                         // Add for...of positions for counter injection
                         var forof_start_set = std.AutoHashMap(usize, usize).init(allocator);
                         defer forof_start_set.deinit();
@@ -3937,10 +3940,13 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             // (o.__idx !== undefined) always hits fallback for non-SOA objects,
                             // adding pure overhead. Factories still write SOA columns for batch ops.
                             // === SOA base capture ===
-                            // At `VAR = []` declaration, emit base offset for index alignment
+                            // At `VAR = []` declaration, emit base offset as property on the array.
+                            // Using `VAR.__sb` (soa_base) instead of `const __VAR_soa_base` so it
+                            // survives across function boundaries when passed as a parameter.
                             if (decl_end_set.get(src_pos)) |pi| {
                                 const prov = provenance[pi];
-                                w.print(";const __{s}_soa_base = __col_idx", .{prov.var_name}) catch { w_errs += 1; };
+                                // Assign module-scope soa_base variable (declared in header)
+                                w.print(";__{s}_soa_base = __col_idx", .{prov.var_name}) catch { w_errs += 1; };
                                 if (prov.raw_index) {
                                     w.print(";{s}.__soa={d}", .{ prov.var_name, prov.site_idx }) catch { w_errs += 1; };
                                 }
@@ -4854,9 +4860,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             if (std.mem.eql(u8, sf, fname_pp)) { field_match_pp = true; break; }
                                         }
                                         if (!field_match_pp) continue;
-                                        // Only emit soa_base rewrite if decl_end is valid (in scope)
-                                        if (prov_pp.decl_end == 0) continue;
                                         // Emit: __col_field[__CONTAINER_soa_base + (expr)]
+                                        // Use container name (module-scope var) not parameter name.
                                         const idx_expr_pp = cc[after_param + 1 .. k_pp - 1];
                                         w.print("__col_{s}[__{s}_soa_base + ({s})]", .{
                                             fname_pp, prov_pp.var_name, idx_expr_pp,
@@ -4907,9 +4912,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                             if (aeq < cc.len and cc[aeq] == '=' and (aeq + 1 >= cc.len or cc[aeq + 1] != '=')) continue;
                                             // Skip compound assignment: alias.field += / |= / etc
                                             if (aeq + 1 < cc.len and cc[aeq + 1] == '=' and (cc[aeq] == '+' or cc[aeq] == '-' or cc[aeq] == '|' or cc[aeq] == '&' or cc[aeq] == '*')) continue;
-                                            // Skip if soa_base disabled (inter-procedural scope leak)
-                                            if (prov.decl_end == 0) continue;
-                                            // Emit: __col_field[__PROV_soa_base + (idx_expr)]
+                                            // Emit: __col_field[PROV.__sb + (idx_expr)]
                                             w.print("__col_{s}[__{s}_soa_base + ({s})]", .{
                                                 afname, prov.var_name, alias.idx_expr,
                                             }) catch { w_errs += 1; };
