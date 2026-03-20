@@ -216,6 +216,48 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         }
     }
 
+    // Additional TSC source patches: SOA columns for type flags
+    // Patch "result.id = typeCount" → "result.id = typeCount; __type_flags[typeCount] = flags"
+    // This stores type flags in a flat Int32Array for O(1) access in hot paths.
+    if (patched_script != null or final_code.ptr != script_code.ptr) {
+        // Already have a mutable buffer — check if we can add SOA patches
+        const soa_needle = "result.id = typeCount;";
+        const soa_replacement = "result.id = typeCount; if(typeof __type_flags !== 'undefined' && typeCount < 262144) __type_flags[typeCount] = flags;";
+        if (std.mem.indexOf(u8, final_code, soa_needle)) |_| {
+            // Need to re-patch with SOA additions
+            var soa_count: usize = 0;
+            {
+                var si: usize = 0;
+                while (si + soa_needle.len <= final_code.len) : (si += 1) {
+                    if (std.mem.startsWith(u8, final_code[si..], soa_needle)) soa_count += 1;
+                }
+            }
+            if (soa_count > 0) {
+                const extra = soa_count * (soa_replacement.len - soa_needle.len + 1);
+                var soa_buf = try alloc.alloc(u8, final_code.len + extra);
+                var sw: usize = 0;
+                var sr: usize = 0;
+                while (sr < final_code.len) {
+                    if (sr + soa_needle.len <= final_code.len and
+                        std.mem.startsWith(u8, final_code[sr..], soa_needle))
+                    {
+                        @memcpy(soa_buf[sw..][0..soa_replacement.len], soa_replacement);
+                        sw += soa_replacement.len;
+                        sr += soa_needle.len;
+                    } else {
+                        soa_buf[sw] = final_code[sr];
+                        sw += 1;
+                        sr += 1;
+                    }
+                }
+                // Free old patched buffer if we own it
+                if (patched_script) |ps| alloc.free(ps);
+                patched_script = soa_buf[0..sw];
+                final_code = patched_script.?;
+            }
+        }
+    }
+
     // Wrap script as CJS module with per-module require
     const dirname = std.fs.path.dirname(abs_path) orelse ".";
     const prefix = "(function(__filename, __dirname) { var module = globalThis.module; var exports = module.exports; var require = globalThis._loadModule ? function(id) { return globalThis._loadModule(id, __dirname); } : globalThis.require;\n";

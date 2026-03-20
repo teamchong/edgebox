@@ -224,4 +224,9 @@
   };
 
   globalThis.__FastRelationCache = FastMap;
+
+  // SOA shadow column for Type.flags — flat Int32Array indexed by type.id
+  // createType() writes here; hot paths can read __type_flags[id] instead of type.flags
+  globalThis.__type_flags = new Int32Array(262144); // 256K types, 1MB
+  globalThis.__type_col_size = 262144;
 })();
