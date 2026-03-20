@@ -75,20 +75,25 @@ pub fn main() !void {
                         _ = v8.ObjectApi.set(global, ctx, @ptrCast(k), @ptrCast(str));
                         std.debug.print("[snapshot-gen] Pre-loaded TSC source ({d} bytes) into snapshot\n", .{src.len});
 
-                        // Pre-compile TSC wrapper and store as global function.
-                        // Workers can call __tsc_factory(module, exports, require, fn, dir)
-                        // instead of eval(__tsc_source) — reuses compiled bytecode from snapshot.
-                        const eval_code = std.fmt.allocPrint(alloc,
-                            "globalThis.__tsc_factory = new Function('module', 'exports', 'require', '__filename', '__dirname', globalThis.__tsc_source);",
-                            .{},
-                        ) catch null;
-                        if (eval_code) |ec| {
-                            defer alloc.free(ec);
-                            _ = v8.eval(isolate, ctx, ec, "tsc_factory_init.js") catch |err| {
-                                std.debug.print("[snapshot-gen] WARNING: TSC factory creation failed: {}\n", .{err});
-                            };
-                            std.debug.print("[snapshot-gen] Pre-compiled TSC factory function into snapshot\n", .{});
-                        }
+                        // Pre-compile AND EXECUTE TSC in the snapshot.
+                        // Workers start with globalThis.ts already initialized — zero load time.
+                        // This executes typescript.js (API only, no CLI) during snapshot creation.
+                        const init_code =
+                            \\globalThis.__tsc_factory = new Function('module', 'exports', 'require', '__filename', '__dirname', globalThis.__tsc_source);
+                            \\// Execute the factory using the REAL bootstrap require
+                            \\// This initializes the ts module in the snapshot so workers get it for free.
+                            \\var __tsc_mod = { exports: {} };
+                            \\try {
+                            \\  globalThis.__tsc_factory(__tsc_mod, __tsc_mod.exports, globalThis.require, '/snapshot/typescript.js', '/snapshot');
+                            \\  globalThis.ts = __tsc_mod.exports;
+                            \\} catch(e) {
+                            \\  // May fail during snapshot if IO is unavailable — factory still available
+                            \\}
+                        ;
+                        _ = v8.eval(isolate, ctx, init_code, "tsc_init.js") catch |err| {
+                            std.debug.print("[snapshot-gen] WARNING: TSC init failed: {} (factory still available)\n", .{err});
+                        };
+                        std.debug.print("[snapshot-gen] Pre-compiled + initialized TSC in snapshot\n", .{});
                     }
                 }
                 // Don't free src — external string references it
