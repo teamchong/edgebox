@@ -38,6 +38,9 @@ v8::Isolate* edgebox_v8_create_isolate() {
   v8::Isolate::CreateParams params;
   params.array_buffer_allocator =
       v8__ArrayBuffer__Allocator__NewDefaultAllocator();
+  // TSC's 9MB bundle needs ~1.4GB heap for compilation alone.
+  // Default V8 limit (~1.5GB) causes OOM. Allow up to 4GB.
+  params.constraints.ConfigureDefaultsFromHeapSize(0, 4096u * 1024 * 1024);
   return v8::Isolate::New(params);
 }
 
@@ -61,6 +64,8 @@ v8::Isolate* edgebox_v8_create_isolate_from_snapshot(
   if (external_refs) {
     params.external_references = external_refs;
   }
+  // TSC needs ~2GB+ heap for full type-checking on large projects.
+  params.constraints.ConfigureDefaultsFromHeapSize(0, 4096u * 1024 * 1024);
   return v8::Isolate::New(params);
 }
 

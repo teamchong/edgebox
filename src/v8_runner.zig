@@ -98,11 +98,13 @@ const embedded_snapshot = @embedFile("v8_bootstrap.snapshot");
 
 /// External references for V8 snapshot deserialization — must match the array
 /// used during snapshot creation (in v8_snapshot_gen.zig).
-var external_refs: [2]usize = .{ 0, 0 };
+/// Order: [ioSyncCallback, ioBatchCallback, 0 (null terminator)]
+var external_refs: [3]usize = .{ 0, 0, 0 };
 
-fn getExternalRefs() *const [2]usize {
+fn getExternalRefs() *const [3]usize {
     if (external_refs[0] == 0) {
         external_refs[0] = @intFromPtr(&v8_io.ioSyncCallback);
+        external_refs[1] = @intFromPtr(&v8_io.ioBatchCallback);
     }
     return &external_refs;
 }
@@ -156,11 +158,11 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         _ = v8.eval(isolate, context, argv_fix, "argv_fix.js") catch {};
     }
 
-    // Wrap script as CJS module
+    // Wrap script as CJS module with per-module require
     const dirname = std.fs.path.dirname(abs_path) orelse ".";
-    const prefix = "(function(exports, require, module, __filename, __dirname) {\n";
+    const prefix = "(function(__filename, __dirname) { var module = globalThis.module; var exports = module.exports; var require = globalThis._loadModule ? function(id) { return globalThis._loadModule(id, __dirname); } : globalThis.require;\n";
     const suffix = try std.fmt.allocPrint(alloc,
-        "\n}})(globalThis.module.exports, require, globalThis.module, \"{s}\", \"{s}\");",
+        "\n}})(\"{s}\", \"{s}\");",
         .{ abs_path, dirname },
     );
     defer alloc.free(suffix);

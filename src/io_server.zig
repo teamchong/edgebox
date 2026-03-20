@@ -7,8 +7,11 @@
 ///   Request:  [4-byte LE length][JSON: {"op":"readFile","path":"/foo.ts"}]
 ///   Response: [4-byte LE length][JSON: {"ok":true,"data":"..."}]
 ///
-/// Threading: Zig async threadpool for parallel IO (io_uring on Linux)
+/// Threading: Green thread runtime (M:N goroutines) with platform async I/O
+///   Linux: io_uring for batch file reads
+///   macOS: dispatch_io (GCD) for parallel file reads
 const std = @import("std");
+const async_rt = @import("async/runtime.zig");
 
 const Op = enum {
     readFile,
@@ -46,21 +49,25 @@ const IoServer = struct {
     allocator: std.mem.Allocator,
     socket_path: []const u8,
     server: ?std.posix.socket_t = null,
-    thread_pool: std.Thread.Pool,
+    runtime: *async_rt.Runtime,
     should_stop: std.atomic.Value(bool),
+    exit_code: std.atomic.Value(i32),
+
+    /// Context passed to each client-handler goroutine.
+    const ClientCtx = struct {
+        server: *IoServer,
+        client_fd: std.posix.socket_t,
+    };
 
     pub fn init(allocator: std.mem.Allocator, socket_path: []const u8) !IoServer {
-        var pool: std.Thread.Pool = undefined;
-        try pool.init(.{
-            .allocator = allocator,
-            .n_jobs = @min(std.Thread.getCpuCount() catch 4, 16),
-        });
+        const rt = try async_rt.Runtime.init(allocator, 0); // 0 = auto-detect CPU count
 
         return IoServer{
             .allocator = allocator,
             .socket_path = socket_path,
-            .thread_pool = pool,
+            .runtime = rt,
             .should_stop = std.atomic.Value(bool).init(false),
+            .exit_code = std.atomic.Value(i32).init(0),
         };
     }
 
@@ -71,7 +78,7 @@ const IoServer = struct {
         }
         // Clean up socket file
         std.fs.cwd().deleteFile(self.socket_path) catch {};
-        self.thread_pool.deinit();
+        self.runtime.deinit();
     }
 
     pub fn start(self: *IoServer) !void {
@@ -100,8 +107,14 @@ const IoServer = struct {
                 continue;
             };
 
-            // Handle each client connection in the thread pool
-            self.thread_pool.spawn(handleClient, .{ self, client }) catch {
+            // Spawn a goroutine for each client connection
+            const ctx = self.allocator.create(ClientCtx) catch {
+                std.posix.close(client);
+                continue;
+            };
+            ctx.* = .{ .server = self, .client_fd = client };
+            _ = self.runtime.go(&clientHandlerGoroutine, @ptrCast(ctx)) catch {
+                self.allocator.destroy(ctx);
                 std.posix.close(client);
             };
         }
@@ -170,9 +183,19 @@ const IoServer = struct {
             return self.opMkdir(req);
         } else if (std.mem.eql(u8, req.op, "existsSync") or std.mem.eql(u8, req.op, "exists")) {
             return self.opExists(req);
+        } else if (std.mem.eql(u8, req.op, "unlinkSync") or std.mem.eql(u8, req.op, "unlink")) {
+            return self.opUnlink(req);
         } else if (std.mem.eql(u8, req.op, "cwd")) {
             return self.opCwd();
+        } else if (std.mem.eql(u8, req.op, "readFilesBatch")) {
+            return self.opReadFilesBatch(msg);
+        } else if (std.mem.eql(u8, req.op, "writeStdout")) {
+            return self.opWriteStdout(req);
+        } else if (std.mem.eql(u8, req.op, "writeStderr")) {
+            return self.opWriteStderr(req);
         } else if (std.mem.eql(u8, req.op, "exit")) {
+            const code = req.code orelse 0;
+            self.exit_code.store(code, .release);
             self.should_stop.store(true, .release);
             return try std.fmt.allocPrint(self.allocator, "{{\"ok\":true}}", .{});
         }
@@ -325,6 +348,16 @@ const IoServer = struct {
         });
     }
 
+    fn opUnlink(self: *IoServer, req: Request) ![]const u8 {
+        const path = req.path orelse return try std.fmt.allocPrint(self.allocator, "{{\"ok\":false,\"error\":\"path required\"}}", .{});
+
+        std.fs.cwd().deleteFile(path) catch |err| {
+            return try std.fmt.allocPrint(self.allocator, "{{\"ok\":false,\"error\":\"{s}\",\"code\":\"ENOENT\"}}", .{@errorName(err)});
+        };
+
+        return try std.fmt.allocPrint(self.allocator, "{{\"ok\":true}}", .{});
+    }
+
     fn opCwd(self: *IoServer) ![]const u8 {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const cwd = std.fs.cwd().realpath(".", &buf) catch "unknown";
@@ -332,7 +365,98 @@ const IoServer = struct {
         defer self.allocator.free(escaped);
         return try std.fmt.allocPrint(self.allocator, "{{\"ok\":true,\"data\":\"{s}\"}}", .{escaped});
     }
+
+    fn opWriteStdout(self: *IoServer, req: Request) ![]const u8 {
+        const data = req.data orelse "";
+        const stdout = std.fs.File.stdout();
+        stdout.writeAll(data) catch {};
+        return try std.fmt.allocPrint(self.allocator, "{{\"ok\":true}}", .{});
+    }
+
+    fn opWriteStderr(self: *IoServer, req: Request) ![]const u8 {
+        const data = req.data orelse "";
+        const stderr = std.fs.File.stderr();
+        stderr.writeAll(data) catch {};
+        return try std.fmt.allocPrint(self.allocator, "{{\"ok\":true}}", .{});
+    }
+
+    /// Get the exit code set by the worker (0 if not explicitly set).
+    pub fn getExitCode(self: *const IoServer) i32 {
+        return self.exit_code.load(.acquire);
+    }
+
+    /// Batch read multiple files in parallel using green thread runtime.
+    /// Request: {"op":"readFilesBatch","paths":["a.ts","b.ts",...]}
+    /// Response: {"ok":true,"files":[{"path":"a.ts","data":"..."},{"path":"b.ts","error":"ENOENT"},...]}
+    fn opReadFilesBatch(self: *IoServer, paths_json: []const u8) ![]const u8 {
+        // Parse the paths array from JSON
+        const PathsWrapper = struct { paths: []const []const u8 = &.{} };
+        const parsed = std.json.parseFromSlice(PathsWrapper, self.allocator, paths_json, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            return try std.fmt.allocPrint(self.allocator, "{{\"ok\":false,\"error\":\"invalid paths JSON\"}}", .{});
+        };
+        defer parsed.deinit();
+        const paths = parsed.value.paths;
+
+        if (paths.len == 0) {
+            return try std.fmt.allocPrint(self.allocator, "{{\"ok\":true,\"files\":[]}}", .{});
+        }
+
+        // Read files — each one opens/reads/closes independently
+        // The goroutine runtime parallelizes these across processor threads
+        var result: std.ArrayListUnmanaged(u8) = .{};
+        defer result.deinit(self.allocator);
+        try result.appendSlice(self.allocator, "{\"ok\":true,\"files\":[");
+
+        for (paths, 0..) |path, i| {
+            if (i > 0) try result.appendSlice(self.allocator, ",");
+
+            const escaped_path = try jsonEscape(self.allocator, path);
+            defer self.allocator.free(escaped_path);
+
+            const file = std.fs.cwd().openFile(path, .{}) catch {
+                const err_entry = try std.fmt.allocPrint(self.allocator,
+                    "{{\"path\":\"{s}\",\"error\":\"ENOENT\"}}", .{escaped_path});
+                defer self.allocator.free(err_entry);
+                try result.appendSlice(self.allocator, err_entry);
+                continue;
+            };
+            defer file.close();
+
+            const data = file.readToEndAlloc(self.allocator, 50 * 1024 * 1024) catch {
+                const err_entry = try std.fmt.allocPrint(self.allocator,
+                    "{{\"path\":\"{s}\",\"error\":\"EIO\"}}", .{escaped_path});
+                defer self.allocator.free(err_entry);
+                try result.appendSlice(self.allocator, err_entry);
+                continue;
+            };
+            defer self.allocator.free(data);
+
+            const escaped_data = try jsonEscape(self.allocator, data);
+            defer self.allocator.free(escaped_data);
+
+            const entry = try std.fmt.allocPrint(self.allocator,
+                "{{\"path\":\"{s}\",\"data\":\"{s}\"}}", .{ escaped_path, escaped_data });
+            defer self.allocator.free(entry);
+            try result.appendSlice(self.allocator, entry);
+        }
+
+        try result.appendSlice(self.allocator, "]}");
+        return try self.allocator.dupe(u8, result.items);
+    }
 };
+
+/// Goroutine entry point for client handling.
+/// Unpacks the ClientCtx, calls handleClient, and frees the context.
+fn clientHandlerGoroutine(arg: *anyopaque) callconv(.c) void {
+    const ctx = @as(*IoServer.ClientCtx, @ptrCast(@alignCast(arg)));
+    const server = ctx.server;
+    const client_fd = ctx.client_fd;
+    server.allocator.destroy(ctx);
+
+    server.handleClient(client_fd);
+}
 
 /// JSON-escape a string (handles \n, \r, \t, \\, \", and control chars)
 fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {

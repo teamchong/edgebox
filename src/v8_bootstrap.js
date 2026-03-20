@@ -104,6 +104,8 @@
     return JSON.parse(globalThis.__edgebox_io_sync(req));
   }
 
+
+
   // ====== CWD ======
   var _cwdCache = null;
   function _cwd() {
@@ -473,51 +475,77 @@
   _modules['node:url'] = _modules.url;
 
   // ====== require() ======
-  function _require(id) {
+  function _resolveModule(id, fromDir) {
     // Built-in modules
-    if (_modules[id]) return _modules[id];
-
-    // Strip node: prefix
+    if (_modules[id]) return { builtin: id };
     var bareId = id.replace(/^node:/, '');
-    if (_modules[bareId]) return _modules[bareId];
+    if (_modules[bareId]) return { builtin: bareId };
 
-    // User module - resolve path
-    var resolved = id;
-    if (!_path.isAbsolute(id)) {
-      // Relative to CWD for now (simple case)
+    // Resolve path relative to requiring file's directory
+    var resolved;
+    if (_path.isAbsolute(id)) {
+      resolved = id;
+    } else if (id.charAt(0) === '.') {
+      // Relative require — resolve from the requiring module's directory
+      resolved = _path.resolve(fromDir || _cwd(), id);
+    } else {
+      // Bare specifier — resolve from CWD
       resolved = _path.resolve(id);
     }
+    return { path: resolved };
+  }
+
+  function _loadModule(id, fromDir) {
+    var r = _resolveModule(id, fromDir);
+    if (r.builtin) return _modules[r.builtin];
+
+    var resolved = r.path;
 
     // Check cache
     if (_cache[resolved]) return _cache[resolved].exports;
 
-    // Read file
+    // Read file — try as-is, then with .js extension
+    var code;
     try {
-      var code = _fs.readFileSync(resolved, 'utf8');
+      code = _fs.readFileSync(resolved, 'utf8');
     } catch(e) {
-      // Try with .js extension
       try {
         code = _fs.readFileSync(resolved + '.js', 'utf8');
         resolved = resolved + '.js';
       } catch(e2) {
-        throw new Error("Cannot find module '" + id + "'");
+        throw new Error("Cannot find module '" + id + "' from '" + (fromDir || _cwd()) + "'");
       }
     }
 
-    // Create module wrapper
+    if (_cache[resolved]) return _cache[resolved].exports;
+
+    // Create module
     var mod = { id: resolved, exports: {}, loaded: false };
     _cache[resolved] = mod;
+
+    // Each module gets its own require that resolves relative to its directory
+    var modDir = _path.dirname(resolved);
+    var modRequire = function(childId) { return _loadModule(childId, modDir); };
+    modRequire.resolve = function(childId) {
+      var cr = _resolveModule(childId, modDir);
+      return cr.builtin || cr.path;
+    };
 
     // Wrap and execute
     var wrapped = '(function(exports, require, module, __filename, __dirname) {\n' + code + '\n});';
     var fn = (0, eval)(wrapped);
-    fn(mod.exports, _require, mod, resolved, _path.dirname(resolved));
+    fn(mod.exports, modRequire, mod, resolved, modDir);
     mod.loaded = true;
 
     return mod.exports;
   }
 
-  globalThis.require = _require;
+  globalThis._loadModule = _loadModule;
+  globalThis.require = function(id) { return _loadModule(id, _cwd()); };
+  globalThis.require.resolve = function(id) {
+    var r = _resolveModule(id, _cwd());
+    return r.builtin || r.path;
+  };
   globalThis.module = { exports: {} };
   globalThis.exports = globalThis.module.exports;
 

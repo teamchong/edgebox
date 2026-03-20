@@ -10,17 +10,21 @@ const v8 = @import("v8.zig");
 
 const alloc = std.heap.page_allocator;
 
-/// Register __edgebox_io_sync as a global function on the V8 context.
+/// Register __edgebox_io_sync and __edgebox_io_batch as global functions.
 pub fn registerGlobals(isolate: *v8.Isolate, context: *const v8.Context) void {
     const global = v8.ContextApi.global(context);
 
-    // Create FunctionTemplate for __edgebox_io_sync
+    // __edgebox_io_sync(jsonString) → jsonString
     const tmpl = v8.FunctionTemplateApi.create(isolate, &ioSyncCallback) orelse return;
     const func = v8.FunctionTemplateApi.getFunction(tmpl, context) orelse return;
-
-    // Set on global object
     const key = v8.StringApi.fromUtf8(isolate, "__edgebox_io_sync") orelse return;
     _ = v8.ObjectApi.set(global, context, @ptrCast(key), @ptrCast(func));
+
+    // __edgebox_io_batch(jsonArrayString) → jsonArrayString
+    const batch_tmpl = v8.FunctionTemplateApi.create(isolate, &ioBatchCallback) orelse return;
+    const batch_func = v8.FunctionTemplateApi.getFunction(batch_tmpl, context) orelse return;
+    const batch_key = v8.StringApi.fromUtf8(isolate, "__edgebox_io_batch") orelse return;
+    _ = v8.ObjectApi.set(global, context, @ptrCast(batch_key), @ptrCast(batch_func));
 }
 
 /// The V8 callback for __edgebox_io_sync(jsonString) → jsonString
@@ -319,6 +323,217 @@ fn opArgv() ![]const u8 {
 
     try result.appendSlice(alloc, "]}");
     return try result.toOwnedSlice(alloc);
+}
+
+// ============================================================
+// Batch IO — parallel execution of multiple IO requests
+// ============================================================
+
+/// V8 callback for __edgebox_io_batch(jsonArrayString).
+/// Takes a JSON array of requests, executes them in parallel using OS threads,
+/// returns a JSON array of results in the same order.
+///
+/// JS usage:
+///   const results = JSON.parse(__edgebox_io_batch(JSON.stringify([
+///     {op:'readFile', path:'a.ts'},
+///     {op:'stat', path:'b.ts'},
+///     {op:'readFile', path:'c.ts'},
+///   ])));
+pub fn ioBatchCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
+    const isolate: *v8.Isolate = v8.CallbackInfoApi.getIsolate(info);
+    var rv = v8.CallbackInfoApi.getReturnValue(info);
+
+    if (v8.CallbackInfoApi.length(info) < 1) {
+        rv.setUndefined();
+        return;
+    }
+    const arg0 = v8.CallbackInfoApi.get(info, 0) orelse {
+        rv.setUndefined();
+        return;
+    };
+    if (!v8.ValueApi.isString(arg0)) {
+        rv.setUndefined();
+        return;
+    }
+    const str: *const v8.String = @ptrCast(arg0);
+    const len: usize = @intCast(v8.StringApi.utf8Length(str, isolate));
+    if (len == 0 or len > 64 * 1024 * 1024) { // 64MB max for batch
+        rv.setUndefined();
+        return;
+    }
+
+    var heap_buf: ?[]u8 = null;
+    defer if (heap_buf) |hb| alloc.free(hb);
+
+    var stack_buf: [8192]u8 = undefined;
+    const buf: []u8 = if (len + 1 <= stack_buf.len)
+        &stack_buf
+    else blk: {
+        heap_buf = alloc.alloc(u8, len + 1) catch {
+            rv.setUndefined();
+            return;
+        };
+        break :blk heap_buf.?;
+    };
+
+    const written = v8.StringApi.writeUtf8(str, isolate, buf);
+    const request_json = buf[0..written];
+
+    const response = handleBatchRequest(request_json) catch {
+        const err_str = v8.StringApi.fromUtf8(isolate, "[]") orelse return;
+        rv.set(@ptrCast(err_str));
+        return;
+    };
+    defer alloc.free(response);
+
+    const result_str = v8.StringApi.fromUtf8(isolate, response) orelse {
+        rv.setUndefined();
+        return;
+    };
+    rv.set(@ptrCast(result_str));
+}
+
+const BatchItem = struct {
+    op: []const u8,
+    path: ?[]const u8 = null,
+    data: ?[]const u8 = null,
+    encoding: ?[]const u8 = null,
+    recursive: ?bool = null,
+};
+
+fn handleBatchRequest(msg: []const u8) ![]const u8 {
+    const parsed = std.json.parseFromSlice([]const BatchItem, alloc, msg, .{
+        .ignore_unknown_fields = true,
+    }) catch {
+        return try std.fmt.allocPrint(alloc, "[]", .{});
+    };
+    defer parsed.deinit();
+    const items = parsed.value;
+
+    if (items.len == 0) return try std.fmt.allocPrint(alloc, "[]", .{});
+    if (items.len == 1) {
+        // Single item — no threading overhead, just dispatch directly
+        const req = Request{
+            .op = items[0].op,
+            .path = items[0].path,
+            .data = items[0].data,
+            .encoding = items[0].encoding,
+            .recursive = items[0].recursive,
+            .code = null,
+        };
+        const r = try handleRequest_noExit(req);
+        defer alloc.free(r);
+        return try std.fmt.allocPrint(alloc, "[{s}]", .{r});
+    }
+
+    // Parallel execution: spawn one thread per request (capped at 32)
+    const max_threads = 32;
+    const n = @min(items.len, max_threads);
+
+    const results = alloc.alloc([]const u8, items.len) catch {
+        return try std.fmt.allocPrint(alloc, "[]", .{});
+    };
+    defer alloc.free(results);
+    for (results) |*r| r.* = "";
+
+    // If batch is small enough, one thread per item; otherwise chunk
+    if (items.len <= max_threads) {
+        var threads: [max_threads]?std.Thread = undefined;
+        var ctxs: [max_threads]BatchWorkerCtx = undefined;
+
+        for (0..n) |i| {
+            ctxs[i] = .{ .items = items, .results = results, .start = i, .end = i + 1 };
+            threads[i] = std.Thread.spawn(.{}, batchWorker, .{&ctxs[i]}) catch null;
+        }
+        for (0..n) |i| {
+            if (threads[i]) |t| t.join();
+        }
+    } else {
+        // Chunk: distribute items across max_threads workers
+        var threads: [max_threads]?std.Thread = undefined;
+        var ctxs: [max_threads]BatchWorkerCtx = undefined;
+        const chunk = (items.len + max_threads - 1) / max_threads;
+
+        for (0..max_threads) |i| {
+            const start = i * chunk;
+            const end = @min(start + chunk, items.len);
+            if (start >= end) {
+                threads[i] = null;
+                continue;
+            }
+            ctxs[i] = .{ .items = items, .results = results, .start = start, .end = end };
+            threads[i] = std.Thread.spawn(.{}, batchWorker, .{&ctxs[i]}) catch null;
+        }
+        for (0..max_threads) |i| {
+            if (threads[i]) |t| t.join();
+        }
+    }
+
+    // Build JSON array response
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    try out.append(alloc, '[');
+    for (results, 0..) |r, i| {
+        if (i > 0) try out.append(alloc, ',');
+        if (r.len > 0) {
+            try out.appendSlice(alloc, r);
+            alloc.free(r);
+        } else {
+            try out.appendSlice(alloc, "{\"ok\":false,\"error\":\"thread failed\"}");
+        }
+    }
+    try out.append(alloc, ']');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn batchWorker(ctx: *const BatchWorkerCtx) void {
+    for (ctx.start..ctx.end) |i| {
+        const item = ctx.items[i];
+        const req = Request{
+            .op = item.op,
+            .path = item.path,
+            .data = item.data,
+            .encoding = item.encoding,
+            .recursive = item.recursive,
+            .code = null,
+        };
+        ctx.results[i] = handleRequest_noExit(req) catch
+            std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"internal\"}}", .{}) catch "";
+    }
+}
+
+const BatchWorkerCtx = struct {
+    items: []const BatchItem,
+    results: [][]const u8,
+    start: usize,
+    end: usize,
+};
+
+/// Like handleRequest but never calls process.exit (safe for batch threads).
+fn handleRequest_noExit(req: Request) ![]const u8 {
+    if (std.mem.eql(u8, req.op, "readFileSync") or std.mem.eql(u8, req.op, "readFile")) {
+        return opReadFile(req);
+    } else if (std.mem.eql(u8, req.op, "writeFileSync") or std.mem.eql(u8, req.op, "writeFile")) {
+        return opWriteFile(req);
+    } else if (std.mem.eql(u8, req.op, "statSync") or std.mem.eql(u8, req.op, "stat")) {
+        return opStat(req);
+    } else if (std.mem.eql(u8, req.op, "readdirSync") or std.mem.eql(u8, req.op, "readdir")) {
+        return opReaddir(req);
+    } else if (std.mem.eql(u8, req.op, "realpathSync") or std.mem.eql(u8, req.op, "realpath")) {
+        return opRealpath(req);
+    } else if (std.mem.eql(u8, req.op, "mkdirSync") or std.mem.eql(u8, req.op, "mkdir")) {
+        return opMkdir(req);
+    } else if (std.mem.eql(u8, req.op, "existsSync") or std.mem.eql(u8, req.op, "exists")) {
+        return opExists(req);
+    } else if (std.mem.eql(u8, req.op, "unlinkSync") or std.mem.eql(u8, req.op, "unlink")) {
+        return opUnlink(req);
+    } else if (std.mem.eql(u8, req.op, "cwd")) {
+        return opCwd();
+    } else if (std.mem.eql(u8, req.op, "argv")) {
+        return opArgv();
+    } else if (std.mem.eql(u8, req.op, "env")) {
+        return opEnv();
+    }
+    return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"unknown op: {s}\"}}", .{req.op});
 }
 
 fn opEnv() ![]const u8 {
