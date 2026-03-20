@@ -1902,8 +1902,11 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             const clean_content: ?[]const u8 = if (clean_content_orig) |orig| blk: {
                 if (std.mem.indexOf(u8, orig, "var assignableRelation") != null) {
                     // Bun bundler outputs "new Map;" (no parens), original TSC has "new Map()"
+                    // Also patch getRelationKey to return packed integer (zero-copy key)
                     const needle = "/* @__PURE__ */ new Map;";
                     const repl = "new __FastRelationCache;";
+                    const grk_needle = "return isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : `${source.id},${target.id}${postFix}`;";
+                    const grk_repl = "if(!postFix&&!isTypeReferenceWithGenericArguments(source)&&!isTypeReferenceWithGenericArguments(target)&&source.id>0&&source.id<1048576&&target.id>0&&target.id<1048576)return((source.id<<20)|target.id)+1;return isTypeReferenceWithGenericArguments(source)&&isTypeReferenceWithGenericArguments(target)?getGenericTypeReferenceRelationKey(source,target,postFix,ignoreConstraints):`${source.id},${target.id}${postFix}`;";
                     var rcount: usize = 0;
                     var ri: usize = 0;
                     while (ri + needle.len <= orig.len) : (ri += 1) {
@@ -1912,10 +1915,11 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             rcount += 1;
                     }
                     if (rcount > 0) {
-                        var buf = allocator.alloc(u8, orig.len + rcount * repl.len) catch break :blk @as(?[]const u8, orig);
+                        var buf = allocator.alloc(u8, orig.len + rcount * repl.len + grk_repl.len) catch break :blk @as(?[]const u8, orig);
                         var pw: usize = 0;
                         var pr: usize = 0;
                         while (pr < orig.len) {
+                            // P1: Relation = new Map → new __FastRelationCache
                             if (pr + needle.len <= orig.len and
                                 std.mem.startsWith(u8, orig[pr..], needle) and
                                 pr >= 15 and std.mem.indexOf(u8, orig[pr - 15 .. pr], "Relation = ") != null)
@@ -1923,11 +1927,20 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 @memcpy(buf[pw..][0..repl.len], repl);
                                 pw += repl.len;
                                 pr += needle.len;
-                            } else {
-                                buf[pw] = orig[pr];
-                                pw += 1;
-                                pr += 1;
+                                continue;
                             }
+                            // P2: getRelationKey → packed integer return
+                            if (pr + grk_needle.len <= orig.len and
+                                std.mem.startsWith(u8, orig[pr..], grk_needle))
+                            {
+                                @memcpy(buf[pw..][0..grk_repl.len], grk_repl);
+                                pw += grk_repl.len;
+                                pr += grk_needle.len;
+                                continue;
+                            }
+                            buf[pw] = orig[pr];
+                            pw += 1;
+                            pr += 1;
                         }
                         clean_content_patched = buf[0..pw];
                         std.debug.print("[soa] Patched {d} relation caches → FastRelationCache in source\n", .{rcount});
