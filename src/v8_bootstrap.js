@@ -563,4 +563,30 @@
     globalThis.queueMicrotask = function(fn) { Promise.resolve().then(fn); };
   }
 
+  // ====== edgebox.parallel — true multi-core JS execution ======
+  // Dispatches independent functions to separate V8 isolates on OS threads.
+  // Usage:
+  //   const results = edgebox.parallel([fn1, fn2, fn3]);
+  //   // Each function runs on a separate core — true parallelism
+  //
+  // Also usable as Promise-compatible:
+  //   const results = await edgebox.parallelAsync([fn1, fn2, fn3]);
+  if (typeof __edgebox_parallel === 'function') {
+    var edgebox = globalThis.edgebox || {};
+    edgebox.parallel = function(fns) {
+      if (!Array.isArray(fns) || fns.length === 0) return [];
+      var codes = fns.map(function(fn) {
+        if (typeof fn === 'function') return 'return (' + fn.toString() + ')()';
+        if (typeof fn === 'string') return fn;
+        return 'return null';
+      });
+      var json = __edgebox_parallel(JSON.stringify(codes));
+      return json ? JSON.parse(json) : [];
+    };
+    edgebox.parallelAsync = function(fns) {
+      return Promise.resolve(edgebox.parallel(fns));
+    };
+    globalThis.edgebox = edgebox;
+  }
+
 })(globalThis);

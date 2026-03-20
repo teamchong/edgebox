@@ -150,6 +150,24 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
     const v8_parallel = @import("v8_parallel.zig");
     v8_parallel.registerGlobals(isolate, context);
 
+    // Create JS-friendly wrapper for edgebox.parallel
+    _ = v8.eval(isolate, context,
+        \\(function(){
+        \\  var e = globalThis.edgebox || {};
+        \\  e.parallel = function(fns) {
+        \\    if (!Array.isArray(fns) || fns.length === 0) return [];
+        \\    var codes = fns.map(function(fn) {
+        \\      if (typeof fn === 'function') return 'return (' + fn.toString() + ')()';
+        \\      if (typeof fn === 'string') return fn;
+        \\      return 'return null';
+        \\    });
+        \\    var json = __edgebox_parallel(JSON.stringify(codes));
+        \\    return json ? JSON.parse(json) : [];
+        \\  };
+        \\  globalThis.edgebox = e;
+        \\})()
+    , "edgebox_parallel_init.js") catch {};
+
     // For packed binaries: ensure process.argv has [exe, script, ...args] format
     // TSC uses process.argv.slice(2), so we need argv[1] to be the script path.
     // In embedded mode, OS argv is [binary, ...args] — insert synthetic script path.
