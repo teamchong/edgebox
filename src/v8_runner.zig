@@ -190,10 +190,19 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
     var try_catch = v8.TryCatch.init(isolate);
     defer try_catch.deinit();
 
-    const source_str = v8.StringApi.fromUtf8(isolate, wrapped) orelse {
-        std.debug.print("[v8] ERROR: failed to create source string\n", .{});
-        std.process.exit(1);
-    };
+    // Use external string for zero-copy — V8 reads directly from Zig's buffer.
+    // For large scripts (>64KB), this avoids a 9MB+ heap allocation.
+    const source_str = if (wrapped.len > 65536)
+        v8.StringApi.fromExternalOneByte(isolate, wrapped) orelse
+            v8.StringApi.fromUtf8(isolate, wrapped) orelse {
+            std.debug.print("[v8] ERROR: failed to create source string\n", .{});
+            std.process.exit(1);
+        }
+    else
+        v8.StringApi.fromUtf8(isolate, wrapped) orelse {
+            std.debug.print("[v8] ERROR: failed to create source string\n", .{});
+            std.process.exit(1);
+        };
     const name_str = v8.StringApi.fromUtf8(isolate, abs_path) orelse {
         std.debug.print("[v8] ERROR: failed to create name string\n", .{});
         std.process.exit(1);

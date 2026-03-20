@@ -202,14 +202,28 @@ pub const ContextApi = struct {
 // String API
 // ============================================================
 
+fn noopStringDestroy(_: [*]const u8, _: usize) callconv(.c) void {}
+
 pub const StringApi = struct {
-    /// Create a V8 string from a Zig slice.
+    /// Create a V8 string from a Zig slice (copies data into V8 heap).
     pub fn fromUtf8(isolate: *Isolate, data: []const u8) ?*const String {
         return c.v8__String__NewFromUtf8(
             isolate,
             data.ptr,
             0, // kNormal
             @intCast(data.len),
+        );
+    }
+
+    /// Create a V8 string backed by external memory (ZERO-COPY).
+    /// V8 reads directly from the caller's buffer — no heap allocation.
+    /// The buffer must outlive the V8 string (Zig manages lifetime).
+    pub fn fromExternalOneByte(isolate: *Isolate, data: []const u8) ?*const String {
+        return c.v8__String__NewExternalOneByte(
+            isolate,
+            data.ptr,
+            @intCast(data.len),
+            &noopStringDestroy,
         );
     }
 
@@ -679,6 +693,13 @@ const c = struct {
     extern fn v8__V8__GetVersion() [*:0]const u8;
     extern fn v8__Platform__NewDefaultPlatform(thread_pool_size: c_int, idle_task_support: bool) ?*Platform;
     extern fn v8__V8__SetFlagsFromString(str: [*]const u8, length: usize) void;
+    // External one-byte string (zero-copy — V8 uses caller's buffer directly)
+    extern fn v8__String__NewExternalOneByte(
+        isolate: *Isolate,
+        data: [*]const u8,
+        length: c_int,
+        destroy: *const fn ([*]const u8, usize) callconv(.c) void,
+    ) ?*const String;
     extern fn v8__V8__InitializePlatform(platform: *Platform) void;
     extern fn v8__V8__Initialize() void;
     extern fn v8__V8__Dispose() bool;
