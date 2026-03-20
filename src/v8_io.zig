@@ -38,6 +38,12 @@ pub fn ioSyncCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
     const isolate: *v8.Isolate = v8.CallbackInfoApi.getIsolate(info);
     var rv = v8.CallbackInfoApi.getReturnValue(info);
 
+    // Pump V8 message loop on every IO callback — processes pending
+    // TurboFan background compilation tasks. Critical for JIT performance.
+    if (v8.global_platform) |platform| {
+        while (v8.pumpMessageLoop(platform, isolate)) {}
+    }
+
     // Get first argument (JSON string)
     if (v8.CallbackInfoApi.length(info) < 1) {
         rv.setUndefined();

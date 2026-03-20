@@ -113,12 +113,18 @@ fn getExternalRefs() *const [3]usize {
 fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]const u8, abs_path: []const u8, display_name: []const u8, is_embedded: bool) !void {
     _ = display_name;
 
+    // Detect TSC early for optimized path selection
+    const is_tsc = std.mem.endsWith(u8, abs_path, "_tsc.js") or
+        std.mem.endsWith(u8, abs_path, "tsc.js");
+
     // Initialize V8
     _ = try v8.initPlatform();
     defer v8.disposePlatform();
 
-    // Create isolate from embedded snapshot — bootstrap context is pre-compiled
-    const isolate = if (embedded_snapshot.len > 0)
+    // For TSC: use plain isolate (no 13.6MB snapshot deserialization).
+    // TSC source transforms + code cache is faster than snapshot-loaded TSC.
+    const use_snapshot = embedded_snapshot.len > 0 and !is_tsc;
+    const isolate = if (use_snapshot)
         v8.SnapshotApi.createIsolateFromSnapshot(embedded_snapshot.ptr, @intCast(embedded_snapshot.len), getExternalRefs())
     else
         v8.IsolateApi.create();
@@ -132,7 +138,7 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
     v8.ContextApi.enter(context);
     defer v8.ContextApi.exit(context);
 
-    if (embedded_snapshot.len > 0) {
+    if (use_snapshot) {
         // Snapshot loaded — IO bridge callback restored via external_refs.
         // Refresh runtime-specific data (argv, env come from snapshot-gen time).
         _ = v8.eval(isolate, context, snapshot_init_js, "snapshot_init.js") catch {};
@@ -177,10 +183,6 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
     // Inject TSC shim + require intercept if snapshot has pre-initialized TSC
     const tsc_shim_code = @embedFile("v8_tsc_shim.js");
     _ = v8.eval(isolate, context, tsc_shim_code, "v8_tsc_shim.js") catch {};
-
-    // Note: snapshot fast-path (running TSC from pre-initialized globalThis.ts) was tested
-    // but source transform + V8 code cache path is faster. The snapshot saves 6.2MB compile
-    // but loses code cache benefits and adds 13.6MB deserialization overhead.
 
     // Auto-inject zero-copy optimizations for TSC
     // Single-pass multi-pattern replacement to minimize scan overhead on 9MB source.
@@ -268,6 +270,12 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
 
     // Note: do NOT call deleteCachedData here — the Source destructor
     // (compiler_source.deinit) owns the CachedData and frees it.
+
+    // Pump V8 message loop before execution — process pending TurboFan
+    // compilation tasks so hot functions get optimized during execution.
+    if (v8.global_platform) |platform| {
+        while (v8.pumpMessageLoop(platform, isolate)) {}
+    }
 
     // Execute
     _ = v8.ScriptApi.run(script, context) orelse {

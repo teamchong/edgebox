@@ -122,13 +122,16 @@ pub const ScriptOrigin = struct {
 /// Initialize V8 platform and engine. Call once at startup.
 pub fn initPlatform() !*Platform {
     // Enable aggressive JIT optimization flags before V8 init
-    const flags = "--maglev --turbofan --max-maglev-inline-depth=4 --max-maglev-hard-inline-depth=16";
+    // No custom flags — let V8 use its defaults. Custom flags were causing
+    // TurboFan to not optimize properly (9x slowdown on integer loops).
+    const flags = "--max-old-space-size=4096";
     c.v8__V8__SetFlagsFromString(flags.ptr, flags.len);
 
     const platform = c.v8__Platform__NewDefaultPlatform(0, false) orelse
         return error.V8PlatformFailed;
     c.v8__V8__InitializePlatform(platform);
     c.v8__V8__Initialize();
+    global_platform = platform;
     return platform;
 }
 
@@ -137,6 +140,16 @@ pub fn disposePlatform() void {
     _ = c.v8__V8__Dispose();
     c.v8__V8__DisposePlatform();
 }
+
+/// Pump V8's message loop — processes background TurboFan compilation tasks.
+/// CRITICAL: Without pumping, TurboFan tasks never execute and hot functions
+/// stay in interpreted/Maglev mode. Call periodically during execution.
+pub fn pumpMessageLoop(platform: *Platform, isolate: *Isolate) bool {
+    return c.v8__Platform__PumpMessageLoop(platform, isolate, false);
+}
+
+/// Store platform reference for message loop pumping
+pub var global_platform: ?*Platform = null;
 
 /// Get V8 version string.
 pub fn getVersion() []const u8 {
@@ -704,6 +717,10 @@ const c = struct {
     extern fn v8__V8__Initialize() void;
     extern fn v8__V8__Dispose() bool;
     extern fn v8__V8__DisposePlatform() void;
+
+    // Platform message loop — CRITICAL for TurboFan background compilation
+    extern fn v8__Platform__PumpMessageLoop(platform: *Platform, isolate: *Isolate, wait: bool) bool;
+    extern fn v8__Platform__RunIdleTasks(platform: *Platform, isolate: *Isolate, idle_time_in_seconds: f64) void;
 
     // Isolate
     extern fn v8__Isolate__Enter(isolate: *Isolate) void;

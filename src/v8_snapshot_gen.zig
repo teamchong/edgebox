@@ -57,9 +57,6 @@ pub fn main() !void {
             return err;
         };
 
-        // TSC pre-loading disabled — the 13.6MB snapshot causes double-loading
-        // when _tsc.js is executed normally. Bootstrap-only snapshot is ~500KB.
-        if (false)
         // Pre-load TSC source into V8 heap at snapshot-build time.
         // Workers can access it via globalThis.__tsc_source without disk IO.
         // Use external one-byte string (zero-copy from Zig buffer to V8).
