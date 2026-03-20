@@ -79,6 +79,8 @@ pub fn main() !void {
                         // Workers start with globalThis.ts already initialized — zero load time.
                         // This executes typescript.js (API only, no CLI) during snapshot creation.
                         const init_code =
+                            \\// Patch JSDoc skip in TSC source before compiling factory
+                            \\globalThis.__tsc_source = globalThis.__tsc_source.replace(/jsDocParsingMode = 0/g, 'jsDocParsingMode = 1');
                             \\globalThis.__tsc_factory = new Function('module', 'exports', 'require', '__filename', '__dirname', globalThis.__tsc_source);
                             \\// Execute the factory using the REAL bootstrap require
                             \\// This initializes the ts module in the snapshot so workers get it for free.
