@@ -14,8 +14,9 @@
 
   // Module cache for user require() calls
   var _cache = {};
-  var _existsCache = Object.create(null); // JS-side cache for existsSync
-  var _realpathCache = Object.create(null); // JS-side cache for realpathSync
+  var _existsCache = Object.create(null);
+  var _realpathCache = Object.create(null);
+  var _readdirCache = Object.create(null);
 
   // ====== Path module (minimal) ======
   var sep = '/';
@@ -185,13 +186,18 @@
       return result;
     },
     readdirSync: function(path, options) {
-      var r = _ioSync('readdir', { path: String(path) });
-      if (!r.ok) { var err = new Error(r.error || 'ENOENT'); err.code = r.code || 'ENOENT'; throw err; }
+      var p = String(path);
       var withTypes = options && options.withFileTypes;
-      return r.entries.map(function(e) {
+      var cacheKey = withTypes ? p + ':t' : p;
+      if (_readdirCache[cacheKey] !== undefined) return _readdirCache[cacheKey];
+      var r = _ioSync('readdir', { path: p });
+      if (!r.ok) { var err = new Error(r.error || 'ENOENT'); err.code = r.code || 'ENOENT'; throw err; }
+      var result = r.entries.map(function(e) {
         if (withTypes) return { name: e.name, isFile: function() { return !e.isDirectory; }, isDirectory: function() { return e.isDirectory; }, isSymbolicLink: function() { return false; } };
         return e.name;
       });
+      _readdirCache[cacheKey] = result;
+      return result;
     },
     realpathSync: function(path) {
       var p = String(path);
