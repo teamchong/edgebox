@@ -695,7 +695,15 @@ fn applyTscTransforms(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
             .needle = "id.startsWith(\"*\")",
             .replacement = "(typeof id === \"string\" && id.startsWith(\"*\"))",
         },
-        // T6: Parallel checkSourceFile sharding — when __EDGEBOX_SHARD is set,
+        // T6: getFlowCacheKey Identifier → packed integer (eliminates template string)
+        // Pack 4 IDs into one number: flowContainer*2^33 + declaredType*2^22 + initialType*2^11 + symbol
+        // Supports IDs up to 2048 (11 bits each) — safe for most projects
+        // Falls back to string for large IDs via || operator
+        .{
+            .needle = "return symbol !== unknownSymbol ? `${flowContainer ? getNodeId(flowContainer) : \"-1\"}|${getTypeId(declaredType)}|${getTypeId(initialType)}|${getSymbolId(symbol)}` : void 0;",
+            .replacement = "if(symbol===unknownSymbol)return void 0;var __fc=flowContainer?getNodeId(flowContainer)+1:0,__dt=getTypeId(declaredType),__it=getTypeId(initialType),__si=getSymbolId(symbol);return(__fc<2048&&__dt<2048&&__it<2048&&__si<2048)?__fc*8589934592+__dt*4194304+__it*2048+__si+1:`${__fc}|${__dt}|${__it}|${__si}`;",
+        },
+        // T7: Parallel checkSourceFile sharding — when __EDGEBOX_SHARD is set,
         // each worker only checks its portion of source files
         .{
             .needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));",
