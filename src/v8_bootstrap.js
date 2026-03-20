@@ -586,6 +586,56 @@
     edgebox.parallelAsync = function(fns) {
       return Promise.resolve(edgebox.parallel(fns));
     };
+
+    // edgebox.map — parallel map over arrays using multi-core
+    // Splits array into chunks, processes each on a separate V8 isolate
+    edgebox.map = function(arr, fn, chunkSize) {
+      if (!Array.isArray(arr) || arr.length === 0) return [];
+      var cpus = 4;
+      var size = chunkSize || Math.ceil(arr.length / cpus);
+      var chunks = [];
+      for (var i = 0; i < arr.length; i += size) {
+        chunks.push(arr.slice(i, i + size));
+      }
+      var fnStr = fn.toString();
+      var codes = chunks.map(function(chunk) {
+        return 'var fn = ' + fnStr + '; var arr = ' + JSON.stringify(chunk) + '; return arr.map(fn)';
+      });
+      var json = __edgebox_parallel(JSON.stringify(codes));
+      if (!json) return arr.map(fn);
+      var results = JSON.parse(json);
+      var flat = [];
+      for (var j = 0; j < results.length; j++) {
+        if (Array.isArray(results[j])) {
+          for (var k = 0; k < results[j].length; k++) flat.push(results[j][k]);
+        }
+      }
+      return flat;
+    };
+
+    // edgebox.reduce — parallel reduce with combiner
+    edgebox.reduce = function(arr, fn, initial, combiner) {
+      if (!Array.isArray(arr) || arr.length === 0) return initial;
+      var cpus = 4;
+      var size = Math.ceil(arr.length / cpus);
+      var chunks = [];
+      for (var i = 0; i < arr.length; i += size) {
+        chunks.push(arr.slice(i, i + size));
+      }
+      var fnStr = fn.toString();
+      var initStr = JSON.stringify(initial);
+      var codes = chunks.map(function(chunk) {
+        return 'var fn = ' + fnStr + '; var arr = ' + JSON.stringify(chunk) + '; return arr.reduce(fn, ' + initStr + ')';
+      });
+      var json = __edgebox_parallel(JSON.stringify(codes));
+      if (!json) return arr.reduce(fn, initial);
+      var results = JSON.parse(json);
+      var comb = combiner || fn;
+      var result = results[0];
+      for (var j = 1; j < results.length; j++) result = comb(result, results[j]);
+      return result;
+    };
+
     globalThis.edgebox = edgebox;
   }
 
