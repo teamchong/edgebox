@@ -818,19 +818,26 @@ fn applyTscTransforms(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
         // 2 slots per bucket: if slot 0 misses, try slot 1
         .{
             .needle = "if (source.flags & 524288 /* Object */ && target.flags & 524288 /* Object */) {\n      const related = relation.get(getRelationKey(",
-            .replacement = "if (source.flags & 524288 && target.flags & 524288) {\n      if(typeof __pc_relKeys!=='undefined'){var __rk=source.id*32768+target.id+1,__rb=(__rk&0x1FFFF)*6;if(__pc_relKeys[__rb]===__rk){var __rr=__pc_relKeys[__rb+2];if(__rr)return !!(__rr&1);}else if(__pc_relKeys[__rb+3]===__rk){var __rr=__pc_relKeys[__rb+5];if(__rr)return !!(__rr&1);}}\n      const related = relation.get(getRelationKey(",
+            .replacement = "if (source.flags & 524288 && target.flags & 524288) {\n      if(typeof __pc_relKeys!=='undefined'){var __rk=source.id*32768+target.id+1,__rb=(__rk&0x7FFFF)*6;if(__pc_relKeys[__rb]===__rk){var __rr=__pc_relKeys[__rb+2];if(__rr)return !!(__rr&1);}else if(__pc_relKeys[__rb+3]===__rk){var __rr=__pc_relKeys[__rb+5];if(__rr)return !!(__rr&1);}}\n      const related = relation.get(getRelationKey(",
         },
         // T17: write to SAB relation cache on succeeded
         .{
             .needle = "relation.set(maybeKeys[i], 1 /* Succeeded */ | propagatingVarianceFlags);",
-            .replacement = "relation.set(maybeKeys[i], 1 | propagatingVarianceFlags);if(typeof __pc_relKeys!=='undefined'&&typeof maybeKeys[i]==='number'){var __wk=maybeKeys[i],__wb=(__wk&0x1FFFF)*6;if(!__pc_relKeys[__wb]||__pc_relKeys[__wb]===__wk){__pc_relKeys[__wb]=__wk;__pc_relKeys[__wb+2]=1;}else{__pc_relKeys[__wb+3]=__wk;__pc_relKeys[__wb+5]=1;}}",
+            .replacement = "relation.set(maybeKeys[i], 1 | propagatingVarianceFlags);if(typeof __pc_relKeys!=='undefined'&&typeof maybeKeys[i]==='number'){var __wk=maybeKeys[i],__wb=(__wk&0x7FFFF)*6;if(!__pc_relKeys[__wb]||__pc_relKeys[__wb]===__wk){__pc_relKeys[__wb]=__wk;__pc_relKeys[__wb+2]=1;}else{__pc_relKeys[__wb+3]=__wk;__pc_relKeys[__wb+5]=1;}}",
         },
         // T18: write to SAB relation cache on failure
         .{
             .needle = "relation.set(id, 2 /* Failed */ | propagatingVarianceFlags);",
-            .replacement = "relation.set(id, 2 | propagatingVarianceFlags);if(typeof __pc_relKeys!=='undefined'&&typeof id==='number'){var __wk2=id,__wb2=(__wk2&0x1FFFF)*6;if(!__pc_relKeys[__wb2]||__pc_relKeys[__wb2]===__wk2){__pc_relKeys[__wb2]=__wk2;__pc_relKeys[__wb2+2]=2;}else{__pc_relKeys[__wb2+3]=__wk2;__pc_relKeys[__wb2+5]=2;}}",
+            .replacement = "relation.set(id, 2 | propagatingVarianceFlags);if(typeof __pc_relKeys!=='undefined'&&typeof id==='number'){var __wk2=id,__wb2=(__wk2&0x7FFFF)*6;if(!__pc_relKeys[__wb2]||__pc_relKeys[__wb2]===__wk2){__pc_relKeys[__wb2]=__wk2;__pc_relKeys[__wb2+2]=2;}else{__pc_relKeys[__wb2+3]=__wk2;__pc_relKeys[__wb2+5]=2;}}",
         },
-        // T19: getObjectFlags → SOA column read (avoid object property access)
+        // T19: removed — deep relation cache needs full entry flags (variance, overflow)
+        // SAB cache only stores 1/2 which loses ReportsMask and Overflow bits.
+        // T20: write overflow failures to SAB cache
+        .{
+            .needle = "relation.set(id, 2 /* Failed */ | (relationCount <= 0 ? 32 /* ComplexityOverflow */ : 64 /* StackDepthOverflow */));",
+            .replacement = "relation.set(id, 2 | (relationCount <= 0 ? 32 : 64));if(typeof __pc_relKeys!=='undefined'&&typeof id==='number'){var __ok=id,__ob=((__ok)&0x7FFFF)*6;if(!__pc_relKeys[__ob]||__pc_relKeys[__ob]===__ok){__pc_relKeys[__ob]=__ok;__pc_relKeys[__ob+2]=2;}else{__pc_relKeys[__ob+3]=__ok;__pc_relKeys[__ob+5]=2;}}",
+        },
+        // T21: getObjectFlags → SOA column read (avoid object property access)
         .{
             .needle = "function getObjectFlags(type) {\n    return type.flags & 3899393 /* ObjectFlagsType */ ? type.objectFlags : 0;\n  }",
             .replacement = "function getObjectFlags(type) {\n    if(typeof __pc_objectFlags!=='undefined'&&type.id>0&&type.id<262144){var __of=__pc_objectFlags[type.id];if(__of)return __of;}return type.flags & 3899393 ? type.objectFlags : 0;\n  }",

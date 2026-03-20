@@ -16,11 +16,11 @@
   }
 
   // 2-way associative relation cache — zero-copy flat array
-  // Layout: [key0, keyHi0, result0, key1, keyHi1, result1] per bucket
-  // 128K buckets × 6 entries × 4 bytes = 3MB (Int32Array)
-  // Key match check prevents hash collision false positives.
+  // Layout: [key0, _, result0, key1, _, result1] per bucket
+  // 512K buckets × 6 entries × 4 bytes = 12MB (Int32Array)
+  // Larger cache = fewer collisions = more cache hits
   if (typeof globalThis.__pc_relKeys === 'undefined') {
-    globalThis.__pc_relKeys = new Int32Array(131072 * 6); // 128K buckets × 6
+    globalThis.__pc_relKeys = new Int32Array(524288 * 6); // 512K buckets × 6
   }
 
   // Source file cache for createSourceFile memoization
