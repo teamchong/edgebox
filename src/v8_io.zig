@@ -10,6 +10,10 @@ const v8 = @import("v8.zig");
 
 const alloc = std.heap.page_allocator;
 
+/// Deferred exit code — set by process.exit(), checked by runner after execution.
+/// Allows code cache to be saved before termination.
+pub var deferred_exit_code: ?u8 = null;
+
 /// Register __edgebox_io_sync and __edgebox_io_batch as global functions.
 pub fn registerGlobals(isolate: *v8.Isolate, context: *const v8.Context) void {
     const global = v8.ContextApi.global(context);
@@ -134,7 +138,10 @@ fn handleRequest(msg: []const u8) ![]const u8 {
         return opWriteStderr(req);
     } else if (std.mem.eql(u8, req.op, "exit")) {
         const code = req.code orelse 0;
-        std.process.exit(@intCast(code));
+        // Defer exit: save exit code, throw to unwind back to runner
+        // so code cache can be saved before termination.
+        deferred_exit_code = @intCast(code);
+        return "{\"ok\":true,\"deferred_exit\":true}";
     } else if (std.mem.eql(u8, req.op, "argv")) {
         return opArgv();
     } else if (std.mem.eql(u8, req.op, "env")) {

@@ -1,4 +1,4 @@
-// v8_tsc_shim.js — Zero-cost Map alias
+// v8_tsc_shim.js — Zero-cost Map alias + SAB-backed SOA columns
 // The getRelationKey and getFlowCacheKey integer packing eliminates
 // string allocation in hot cache paths. No Map wrapping needed.
 (function() {
@@ -6,7 +6,11 @@
   globalThis.__FastRelationCache = Map;
   // SOA columns for Type objects — flat arrays indexed by type.id
   globalThis.__typesById = [];
-  globalThis.__typeFlags = new Int32Array(262144); // 256K types, 1MB
+  // __pc_typeFlags is now SAB-backed (set by v8_parallel_check.zig registerGlobals)
+  // Fallback if parallel check not available:
+  if (typeof globalThis.__pc_typeFlags === 'undefined') {
+    globalThis.__pc_typeFlags = new Int32Array(262144);
+  }
 
   // Source file cache for createSourceFile memoization
   // Populated by source transform that wraps createSourceFile

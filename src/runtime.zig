@@ -1941,7 +1941,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     // This enables SOA columns to store type IDs instead of object refs
                     // Patch createType: store in typesById (accessor approach reverted — 1.24x slower)
                     const ct_needle = "typeCount++;\n    result.id = typeCount;";
-                    const ct_repl = "typeCount++;\n    result.id = typeCount;\n    if(typeof __typesById!=='undefined')__typesById[typeCount]=result;";
+                    const ct_repl = "typeCount++;\n    result.id = typeCount;\n    if(typeof __typesById!=='undefined')__typesById[typeCount]=result;\n    if(typeof __pc_typeFlags!=='undefined'&&typeCount<262144)__pc_typeFlags[typeCount]=result.flags;";
                     // getTypeOfSymbol cache disabled — type resolution is context-dependent.
                     // Caching breaks on deferred/instantiated types that vary during checking.
                     // TODO: implement safe caching with invalidation (two-pass approach).
@@ -2043,7 +2043,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 // type.flags is IMMUTABLE — __typeFlags[id] is always correct.
                                 // type.id is always > 0 (assigned by typeCount++ starting at 1).
                                 // __typeFlags[0] = 0 (safe fallback for id=0).
-                                const soa_fr = "const s = __typeFlags[source.id|0] || source.flags;\n    const t = __typeFlags[target.id|0] || target.flags;";
+                                const soa_fr = "const s = __pc_typeFlags[source.id|0] || source.flags;\n    const t = __pc_typeFlags[target.id|0] || target.flags;";
                                 @memcpy(buf[pw..][0..soa_fr.len], soa_fr);
                                 pw += soa_fr.len;
                                 pr += 55;

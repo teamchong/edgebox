@@ -154,6 +154,10 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
     const v8_channel = @import("v8_channel.zig");
     v8_channel.registerGlobals(isolate, context);
 
+    // Register Zig-threaded parallel type checking
+    const v8_parallel_check = @import("v8_parallel_check.zig");
+    v8_parallel_check.registerGlobals(isolate, context);
+
     // Create JS-friendly wrappers: edgebox.parallel, edgebox.map, edgebox.reduce, edgebox.channel
     const parallel_init_js = @embedFile("v8_parallel_init.js");
     _ = v8.eval(isolate, context, parallel_init_js, "v8_parallel_init.js") catch {};
@@ -170,6 +174,14 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         _ = v8.eval(isolate, context, argv_fix, "argv_fix.js") catch {};
     }
 
+    // Inject TSC shim + require intercept if snapshot has pre-initialized TSC
+    const tsc_shim_code = @embedFile("v8_tsc_shim.js");
+    _ = v8.eval(isolate, context, tsc_shim_code, "v8_tsc_shim.js") catch {};
+
+    // Note: snapshot fast-path (running TSC from pre-initialized globalThis.ts) was tested
+    // but source transform + V8 code cache path is faster. The snapshot saves 6.2MB compile
+    // but loses code cache benefits and adds 13.6MB deserialization overhead.
+
     // Auto-inject zero-copy optimizations for TSC
     // Single-pass multi-pattern replacement to minimize scan overhead on 9MB source.
     // Set __filename and __dirname as globals (zero-copy — no wrapper needed)
@@ -181,10 +193,17 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
     defer alloc.free(set_globals);
     _ = v8.eval(isolate, context, set_globals, "globals.js") catch {};
 
-    // Skip CJS wrapping — execute script directly.
-    // This eliminates 9MB+ memcpy for large scripts like TSC.
-    // module.exports / require already set up in bootstrap.
-    const wrapped = script_code;
+    // Apply source transforms for large scripts (TSC optimization).
+    // Single-pass scan replaces key patterns to enable SOA reads, integer packing, JSDoc skip.
+    // Only applies when script is large enough to be TSC (>5MB).
+    var transformed: ?[]u8 = null;
+    defer if (transformed) |t| alloc.free(t);
+
+    if (script_code.len > 5 * 1024 * 1024) {
+        transformed = applyTscTransforms(alloc, script_code) catch null;
+    }
+
+    const wrapped = transformed orelse script_code;
 
     // Compile with code cache
     var try_catch = v8.TryCatch.init(isolate);
@@ -228,14 +247,17 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
     const compile_options: c_int = if (cached_data != null)
         v8.ScriptCompilerApi.kConsumeCodeCache
     else
-        v8.ScriptCompilerApi.kNoCompileOptions;
+        // Eager compile: compile ALL functions upfront (not lazily).
+        // Creates a complete code cache that speeds up subsequent runs.
+        // First run is ~10% slower, but all subsequent runs benefit.
+        v8.ScriptCompilerApi.kEagerCompile;
 
     const script = v8.ScriptCompilerApi.compile(context, &compiler_source, compile_options) orelse {
         reportException(&try_catch, isolate, context);
         std.process.exit(1);
     };
 
-    // Save code cache if this is a fresh compile (not embedded mode)
+    // Check if code cache was accepted
     var cache_was_used = false;
     if (cached_data != null) {
         if (compiler_source.getCachedData()) |cd| {
@@ -243,9 +265,28 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
             cache_was_used = !info.rejected;
         }
     }
-    if (!cache_was_used) {
-        const cache_path = getCachePath(alloc, script_code) catch null;
-        if (cache_path) |cp| {
+
+    // Note: do NOT call deleteCachedData here — the Source destructor
+    // (compiler_source.deinit) owns the CachedData and frees it.
+
+    // Execute
+    _ = v8.ScriptApi.run(script, context) orelse {
+        // Check if this was a deferred process.exit() — not a real error
+        if (v8_io.deferred_exit_code != null) {
+            // Script called process.exit() — save code cache then exit
+        } else {
+            reportException(&try_catch, isolate, context);
+            std.process.exit(1);
+        }
+    };
+
+    // Save code cache AFTER execution — captures all compiled functions.
+    // V8 lazy-compiles functions on first call. Saving before execution only
+    // gets top-level code. After a full type-check run, all hot functions
+    // are compiled and the cache is much more complete.
+    if (!cache_was_used and !is_embedded) {
+        const save_cache_path = getCachePath(alloc, script_code) catch null;
+        if (save_cache_path) |cp| {
             const unbound = v8.ScriptExtApi.getUnboundScript(script);
             const new_cache = v8.UnboundScriptApi.createCodeCache(unbound);
             const cache_info = v8.ScriptCompilerApi.getCachedDataBytes(new_cache);
@@ -262,14 +303,10 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         }
     }
 
-    // Note: do NOT call deleteCachedData here — the Source destructor
-    // (compiler_source.deinit) owns the CachedData and frees it.
-
-    // Execute
-    _ = v8.ScriptApi.run(script, context) orelse {
-        reportException(&try_catch, isolate, context);
-        std.process.exit(1);
-    };
+    // Apply deferred exit code if process.exit was called
+    if (v8_io.deferred_exit_code) |code| {
+        std.process.exit(code);
+    }
 }
 
 /// Pack a JS file into a single binary by appending source + code cache.
@@ -507,6 +544,84 @@ fn generateCodeCache(alloc: std.mem.Allocator, script_code: []const u8) ![]const
     const result = try alloc.alloc(u8, @intCast(info.length));
     @memcpy(result, info.data[0..@intCast(info.length)]);
     return result;
+}
+
+/// Apply TSC-specific source transforms — single-pass scan with needle/replacement pairs.
+/// Transforms: SOA typeFlags read, createType registration, integer key packing, JSDoc skip.
+fn applyTscTransforms(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    // Needle/replacement pairs applied in a single scan
+    const Transform = struct {
+        needle: []const u8,
+        replacement: []const u8,
+    };
+
+    const transforms = [_]Transform{
+        // T1: createType → populate __pc_typeFlags SOA column
+        .{
+            .needle = "typeCount++;\n    result.id = typeCount;",
+            .replacement = "typeCount++;\n    result.id = typeCount;\n    if(typeof __pc_typeFlags!=='undefined'&&typeCount<262144)__pc_typeFlags[typeCount]=result.flags;",
+        },
+        // T2: isSimpleTypeRelatedTo → read flags from SAB-backed SOA column
+        .{
+            .needle = "const s = source.flags;\n    const t = target.flags;",
+            .replacement = "const s = __pc_typeFlags[source.id|0] || source.flags;\n    const t = __pc_typeFlags[target.id|0] || target.flags;",
+        },
+        // T3: getRelationKey → packed integer (eliminates template string allocation)
+        .{
+            .needle = "isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : `${source.id},${target.id}${postFix}`",
+            .replacement = "isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : source.id * 67108864 + target.id + 1",
+        },
+        // T4: JSDoc skip — function default parameter
+        .{
+            .needle = "jsDocParsingMode = 0",
+            .replacement = "jsDocParsingMode = 1",
+        },
+        // T5: typeof guard for packed integer key (id.startsWith crashes on number)
+        .{
+            .needle = "id.startsWith(\"*\")",
+            .replacement = "(typeof id === \"string\" && id.startsWith(\"*\"))",
+        },
+    };
+
+    // Calculate max possible output size (replacements might be longer)
+    var max_growth: usize = 0;
+    for (&transforms) |t| {
+        if (t.replacement.len > t.needle.len) {
+            max_growth += (t.replacement.len - t.needle.len) * 10; // max 10 occurrences each
+        }
+    }
+
+    const buf = try allocator.alloc(u8, source.len + max_growth);
+    var pw: usize = 0; // write position
+    var pr: usize = 0; // read position
+
+    while (pr < source.len) {
+        var matched = false;
+
+        for (&transforms) |t| {
+            if (pr + t.needle.len <= source.len and
+                std.mem.startsWith(u8, source[pr..], t.needle))
+            {
+                @memcpy(buf[pw..][0..t.replacement.len], t.replacement);
+                pw += t.replacement.len;
+                pr += t.needle.len;
+                matched = true;
+                break;
+            }
+        }
+
+        if (!matched) {
+            buf[pw] = source[pr];
+            pw += 1;
+            pr += 1;
+        }
+    }
+
+    // Resize to actual length
+    if (pw < buf.len) {
+        return try allocator.realloc(buf, pw);
+    }
+    return buf[0..pw];
 }
 
 /// Report a JavaScript exception to stderr.

@@ -250,7 +250,7 @@
   _proc.argv = ['edgebox'];
   _proc.env = {};
   _proc.cwd = _cwd;
-  _proc.exit = function(code) { _ioSync('exit', { code: code || 0 }); };
+  _proc.exit = function(code) { _ioSync('exit', { code: code || 0 }); throw new Error('__edgebox_exit__' + (code || 0)); };
   _proc.platform = 'linux';
   _proc.arch = 'x64';
   _proc.version = 'v20.0.0';
