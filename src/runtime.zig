@@ -2920,6 +2920,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         while (ctx > 0 and cc[ctx - 1] == ' ') ctx -= 1;
                                         if (ctx > 0 and cc[ctx - 1] == '(') continue;
                                         provenance_buf[pi].decl_end = ep + 2;
+                                        std.debug.print("[soa] decl_end: '{s}' = [] at pos {d}\n", .{ vn, ep + 2 });
                                         break;
                                     }
                                 }
@@ -4078,6 +4079,11 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 }
                                 if (matched_prov == null) break :inline_push;
                                 const prov = provenance[matched_prov.?];
+                                // Inline push rewrite replaces objects with integers in the array.
+                                // This is ONLY safe when reads also go through SOA columns.
+                                // Reads require decl_end > 0 (VAR = [] found → __sb assigned).
+                                // Without reads, push stores integers but reads expect objects.
+                                if (prov.decl_end == 0) break :inline_push;
                                 const site = alloc_sites.items[prov.site_idx];
                                 // Find the '{' after .push(
                                 var obj_start = ie + 6; // skip ".push("
