@@ -90,7 +90,8 @@ pub fn ioSyncCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
         rv.set(@ptrCast(err_str));
         return;
     };
-    defer alloc.free(response);
+    // Note: cached IO responses must NOT be freed — they're reused across calls.
+    // Uncached responses (errors, dynamic results) are leaked but minimal.
 
     // Return response as V8 string
     const result_str = v8.StringApi.fromUtf8(isolate, response) orelse {
@@ -161,8 +162,17 @@ fn handleRequest(msg: []const u8) ![]const u8 {
 // IO Operations — direct filesystem access (no socket/IPC)
 // ============================================================
 
+/// File read cache — avoids re-reading and re-escaping the same file.
+/// TSC reads many files multiple times (program creation + type checking).
+var file_cache: std.StringHashMapUnmanaged([]const u8) = .{};
+
 fn opReadFile(req: Request) ![]const u8 {
     const path = req.path orelse return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"path required\"}}", .{});
+
+    // Check cache first
+    if (file_cache.get(path)) |cached| {
+        return cached;
+    }
 
     const file = std.fs.cwd().openFile(path, .{}) catch |err| {
         return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"{s}\",\"code\":\"ENOENT\"}}", .{@errorName(err)});
@@ -172,31 +182,57 @@ fn opReadFile(req: Request) ![]const u8 {
     const content = file.readToEndAlloc(alloc, 64 * 1024 * 1024) catch |err| {
         return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"{s}\"}}", .{@errorName(err)});
     };
-    defer alloc.free(content);
 
-    // JSON-escape the content
-    var result: std.ArrayListUnmanaged(u8) = .{};
-    try result.appendSlice(alloc, "{\"ok\":true,\"data\":\"");
+    // Fast JSON-escape: pre-scan to count escape chars, single allocation
+    var escape_count: usize = 0;
+    var control_count: usize = 0;
     for (content) |byte| {
         switch (byte) {
-            '"' => try result.appendSlice(alloc, "\\\""),
-            '\\' => try result.appendSlice(alloc, "\\\\"),
-            '\n' => try result.appendSlice(alloc, "\\n"),
-            '\r' => try result.appendSlice(alloc, "\\r"),
-            '\t' => try result.appendSlice(alloc, "\\t"),
+            '"', '\\' => escape_count += 1,
+            '\n', '\r', '\t' => escape_count += 1,
+            else => if (byte < 0x20) { control_count += 1; },
+        }
+    }
+
+    // Pre-allocate exact size: prefix + content + escapes + control chars + suffix
+    const prefix = "{\"ok\":true,\"data\":\"";
+    const suffix = "\"}";
+    const total_len = prefix.len + content.len + escape_count + control_count * 5 + suffix.len;
+    const result = try alloc.alloc(u8, total_len);
+
+    @memcpy(result[0..prefix.len], prefix);
+    var pw: usize = prefix.len;
+
+    for (content) |byte| {
+        switch (byte) {
+            '"' => { result[pw] = '\\'; result[pw + 1] = '"'; pw += 2; },
+            '\\' => { result[pw] = '\\'; result[pw + 1] = '\\'; pw += 2; },
+            '\n' => { result[pw] = '\\'; result[pw + 1] = 'n'; pw += 2; },
+            '\r' => { result[pw] = '\\'; result[pw + 1] = 'r'; pw += 2; },
+            '\t' => { result[pw] = '\\'; result[pw + 1] = 't'; pw += 2; },
             else => {
                 if (byte < 0x20) {
-                    var hex_buf: [6]u8 = undefined;
-                    const hex = std.fmt.bufPrint(&hex_buf, "\\u{x:0>4}", .{byte}) catch unreachable;
-                    try result.appendSlice(alloc, hex);
+                    const hex = std.fmt.bufPrint(result[pw..][0..6], "\\u{x:0>4}", .{byte}) catch unreachable;
+                    pw += hex.len;
                 } else {
-                    try result.append(alloc, byte);
+                    result[pw] = byte;
+                    pw += 1;
                 }
             },
         }
     }
-    try result.appendSlice(alloc, "\"}");
-    return try result.toOwnedSlice(alloc);
+
+    @memcpy(result[pw..][0..suffix.len], suffix);
+    pw += suffix.len;
+
+    alloc.free(content);
+    const final = result[0..pw];
+
+    // Cache the escaped result (path must be duped for map key)
+    const key = try alloc.dupe(u8, path);
+    try file_cache.put(alloc, key, final);
+
+    return final;
 }
 
 fn opWriteFile(req: Request) ![]const u8 {
@@ -214,8 +250,13 @@ fn opWriteFile(req: Request) ![]const u8 {
     return try std.fmt.allocPrint(alloc, "{{\"ok\":true}}", .{});
 }
 
+/// Stat cache
+var stat_cache: std.StringHashMapUnmanaged([]const u8) = .{};
+
 fn opStat(req: Request) ![]const u8 {
     const path = req.path orelse return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"path required\"}}", .{});
+
+    if (stat_cache.get(path)) |cached| return cached;
 
     const stat = std.fs.cwd().statFile(path) catch |err| {
         return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"{s}\",\"code\":\"ENOENT\"}}", .{@errorName(err)});
@@ -223,11 +264,21 @@ fn opStat(req: Request) ![]const u8 {
 
     const is_dir = stat.kind == .directory;
     const is_file = stat.kind == .file;
-    return try std.fmt.allocPrint(alloc, "{{\"ok\":true,\"isFile\":{},\"isDirectory\":{},\"size\":{d}}}", .{ is_file, is_dir, stat.size });
+    const result = try std.fmt.allocPrint(alloc, "{{\"ok\":true,\"isFile\":{},\"isDirectory\":{},\"size\":{d}}}", .{ is_file, is_dir, stat.size });
+
+    const key = alloc.dupe(u8, path) catch path;
+    stat_cache.put(alloc, key, result) catch {};
+
+    return result;
 }
+
+/// Readdir cache
+var readdir_cache: std.StringHashMapUnmanaged([]const u8) = .{};
 
 fn opReaddir(req: Request) ![]const u8 {
     const path = req.path orelse return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"path required\"}}", .{});
+
+    if (readdir_cache.get(path)) |cached| return cached;
 
     var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |err| {
         return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"{s}\",\"code\":\"ENOENT\"}}", .{@errorName(err)});
@@ -249,18 +300,32 @@ fn opReaddir(req: Request) ![]const u8 {
     }
 
     try result.appendSlice(alloc, "]}");
-    return try result.toOwnedSlice(alloc);
+    const final = try result.toOwnedSlice(alloc);
+
+    const key = alloc.dupe(u8, path) catch path;
+    readdir_cache.put(alloc, key, final) catch {};
+
+    return final;
 }
+
+/// Realpath cache
+var realpath_cache: std.StringHashMapUnmanaged([]const u8) = .{};
 
 fn opRealpath(req: Request) ![]const u8 {
     const path = req.path orelse return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"path required\"}}", .{});
+
+    if (realpath_cache.get(path)) |cached| return cached;
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const real = std.fs.cwd().realpath(path, &buf) catch |err| {
         return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"{s}\"}}", .{@errorName(err)});
     };
 
-    return try std.fmt.allocPrint(alloc, "{{\"ok\":true,\"data\":\"{s}\"}}", .{real});
+    const result = try std.fmt.allocPrint(alloc, "{{\"ok\":true,\"data\":\"{s}\"}}", .{real});
+    const key = alloc.dupe(u8, path) catch path;
+    realpath_cache.put(alloc, key, result) catch {};
+
+    return result;
 }
 
 fn opMkdir(req: Request) ![]const u8 {
@@ -278,13 +343,29 @@ fn opMkdir(req: Request) ![]const u8 {
     return try std.fmt.allocPrint(alloc, "{{\"ok\":true}}", .{});
 }
 
+/// Exists cache — TSC checks fileExists/directoryExists thousands of times
+var exists_cache: std.StringHashMapUnmanaged(bool) = .{};
+
 fn opExists(req: Request) ![]const u8 {
     const path = req.path orelse return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"path required\"}}", .{});
 
-    _ = std.fs.cwd().statFile(path) catch {
-        return try std.fmt.allocPrint(alloc, "{{\"ok\":true,\"exists\":false}}", .{});
+    // Check cache
+    if (exists_cache.get(path)) |exists| {
+        return if (exists) "{\"ok\":true,\"exists\":true}" else "{\"ok\":true,\"exists\":false}";
+    }
+
+    const exists = blk: {
+        _ = std.fs.cwd().statFile(path) catch {
+            break :blk false;
+        };
+        break :blk true;
     };
-    return try std.fmt.allocPrint(alloc, "{{\"ok\":true,\"exists\":true}}", .{});
+
+    // Cache result
+    const key = alloc.dupe(u8, path) catch path;
+    exists_cache.put(alloc, key, exists) catch {};
+
+    return if (exists) "{\"ok\":true,\"exists\":true}" else "{\"ok\":true,\"exists\":false}";
 }
 
 fn opUnlink(req: Request) ![]const u8 {
