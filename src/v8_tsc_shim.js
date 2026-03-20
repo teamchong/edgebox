@@ -106,26 +106,36 @@
   }
 
   FastMap.prototype.get = function(key) {
+    // Fast path: integer key (packed type ID pair from patched getRelationKey)
+    if (typeof key === 'number' && key > 0) {
+      if (!this._promoted) promote(this);
+      var v = fastGet(this, key);
+      if (v !== undefined) return v;
+      return undefined;
+    }
     if (this._promoted && typeof key === 'string') {
       var packed = parseNumericKey(key);
       if (packed >= 0) {
-        var v = fastGet(this, packed);
-        if (v !== undefined) return v;
-        // Could be a hash collision miss — check Map fallback
+        var v2 = fastGet(this, packed);
+        if (v2 !== undefined) return v2;
       }
     }
     return this._map.get(key);
   };
 
   FastMap.prototype.set = function(key, value) {
+    // Fast path: integer key
+    if (typeof key === 'number' && key > 0) {
+      if (!this._promoted) promote(this);
+      fastSet(this, key, value);
+      return this;
+    }
     if (typeof key === 'string') {
       var packed = parseNumericKey(key);
       if (packed >= 0) {
         if (!this._promoted) {
           this._numericCount++;
-          if (this._numericCount >= 16) {
-            promote(this);
-          }
+          if (this._numericCount >= 16) promote(this);
         }
         if (this._promoted) {
           fastSet(this, packed, value);
@@ -138,6 +148,10 @@
   };
 
   FastMap.prototype.has = function(key) {
+    if (typeof key === 'number' && key > 0) {
+      if (!this._promoted) return false;
+      return fastGet(this, key) !== undefined;
+    }
     if (this._promoted && typeof key === 'string') {
       var packed = parseNumericKey(key);
       if (packed >= 0 && fastGet(this, packed) !== undefined) return true;

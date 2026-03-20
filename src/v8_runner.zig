@@ -216,6 +216,24 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         }
     }
 
+    // Patch getRelationKey to return packed integer for simple cases
+    // Eliminates string allocation "N,N" on every type relation check
+    if (patched_script != null or final_code.ptr != script_code.ptr) {
+        const grk_needle = "return isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : `${source.id},${target.id}${postFix}`;";
+        const grk_replacement = "if(!postFix && !isTypeReferenceWithGenericArguments(source) && !isTypeReferenceWithGenericArguments(target) && source.id < 0x100000 && target.id < 0x100000) return (source.id << 20) | target.id; return isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : `${source.id},${target.id}${postFix}`;";
+        if (std.mem.indexOf(u8, final_code, grk_needle)) |grk_pos| {
+            const extra = grk_replacement.len - grk_needle.len + 1;
+            var grk_buf = try alloc.alloc(u8, final_code.len + extra);
+            @memcpy(grk_buf[0..grk_pos], final_code[0..grk_pos]);
+            @memcpy(grk_buf[grk_pos..][0..grk_replacement.len], grk_replacement);
+            @memcpy(grk_buf[grk_pos + grk_replacement.len ..][0 .. final_code.len - grk_pos - grk_needle.len], final_code[grk_pos + grk_needle.len ..]);
+            const grk_total = grk_pos + grk_replacement.len + (final_code.len - grk_pos - grk_needle.len);
+            if (patched_script) |ps| alloc.free(ps);
+            patched_script = grk_buf[0..grk_total];
+            final_code = patched_script.?;
+        }
+    }
+
     // Additional TSC source patches: SOA columns for type flags
     // Patch "result.id = typeCount" → "result.id = typeCount; __type_flags[typeCount] = flags"
     // This stores type flags in a flat Int32Array for O(1) access in hot paths.
