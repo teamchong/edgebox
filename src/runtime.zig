@@ -1913,6 +1913,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     // Patch getFlowCacheKey: pack 4 IDs into single number instead of string concat
                     const fck_needle = "return symbol !== unknownSymbol ? `${flowContainer ? getNodeId(flowContainer) : \"-1\"}|${getTypeId(declaredType)}|${getTypeId(initialType)}|${getSymbolId(symbol)}` : undefined;";
                     const fck_repl = "if(symbol===unknownSymbol)return undefined;var __fc=flowContainer?getNodeId(flowContainer):0,__dt=getTypeId(declaredType),__it=getTypeId(initialType),__si=getSymbolId(symbol);if(__fc<10000&&__dt<10000&&__it<10000&&__si<10000)return __fc*1000000000000+__dt*100000000+__it*10000+__si+1;return`${flowContainer?getNodeId(flowContainer):\"-1\"}|${__dt}|${__it}|${__si}`;";
+                    // Patch getFlowCacheKey "this" case: 3 IDs → integer
+                    const fck2_needle = "return `0|${flowContainer ? getNodeId(flowContainer) : \"-1\"}|${getTypeId(declaredType)}|${getTypeId(initialType)}`;";
+                    const fck2_repl = "{var __fc2=flowContainer?getNodeId(flowContainer):0,__dt2=getTypeId(declaredType),__it2=getTypeId(initialType);if(__fc2<100000&&__dt2<100000&&__it2<100000)return __fc2*10000000000+__dt2*100000+__it2+1;return`0|${flowContainer?getNodeId(flowContainer):\"-1\"}|${__dt2}|${__it2}`;}";
                     // Patch ALL Maps — FastRelationCache must be complete drop-in.
                     // Broad patching (all 161 Maps) causes silent crashes on some Maps
                     // that use Set-like iteration patterns our FastRelationCache doesn't handle.
@@ -1924,7 +1927,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             rcount += 1;
                     }
                     if (rcount > 0) {
-                        var buf = allocator.alloc(u8, orig.len + rcount * repl.len + grk_repl.len + 10 * sw_repl.len + fck_repl.len) catch break :blk @as(?[]const u8, orig);
+                        var buf = allocator.alloc(u8, orig.len + rcount * repl.len + grk_repl.len + 10 * sw_repl.len + fck_repl.len + fck2_repl.len) catch break :blk @as(?[]const u8, orig);
                         var pw: usize = 0;
                         var pr: usize = 0;
                         while (pr < orig.len) {
@@ -1956,13 +1959,22 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 pr += sw_needle.len;
                                 continue;
                             }
-                            // P4: getFlowCacheKey → integer packing for 4-ID keys
+                            // P4: getFlowCacheKey identifier → integer packing for 4-ID keys
                             if (pr + fck_needle.len <= orig.len and
                                 std.mem.startsWith(u8, orig[pr..], fck_needle))
                             {
                                 @memcpy(buf[pw..][0..fck_repl.len], fck_repl);
                                 pw += fck_repl.len;
                                 pr += fck_needle.len;
+                                continue;
+                            }
+                            // P5: getFlowCacheKey "this" → integer packing for 3-ID keys
+                            if (pr + fck2_needle.len <= orig.len and
+                                std.mem.startsWith(u8, orig[pr..], fck2_needle))
+                            {
+                                @memcpy(buf[pw..][0..fck2_repl.len], fck2_repl);
+                                pw += fck2_repl.len;
+                                pr += fck2_needle.len;
                                 continue;
                             }
                             buf[pw] = orig[pr];
