@@ -470,27 +470,24 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
             while (v8.pumpMessageLoop(platform, isolate)) {}
         }
 
+        // Use pre-compiled __runTsc from snapshot (already Sparkplug-compiled).
+        // Falls back to inline eval if __runTsc not in snapshot.
         const tsc_fast_js =
             \\(function() {
-            \\  if (typeof globalThis.ts === 'undefined' || !ts.executeCommandLine) return;
-            \\  // Inline shim
-            \\  globalThis.__FastRelationCache = Map;
-            \\  globalThis.__typesById = [];
-            \\  globalThis.__sfCache = Object.create(null);
             \\  var args = process.argv.slice(2).filter(function(a){return a!=='--serve';});
-            \\  // In --serve mode, auto-inject --incremental for fast warm runs.
-            \\  // Without serve, let the user control incremental explicitly.
             \\  if (process.argv.indexOf('--serve')>=0 && args.indexOf('--incremental')===-1) {
             \\    args.push('--incremental','--tsBuildInfoFile','/tmp/edgebox-incr-cache/tsinfo.json');
             \\  }
-            \\  ts.sys.args = args;
-            \\  ts.sys.getExecutingFilePath = function() { return __filename; };
-            \\  ts.Debug.loggingHost = {
-            \\    log: function(_level, s) { ts.sys.write((s || '') + ts.sys.newLine); }
-            \\  };
-            \\  if (ts.Debug.isDebugging) ts.Debug.enableDebugInfo();
-            \\  if (ts.sys.setBlocking) ts.sys.setBlocking();
-            \\  ts.executeCommandLine(ts.sys, function(){}, ts.sys.args);
+            \\  if (typeof __runTsc === 'function') {
+            \\    __runTsc(args);
+            \\  } else if (typeof ts !== 'undefined' && ts.executeCommandLine) {
+            \\    globalThis.__sfCache = Object.create(null);
+            \\    ts.sys.args = args;
+            \\    ts.sys.getExecutingFilePath = function() { return __filename; };
+            \\    ts.Debug.loggingHost = { log: function(_level, s) { ts.sys.write((s || '') + ts.sys.newLine); } };
+            \\    if (ts.sys.setBlocking) ts.sys.setBlocking();
+            \\    ts.executeCommandLine(ts.sys, function(){}, ts.sys.args);
+            \\  }
             \\})();
         ;
 

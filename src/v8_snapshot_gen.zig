@@ -104,7 +104,24 @@ pub fn main() !void {
                         };
                         std.debug.print("[snapshot-gen] Pre-compiled + initialized TSC in snapshot\n", .{});
 
-                        // Warm Sparkplug+Maglev: parse small files and run a micro type check.
+                        // Pre-compile __runTsc function — saved as Sparkplug bytecode in snapshot.
+                        // At runtime, calling __runTsc(args) is faster than eval'ing the same code.
+                        const run_tsc_code =
+                            \\globalThis.__FastRelationCache = Map;
+                            \\globalThis.__typesById = [];
+                            \\globalThis.__sfCache = Object.create(null);
+                            \\globalThis.__runTsc = function(__args) {
+                            \\  ts.sys.args = __args;
+                            \\  ts.sys.getExecutingFilePath = function() { return globalThis.__filename || '/usr/bin/tsc'; };
+                            \\  ts.Debug.loggingHost = {
+                            \\    log: function(_level, s) { ts.sys.write((s || '') + ts.sys.newLine); }
+                            \\  };
+                            \\  if (ts.Debug.isDebugging) ts.Debug.enableDebugInfo();
+                            \\  if (ts.sys.setBlocking) ts.sys.setBlocking();
+                            \\  ts.executeCommandLine(ts.sys, function(){}, ts.sys.args);
+                            \\};
+                        ;
+                        _ = v8.eval(isolate, ctx, run_tsc_code, "run_tsc.js") catch {};
                         std.debug.print("[snapshot-gen] TSC initialized in snapshot\n", .{});
                     }
                 }
