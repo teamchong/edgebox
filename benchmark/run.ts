@@ -438,9 +438,16 @@ function benchmarkProject(
     nodeTimes.push(nodeResult.time);
   }
 
-  // Benchmark EdgeBox tsc (worker .mjs via Node.js — V8 inlines WASM)
+  // Benchmark EdgeBox tsc
+  // Run 1 is COLD (clean incremental cache), runs 2-N are WARM (incremental).
+  // The worker path auto-injects --incremental, so warm runs skip unchanged file checks.
   const edgeboxTimes: number[] = [];
+  let edgeboxColdTime = 0;
   let edgeboxResult: RunResult = { time: 0, success: false, outputFiles: 0, outputSize: 0, diagnostics: 0 };
+
+  // Clean incremental cache before first run
+  const incrCacheDir = "/tmp/edgebox-incr-cache";
+  rmSync(incrCacheDir, { recursive: true, force: true });
 
   for (let i = 0; i < runs; i++) {
     edgeboxResult = runTsc("node", [edgeboxTsc, ...tscArgs], edgeboxOutDir, debug);
@@ -448,6 +455,7 @@ function benchmarkProject(
       console.log(`    EdgeBox: Failed - ${edgeboxResult.error}`);
       return null;
     }
+    if (i === 0) edgeboxColdTime = edgeboxResult.time;
     edgeboxTimes.push(edgeboxResult.time);
   }
 
@@ -527,15 +535,19 @@ function benchmarkProject(
     tsgoSpeedup = nodeMean / tsgoMean;
   }
 
-  console.log(`    Node.js:  ${nodeMin.toFixed(0)}ms (${nodeResult.diagnostics} errors)`);
+  console.log(`    Node.js:      ${nodeMin.toFixed(0)}ms cold (${nodeResult.diagnostics} errors)`);
   if (bunMean !== undefined) {
-    console.log(`    Bun:      ${bunMin!.toFixed(0)}ms - ${(bunMin! / edgeboxMin).toFixed(2)}x vs EdgeBox`);
+    console.log(`    Bun:          ${bunMin!.toFixed(0)}ms - ${(bunMin! / edgeboxMin).toFixed(2)}x vs EdgeBox`);
   }
-  console.log(`    EdgeBox:  ${edgeboxMin.toFixed(0)}ms (${edgeboxResult.diagnostics} errors) - ${speedup.toFixed(2)}x vs Node`);
+  const warmMin = runs > 1 ? Math.min(...edgeboxTimes.slice(1)) : edgeboxMin;
+  console.log(`    EdgeBox cold: ${edgeboxColdTime.toFixed(0)}ms (${edgeboxResult.diagnostics} errors) - ${(nodeMin / edgeboxColdTime).toFixed(2)}x vs Node`);
+  if (runs > 1) {
+    console.log(`    EdgeBox warm: ${warmMin.toFixed(0)}ms - ${(nodeMin / warmMin).toFixed(2)}x vs Node`);
+  }
   if (tsgoMin !== undefined) {
-    console.log(`    tsgo:     ${tsgoMin.toFixed(0)}ms - ${(nodeMin / tsgoMin).toFixed(2)}x vs Node`);
+    console.log(`    tsgo:         ${tsgoMin.toFixed(0)}ms - ${(nodeMin / tsgoMin).toFixed(2)}x vs Node`);
   }
-  console.log(`    Match:    ${comparison.match ? "✓ Same diagnostics" : `✗ ${comparison.diff}`}`);
+  console.log(`    Match:        ${comparison.match ? "✓ Same diagnostics" : `✗ ${comparison.diff}`}`);
 
   // Cleanup
   rmSync(nodeOutDir, { recursive: true, force: true });
@@ -557,7 +569,10 @@ function benchmarkProject(
     edgeboxMean,
     edgeboxMin,
     edgeboxMax,
+    edgeboxCold: edgeboxColdTime,
+    edgeboxWarmMin: runs > 1 ? Math.min(...edgeboxTimes.slice(1)) : edgeboxMin,
     speedup,
+    speedupCold: nodeMin / edgeboxColdTime,
     nodeDiagnostics: nodeResult.diagnostics,
     edgeboxDiagnostics: edgeboxResult.diagnostics,
     outputMatch: comparison.match,
@@ -713,10 +728,9 @@ async function main() {
   let header = "| Project    | Lines     | Node.js (ms) |";
   let separator = "|------------|-----------|--------------|";
   if (hasBun) { header += " Bun (ms)     |"; separator += "--------------|"; }
-  header += " EdgeBox (ms) | vs Node |";
-  separator += "--------------|---------|";
-  if (hasBun) { header += " vs Bun  |"; separator += "---------|"; }
-  if (hasTsgo) { header += " tsgo (ms) | tsgo Speedup |"; separator += "-----------|--------------|"; }
+  header += " EB cold (ms) | EB warm (ms) | cold vs Node | warm vs Node |";
+  separator += "--------------|--------------|--------------|--------------|";
+  if (hasTsgo) { header += " tsgo (ms) | tsgo vs Node |"; separator += "-----------|--------------|"; }
   header += " Match |";
   separator += "-------|";
 
@@ -726,8 +740,10 @@ async function main() {
   for (const r of results) {
     const lines = r.lines.toLocaleString().padStart(9);
     const node = r.nodeMin.toFixed(0).padStart(12);
-    const edgebox = r.edgeboxMin.toFixed(0).padStart(12);
-    const speedup = `${r.speedup.toFixed(2)}x`.padStart(7);
+    const ebCold = (r as any).edgeboxCold !== undefined ? (r as any).edgeboxCold.toFixed(0).padStart(12) : r.edgeboxMin.toFixed(0).padStart(12);
+    const ebWarm = (r as any).edgeboxWarmMin !== undefined ? (r as any).edgeboxWarmMin.toFixed(0).padStart(12) : r.edgeboxMin.toFixed(0).padStart(12);
+    const coldSpd = (r as any).speedupCold !== undefined ? `${(r as any).speedupCold.toFixed(2)}x`.padStart(12) : `${r.speedup.toFixed(2)}x`.padStart(12);
+    const warmSpd = `${r.speedup.toFixed(2)}x`.padStart(12);
     const match = r.outputMatch ? "  ✓  " : "  ✗  ";
 
     let row = `| ${r.project.padEnd(10)} | ${lines} | ${node} |`;
@@ -735,11 +751,7 @@ async function main() {
       const bun = r.bunMin !== undefined ? r.bunMin.toFixed(0).padStart(12) : "-".padStart(12);
       row += ` ${bun} |`;
     }
-    row += ` ${edgebox} | ${speedup} |`;
-    if (hasBun) {
-      const bunSpd = r.bunMin !== undefined && r.edgeboxMin > 0 ? `${(r.bunMin / r.edgeboxMin).toFixed(2)}x`.padStart(7) : "-".padStart(7);
-      row += ` ${bunSpd} |`;
-    }
+    row += ` ${ebCold} | ${ebWarm} | ${coldSpd} | ${warmSpd} |`;
     if (hasTsgo) {
       const tsgo = r.tsgoMin !== undefined ? r.tsgoMin.toFixed(0).padStart(9) : "-".padStart(9);
       const tsgoSpd = r.tsgoMin !== undefined && r.nodeMin > 0 ? `${(r.nodeMin / r.tsgoMin).toFixed(2)}x`.padStart(12) : "-".padStart(12);
