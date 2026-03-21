@@ -411,12 +411,14 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         _ = v8.eval(isolate, context, argv_fix, "argv_fix.js") catch {};
     }
 
-    // Inject TSC shim (always — snapshot's version may be outdated)
-    const tsc_shim_code = @embedFile("v8_tsc_shim.js");
-    _ = v8.eval(isolate, context, tsc_shim_code, "v8_tsc_shim.js") catch {};
+    // Inject TSC shim — skip for freeze-compiled modules (they have their own)
+    if (!is_freeze_compiled) {
+        const tsc_shim_code = @embedFile("v8_tsc_shim.js");
+        _ = v8.eval(isolate, context, tsc_shim_code, "v8_tsc_shim.js") catch {};
+    }
 
-    // Load freeze-compiled WASM functions (type checker hot paths)
-    if (is_tsc) {
+    // Load freeze-compiled WASM functions (skip for freeze modules — they handle this)
+    if (is_tsc and !is_freeze_compiled) {
         const wasm_init_js =
             \\(function() {
             \\  try {
@@ -449,7 +451,7 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
 
     // TSC snapshot fast-path: on cold start (no code cache), use pre-initialized
     // globalThis.ts from snapshot. Skips compiling 6.2MB _tsc.js entirely.
-    if (is_tsc and use_snapshot and !has_warm_cache) {
+    if (is_tsc and use_snapshot and !has_warm_cache and !is_freeze_compiled) {
         const dirname_sp = std.fs.path.dirname(abs_path) orelse ".";
         const sp_globals = try std.fmt.allocPrint(alloc,
             "globalThis.__filename = \"{s}\"; globalThis.__dirname = \"{s}\";",
