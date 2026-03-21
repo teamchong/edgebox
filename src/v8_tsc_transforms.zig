@@ -13,14 +13,15 @@ const Transform = struct {
 
 /// All TSC source transforms. Order matters — first match wins.
 pub const transforms = [_]Transform{
-    // T1: disabled — SOA writes removed (T-SOA1/T-SOA2 disabled, no readers)
-    // T2: isTypeRelatedTo → inline flag fast-path for safe primitive widening.
-    // Handles: Any←*, *←Never, StringLike→String, NumberLike→Number,
-    // BigIntLike→BigInt, BooleanLike→Boolean, ESSymbolLike→ESSymbol.
-    // These are safe for ALL relations (subtype, assignable, comparable, identity).
-    .{ .needle = "function isTypeRelatedTo(source, target, relation) {\n    if (isFreshLiteralType(source)) {\n      source = source.regularType;\n    }\n    if (isFreshLiteralType(target)) {\n      target = target.regularType;\n    }\n    if (source === target) {\n      return true;\n    }", .replacement = "function isTypeRelatedTo(source, target, relation) {\n    if (isFreshLiteralType(source)) {\n      source = source.regularType;\n    }\n    if (isFreshLiteralType(target)) {\n      target = target.regularType;\n    }\n    if (source === target) {\n      return true;\n    }\n    var __tf=target.flags;if(__tf&1)return true;var __sf=source.flags;if(__sf&131072)return true;if(__sf&402653316&&__tf&4||__sf&296&&__tf&8||__sf&2112&&__tf&64||__sf&528&&__tf&16||__sf&12288&&__tf&4096)return true;" },
+    // T1: createType → assign __fid (flag ID) for bitmap lookup.
+    // Maps type.flags → small integer ID. ~200 distinct flag values for 66K types.
+    .{ .needle = "typeCount++;\n    result.id = typeCount;", .replacement = "typeCount++;\n    result.id = typeCount;\n    if(typeof __fidMap!=='undefined'){var __f=result.flags,__fid=__fidMap[__f];if(__fid===undefined){__fid=__fidNext++;__fidMap[__f]=__fid;if(__fid<256&&typeof __pc_typeFlags!=='undefined')__pc_typeFlags[__fid]=__f;}result.__fid=__fid;}" },
+    // T2: isTypeRelatedTo → bitmap lookup (pre-computed by Zig SIMD).
+    // bitmap[source.__fid * 256 + target.__fid] = 1 (related) or 0 (unknown).
+    // Falls back to inline flag checks if bitmap miss or __fid not set.
+    .{ .needle = "function isTypeRelatedTo(source, target, relation) {\n    if (isFreshLiteralType(source)) {\n      source = source.regularType;\n    }\n    if (isFreshLiteralType(target)) {\n      target = target.regularType;\n    }\n    if (source === target) {\n      return true;\n    }", .replacement = "function isTypeRelatedTo(source, target, relation) {\n    if (isFreshLiteralType(source)) {\n      source = source.regularType;\n    }\n    if (isFreshLiteralType(target)) {\n      target = target.regularType;\n    }\n    if (source === target) {\n      return true;\n    }\n    if(typeof __flagBitmap!=='undefined'&&source.__fid!==undefined&&target.__fid!==undefined){var __br=__flagBitmap[source.__fid*256+target.__fid];if(__br===1)return true;}\n    var __tf=target.flags;if(__tf&1)return true;var __sf=source.flags;if(__sf&131072)return true;if(__sf&402653316&&__tf&4||__sf&296&&__tf&8||__sf&2112&&__tf&64||__sf&528&&__tf&16||__sf&12288&&__tf&4096)return true;" },
     // T3: getRelationKey → packed Smi when IDs fit (< 32768) and no postFix.
-    .{ .needle = "isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : `${source.id},${target.id}${postFix}`", .replacement = "isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : (!postFix&&source.id<32768&&target.id<46340) ? source.id * 46340 + target.id + 1 : `${source.id},${target.id}${postFix}`" },
+    .{ .needle = "isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : `${source.id},${target.id}${postFix}`", .replacement = "isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : (!postFix&&source.id<32768&&target.id<32768) ? source.id * 32768 + target.id + 1 : `${source.id},${target.id}${postFix}`" },
     // T4: JSDoc skip
     .{ .needle = "jsDocParsingMode = 0", .replacement = "jsDocParsingMode = 1" },
     // T5: typeof guard for packed integer key

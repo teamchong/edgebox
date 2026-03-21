@@ -110,6 +110,11 @@ pub fn main() !void {
                             \\globalThis.__FastRelationCache = Map;
                             \\globalThis.__typesById = [];
                             \\globalThis.__sfCache = Object.create(null);
+                            \\// Flag ID mapping for bitmap lookup (T1 assigns __fid to each type)
+                            \\globalThis.__fidMap = Object.create(null);
+                            \\globalThis.__fidNext = 0;
+                            \\// Bitmap: 256×256 = 64KB, filled by Zig SIMD before Check
+                            \\globalThis.__flagBitmap = new Uint8Array(65536);
                             \\globalThis.__runTsc = function(__args) {
                             \\  ts.sys.args = __args;
                             \\  ts.sys.getExecutingFilePath = function() { return globalThis.__filename || '/usr/bin/tsc'; };

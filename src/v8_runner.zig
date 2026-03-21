@@ -386,16 +386,31 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         const parallel_init_js = @embedFile("v8_parallel_init.js");
         _ = v8.eval(isolate, context, parallel_init_js, "v8_parallel_init.js") catch {};
     } else {
-        // For TSC: register precompute callback (pumps V8 message loop for TurboFan).
-        // SAB columns removed — SOA transforms disabled (net-neutral).
+        // For TSC: expose SAB typeFlags for T1 + register precompute callback.
+        // T1 writes distinct flag values to __pc_typeFlags[__fid].
+        // Precompute callback builds SIMD bitmap before Check.
         const v8_parallel_check = @import("v8_parallel_check.zig");
         const global_obj = v8.ContextApi.global(context);
 
+        // Expose SAB typeFlags column (256 slots for flag IDs)
+        const buf = v8_parallel_check.getSharedBuffer() orelse return;
+        const sab = v8.SharedArrayBufferApi.fromExternalMemory(isolate, buf, v8_parallel_check.TOTAL_BYTES) orelse return;
+        const sab_key = v8.StringApi.fromUtf8(isolate, "__pc_sab") orelse return;
+        _ = v8.ObjectApi.set(global_obj, context, @ptrCast(sab_key), sab);
+
+        // Create typeFlags view (256 slots — one per distinct flag value)
+        var init_buf: [256]u8 = undefined;
+        const init_js = std.fmt.bufPrint(&init_buf,
+            "globalThis.__pc_typeFlags=new Int32Array(__pc_sab,0,256);",
+            .{},
+        ) catch return;
+        _ = v8.eval(isolate, context, init_js, "pc_init.js") catch {};
+
+        // Register precompute callback (builds bitmap + pumps TurboFan)
         const pc_tmpl = v8.FunctionTemplateApi.create(isolate, &v8_parallel_check.precomputeCallback) orelse return;
         const pc_func = v8.FunctionTemplateApi.getFunction(pc_tmpl, context) orelse return;
         const pc_key = v8.StringApi.fromUtf8(isolate, "__edgebox_precompute_relations") orelse return;
         _ = v8.ObjectApi.set(global_obj, context, @ptrCast(pc_key), @ptrCast(pc_func));
-
     }
 
     // For packed binaries: ensure process.argv has [exe, script, ...args] format

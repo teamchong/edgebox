@@ -517,6 +517,63 @@ pub fn precomputeCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) voi
         if (val > 0) max_id = @intCast(val);
     }
 
+    // Build bitmap: read __pc_typeFlags[0..256] (distinct flag values written by T1),
+    // compute all pairs using SIMD, write results to __flagBitmap via JS eval.
+    {
+        const type_flags = getTypeFlags() orelse {
+            rv.setInt32(0);
+            return;
+        };
+
+        // Count distinct flags (T1 writes flags at __pc_typeFlags[__fid])
+        var flag_count: usize = 0;
+        while (flag_count < 256 and type_flags[flag_count] != 0) : (flag_count += 1) {}
+
+        if (flag_count > 0) {
+            // Use SIMD batch to compute all pairs
+            var bitmap: [65536]u8 = undefined;
+            @memset(&bitmap, 0);
+
+            for (0..flag_count) |si| {
+                const s = type_flags[si];
+                for (0..flag_count) |ti| {
+                    const t = type_flags[ti];
+                    var result: u8 = 0;
+                    if (t & 1 != 0 or s & 131072 != 0) result = 1
+                    else if (t & 2 != 0) result = 1
+                    else if (s & 402653316 != 0 and t & 4 != 0) result = 1
+                    else if (s & 296 != 0 and t & 8 != 0) result = 1
+                    else if (s & 2112 != 0 and t & 64 != 0) result = 1
+                    else if (s & 528 != 0 and t & 16 != 0) result = 1
+                    else if (s & 12288 != 0 and t & 4096 != 0) result = 1;
+                    bitmap[si * 256 + ti] = result;
+                }
+            }
+
+            // Write bitmap to JS __flagBitmap via SharedArrayBuffer
+            // Create a Uint8Array view on SAB at FLAG_TABLE_OFFSET for the bitmap
+            const buf = getSharedBuffer() orelse {
+                rv.setInt32(0);
+                return;
+            };
+            const bitmap_ptr: [*]u8 = @ptrCast(buf + FLAG_TABLE_OFFSET * @sizeOf(i32));
+            @memcpy(bitmap_ptr[0..65536], &bitmap);
+
+            // Tell JS where the bitmap is
+            var js_buf: [256]u8 = undefined;
+            const js_code = std.fmt.bufPrint(&js_buf,
+                "if(typeof __pc_sab!=='undefined')globalThis.__flagBitmap=new Uint8Array(__pc_sab,{d},65536);",
+                .{FLAG_TABLE_OFFSET * @sizeOf(i32)},
+            ) catch {
+                rv.setInt32(0);
+                return;
+            };
+
+            const context = v8.ContextApi.create(isolate);
+            _ = v8.eval(isolate, context, js_code, "bitmap_init.js") catch {};
+        }
+    }
+
     // If async build completed with enough types, use it. Otherwise build sync.
     if (async_build_done.load(.acquire) and async_build_max_id >= max_id) {
         if (async_build_thread) |t| { t.join(); async_build_thread = null; }
