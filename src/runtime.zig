@@ -1889,9 +1889,22 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             defer if (patch_manifest) |pm| allocator.free(pm);
 
             // Read clean bundle
+            // Load the FULL bundle (not clean) for SOA patch application.
+            // Patches reference bundle.js line numbers (from bytecode analysis).
+            // bundle_clean.js has different line numbers (polyfills stripped).
             var clean_content_orig: ?[]u8 = null;
-            if (clean_bundle_path) |cbp| {
-                clean_content_orig = std.fs.cwd().readFileAlloc(allocator, cbp, 50 * 1024 * 1024) catch null;
+            {
+                var bundle_path_buf2: [4096]u8 = undefined;
+                const bundle_path2 = std.fmt.bufPrint(&bundle_path_buf2, "{s}/bundle.js", .{cache_dir}) catch null;
+                if (bundle_path2) |bp2| {
+                    clean_content_orig = std.fs.cwd().readFileAlloc(allocator, bp2, 50 * 1024 * 1024) catch null;
+                }
+                // Fallback to clean bundle if full bundle not available
+                if (clean_content_orig == null) {
+                    if (clean_bundle_path) |cbp| {
+                        clean_content_orig = std.fs.cwd().readFileAlloc(allocator, cbp, 50 * 1024 * 1024) catch null;
+                    }
+                }
             }
             defer if (clean_content_orig) |cc| allocator.free(cc);
 
@@ -4006,7 +4019,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         // soa_base now stored as VAR.__sb (property on array), not scoped variable.
                         // No need to disable for inter-procedural leaks — .__sb travels with the array.
 
-                        var rs_rewrite_count: u32 = 0;
+                        const rs_rewrite_count: u32 = 0;
 
                         // Pre-pass: build exact rewrite positions
                         const RewriteInfo = struct { dot_pos: u32, end_pos: u32, field: []const u8 };
