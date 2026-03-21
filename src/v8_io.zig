@@ -472,12 +472,20 @@ pub fn readFileFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) v
     const isolate = v8.CallbackInfoApi.getIsolate(info);
     var rv = v8.CallbackInfoApi.getReturnValue(info);
 
-    maybePumpMessageLoop(isolate);
+    // Pump on readFile — but less frequently than before.
+    // readFile is called ~400 times; pump every 128th call = ~3 pumps total.
+    {
+        pump_counter +%= 1;
+        if (!is_worker_thread and pump_counter & 127 == 0) {
+            if (v8.global_platform) |platform| {
+                while (v8.pumpMessageLoop(platform, isolate)) {}
+            }
+        }
+    }
 
     if (v8.CallbackInfoApi.length(info) < 1) { rv.setUndefined(); return; }
     const arg0 = v8.CallbackInfoApi.get(info, 0) orelse { rv.setUndefined(); return; };
     if (!v8.ValueApi.isString(arg0)) { rv.setUndefined(); return; }
-
     const str: *const v8.String = @ptrCast(arg0);
     const len: usize = @intCast(v8.StringApi.utf8Length(str, isolate));
     if (len == 0 or len > 4096) { rv.setUndefined(); return; }
@@ -486,7 +494,7 @@ pub fn readFileFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) v
     const written = v8.StringApi.writeUtf8(str, isolate, &path_buf);
     const path = path_buf[0..written];
 
-    // Wait for speculative prefetch to complete (may have pre-read this file)
+    // Join speculative prefetch only if one is pending
     if (prefetch_thread) |t| { t.join(); prefetch_thread = null; }
 
     // Check raw content cache (thread-safe via mutex)
@@ -537,15 +545,16 @@ pub fn readFileFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) v
 
 /// Fast fileExists: path → boolean (no JSON)
 pub fn fileExistsFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
-    const isolate = v8.CallbackInfoApi.getIsolate(info);
     var rv = v8.CallbackInfoApi.getReturnValue(info);
 
-    maybePumpMessageLoop(isolate);
+    // No pump here — fileExists is called thousands of times during Program phase.
+    // TurboFan pumping happens in readFile and at Check phase boundaries.
 
     if (v8.CallbackInfoApi.length(info) < 1) { rv.setUndefined(); return; }
     const arg0 = v8.CallbackInfoApi.get(info, 0) orelse { rv.setUndefined(); return; };
     if (!v8.ValueApi.isString(arg0)) { rv.setUndefined(); return; }
 
+    const isolate = v8.CallbackInfoApi.getIsolate(info);
     const str: *const v8.String = @ptrCast(arg0);
     const len: usize = @intCast(v8.StringApi.utf8Length(str, isolate));
     if (len == 0 or len > 4096) { rv.setUndefined(); return; }
@@ -554,30 +563,32 @@ pub fn fileExistsFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c)
     const written = v8.StringApi.writeUtf8(str, isolate, &path_buf);
     const path = path_buf[0..written];
 
+    // Hot path: cache lookup (no mutex needed in single-threaded TSC mode —
+    // batch prefetch completed before TSC starts)
     io_mutex.lock();
     const cached = exists_cache.get(path);
+    const dir_check = if (cached == null) blk: {
+        // Fast negative: check if directory was scanned
+        const dir = std.fs.path.dirname(path);
+        if (dir) |d| {
+            break :blk scanned_dirs.get(d) != null;
+        }
+        break :blk false;
+    } else false;
     io_mutex.unlock();
+
     if (cached) |exists| {
         rv.setInt32(if (exists) 1 else 0);
         return;
     }
-
-    // Fast negative: if the directory was fully scanned and path isn't in
-    // exists_cache, the file doesn't exist (no stat() syscall needed).
-    const dir = std.fs.path.dirname(path);
-    if (dir) |d| {
+    if (dir_check) {
+        // Directory was scanned — path not in exists_cache = doesn't exist
+        const key = alloc.dupe(u8, path) catch path;
         io_mutex.lock();
-        const dir_scanned = scanned_dirs.get(d) != null;
+        exists_cache.put(alloc, key, false) catch {};
         io_mutex.unlock();
-        if (dir_scanned) {
-            // Directory was scanned — path not in exists_cache = doesn't exist
-            const key = alloc.dupe(u8, path) catch path;
-            io_mutex.lock();
-            exists_cache.put(alloc, key, false) catch {};
-            io_mutex.unlock();
-            rv.setInt32(0);
-            return;
-        }
+        rv.setInt32(0);
+        return;
     }
 
     const exists = blk: {
