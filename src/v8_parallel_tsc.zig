@@ -1,12 +1,15 @@
 // v8_parallel_tsc.zig — Parallel type checking via multiple V8 isolates
 //
-// Architecture (A/B V8 idea):
-// - Main isolate (A): snapshot-based, acts as worker 0
-// - Worker isolates (B1..BN): snapshot-based (TSC pre-compiled, ~10ms startup)
-// - Zig: the channel connecting A↔B via shared memory (file cache, stdout)
-// - Each worker creates its own program (re-parses from Zig file cache)
-// - Check loop sharding: worker only checks files where fileIndex % N === workerId
-// - MapReduce: diagnostics fan out to workers, reduce back via shared stdout
+// Architecture (phase-split):
+// 1. Main isolate: createProgram (parse + bind all files) — populates Zig file cache
+// 2. After createProgram: __edgebox_spawn_check_workers callback fires
+// 3. Zig spawns N-1 worker threads with snapshot isolates
+// 4. Workers: createProgram (instant — files already in Zig cache) + check assigned files
+// 5. Main: checks its assigned files (worker 0)
+// 6. All workers finish → diagnostics merged via shared stdout
+//
+// Key: workers start AFTER main's createProgram, so all file reads hit cache.
+// No IO contention during workers' createProgram phase.
 
 const std = @import("std");
 const v8 = @import("v8.zig");
@@ -18,7 +21,6 @@ const max_check_workers = 8;
 const embedded_snapshot = @embedFile("v8_bootstrap.snapshot");
 
 /// External references — MUST match snapshot_gen.zig exactly (same order, same count).
-/// Missing refs cause V8 to map wrong function pointers → segfault.
 var external_refs: [11]usize = .{0} ** 11;
 var ext_refs_initialized = false;
 
@@ -47,6 +49,13 @@ const snapshot_init_js =
     \\})();
 ;
 
+/// Shared state — set by main thread, read by workers
+var g_worker_count: usize = 0;
+var g_tsc_path: []const u8 = "";
+var g_tsc_dir: []const u8 = "";
+var g_tsc_fast_js: []const u8 = "";
+var g_threads: [max_check_workers]?std.Thread = .{null} ** max_check_workers;
+
 const CheckWorkerCtx = struct {
     worker_id: usize,
     worker_count: usize,
@@ -55,12 +64,12 @@ const CheckWorkerCtx = struct {
     tsc_fast_js: []const u8,
 };
 
+var g_ctxs: [max_check_workers]CheckWorkerCtx = undefined;
+
 fn checkWorkerFn(ctx: *CheckWorkerCtx) void {
-    // Mark as worker thread — prevents pumpMessageLoop and speculative prefetch
     v8_io.is_worker_thread = true;
 
-    // Create isolate from snapshot — TSC already compiled (~10ms startup)
-    // CRITICAL: external_refs must match snapshot_gen.zig exactly (all 9 callbacks)
+    // Snapshot isolate — TSC pre-compiled (~10ms startup)
     const iso = v8.SnapshotApi.createIsolateFromSnapshot(
         embedded_snapshot.ptr,
         @intCast(embedded_snapshot.len),
@@ -76,10 +85,8 @@ fn checkWorkerFn(ctx: *CheckWorkerCtx) void {
     v8.ContextApi.enter(context);
     defer v8.ContextApi.exit(context);
 
-    // Refresh process.argv and process.env from OS args
     _ = v8.eval(iso, context, snapshot_init_js, "snapshot_init.js") catch {};
 
-    // Set worker sharding globals + __filename/__dirname
     var init_buf: [2048]u8 = undefined;
     const init_js = std.fmt.bufPrint(&init_buf,
         "globalThis.__edgebox_worker_id={d};" ++
@@ -91,69 +98,90 @@ fn checkWorkerFn(ctx: *CheckWorkerCtx) void {
     ) catch return;
     _ = v8.eval(iso, context, init_js, "check_worker_init.js") catch {};
 
-    // Run TSC — snapshot has ts global, check loop will shard by worker_id
-    std.debug.print("[worker-{d}] running TSC (snapshot)\n", .{ctx.worker_id});
+    // Run TSC — createProgram reads from Zig cache
+    const t0 = std.time.milliTimestamp();
+    std.debug.print("[worker-{d}] start (+{d}ms)\n", .{ ctx.worker_id, t0 - g_start_time });
     _ = v8.eval(iso, context, ctx.tsc_fast_js, "tsc_check_worker.js") catch {};
-    std.debug.print("[worker-{d}] done (exit={any})\n", .{ ctx.worker_id, v8_io.deferred_exit_code });
+    const t1 = std.time.milliTimestamp();
+    std.debug.print("[worker-{d}] done ({d}ms total, +{d}ms)\n", .{ ctx.worker_id, t1 - t0, t1 - g_start_time });
 
     v8_io.flushAll();
 }
 
-/// Run TSC type checking in parallel across N worker isolates.
-/// Main thread acts as worker 0 (snapshot), spawns N-1 workers (also snapshot).
-///
-/// Returns true if parallel checking was used, false if single-threaded.
-pub fn runParallelCheck(
-    main_isolate: *v8.Isolate,
-    main_context: *const v8.Context,
+/// V8 callback: __edgebox_spawn_check_workers()
+/// Called from TSC transform AFTER createProgram completes.
+/// Spawns N-1 worker threads. Main continues as worker 0.
+var g_start_time: i64 = 0;
+
+pub fn spawnCheckWorkersCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
+    _ = info;
+    const now = std.time.milliTimestamp();
+    std.debug.print("[parallel-tsc] createProgram done ({d}ms), spawning workers\n", .{now - g_start_time});
+
+    if (g_worker_count <= 1) return;
+
+    std.debug.print("[parallel-tsc] spawning {d} workers (after createProgram)\n", .{g_worker_count - 1});
+
+    // Freeze IO caches — workers can read lock-free
+    v8_io.prefetch_complete = true;
+
+    for (1..g_worker_count) |i| {
+        g_ctxs[i] = .{
+            .worker_id = i,
+            .worker_count = g_worker_count,
+            .tsc_path = g_tsc_path,
+            .tsc_dir = g_tsc_dir,
+            .tsc_fast_js = g_tsc_fast_js,
+        };
+        g_threads[i] = std.Thread.spawn(.{}, checkWorkerFn, .{&g_ctxs[i]}) catch null;
+    }
+}
+
+/// Set up parallel checking. Called from v8_runner.zig before TSC starts.
+/// Registers __edgebox_spawn_check_workers callback + sets worker sharding.
+/// Workers are NOT spawned here — they start when createProgram completes.
+pub fn setupParallelCheck(
+    isolate: *v8.Isolate,
+    context: *const v8.Context,
     tsc_path: []const u8,
     tsc_fast_js: []const u8,
 ) bool {
     const cpu_count = std.Thread.getCpuCount() catch 4;
-    const worker_count: usize = @min(cpu_count, max_check_workers);
+    g_worker_count = @min(cpu_count, 4);
 
-    std.debug.print("[parallel-tsc] {d} cores, {d} workers\n", .{ cpu_count, worker_count });
+    if (g_worker_count <= 1 or embedded_snapshot.len == 0) return false;
 
-    if (worker_count <= 1 or embedded_snapshot.len == 0) return false;
+    g_start_time = std.time.milliTimestamp();
+    std.debug.print("[parallel-tsc] {d} cores, {d} workers (deferred spawn)\n", .{ cpu_count, g_worker_count });
 
-    const tsc_dir = std.fs.path.dirname(tsc_path) orelse ".";
+    g_tsc_path = tsc_path;
+    g_tsc_dir = std.fs.path.dirname(tsc_path) orelse ".";
+    g_tsc_fast_js = tsc_fast_js;
 
-    // Set worker sharding on main isolate (worker 0)
+    // Set worker 0 sharding on main isolate
     var main_buf: [256]u8 = undefined;
     const main_init = std.fmt.bufPrint(&main_buf,
         "globalThis.__edgebox_worker_id=0;globalThis.__edgebox_worker_count={d};",
-        .{worker_count},
+        .{g_worker_count},
     ) catch return false;
-    _ = v8.eval(main_isolate, main_context, main_init, "w0_init.js") catch return false;
+    _ = v8.eval(isolate, context, main_init, "w0_init.js") catch return false;
 
-    // Spawn N-1 worker threads — each uses snapshot (TSC pre-compiled, ~10ms)
-    var threads: [max_check_workers]?std.Thread = .{null} ** max_check_workers;
-    var ctxs: [max_check_workers]CheckWorkerCtx = undefined;
+    // Register __edgebox_spawn_check_workers callback
+    const global_obj = v8.ContextApi.global(context);
+    const tmpl = v8.FunctionTemplateApi.create(isolate, &spawnCheckWorkersCallback) orelse return false;
+    const func = v8.FunctionTemplateApi.getFunction(tmpl, context) orelse return false;
+    const key = v8.StringApi.fromUtf8(isolate, "__edgebox_spawn_check_workers") orelse return false;
+    _ = v8.ObjectApi.set(global_obj, context, @ptrCast(key), @ptrCast(func));
 
-    for (1..worker_count) |i| {
-        ctxs[i] = .{
-            .worker_id = i,
-            .worker_count = worker_count,
-            .tsc_path = tsc_path,
-            .tsc_dir = tsc_dir,
-            .tsc_fast_js = tsc_fast_js,
-        };
-        threads[i] = std.Thread.spawn(.{}, checkWorkerFn, .{&ctxs[i]}) catch null;
-    }
+    return true;
+}
 
-    // Main thread runs as worker 0 (snapshot — instant TSC load)
-    var try_catch = v8.TryCatch.init(main_isolate);
-    defer try_catch.deinit();
-    _ = v8.eval(main_isolate, main_context, tsc_fast_js, "tsc_fast.js") catch {};
-    v8_io.flushAll();
-
-    // Wait for all workers
-    for (&threads) |*t| {
+/// Wait for all parallel workers to finish. Call after main TSC eval completes.
+pub fn waitForWorkers() void {
+    for (&g_threads) |*t| {
         if (t.*) |thread| {
             thread.join();
             t.* = null;
         }
     }
-
-    return true;
 }

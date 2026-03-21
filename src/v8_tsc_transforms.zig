@@ -66,6 +66,17 @@ pub const transforms = [_]Transform{
     // Before Check: warm hot checker functions by calling with real types,
     // then pump to flush TurboFan compilations. Reduces JIT variance.
     // checkSourceFile: pump TurboFan before Check + periodic pump during early files
+    // T-PARALLEL: Intercept performCompilation → spawn workers AFTER parse completes.
+    // Workers get sharded rootNames (only parse files they'll check + dependencies).
+    .{ .needle = "const program = createProgram(programOptions);\n  const exitStatus = emitFilesAndReportErrorsAndGetExitStatus(", .replacement = "const program = createProgram(programOptions);\n  if(typeof __edgebox_spawn_check_workers==='function')__edgebox_spawn_check_workers();\n  const exitStatus = emitFilesAndReportErrorsAndGetExitStatus(" },
+    // T-SHARD-ROOTS: Shard rootNames for workers (worker_id > 0) only.
+    // Main (worker_id=0) keeps ALL files for the full program.
+    // Workers only include files where fileIndex % count === id.
+    // TSC's module resolution still pulls in imported files as needed.
+    // T-SHARD-ROOTS: DISABLED — partial programs produce wrong diagnostics.
+    // Workers need full programs. The bottleneck is createProgram (parse) on workers.
+    // Future: share parsed program via SharedArrayBuffer or V8 code cache.
+    // .{ .needle = "const programOptions = ...", .replacement = "..." },
     // Check loop: shard files across parallel workers.
     // __edgebox_worker_id/count are set by v8_parallel_tsc.zig.
     // When not set (single-threaded), defaults to id=0, count=1 → checks all files.

@@ -508,17 +508,17 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         // Using inline eval instead: slightly slower but correct on all platforms.
         ;
 
-        // Try parallel type checking (multiple V8 isolates, each checks a file subset).
-        // Falls back to serial if single-core or no snapshot.
-        const used_parallel = v8_parallel_tsc.runParallelCheck(
+        // Set up parallel checking: register __edgebox_spawn_check_workers callback.
+        // Workers are spawned AFTER createProgram completes (files cached in Zig).
+        const used_parallel = v8_parallel_tsc.setupParallelCheck(
             isolate,
             context,
             abs_path,
             tsc_fast_js,
         );
 
-        if (!used_parallel) {
-            // Serial fallback
+        // Run TSC — if parallel, workers spawn after createProgram via callback
+        {
             var sp_try_catch = v8.TryCatch.init(isolate);
             defer sp_try_catch.deinit();
 
@@ -531,6 +531,12 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         }
 
         v8_io.flushAll();
+
+        // Wait for parallel workers to finish (no-op if serial)
+        if (used_parallel) {
+            v8_parallel_tsc.waitForWorkers();
+            v8_io.flushAll();
+        }
 
         // Check for --serve mode: keep isolate alive, re-run on stdin "run" command.
         // This enables sub-100ms warm runs by preserving __sfCache across invocations.
