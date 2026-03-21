@@ -127,17 +127,15 @@ fn flushStdout() void {
     // Wait for previous flush to complete
     if (stdout_flush_thread) |t| { t.join(); stdout_flush_thread = null; }
 
-    // Synchronous write + fsync for cross-platform reliability.
-    // macOS ARM64: _exit() terminates before buffered writes complete.
-    const fd: std.posix.fd_t = 1; // stdout
+    // Direct write to fd 1 (stdout). Use std.posix.write for reliability
+    // across platforms (macOS ARM64 had issues with File.writeAll).
+    const data = stdout_buf.items;
     var written: usize = 0;
-    while (written < stdout_buf.items.len) {
-        const n = std.posix.write(fd, stdout_buf.items[written..]) catch break;
+    while (written < data.len) {
+        const n = std.posix.write(1, data[written..]) catch break;
         if (n == 0) break;
         written += n;
     }
-    // fsync to ensure data reaches the pipe/terminal before _exit()
-    _ = std.posix.fsync(fd) catch {};
     stdout_buf.clearRetainingCapacity();
 }
 

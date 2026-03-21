@@ -493,9 +493,7 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
             \\  if (process.argv.indexOf('--serve')>=0 && args.indexOf('--incremental')===-1) {
             \\    args.push('--incremental','--tsBuildInfoFile','/tmp/edgebox-incr-cache/tsinfo.json');
             \\  }
-            \\  if (typeof __runTsc === 'function') {
-            \\    __runTsc(args);
-            \\  } else if (typeof ts !== 'undefined' && ts.executeCommandLine) {
+            \\  if (typeof ts !== 'undefined' && ts.executeCommandLine) {
             \\    globalThis.__sfCache = Object.create(null);
             \\    ts.sys.args = args;
             \\    ts.sys.getExecutingFilePath = function() { return __filename; };
@@ -504,6 +502,9 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
             \\    ts.executeCommandLine(ts.sys, function(){}, ts.sys.args);
             \\  }
             \\})();
+        // NOTE: __runTsc snapshot function bypassed — it produced 0 diagnostics
+        // on macOS ARM64 (possibly stale ts.sys.write reference in snapshot).
+        // Using inline eval instead: slightly slower but correct on all platforms.
         ;
 
         var sp_try_catch = v8.TryCatch.init(isolate);
