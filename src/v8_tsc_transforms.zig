@@ -29,7 +29,7 @@ pub const transforms = [_]Transform{
     //   Actually this is NOT safe — different relations give different results.
     //   So we include relation.__rid in the cache key.
     .{ .needle = "if (source.flags & 469499904 /* StructuredOrInstantiable */ || target.flags & 469499904 /* StructuredOrInstantiable */) {\n      return checkTypeRelatedTo(\n        source,\n        target,\n        relation,\n        /*errorNode*/\n        void 0\n      );\n    }\n    return false;\n  }", .replacement = "if (source.flags & 469499904 || target.flags & 469499904) {\n      var __cr=checkTypeRelatedTo(source,target,relation,void 0);\n      if(typeof __rc_keys!=='undefined'&&relation.__rid){var __wk=((source.id*131+target.id)*5+relation.__rid)|0,__wi=__wk&131071;__rc_keys[__wi]=(__wk&0x7FFFFFFF)|0;__rc_vals[__wi]=__cr?1:-1;}return __cr;\n    }\n    return false;\n  }" },
-    // T3: getRelationKey → packed Smi (only when postFix is empty)
+    // T3: getRelationKey → packed Smi (only when postFix is empty and IDs fit)
     .{ .needle = "isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : `${source.id},${target.id}${postFix}`", .replacement = "isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : (!postFix&&source.id<32768&&target.id<32768) ? source.id * 32768 + target.id + 1 : `${source.id},${target.id}${postFix}`" },
     // T4: JSDoc skip
     .{ .needle = "jsDocParsingMode = 0", .replacement = "jsDocParsingMode = 1" },
