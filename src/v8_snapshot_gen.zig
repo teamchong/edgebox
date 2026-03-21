@@ -151,7 +151,23 @@ pub fn main() !void {
                             \\(function() {
                             \\  if (typeof ts === 'undefined' || !ts.createProgram) return;
                             \\  try {
-                            \\    var src = 'var x: number = 1; var y: string = "a"; function f(a: number, b: string): boolean { return a > 0; }';
+                            \\    // Exercise structural type checking with generics, unions, interfaces
+                            \\    var src = [
+                            \\      'interface A { x: number; y: string; }',
+                            \\      'interface B extends A { z: boolean; }',
+                            \\      'type C = A | B | null | undefined;',
+                            \\      'type D<T> = { [K in keyof T]: T[K] extends string ? true : false };',
+                            \\      'function f<T extends A>(a: T, b: B): D<T> { return {} as any; }',
+                            \\      'const r: D<B> = f({x:1,y:"",z:true}, {x:2,y:"b",z:false});',
+                            \\      'type E = { [k: string]: number };',
+                            \\      'const e: E = {}; const n: number = e["x"];',
+                            \\      'type F = [number, string, ...boolean[]];',
+                            \\      'function g(...args: F): string { return args[1]; }',
+                            \\      'class G<T> { constructor(public val: T) {} get v(): T { return this.val; } }',
+                            \\      'const gi = new G<A>({x:1,y:""}); const gv: A = gi.v;',
+                            \\      'type Narrow<T, U> = T extends U ? T : never;',
+                            \\      'type H = Narrow<string | number | boolean, string>;',
+                            \\    ].join('\n');
                             \\    var sf = ts.createSourceFile('warmup.ts', src, 99, true);
                             \\    var host = ts.createCompilerHost({target:99,module:99,strict:true});
                             \\    var origGet = host.getSourceFile;
