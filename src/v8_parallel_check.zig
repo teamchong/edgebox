@@ -419,7 +419,17 @@ pub fn precomputeCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) voi
     const type_flags = getTypeFlags() orelse { rv.setInt32(0); return; };
     buildFlagTable(type_flags, max_id);
 
-    // Also pump V8 message loop for TurboFan
+    // Pre-compute statistics for Zig-side analysis
+    const obj_flags = getObjFlags() orelse { rv.setInt32(1); return; };
+    var obj_type_count: u32 = 0;
+    for (0..@min(max_id + 1, MAX_TYPES)) |i| {
+        const f = type_flags[i];
+        if (f & 524288 != 0) obj_type_count += 1; // Object flag
+    }
+    _ = obj_flags;
+    _ = obj_type_count;
+
+    // Pump V8 message loop for TurboFan
     if (v8.global_platform) |platform| {
         while (v8.pumpMessageLoop(platform, isolate)) {}
     }
