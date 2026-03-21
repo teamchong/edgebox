@@ -73,10 +73,14 @@ pub const transforms = [_]Transform{
     // Main (worker_id=0) keeps ALL files for the full program.
     // Workers only include files where fileIndex % count === id.
     // TSC's module resolution still pulls in imported files as needed.
-    // T-SHARD-ROOTS: DISABLED — partial programs produce wrong diagnostics.
-    // Workers need full programs. The bottleneck is createProgram (parse) on workers.
-    // Future: share parsed program via SharedArrayBuffer or V8 code cache.
-    // .{ .needle = "const programOptions = ...", .replacement = "..." },
+    // T-SHARD-ROOTS: Workers parse only their assigned root files + skip module resolution.
+    // This makes workers parse ~46 files instead of 366 (with 8 workers).
+    // Main (worker_id=0) keeps ALL files for correct full-program diagnostics.
+    .{ .needle = "const programOptions = {\n    rootNames: fileNames,", .replacement = "var __rootNames=fileNames;if(typeof __edgebox_worker_id!=='undefined'&&__edgebox_worker_id>0&&__edgebox_worker_count>1){__rootNames=fileNames.filter(function(_,i){return i%__edgebox_worker_count===__edgebox_worker_id;});}\n  const programOptions = {\n    rootNames: __rootNames," },
+    // T-SKIP-IMPORTS: Workers skip module resolution (don't follow imports).
+    // Workers only parse root files — unresolved imports get `any` type.
+    // Main thread has full program and produces correct diagnostics.
+    .{ .needle = "function resolveModuleNamesReusingOldState(moduleNames, containingFile) {", .replacement = "function resolveModuleNamesReusingOldState(moduleNames, containingFile) {\n    if(typeof __edgebox_worker_id!=='undefined'&&__edgebox_worker_id>0)return moduleNames.map(function(){return void 0;});" },
     // Check loop: shard files across parallel workers.
     // __edgebox_worker_id/count are set by v8_parallel_tsc.zig.
     // When not set (single-threaded), defaults to id=0, count=1 → checks all files.
