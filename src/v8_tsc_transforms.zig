@@ -13,8 +13,7 @@ const Transform = struct {
 
 /// All TSC source transforms. Order matters — first match wins.
 pub const transforms = [_]Transform{
-    // T1: createType → write objectFlags to SAB for T-SOA2 property count check
-    .{ .needle = "typeCount++;\n    result.id = typeCount;", .replacement = "typeCount++;\n    result.id = typeCount;\n    if(typeof __pc_objectFlags!=='undefined'&&typeCount<131072&&result.objectFlags)__pc_objectFlags[typeCount]=result.objectFlags;" },
+    // T1: disabled — SOA writes removed (T-SOA1/T-SOA2 disabled, no readers)
     // T2: isTypeRelatedTo → inline flag fast-path for safe primitive widening.
     // Handles: Any←*, *←Never, StringLike→String, NumberLike→Number,
     // BigIntLike→BigInt, BooleanLike→Boolean, ESSymbolLike→ESSymbol.

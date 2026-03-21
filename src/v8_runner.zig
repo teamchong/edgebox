@@ -386,44 +386,16 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         const parallel_init_js = @embedFile("v8_parallel_init.js");
         _ = v8.eval(isolate, context, parallel_init_js, "v8_parallel_init.js") catch {};
     } else {
-        // For TSC: expose SAB-backed SOA columns + precompute/trigger callbacks.
-        // T1 writes type flags to __pc_typeFlags during createType.
-        // __edgebox_trigger_build starts async flag table build on Zig thread.
-        // __edgebox_precompute_relations finalizes + pumps before Check.
+        // For TSC: register precompute callback (pumps V8 message loop for TurboFan).
+        // SAB columns removed — SOA transforms disabled (net-neutral).
         const v8_parallel_check = @import("v8_parallel_check.zig");
         const global_obj = v8.ContextApi.global(context);
 
-        // Expose SAB with typeFlags, objectFlags, flagMap columns
-        const buf = v8_parallel_check.getSharedBuffer() orelse return;
-        const sab = v8.SharedArrayBufferApi.fromExternalMemory(isolate, buf, v8_parallel_check.TOTAL_BYTES) orelse return;
-        const sab_key = v8.StringApi.fromUtf8(isolate, "__pc_sab") orelse return;
-        _ = v8.ObjectApi.set(global_obj, context, @ptrCast(sab_key), sab);
-
-        // Create typed array views on SAB — typeFlags, objectFlags, flagMap
-        var init_buf: [1024]u8 = undefined;
-        const init_js = std.fmt.bufPrint(&init_buf,
-            "globalThis.__pc_typeFlags=new Int32Array(__pc_sab,0,{d});" ++
-                "globalThis.__pc_objectFlags=new Int32Array(__pc_sab,{d},{d});" ++
-                "globalThis.__pc_flagMap=new Int32Array(__pc_sab,{d},{d});",
-            .{
-                v8_parallel_check.MAX_TYPES, // typeFlags count
-                v8_parallel_check.MAX_TYPES * 4, v8_parallel_check.MAX_TYPES, // objectFlags offset+count
-                v8_parallel_check.FLAG_TABLE_OFFSET * 4, v8_parallel_check.FLAG_TABLE_ENTRIES, // flagMap offset+count
-            },
-        ) catch return;
-        _ = v8.eval(isolate, context, init_js, "pc_init.js") catch {};
-
-        // Register precompute callback
         const pc_tmpl = v8.FunctionTemplateApi.create(isolate, &v8_parallel_check.precomputeCallback) orelse return;
         const pc_func = v8.FunctionTemplateApi.getFunction(pc_tmpl, context) orelse return;
         const pc_key = v8.StringApi.fromUtf8(isolate, "__edgebox_precompute_relations") orelse return;
         _ = v8.ObjectApi.set(global_obj, context, @ptrCast(pc_key), @ptrCast(pc_func));
 
-        // Register trigger callback (called from createType at type 5000)
-        const tb_tmpl = v8.FunctionTemplateApi.create(isolate, &v8_parallel_check.triggerBuildCallback) orelse return;
-        const tb_func = v8.FunctionTemplateApi.getFunction(tb_tmpl, context) orelse return;
-        const tb_key = v8.StringApi.fromUtf8(isolate, "__edgebox_trigger_build") orelse return;
-        _ = v8.ObjectApi.set(global_obj, context, @ptrCast(tb_key), @ptrCast(tb_func));
     }
 
     // For packed binaries: ensure process.argv has [exe, script, ...args] format
