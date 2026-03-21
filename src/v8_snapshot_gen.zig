@@ -144,7 +144,37 @@ pub fn main() !void {
                             \\})();
                         ;
                         _ = v8.eval(isolate, ctx, preparse_js, "preparse_lib.js") catch {};
-                        std.debug.print("[snapshot-gen] Pre-parsed lib.d.ts files into snapshot cache\n", .{});
+
+                        // Also warm the checker — run a mini type check to trigger TurboFan
+                        // optimization of isTypeRelatedTo, structuredTypeRelatedTo, etc.
+                        const warmup_js =
+                            \\(function() {
+                            \\  if (typeof ts === 'undefined' || !ts.createProgram) return;
+                            \\  try {
+                            \\    var src = 'var x: number = 1; var y: string = "a"; function f(a: number, b: string): boolean { return a > 0; }';
+                            \\    var sf = ts.createSourceFile('warmup.ts', src, 99, true);
+                            \\    var host = ts.createCompilerHost({target:99,module:99,strict:true});
+                            \\    var origGet = host.getSourceFile;
+                            \\    host.getSourceFile = function(name,lang,err) {
+                            \\      if (name === 'warmup.ts') return sf;
+                            \\      return origGet.call(host, name, lang, err);
+                            \\    };
+                            \\    var prog = ts.createProgram(['warmup.ts'], {target:99,module:99,strict:true,noEmit:true,skipLibCheck:true}, host);
+                            \\    prog.getSemanticDiagnostics(sf);
+                            \\  } catch(e) {}
+                            \\})();
+                        ;
+                        _ = v8.eval(isolate, ctx, warmup_js, "warmup_checker.js") catch {};
+
+                        // Pump message loop to finalize TurboFan compilations before snapshot
+                        if (v8.global_platform) |platform| {
+                            var pumps: u32 = 0;
+                            while (pumps < 100) : (pumps += 1) {
+                                if (!v8.pumpMessageLoop(platform, isolate)) break;
+                            }
+                        }
+
+                        std.debug.print("[snapshot-gen] Pre-parsed lib.d.ts + warmed checker in snapshot\n", .{});
                     }
                 }
                 // Don't free src — external string references it
