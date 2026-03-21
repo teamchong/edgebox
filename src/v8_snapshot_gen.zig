@@ -113,14 +113,6 @@ pub fn main() !void {
                             \\  try {
                             \\    // Warm parser (Sparkplug)
                             \\    ts.createSourceFile('w.ts', 'var x:number=1;interface A{a:string;b:number}', 99, true);
-                            \\    // Warm checker (Maglev) — micro type check with structural types
-                            \\    var src = 'interface X{a:number;b:string}interface Y{a:number;b:string;c:boolean}var v:X={a:1,b:""};var w:Y={a:1,b:"",c:true};var z:X=w;';
-                            \\    var sf = ts.createSourceFile('warmup.ts', src, 99, true);
-                            \\    var host = ts.createCompilerHost({target:99,module:99,strict:true});
-                            \\    var origGet = host.getSourceFile;
-                            \\    host.getSourceFile = function(n,l,e) { return n==='warmup.ts'?sf:origGet.call(host,n,l,e); };
-                            \\    var prog = ts.createProgram(['warmup.ts'], {target:99,module:99,strict:true,noEmit:true,skipLibCheck:true}, host);
-                            \\    prog.getSemanticDiagnostics(sf);
                             \\  } catch(e) {}
                             \\})();
                         ;
