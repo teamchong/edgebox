@@ -411,7 +411,7 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         _ = v8.eval(isolate, context, argv_fix, "argv_fix.js") catch {};
     }
 
-    // Inject TSC shim
+    // Inject TSC shim (always — snapshot's version may be outdated)
     const tsc_shim_code = @embedFile("v8_tsc_shim.js");
     _ = v8.eval(isolate, context, tsc_shim_code, "v8_tsc_shim.js") catch {};
 
