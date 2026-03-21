@@ -128,7 +128,10 @@ pub fn initPlatform() !*Platform {
     // - concurrent-recompilation: TurboFan compiles on background threads
     // - use-osr: on-stack replacement (replace running code with optimized version)
     // - no-lazy-feedback-allocation: allocate feedback vectors eagerly (faster JIT)
-    const flags = "--max-old-space-size=4096 --concurrent-recompilation --use-osr --always-sparkplug --no-lazy-feedback-allocation";
+        // GC tuning: larger semi-space reduces minor GC frequency.
+    // TSC creates millions of short-lived objects (diagnostics, type instances).
+    // Larger young generation → fewer scavenges → less GC overhead.
+    const flags = "--max-old-space-size=4096 --concurrent-recompilation --use-osr --always-sparkplug --no-lazy-feedback-allocation --max-semi-space-size=128";
     c.v8__V8__SetFlagsFromString(flags.ptr, flags.len);
 
     const platform = c.v8__Platform__NewDefaultPlatform(0, false) orelse
