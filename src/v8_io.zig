@@ -127,29 +127,11 @@ fn flushStdout() void {
     // Wait for previous flush to complete
     if (stdout_flush_thread) |t| { t.join(); stdout_flush_thread = null; }
 
-    // Move buffer to flush data (swap instead of copy)
-    stdout_flush_mutex.lock();
-    const data = alloc.dupe(u8, stdout_buf.items) catch {
-        stdout_flush_mutex.unlock();
-        // Fallback: sync write
-        const stdout = std.fs.File.stdout();
-        stdout.writeAll(stdout_buf.items) catch {};
-        stdout_buf.clearRetainingCapacity();
-        return;
-    };
-    stdout_flush_data = data;
-    stdout_flush_mutex.unlock();
+    // Synchronous write — background flush caused data loss on macOS ARM64
+    // because _exit() terminates before the background thread completes.
+    const stdout_file = std.fs.File.stdout();
+    stdout_file.writeAll(stdout_buf.items) catch {};
     stdout_buf.clearRetainingCapacity();
-
-    // Flush on background thread
-    stdout_flush_thread = std.Thread.spawn(.{}, flushStdoutWorker, .{}) catch {
-        // Fallback: sync write
-        const stdout = std.fs.File.stdout();
-        stdout.writeAll(data) catch {};
-        alloc.free(data);
-        stdout_flush_data = null;
-        return;
-    };
 }
 
 /// Fast stdout write — buffered, no JSON
