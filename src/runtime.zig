@@ -5335,6 +5335,13 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                         if (prov_matched) continue :char_loop;
                                     }
                                 }
+                                // === ID-indexed SOA fallback ===
+                                // If this position is a pre-pass detected rewrite AND
+                                // the field matches an ID-assigning constructor's field,
+                                // rewrite: obj.field → (__pc_FIELD[obj.id|0] || obj.field)
+                                // ID-indexed SOA: different object types share field names
+                                // (node.flags, type.flags, flow.flags) but have different
+                                // ID spaces. Need per-type-class columns to avoid corruption.
                                 // No match — copy one character
                                 w.writeAll(cc[src_pos .. src_pos + 1]) catch { w_errs += 1; };
                                 src_pos += 1;
