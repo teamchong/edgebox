@@ -563,8 +563,8 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
                 if (std.mem.eql(u8, cmd, "quit") or std.mem.eql(u8, cmd, "exit")) break;
                 if (!std.mem.eql(u8, cmd, "run")) continue;
 
-                // Clear IO caches for changed files (simple: clear all)
-                v8_io.clearCaches();
+                // Keep IO caches — files haven't changed between runs.
+                // Only reset deferred exit code.
                 v8_io.deferred_exit_code = null;
 
                 // Re-run TSC — __sfCache still has parsed SourceFiles
