@@ -127,7 +127,9 @@ pub fn main() !void {
     v8.IsolateApi.exit(isolate);
 
     // Create the snapshot blob
-    const blob = creator.createBlob(v8.SnapshotCreator.kClear);
+    // kKeep retains compiled code (Sparkplug baseline) in the snapshot,
+    // giving pre-compiled functions a head start without TurboFan warmup.
+    const blob = creator.createBlob(v8.SnapshotCreator.kKeep);
     creator.deinit();
 
     if (blob.data == null or blob.raw_size <= 0) {
