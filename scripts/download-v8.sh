@@ -51,7 +51,7 @@ if [ -f "$VERSION_FILE" ] && [ "$(cat "$VERSION_FILE")" = "${V8_VERSION}-${TARGE
     echo "[v8] Already downloaded ${V8_VERSION} for ${TARGET}, skipping"
 else
     echo "[v8] Downloading ${LIB_NAME}.gz (~60MB)..."
-    TEMP_GZ=$(mktemp --suffix=.gz)
+    TEMP_GZ=$(mktemp).gz
     curl -fSL -o "$TEMP_GZ" "$DOWNLOAD_URL"
 
     echo "[v8] Decompressing..."
@@ -91,7 +91,7 @@ if [ ! -d "$V8_INCLUDE_DIR" ] || [ ! -f "${V8_INCLUDE_DIR}/v8.h" ]; then
     V8_ENGINE_VERSION="14.6.202.9"
     INCLUDE_URL="https://chromium.googlesource.com/v8/v8/+archive/${V8_ENGINE_VERSION}/include.tar.gz"
     echo "[v8] Downloading V8 ${V8_ENGINE_VERSION} include headers..."
-    TEMP_TAR=$(mktemp --suffix=.tar.gz)
+    TEMP_TAR=$(mktemp).tar.gz
     curl -fSL -o "$TEMP_TAR" "$INCLUDE_URL"
     mkdir -p "$V8_INCLUDE_DIR"
     tar xzf "$TEMP_TAR" -C "$V8_INCLUDE_DIR"

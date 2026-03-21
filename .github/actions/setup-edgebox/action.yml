@@ -108,7 +108,8 @@ runs:
           zig-out/bin/
           zig-out/cache/
           vendor/binaryen/
-        key: edgebox-v8-${{ runner.os }}-${{ hashFiles('build.zig', 'src/**/*.zig', 'src/freeze/*.zig', 'bench/*.js', 'src/polyfills/*.js') }}
+          vendor/v8/
+        key: edgebox-v9-${{ runner.os }}-${{ hashFiles('build.zig', 'src/**/*.zig', 'src/freeze/*.zig', 'bench/*.js', 'src/polyfills/*.js') }}
 
     # === Build Binaryen (if cache miss) ===
     - name: Build Binaryen
@@ -128,6 +129,13 @@ runs:
         if [[ "$OSTYPE" != "darwin"* ]]; then
           sudo ldconfig
         fi
+
+    # === Download V8 library for current platform (if cache miss) ===
+    - name: Download V8 (rusty_v8)
+      if: steps.cache-edgebox.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        ./scripts/download-v8.sh
 
     # === Build EdgeBox CLI (if cache miss) ===
     - name: Build EdgeBox
