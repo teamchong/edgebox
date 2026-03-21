@@ -19,7 +19,6 @@ PALETTE="$DOOM_DIR/packages/playground/final-doom-pun-intended/palette-values.ts
 if [ -f "$PALETTE" ]; then
     printf '\e8'
     "$EDGEBOX" "$PALETTE_RENDERER" "$PALETTE" "$SCALE"
-    # Clear line then print status
     printf '\e[2K  DOOM in TypeScript Types — EdgeBox Renderer\n'
     printf '\e[2K  Title screen — type-checked by TypeScript\n'
     sleep 3
@@ -31,6 +30,15 @@ TOTAL=$(echo "$RESULTS" | wc -l | tr -d ' ')
 
 # Loop frames forever (Ctrl+C to stop)
 while true; do
+    # Show title screen at the start of each cycle
+    if [ -f "$PALETTE" ]; then
+        printf '\e8'
+        "$EDGEBOX" "$PALETTE_RENDERER" "$PALETTE" "$SCALE"
+        printf '\e[2K  DOOM in TypeScript Types — EdgeBox Renderer\n'
+        printf '\e[2K  Title screen — type-checked by TypeScript\n'
+        sleep 3
+    fi
+
     FRAME=1
     for result in $RESULTS; do
         printf '\e8'  # restore cursor to top
