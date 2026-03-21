@@ -47,10 +47,6 @@ jobs:
           cd benchmark
           npm install
 
-      - name: Compile tsc with EdgeBox (worker path)
-        run: |
-          ./zig-out/bin/edgebox-compile benchmark/node_modules/typescript/lib/_tsc.js
-
       - name: Install tsgo (TypeScript Native Preview)
         continue-on-error: true
         run: |

@@ -184,59 +184,21 @@ function downloadProject(project: Project): string | null {
 
 function buildEdgeboxTsc(): string | null {
   const edgeboxRunner = join(PROJECT_ROOT, "zig-out/bin/edgebox");
-  const edgeboxCompile = join(PROJECT_ROOT, "zig-out/bin/edgebox-compile");
-  const tscSourceAbs = join(BENCHMARK_DIR, "node_modules/typescript/lib/_tsc.js");
-  const tscSourceRel = relative(PROJECT_ROOT, tscSourceAbs);
-  const outputDir = join(PROJECT_ROOT, "zig-out/bin", tscSourceRel);
-  const workerJs = join(outputDir, "_tsc-worker.js");
+  const tscSource = join(BENCHMARK_DIR, "node_modules/typescript/lib/_tsc.js");
 
-  // Build edgebox if needed
+  // Build edgebox V8 runner if needed
   if (!existsSync(edgeboxRunner)) {
     console.log("Building edgebox...");
     try {
-      execSync("zig build cli -Doptimize=ReleaseFast", { cwd: PROJECT_ROOT, stdio: "inherit" });
+      execSync("zig build v8-run -Doptimize=ReleaseFast", { cwd: PROJECT_ROOT, stdio: "inherit" });
     } catch {
       console.error("Failed to build edgebox");
       return null;
     }
   }
 
-  // Try worker path first (has WASM kernels + incremental)
-  if (!existsSync(workerJs) && existsSync(edgeboxCompile)) {
-    console.log("Compiling tsc with EdgeBox AOT (worker path)...");
-    try {
-      execSync(`"${edgeboxCompile}" "${tscSourceRel}"`, {
-        cwd: PROJECT_ROOT,
-        stdio: "pipe",
-        timeout: 600000,
-      });
-    } catch {
-      console.log("Worker compilation failed, using V8 runner path");
-    }
-  }
-
-  if (existsSync(workerJs)) {
-    // Verify worker produces diagnostics by checking a file with a known error
-    try {
-      const testTs = join(outputDir, "__test_diag.ts");
-      writeFileSync(testTs, "let x: number = 'hello';"); // Type error
-      const testResult = spawnSync("node", [workerJs, "--noEmit", "--target", "ES2020", "--skipLibCheck", testTs], {
-        timeout: 30000, stdio: "pipe",
-      });
-      const stdout = testResult.stdout?.toString() || "";
-      rmSync(testTs, { force: true });
-      if (stdout.includes("error TS")) {
-        return workerJs;
-      }
-      console.log("Worker path broken (no diagnostics output), falling back to V8 runner");
-    } catch {
-      console.log("Worker path test failed, falling back to V8 runner");
-    }
-  }
-
-  // Fallback: use V8 runner directly (edgebox _tsc.js)
-  // The benchmark will call: edgebox _tsc.js [args] instead of: node _tsc-worker.js [args]
-  return existsSync(edgeboxRunner) ? `__v8runner__${tscSourceAbs}` : null;
+  // Return V8 runner path marker — benchmark uses `edgebox _tsc.js` directly
+  return existsSync(edgeboxRunner) ? `__v8runner__${tscSource}` : null;
 }
 
 // ============================================================================
