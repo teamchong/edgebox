@@ -47,6 +47,14 @@ jobs:
           cd benchmark
           npm install
 
+      - name: Install VS Code dependencies (for proper tsconfig benchmark)
+        continue-on-error: true
+        run: |
+          if [ -d benchmark/fixtures/vscode ]; then
+            cd benchmark/fixtures/vscode
+            npm install --ignore-scripts 2>/dev/null || echo "vscode deps install failed"
+          fi
+
       - name: Install tsgo (TypeScript Native Preview)
         continue-on-error: true
         run: |

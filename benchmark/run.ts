@@ -40,17 +40,18 @@ interface Project {
   name: string;
   repo: string;
   path: string;
+  tsconfig?: string; // Relative path to tsconfig.json (for tsgo -p)
   quick?: boolean; // Include in --quick mode
 }
 
 // Microsoft's tsgo benchmark projects
 const ALL_PROJECTS: Project[] = [
-  { name: "rxjs", repo: "ReactiveX/rxjs", path: "packages/rxjs/src", quick: true },
-  { name: "trpc", repo: "trpc/trpc", path: "packages/server/src", quick: true },
-  { name: "date-fns", repo: "date-fns/date-fns", path: "src" },
-  { name: "typeorm", repo: "typeorm/typeorm", path: "src" },
-  { name: "playwright", repo: "microsoft/playwright", path: "packages/playwright-core/src" },
-  { name: "vscode", repo: "microsoft/vscode", path: "src" },
+  { name: "rxjs", repo: "ReactiveX/rxjs", path: "packages/rxjs/src", tsconfig: "packages/rxjs/tsconfig.json", quick: true },
+  { name: "trpc", repo: "trpc/trpc", path: "packages/server/src", tsconfig: "packages/server/tsconfig.json", quick: true },
+  { name: "date-fns", repo: "date-fns/date-fns", path: "src", tsconfig: "tsconfig.json" },
+  { name: "typeorm", repo: "typeorm/typeorm", path: "src", tsconfig: "tsconfig.json" },
+  { name: "playwright", repo: "microsoft/playwright", path: "packages/playwright-core/src", tsconfig: "tsconfig.json" },
+  { name: "vscode", repo: "microsoft/vscode", path: "src", tsconfig: "src/tsconfig.json" },
 ];
 
 // ============================================================================
@@ -395,14 +396,12 @@ function benchmarkProject(
   const edgeboxOutDir = join(OUT_DIR, `${project.name}_edgebox`);
   const tsgoOutDir = join(OUT_DIR, `${project.name}_tsgo`);
 
-  const tscArgs = [
-    "--noEmit",
-    "--target", "ES2020",
-    "--module", "ESNext",
-    "--moduleResolution", "node",
-    "--skipLibCheck",
-    ...tsFiles,
-  ];
+  // Use tsconfig.json when available for apples-to-apples comparison.
+  // All runners (Node, EdgeBox, tsgo) use the same config.
+  const tsconfigPath = project.tsconfig ? join(projectDir, project.tsconfig) : null;
+  const tscArgs = tsconfigPath && existsSync(tsconfigPath)
+    ? ["-p", tsconfigPath, "--noEmit"]
+    : ["--noEmit", "--target", "ES2020", "--module", "ESNext", "--moduleResolution", "node", "--skipLibCheck", ...tsFiles];
 
   // Benchmark Node.js tsc
   const nodeTimes: number[] = [];
@@ -468,8 +467,14 @@ function benchmarkProject(
   let tsgoResult: RunResult | undefined;
 
   if (includeTsgo && tsgoPath) {
+    // tsgo v7 requires -p tsconfig.json (doesn't accept individual file args)
+    const tsconfigPath = project.tsconfig ? join(projectDir, project.tsconfig) : null;
+    const tsgoArgs = tsconfigPath && existsSync(tsconfigPath)
+      ? ["-p", tsconfigPath, "--noEmit"]
+      : tscArgs; // fallback to individual files
+
     for (let i = 0; i < runs; i++) {
-      tsgoResult = runTsc(tsgoPath, tscArgs, tsgoOutDir, debug);
+      tsgoResult = runTsc(tsgoPath, tsgoArgs, tsgoOutDir, debug);
       if (!tsgoResult.success) {
         console.log(`    tsgo: Failed - ${tsgoResult.error}`);
         tsgoTimes = []; // Skip tsgo stats
