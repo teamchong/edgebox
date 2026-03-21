@@ -11,9 +11,13 @@ const v8 = @import("v8.zig");
 const alloc = std.heap.page_allocator;
 
 /// Deferred exit code — set by process.exit(), checked by runner after execution.
-/// Allows code cache to be saved before termination.
-/// Thread-safe: multiple V8 isolates may call process.exit concurrently.
 pub threadlocal var deferred_exit_code: ?u8 = null;
+
+/// Global IO mutex — protects all hash map caches for multi-isolate safety.
+var io_mutex: std.Thread.Mutex = .{};
+
+/// Set to true in worker threads to skip PumpMessageLoop
+pub threadlocal var is_worker_thread: bool = false;
 
 /// Register __edgebox_io_sync, __edgebox_io_batch, and fast-path callbacks.
 pub fn registerGlobals(isolate: *v8.Isolate, context: *const v8.Context) void {
@@ -141,26 +145,25 @@ pub fn writeStdoutFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c
     if (len == 0) return;
 
     // Ensure capacity in the buffer
-    stdout_buf.ensureTotalCapacity(alloc, stdout_buf.items.len + len) catch {
-        flushStdout();
-        stdout_buf.ensureTotalCapacity(alloc, len) catch return;
-    };
-
-    // Write directly into buffer
     var stack_buf: [4096]u8 = undefined;
     if (len <= stack_buf.len) {
-        const written = v8.StringApi.writeUtf8(str, isolate, &stack_buf);
-        stdout_buf.appendSlice(alloc, stack_buf[0..written]) catch {};
+        const written_count = v8.StringApi.writeUtf8(str, isolate, &stack_buf);
+        stdout_mutex.lock();
+        stdout_buf.ensureTotalCapacity(alloc, stdout_buf.items.len + written_count) catch {
+            flushStdout();
+            stdout_buf.ensureTotalCapacity(alloc, written_count) catch { stdout_mutex.unlock(); return; };
+        };
+        stdout_buf.appendSlice(alloc, stack_buf[0..written_count]) catch {};
+        if (stdout_buf.items.len >= STDOUT_BUF_SIZE) flushStdout();
+        stdout_mutex.unlock();
     } else {
         const heap_buf = alloc.alloc(u8, len) catch return;
         defer alloc.free(heap_buf);
-        const written = v8.StringApi.writeUtf8(str, isolate, heap_buf);
-        stdout_buf.appendSlice(alloc, heap_buf[0..written]) catch {};
-    }
-
-    // Flush when buffer is large enough
-    if (stdout_buf.items.len >= STDOUT_BUF_SIZE) {
-        flushStdout();
+        const written_count = v8.StringApi.writeUtf8(str, isolate, heap_buf);
+        stdout_mutex.lock();
+        stdout_buf.appendSlice(alloc, heap_buf[0..written_count]) catch {};
+        if (stdout_buf.items.len >= STDOUT_BUF_SIZE) flushStdout();
+        stdout_mutex.unlock();
     }
 }
 
@@ -293,7 +296,10 @@ pub fn dirExistsFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) 
     const written = v8.StringApi.writeUtf8(str, isolate, &path_buf);
     const path = path_buf[0..written];
 
-    if (dir_exists_cache.get(path)) |exists| {
+    io_mutex.lock();
+    const dir_cached = dir_exists_cache.get(path);
+    io_mutex.unlock();
+    if (dir_cached) |exists| {
         rv.setInt32(if (exists) 1 else 0);
         return;
     }
@@ -305,7 +311,9 @@ pub fn dirExistsFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) 
     };
 
     const key = alloc.dupe(u8, path) catch path;
+    io_mutex.lock();
     dir_exists_cache.put(alloc, key, exists) catch {};
+    io_mutex.unlock();
     rv.setInt32(if (exists) 1 else 0);
 }
 
@@ -388,9 +396,10 @@ pub fn readFileFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) v
     const isolate = v8.CallbackInfoApi.getIsolate(info);
     var rv = v8.CallbackInfoApi.getReturnValue(info);
 
-    // Pump V8 message loop — critical for TurboFan background compilation
     if (v8.global_platform) |platform| {
-        while (v8.pumpMessageLoop(platform, isolate)) {}
+        if (!is_worker_thread) {
+            while (v8.pumpMessageLoop(platform, isolate)) {}
+        }
     }
 
     if (v8.CallbackInfoApi.length(info) < 1) { rv.setUndefined(); return; }
@@ -408,15 +417,18 @@ pub fn readFileFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) v
     // Wait for speculative prefetch to complete (may have pre-read this file)
     if (prefetch_thread) |t| { t.join(); prefetch_thread = null; }
 
-    // Check raw content cache first
+    // Check raw content cache (thread-safe via mutex)
+    io_mutex.lock();
     const cached_content = raw_file_cache.get(path);
+    io_mutex.unlock();
     const content = cached_content orelse blk: {
         const file = std.fs.cwd().openFile(path, .{}) catch { rv.setUndefined(); return; };
         defer file.close();
         const data = file.readToEndAlloc(alloc, 64 * 1024 * 1024) catch { rv.setUndefined(); return; };
-        // Cache the raw content
         const key = alloc.dupe(u8, path) catch path;
+        io_mutex.lock();
         raw_file_cache.put(alloc, key, data) catch {};
+        io_mutex.unlock();
         break :blk data;
     };
 
@@ -448,7 +460,9 @@ pub fn fileExistsFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c)
     var rv = v8.CallbackInfoApi.getReturnValue(info);
 
     if (v8.global_platform) |platform| {
-        while (v8.pumpMessageLoop(platform, isolate)) {}
+        if (!is_worker_thread) {
+            while (v8.pumpMessageLoop(platform, isolate)) {}
+        }
     }
 
     if (v8.CallbackInfoApi.length(info) < 1) { rv.setUndefined(); return; }
@@ -463,9 +477,10 @@ pub fn fileExistsFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c)
     const written = v8.StringApi.writeUtf8(str, isolate, &path_buf);
     const path = path_buf[0..written];
 
-    // Check cache first
-    if (exists_cache.get(path)) |exists| {
-        // Return 1 for true, 0 for false (JS treats both as truthy/falsy correctly)
+    io_mutex.lock();
+    const cached = exists_cache.get(path);
+    io_mutex.unlock();
+    if (cached) |exists| {
         rv.setInt32(if (exists) 1 else 0);
         return;
     }
@@ -476,7 +491,9 @@ pub fn fileExistsFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c)
     };
 
     const key = alloc.dupe(u8, path) catch path;
+    io_mutex.lock();
     exists_cache.put(alloc, key, exists) catch {};
+    io_mutex.unlock();
 
     // Speculative prefetch: if file exists and is a source file,
     // start reading it on a background Zig thread.
@@ -500,10 +517,13 @@ pub fn ioSyncCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
     const isolate: *v8.Isolate = v8.CallbackInfoApi.getIsolate(info);
     var rv = v8.CallbackInfoApi.getReturnValue(info);
 
-    // Pump V8 message loop on every IO callback — processes pending
-    // TurboFan background compilation tasks. Critical for JIT performance.
+    // Pump V8 message loop — skip in worker threads (PumpMessageLoop
+    // dispatches to foreground task runner which is per-isolate but the
+    // platform mutex may not be thread-safe for concurrent pump calls).
     if (v8.global_platform) |platform| {
-        while (v8.pumpMessageLoop(platform, isolate)) {}
+        if (!is_worker_thread) {
+            while (v8.pumpMessageLoop(platform, isolate)) {}
+        }
     }
 
     // Get first argument (JSON string)

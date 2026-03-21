@@ -111,9 +111,10 @@ pub fn main() !void {
         }
     }
 
-    // In-process parallel V8 isolates: implemented but needs thread-safety fixes
-    // for IO callbacks (PumpMessageLoop, deferred_exit_code, stdout buffers).
-    // Enable with __EDGEBOX_PARALLEL=1 env var for testing.
+    // In-process parallel V8 isolates: infrastructure ready but V8 crashes
+    // when multiple isolates call IO callbacks simultaneously during type checking.
+    // The snapshot and IO cache sharing works. The issue is likely in V8's
+    // internal thread-safety for concurrent isolate operations.
 
     return runScript(alloc, script_code, disk_cache, abs_path, script_path, false);
 }
@@ -132,6 +133,7 @@ const WorkerContext = struct {
 
     fn run(self: *WorkerContext) void {
         const alloc = std.heap.page_allocator;
+        v8_io.is_worker_thread = true;
 
         // Create worker V8 isolate from snapshot (TSC pre-initialized)
         const worker_isolate = v8.SnapshotApi.createIsolateFromSnapshot(

@@ -52,8 +52,9 @@ v8::Isolate* edgebox_v8_create_isolate() {
 v8::Isolate* edgebox_v8_create_isolate_from_snapshot(
     const char* snapshot_data, int snapshot_len,
     const intptr_t* external_refs) {
-  // Static — V8 may reference this after Isolate::New returns
-  static v8::StartupData startup;
+  // Thread-local: each worker thread gets its own StartupData copy.
+  // V8 may reference this after Isolate::New returns.
+  thread_local v8::StartupData startup;
   startup.data = snapshot_data;
   startup.raw_size = snapshot_len;
 
