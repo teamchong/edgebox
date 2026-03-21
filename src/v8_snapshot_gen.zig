@@ -105,33 +105,7 @@ pub fn main() !void {
                         std.debug.print("[snapshot-gen] Pre-compiled + initialized TSC in snapshot\n", .{});
 
                         // Warm Sparkplug+Maglev: parse small files and run a micro type check.
-                        // Maglev requires execution feedback — calling checker functions
-                        // during snapshot triggers Maglev compilation, retained by kKeep.
-                        const warmup_js =
-                            \\(function() {
-                            \\  if (typeof ts === 'undefined' || !ts.createSourceFile) return;
-                            \\  try {
-                            \\    // Warm parser (Sparkplug) — parse enough code to trigger compilation
-                            \\    for (var i = 0; i < 5; i++) {
-                            \\      ts.createSourceFile('w'+i+'.ts',
-                            \\        'interface A{x:number;y:string}interface B extends A{z:boolean}' +
-                            \\        'function f(a:A,b:B):boolean{return a.x>0}' +
-                            \\        'type C<T>={[K in keyof T]:T[K]};const c:C<A>={x:1,y:""}', 99, true);
-                            \\    }
-                            \\  } catch(e) {}
-                            \\})();
-                        ;
-                        _ = v8.eval(isolate, ctx, warmup_js, "warmup.js") catch {};
-
-                        // Pump message loop to finalize Sparkplug compilations
-                        if (v8.global_platform) |platform| {
-                            var pumps: u32 = 0;
-                            while (pumps < 100) : (pumps += 1) {
-                                if (!v8.pumpMessageLoop(platform, isolate)) break;
-                            }
-                        }
-
-                        std.debug.print("[snapshot-gen] Warmed parser Sparkplug in snapshot\n", .{});
+                        std.debug.print("[snapshot-gen] TSC initialized in snapshot\n", .{});
                     }
                 }
                 // Don't free src — external string references it
@@ -147,8 +121,7 @@ pub fn main() !void {
     v8.IsolateApi.exit(isolate);
 
     // Create the snapshot blob
-    // kKeep retains compiled code (Sparkplug baseline) in the snapshot,
-    // giving pre-compiled functions a head start without TurboFan warmup.
+    // kKeep retains Sparkplug-compiled code — functions start at baseline JIT.
     const blob = creator.createBlob(v8.SnapshotCreator.kKeep);
     creator.deinit();
 
