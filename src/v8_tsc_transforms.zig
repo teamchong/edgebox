@@ -66,7 +66,9 @@ pub const transforms = [_]Transform{
     // checkSourceFile: force TurboFan optimization of hot checker functions before Check.
     // %PrepareFunctionForOptimization + %OptimizeFunctionOnNextCall = immediate TurboFan.
     // checkSourceFile: pump TurboFan before + during early Check
-    .{ .needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));", .replacement = "{if(typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);const __files=host.getSourceFiles();for(let __i=0;__i<__files.length;__i++){checkSourceFileWithEagerDiagnostics(__files[__i]);if(__i<30&&__i%5===4&&typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);}}" },
+    // Before Check: warm hot checker functions by calling with real types,
+    // then pump to flush TurboFan compilations. Reduces JIT variance.
+    .{ .needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));", .replacement = "{try{var __nt=numberType,__st=stringType,__bt=booleanType,__at=anyType;for(var __w=0;__w<200;__w++){isTypeRelatedTo(__nt,__at,assignableRelation);isTypeRelatedTo(__st,__at,assignableRelation);isTypeRelatedTo(__bt,__at,assignableRelation);isTypeRelatedTo(__nt,__st,assignableRelation);isTypeRelatedTo(__st,__nt,assignableRelation);}}catch(e){}if(typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);const __files=host.getSourceFiles();for(let __i=0;__i<__files.length;__i++){checkSourceFileWithEagerDiagnostics(__files[__i]);if(__i<30&&__i%5===4&&typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);}}" },
 };
 
 /// Apply all TSC source transforms in a single pass.
