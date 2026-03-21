@@ -131,7 +131,13 @@ pub fn initPlatform() !*Platform {
         // GC tuning: larger semi-space reduces minor GC frequency.
     // TSC creates millions of short-lived objects (diagnostics, type instances).
     // Larger young generation → fewer scavenges → less GC overhead.
-    const flags = "--max-old-space-size=4096 --concurrent-recompilation --use-osr --always-sparkplug --no-lazy-feedback-allocation --max-semi-space-size=128";
+    // V8 flags tuned for TSC cold start:
+    // --always-sparkplug: skip interpreter, go straight to baseline JIT
+    // --max-semi-space-size=128: reduce GC frequency for allocation-heavy checker
+    // --no-lazy-feedback-allocation: allocate feedback vectors eagerly
+    // --concurrent-recompilation --use-osr: background TurboFan + on-stack replacement
+    // --max-maglev-inline-depth=8: increase Maglev inlining for checker functions
+    const flags = "--max-old-space-size=4096 --concurrent-recompilation --use-osr --always-sparkplug --no-lazy-feedback-allocation --max-semi-space-size=128 --max-maglev-inline-depth=8";
     c.v8__V8__SetFlagsFromString(flags.ptr, flags.len);
 
     const platform = c.v8__Platform__NewDefaultPlatform(0, false) orelse
