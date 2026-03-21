@@ -478,6 +478,10 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         }
     }
 
+    // Ensure batch prefetch completed before TSC starts reading files.
+    // The prefetch ran in parallel with V8 init — wait for it now.
+    v8_io.waitBatchPrefetch();
+
     // TSC snapshot fast-path: on cold start (no code cache), use pre-initialized
     // globalThis.ts from snapshot. Skips compiling 6.2MB _tsc.js entirely.
     if (is_tsc and use_snapshot and !has_warm_cache and !is_freeze_compiled) {
