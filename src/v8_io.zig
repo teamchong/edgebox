@@ -208,7 +208,6 @@ pub fn clearCaches() void {
     exists_cache = .{};
     dir_exists_cache = .{};
     readdir_cache = .{};
-    scanned_dirs = .{};
     // Don't clear file_cache (JSON-escaped) — rarely used in fast path
     prefetch_complete = false;
 }
@@ -659,36 +658,17 @@ pub fn fileExistsFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c)
     const written = v8.StringApi.writeUtf8(str, isolate, &path_buf);
     const path = path_buf[0..written];
 
-    // Hot path: cache lookup — skip mutex after prefetch completes
-    var cached: ?bool = null;
-    var dir_check: bool = false;
-    if (prefetch_complete) {
-        cached = exists_cache.get(path);
-        if (cached == null) {
-            const dir = std.fs.path.dirname(path);
-            if (dir) |d| dir_check = scanned_dirs.get(d) != null;
-        }
-    } else {
+    // Hot path: cache lookup — no mutex needed after prefetch completes
+    const cached = if (prefetch_complete)
+        exists_cache.get(path)
+    else blk: {
         io_mutex.lock();
-        cached = exists_cache.get(path);
-        if (cached == null) {
-            const dir = std.fs.path.dirname(path);
-            if (dir) |d| dir_check = scanned_dirs.get(d) != null;
-        }
-        io_mutex.unlock();
-    }
+        defer io_mutex.unlock();
+        break :blk exists_cache.get(path);
+    };
 
     if (cached) |exists| {
         rv.setInt32(if (exists) 1 else 0);
-        return;
-    }
-    if (dir_check) {
-        // Directory was scanned — path not in exists_cache = doesn't exist
-        const key = alloc.dupe(u8, path) catch path;
-        io_mutex.lock();
-        exists_cache.put(alloc, key, false) catch {};
-        io_mutex.unlock();
-        rv.setInt32(0);
         return;
     }
 
