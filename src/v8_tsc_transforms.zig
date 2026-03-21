@@ -23,6 +23,12 @@ pub const transforms = [_]Transform{
     .{ .needle = "jsDocParsingMode = 0", .replacement = "jsDocParsingMode = 1" },
     // T5: typeof guard for packed integer key
     .{ .needle = "id.startsWith(\"*\")", .replacement = "(typeof id === \"string\" && id.startsWith(\"*\"))" },
+    // T-SOA1: store property count in upper 16 bits of __pc_objectFlags after member resolution
+    .{ .needle = "if (members !== emptySymbols) resolved.properties = getNamedMembers(members);\n    return resolved;", .replacement = "if (members !== emptySymbols) resolved.properties = getNamedMembers(members);\n    if(typeof __pc_objectFlags!=='undefined'&&resolved.id>0&&resolved.id<262144)__pc_objectFlags[resolved.id]=(__pc_objectFlags[resolved.id]&0xFFFF)|(resolved.properties.length<<16);\n    return resolved;" },
+    // T-SOA2: fast reject in propertiesIdenticalTo using SOA property counts
+    // If property counts differ AND no excludedProperties, types are not identical.
+    // This skips the expensive getPropertiesOfObjectType + getNamedMembers calls.
+    .{ .needle = "const sourceProperties = excludeProperties(getPropertiesOfObjectType(source2), excludedProperties);\n      const targetProperties = excludeProperties(getPropertiesOfObjectType(target2), excludedProperties);\n      if (sourceProperties.length !== targetProperties.length) {", .replacement = "if(typeof __pc_objectFlags!=='undefined'&&!excludedProperties&&source2.id>0&&source2.id<262144&&target2.id>0&&target2.id<262144){var __sc=__pc_objectFlags[source2.id]>>>16,__tc=__pc_objectFlags[target2.id]>>>16;if(__sc&&__tc&&__sc!==__tc)return 0;}\n      const sourceProperties = excludeProperties(getPropertiesOfObjectType(source2), excludedProperties);\n      const targetProperties = excludeProperties(getPropertiesOfObjectType(target2), excludedProperties);\n      if (sourceProperties.length !== targetProperties.length) {" },
     // T6: getFlowCacheKey Identifier → packed integer
     .{ .needle = "return symbol !== unknownSymbol ? `${flowContainer ? getNodeId(flowContainer) : \"-1\"}|${getTypeId(declaredType)}|${getTypeId(initialType)}|${getSymbolId(symbol)}` : void 0;", .replacement = "if(symbol===unknownSymbol)return void 0;var __fc=flowContainer?getNodeId(flowContainer)+1:0,__dt=getTypeId(declaredType),__it=getTypeId(initialType),__si=getSymbolId(symbol);return(__dt<32768&&__si<32768)?__dt*32768+__si+1:`${__fc}|${__dt}|${__it}|${__si}`;" },
     // T7: accessibleChainCache key → packed integer
