@@ -333,6 +333,38 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
     const tsc_shim_code = @embedFile("v8_tsc_shim.js");
     _ = v8.eval(isolate, context, tsc_shim_code, "v8_tsc_shim.js") catch {};
 
+    // Load freeze-compiled WASM functions (type checker hot paths)
+    if (is_tsc) {
+        const wasm_init_js =
+            \\(function() {
+            \\  try {
+            \\    var wasmBytes = new Uint8Array(__edgebox_wasm_bytes);
+            \\    var mod = new WebAssembly.Module(wasmBytes);
+            \\    var instance = new WebAssembly.Instance(mod);
+            \\    globalThis.__wasm = instance.exports;
+            \\  } catch(e) {}
+            \\})();
+        ;
+
+        // Expose the embedded WASM bytes as a global array
+        const wasm_data = @embedFile("tsc_standalone.wasm");
+        const global_obj = v8.ContextApi.global(context);
+
+        // Create a SAB with the WASM bytes
+        const wasm_sab = v8.SharedArrayBufferApi.fromExternalMemory(
+            isolate,
+            @constCast(@ptrCast(wasm_data.ptr)),
+            wasm_data.len,
+        );
+        if (wasm_sab) |sab| {
+            const sab_key = v8.StringApi.fromUtf8(isolate, "__edgebox_wasm_bytes") orelse null;
+            if (sab_key) |sk| {
+                _ = v8.ObjectApi.set(global_obj, context, @ptrCast(sk), sab);
+                _ = v8.eval(isolate, context, wasm_init_js, "wasm_init.js") catch {};
+            }
+        }
+    }
+
     // TSC snapshot fast-path: on cold start (no code cache), use pre-initialized
     // globalThis.ts from snapshot. Skips compiling 6.2MB _tsc.js entirely.
     if (is_tsc and use_snapshot and !has_warm_cache) {
