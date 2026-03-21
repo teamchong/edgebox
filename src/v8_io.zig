@@ -417,11 +417,14 @@ pub fn prefetchFile(path: []const u8) void {
     prefetch_file_list.append(alloc, key) catch {};
 }
 
-/// Background thread for batch prefetch
-var batch_prefetch_thread: ?std.Thread = null;
+/// Background threads for parallel batch prefetch
+const MAX_BATCH_THREADS = 4;
+var batch_threads: [MAX_BATCH_THREADS]?std.Thread = .{null} ** MAX_BATCH_THREADS;
+var batch_thread_count: usize = 0;
 
-fn batchPrefetchWorker() void {
-    for (prefetch_file_list.items) |path| {
+fn batchPrefetchShard(items: []const []const u8, start: usize, end: usize) void {
+    for (start..end) |i| {
+        const path = items[i];
         io_mutex.lock();
         const already = raw_file_cache.get(path) != null;
         io_mutex.unlock();
@@ -437,15 +440,27 @@ fn batchPrefetchWorker() void {
     }
 }
 
-/// Start batch prefetch on background thread. Non-blocking — V8 can start while files load.
+/// Start parallel batch prefetch. Non-blocking — V8 starts while files load.
 pub fn startBatchPrefetch() void {
-    if (prefetch_file_list.items.len == 0) return;
-    batch_prefetch_thread = std.Thread.spawn(.{}, batchPrefetchWorker, .{}) catch null;
+    const n = prefetch_file_list.items.len;
+    if (n == 0) return;
+    const tc = @min(n, MAX_BATCH_THREADS);
+    batch_thread_count = tc;
+    const per = (n + tc - 1) / tc;
+    for (0..tc) |i| {
+        const s = i * per;
+        const e = @min(s + per, n);
+        if (s >= e) break;
+        batch_threads[i] = std.Thread.spawn(.{}, batchPrefetchShard, .{ prefetch_file_list.items, s, e }) catch null;
+    }
 }
 
 /// Wait for batch prefetch to complete.
 pub fn waitBatchPrefetch() void {
-    if (batch_prefetch_thread) |t| { t.join(); batch_prefetch_thread = null; }
+    for (0..batch_thread_count) |i| {
+        if (batch_threads[i]) |t| { t.join(); batch_threads[i] = null; }
+    }
+    batch_thread_count = 0;
 }
 
 pub fn readFileFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
