@@ -10,17 +10,14 @@ EDGEBOX="$(cd "$(dirname "$0")/.." && pwd)/zig-out/bin/edgebox"
 RENDERER="$(cd "$(dirname "$0")" && pwd)/doom-extract-frame.js"
 PALETTE_RENDERER="$(cd "$(dirname "$0")" && pwd)/doom-render.js"
 
-clear
-echo ""
-echo "  DOOM in TypeScript Types — EdgeBox Renderer"
-echo "  Scale: ${SCALE}x ($(( 320 * SCALE ))×$(( 200 * SCALE )))"
-echo ""
-
 # Render the title screen (pre-computed frame)
 PALETTE="$DOOM_DIR/packages/playground/final-doom-pun-intended/palette-values.ts"
 if [ -f "$PALETTE" ]; then
+    clear
+    echo ""
     "$EDGEBOX" "$PALETTE_RENDERER" "$PALETTE" "$SCALE"
     echo ""
+    echo "  DOOM in TypeScript Types — EdgeBox Renderer"
     echo "  Title screen — computed by TypeScript type checker"
     echo "  Press Enter for WASM machine state frames..."
     read
