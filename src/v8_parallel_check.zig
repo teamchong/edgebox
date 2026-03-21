@@ -268,21 +268,68 @@ pub fn parallelCheckCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) 
 // ============================================================
 // Maps (sourceFlags, targetFlags) → result for isSimpleTypeRelatedTo.
 // Built once after types are created, then every call is a single lookup.
-// Table indexed by: (sourceFlags & 0x7FF) * 2048 + (targetFlags & 0x7FF)
-// This captures the bottom 11 bits of flags which contain all type kinds.
+// Hash map flag table: stores (sourceFlags, targetFlags, result) entries.
+// Uses open addressing with multiplicative hash for full 32-bit flag values.
+// 64K entries × 3 i32 per entry = 768KB (fits in L2 cache).
+const FLAG_MAP_CAPACITY: usize = 65536; // power of 2 for fast modulo
+const FLAG_MAP_ENTRIES: usize = FLAG_MAP_CAPACITY * 3; // 3 i32 per entry: [sFlags, tFlags, result]
+const FLAG_TABLE_ENTRIES: usize = FLAG_MAP_ENTRIES;
 
-const FLAG_TABLE_ENTRIES: usize = 2048 * 2048; // 4M entries
-
-fn getFlagTable() ?[*]u8 {
+fn getFlagTable() ?[*]i32 {
     const buf = getSharedBuffer() orelse return null;
-    return buf + FLAG_TABLE_OFFSET * @sizeOf(i32);
+    return @alignCast(@ptrCast(buf + FLAG_TABLE_OFFSET * @sizeOf(i32)));
+}
+
+/// Hash two flag values to a bucket index
+fn flagPairHash(s: i32, t: i32) usize {
+    const su: u32 = @bitCast(s);
+    const tu: u32 = @bitCast(t);
+    const h = (su *% 2654435761) ^ (tu *% 2246822519);
+    return @intCast(h & (FLAG_MAP_CAPACITY - 1));
+}
+
+/// Insert into the flag map (open addressing, linear probe)
+fn flagMapInsert(table: [*]i32, s: i32, t: i32, result: i32) void {
+    var idx = flagPairHash(s, t);
+    var probes: usize = 0;
+    while (probes < 64) : (probes += 1) {
+        const base = idx * 3;
+        if (table[base] == 0 and table[base + 1] == 0) {
+            // Empty slot
+            table[base] = s;
+            table[base + 1] = t;
+            table[base + 2] = result;
+            return;
+        }
+        if (table[base] == s and table[base + 1] == t) {
+            // Already exists — update
+            table[base + 2] = result;
+            return;
+        }
+        idx = (idx + 1) & (FLAG_MAP_CAPACITY - 1);
+    }
+}
+
+/// Lookup in the flag map. Returns 0 (miss), 1 (related), 2 (not-related).
+fn flagMapLookup(table: [*]const i32, s: i32, t: i32) i32 {
+    var idx = flagPairHash(s, t);
+    var probes: usize = 0;
+    while (probes < 8) : (probes += 1) {
+        const base = idx * 3;
+        if (table[base] == 0 and table[base + 1] == 0) return 0; // Empty = miss
+        if (table[base] == s and table[base + 1] == t) return table[base + 2];
+        idx = (idx + 1) & (FLAG_MAP_CAPACITY - 1);
+    }
+    return 0; // Too many probes = miss
 }
 
 /// Build the flag-pair lookup table using ALL type flags in the SAB.
 /// The table lives IN the SAB — JS reads it directly via Uint8Array (zero-copy).
 pub fn buildFlagTable(type_flags: [*]const i32, max_id: usize) void {
     const table = getFlagTable() orelse return;
-    @memset(table[0..FLAG_TABLE_ENTRIES], 0);
+    // Clear the hash map (zero = empty)
+    const table_bytes: [*]u8 = @ptrCast(table);
+    @memset(table_bytes[0 .. FLAG_MAP_ENTRIES * @sizeOf(i32)], 0);
 
     // Collect distinct flag values
     var seen_flags: [4096]i32 = undefined;
@@ -300,14 +347,11 @@ pub fn buildFlagTable(type_flags: [*]const i32, max_id: usize) void {
         }
     }
 
-    // Pre-compute all pairs of distinct flags
+    // Pre-compute all pairs of distinct flags using hash map
     for (0..seen_count) |si| {
         const s = seen_flags[si];
-        const s_idx: usize = @intCast(s & 0x7FF);
         for (0..seen_count) |ti| {
             const t = seen_flags[ti];
-            const t_idx: usize = @intCast(t & 0x7FF);
-            const idx = s_idx * 2048 + t_idx;
 
             // isSimpleTypeRelatedTo logic
             var result: u8 = 0;
@@ -323,7 +367,9 @@ pub fn buildFlagTable(type_flags: [*]const i32, max_id: usize) void {
             else if (s & 65536 != 0 and t & 65536 != 0) { result = 1; }
             else if (s & 524288 != 0 and t & 67108864 != 0) { result = 1; }
 
-            table[idx] = result;
+            if (result != 0) {
+                flagMapInsert(table, s, t, result);
+            }
         }
     }
 }
@@ -396,15 +442,10 @@ pub fn triggerBuildCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) v
     if (val > 0) triggerAsyncBuild(@intCast(val));
 }
 
-/// Look up the flag-pair table result.
-/// Returns 0 (unknown), 1 (related), 2 (not-related).
-pub fn lookupFlagPair(source_flags: i32, target_flags: i32) u8 {
+/// Look up the flag-pair result from hash map.
+pub fn lookupFlagPair(source_flags: i32, target_flags: i32) i32 {
     const table = getFlagTable() orelse return 0;
-    const s_idx: usize = @intCast(source_flags & 0x7FF);
-    const t_idx: usize = @intCast(target_flags & 0x7FF);
-    const idx = s_idx * 2048 + t_idx;
-    if (idx >= FLAG_TABLE_ENTRIES) return 0;
-    return table[idx];
+    return flagMapLookup(table, source_flags, target_flags);
 }
 
 /// Register __edgebox_parallel_check and expose SAB-backed typed arrays.
@@ -426,7 +467,7 @@ pub fn registerGlobals(isolate: *v8.Isolate, context: *const v8.Context) void {
     const init_js = std.fmt.bufPrint(&init_buf,
         "globalThis.__pc_typeFlags=new Int32Array(__pc_sab,0,{d});" ++
         "globalThis.__pc_objectFlags=new Int32Array(__pc_sab,{d},{d});" ++
-        "globalThis.__pc_flagTable=new Uint8Array(__pc_sab,{d},{d});" ++
+        "globalThis.__pc_flagMap=new Int32Array(__pc_sab,{d},{d});" ++
         "globalThis.__pc_pairs=new Int32Array(__pc_sab,{d},{d});" ++
         "globalThis.__pc_results=new Int32Array(__pc_sab,{d},{d});",
         .{
