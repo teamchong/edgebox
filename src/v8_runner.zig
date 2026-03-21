@@ -255,7 +255,9 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
             }
         }
     }
-    const use_snapshot = embedded_snapshot.len > 0 and !is_tsc;
+    // Use snapshot for all scripts. For TSC, snapshot has pre-initialized
+    // globalThis.ts with all source transforms applied.
+    const use_snapshot = embedded_snapshot.len > 0;
     const isolate = if (use_snapshot)
         v8.SnapshotApi.createIsolateFromSnapshot(embedded_snapshot.ptr, @intCast(embedded_snapshot.len), getExternalRefs())
     else

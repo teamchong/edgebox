@@ -69,9 +69,15 @@ pub fn main() !void {
         // Use external one-byte string (zero-copy from Zig buffer to V8).
         {
             const alloc = std.heap.page_allocator;
-            const tsc_source = std.fs.cwd().readFileAlloc(alloc, "node_modules/typescript/lib/typescript.js", 20 * 1024 * 1024) catch null;
-            if (tsc_source) |src| {
-                // Create V8 string from TSC source (external, zero-copy)
+            const tsc_raw = std.fs.cwd().readFileAlloc(alloc, "node_modules/typescript/lib/typescript.js", 20 * 1024 * 1024) catch null;
+            if (tsc_raw) |raw_src| {
+                // Apply the SAME source transforms used by v8_runner at runtime.
+                // This ensures snapshot TSC is identical to runtime-transformed TSC.
+                const tsc_transforms = @import("v8_tsc_transforms.zig");
+                const src = tsc_transforms.apply(alloc, raw_src) catch raw_src;
+                alloc.free(raw_src);
+                std.debug.print("[snapshot-gen] Applied {d} bytes of transforms\n", .{src.len - raw_src.len + raw_src.len});
+
                 const v8_str = v8.StringApi.fromExternalOneByte(isolate, src) orelse
                     v8.StringApi.fromUtf8(isolate, src);
                 if (v8_str) |str| {
@@ -86,29 +92,8 @@ pub fn main() !void {
                         // Workers start with globalThis.ts already initialized — zero load time.
                         // This executes typescript.js (API only, no CLI) during snapshot creation.
                         const init_code =
-                            \\// Apply source transforms before compiling factory
-                            \\// T1: JSDoc skip — 2x faster parsing
-                            \\globalThis.__tsc_source = globalThis.__tsc_source.replace(/jsDocParsingMode = 0/g, 'jsDocParsingMode = 1');
-                            \\// T2: createType → populate __pc_typeFlags SOA column
-                            \\globalThis.__tsc_source = globalThis.__tsc_source.replace(
-                            \\  'typeCount++;\n    result.id = typeCount;',
-                            \\  'typeCount++;\n    result.id = typeCount;\n    if(typeof __pc_typeFlags!=="undefined"&&typeCount<262144)__pc_typeFlags[typeCount]=result.flags;'
-                            \\);
-                            \\// T3: isSimpleTypeRelatedTo → read from SAB-backed SOA column
-                            \\globalThis.__tsc_source = globalThis.__tsc_source.replace(
-                            \\  'const s = source.flags;\n    const t = target.flags;',
-                            \\  'const s = (typeof __pc_typeFlags!=="undefined"?__pc_typeFlags[source.id|0]:0) || source.flags;\n    const t = (typeof __pc_typeFlags!=="undefined"?__pc_typeFlags[target.id|0]:0) || target.flags;'
-                            \\);
-                            \\// T4: getRelationKey → packed integer (eliminates string+template allocation)
-                            \\globalThis.__tsc_source = globalThis.__tsc_source.replace(
-                            \\  'isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : `${source.id},${target.id}${postFix}`',
-                            \\  'isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : (!postFix&&source.id<32768&&target.id<32768)?source.id*32768+target.id+1:`${source.id},${target.id}${postFix}`'
-                            \\);
-                            \\// T5: typeof guard for packed integer key (id.startsWith crashes on number)
-                            \\globalThis.__tsc_source = globalThis.__tsc_source.replace(
-                            \\  'id.startsWith("*")',
-                            \\  '(typeof id === "string" && id.startsWith("*"))'
-                            \\);
+                            \\// Source already transformed by Zig (v8_tsc_transforms.zig).
+                            \\// Just compile and execute — no JS replace() needed.
                             \\globalThis.__tsc_factory = new Function('module', 'exports', 'require', '__filename', '__dirname', globalThis.__tsc_source);
                             \\// Execute the factory using the REAL bootstrap require
                             \\// This initializes the ts module in the snapshot so workers get it for free.
