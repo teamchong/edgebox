@@ -13,9 +13,12 @@ const Transform = struct {
 
 /// All TSC source transforms. Order matters — first match wins.
 pub const transforms = [_]Transform{
-    // T1: createType SOA write — DISABLED for A/B test
-    // T2: isSimpleTypeRelatedTo SOA read — DISABLED: V8 inline cache on source.flags
-    // is faster than __pc_typeFlags[source.id|0] || source.flags (3 ops vs 1 op)
+    // T1: createType → write flags to SAB-backed __pc_typeFlags + trigger async build
+    .{ .needle = "typeCount++;\n    result.id = typeCount;", .replacement = "typeCount++;\n    result.id = typeCount;\n    if(typeof __pc_typeFlags!=='undefined'&&typeCount<262144){__pc_typeFlags[typeCount]=result.flags;if(result.objectFlags)__pc_objectFlags[typeCount]=result.objectFlags;if(typeCount===5000&&typeof __edgebox_trigger_build==='function')__edgebox_trigger_build(typeCount);}" },
+    // T2: isTypeRelatedTo → SAB flag fast-path for SAFE cases only.
+    // Only returns true for flag combinations that don't depend on strictNullChecks,
+    // wildcardType, value comparison, or relation-specific rules.
+    .{ .needle = "function isTypeRelatedTo(source, target, relation) {\n    if (isFreshLiteralType(source)) {\n      source = source.regularType;\n    }\n    if (isFreshLiteralType(target)) {\n      target = target.regularType;\n    }\n    if (source === target) {\n      return true;\n    }", .replacement = "function isTypeRelatedTo(source, target, relation) {\n    if (isFreshLiteralType(source)) {\n      source = source.regularType;\n    }\n    if (isFreshLiteralType(target)) {\n      target = target.regularType;\n    }\n    if (source === target) {\n      return true;\n    }\n    if(typeof __pc_typeFlags!=='undefined'&&source.id>0&&source.id<262144&&target.id>0&&target.id<262144){var __sf=__pc_typeFlags[source.id],__tf=__pc_typeFlags[target.id];if(__sf&&__tf){if(__tf&1||__sf&131072)return true;if(__sf&402653316&&__tf&4)return true;if(__sf&296&&__tf&8)return true;if(__sf&2112&&__tf&64)return true;if(__sf&528&&__tf&16)return true;if(__sf&12288&&__tf&4096)return true;}}" },
     // T3: getRelationKey → packed Smi (only when postFix is empty)
     .{ .needle = "isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : `${source.id},${target.id}${postFix}`", .replacement = "isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : (!postFix&&source.id<32768&&target.id<32768) ? source.id * 32768 + target.id + 1 : `${source.id},${target.id}${postFix}`" },
     // T4: JSDoc skip

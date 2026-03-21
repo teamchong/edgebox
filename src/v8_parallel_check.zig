@@ -21,13 +21,13 @@ const v8 = @import("v8.zig");
 const max_threads = 8;
 
 // Buffer sizing: 256K types, 512K pairs max
-const MAX_TYPES: usize = 262144; // 256K type slots
+pub const MAX_TYPES: usize = 262144; // 256K type slots
 const MAX_PAIRS: usize = 524288; // 512K pair slots
 // Layout: [typeFlags 256K | objectFlags 256K | flagTable 4M bytes | pairs 1M | results 512K]
 // flagTable: 2048*2048 = 4M entries of u8, for isSimpleTypeRelatedTo lookup
 const FLAG_TABLE_I32 = (2048 * 2048 + 3) / 4; // 4MB in i32 units (rounded up)
 const TOTAL_I32 = MAX_TYPES * 2 + FLAG_TABLE_I32 + 2 * MAX_PAIRS + MAX_PAIRS;
-const TOTAL_BYTES = TOTAL_I32 * @sizeOf(i32);
+pub const TOTAL_BYTES = TOTAL_I32 * @sizeOf(i32);
 
 const TYPE_FLAGS_OFFSET: usize = 0;
 const OBJ_FLAGS_OFFSET: usize = MAX_TYPES;
@@ -38,7 +38,7 @@ const RESULTS_OFFSET: usize = MAX_TYPES * 2 + FLAG_TABLE_I32 + 2 * MAX_PAIRS;
 // Zig-owned shared memory
 var shared_buffer: ?[*]align(4096) u8 = null;
 
-fn getSharedBuffer() ?[*]align(4096) u8 {
+pub fn getSharedBuffer() ?[*]align(4096) u8 {
     if (shared_buffer) |buf| return buf;
     const buf = std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(4096), TOTAL_BYTES) catch return null;
     shared_buffer = buf.ptr;
