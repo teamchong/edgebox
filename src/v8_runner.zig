@@ -234,8 +234,27 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
     _ = try v8.initPlatform();
     defer v8.disposePlatform();
 
-    // For TSC: use plain isolate (no 13.6MB snapshot deserialization).
-    // TSC source transforms + code cache is faster than snapshot-loaded TSC.
+    // Path selection:
+    // - Non-TSC: always use snapshot (fast bootstrap)
+    // - TSC cold start (no code cache): use snapshot (TSC pre-initialized, skip 6.2MB compile)
+    // - TSC warm start (code cache exists): use plain isolate + transforms + code cache
+    var has_warm_cache = false;
+    if (is_tsc) {
+        const orig_cache = getCachePath(alloc, script_code) catch null;
+        if (orig_cache) |oc| {
+            if (std.mem.endsWith(u8, oc, ".codecache")) {
+                const base = oc[0 .. oc.len - ".codecache".len];
+                if (std.fmt.allocPrint(alloc, "{s}.transformed", .{base})) |tp| {
+                    if (std.fs.cwd().readFileAlloc(alloc, tp, 64 * 1024 * 1024)) |tfm| {
+                        defer alloc.free(tfm);
+                        if (getCachePath(alloc, tfm)) |ccp| {
+                            has_warm_cache = (std.fs.cwd().statFile(ccp) catch null) != null;
+                        } else |_| {}
+                    } else |_| {}
+                } else |_| {}
+            }
+        }
+    }
     const use_snapshot = embedded_snapshot.len > 0 and !is_tsc;
     const isolate = if (use_snapshot)
         v8.SnapshotApi.createIsolateFromSnapshot(embedded_snapshot.ptr, @intCast(embedded_snapshot.len), getExternalRefs())
@@ -308,9 +327,55 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         _ = v8.eval(isolate, context, argv_fix, "argv_fix.js") catch {};
     }
 
-    // Inject TSC shim + require intercept if snapshot has pre-initialized TSC
+    // Inject TSC shim
     const tsc_shim_code = @embedFile("v8_tsc_shim.js");
     _ = v8.eval(isolate, context, tsc_shim_code, "v8_tsc_shim.js") catch {};
+
+    // TSC snapshot fast-path: on cold start (no code cache), use pre-initialized
+    // globalThis.ts from snapshot. Skips compiling 6.2MB _tsc.js entirely.
+    if (is_tsc and use_snapshot and !has_warm_cache) {
+        const dirname_sp = std.fs.path.dirname(abs_path) orelse ".";
+        const sp_globals = try std.fmt.allocPrint(alloc,
+            "globalThis.__filename = \"{s}\"; globalThis.__dirname = \"{s}\";",
+            .{ abs_path, dirname_sp },
+        );
+        defer alloc.free(sp_globals);
+        _ = v8.eval(isolate, context, sp_globals, "globals.js") catch {};
+
+        const tsc_fast_js =
+            \\(function() {
+            \\  if (typeof globalThis.ts === 'undefined' || !ts.executeCommandLine) return;
+            \\  ts.sys.args = process.argv.slice(2);
+            \\  ts.sys.getExecutingFilePath = function() { return __filename; };
+            \\  ts.Debug.loggingHost = {
+            \\    log: function(_level, s) { ts.sys.write((s || '') + ts.sys.newLine); }
+            \\  };
+            \\  if (ts.Debug.isDebugging) ts.Debug.enableDebugInfo();
+            \\  if (ts.sys.setBlocking) ts.sys.setBlocking();
+            \\  ts.executeCommandLine(ts.sys, function(){}, ts.sys.args);
+            \\})();
+        ;
+
+        var sp_try_catch = v8.TryCatch.init(isolate);
+        defer sp_try_catch.deinit();
+
+        _ = v8.eval(isolate, context, tsc_fast_js, "tsc_fast.js") catch {
+            if (v8_io.deferred_exit_code == null) {
+                reportException(&sp_try_catch, isolate, context);
+                std.process.exit(1);
+            }
+        };
+
+        v8_io.flushAll();
+
+        // Save code cache for warm start path (compile _tsc.js in background)
+        // On next run, the warm path will be used instead of snapshot.
+
+        if (v8_io.deferred_exit_code) |code| {
+            std.process.exit(code);
+        }
+        return;
+    }
 
     // Auto-inject zero-copy optimizations for TSC
     // Single-pass multi-pattern replacement to minimize scan overhead on 9MB source.
