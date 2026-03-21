@@ -89,24 +89,15 @@ pub fn main() !void {
                         std.debug.print("[snapshot-gen] Pre-loaded TSC source ({d} bytes) into snapshot\n", .{src.len});
 
                         // Pre-compile AND EXECUTE TSC in the snapshot.
-                        // Workers start with globalThis.ts already initialized — zero load time.
-                        // This executes typescript.js (API only, no CLI) during snapshot creation.
                         const init_code =
-                            \\// Source already transformed by Zig (v8_tsc_transforms.zig).
-                            \\// Just compile and execute — no JS replace() needed.
                             \\globalThis.__tsc_factory = new Function('module', 'exports', 'require', '__filename', '__dirname', globalThis.__tsc_source);
-                            \\// Execute the factory using the REAL bootstrap require
-                            \\// This initializes the ts module in the snapshot so workers get it for free.
                             \\var __tsc_mod = { exports: {} };
                             \\try {
                             \\  globalThis.__tsc_factory(__tsc_mod, __tsc_mod.exports, globalThis.require, '/snapshot/typescript.js', '/snapshot');
                             \\  globalThis.ts = __tsc_mod.exports;
-                            \\  // Free source string — ts module is initialized, source no longer needed
                             \\  delete globalThis.__tsc_source;
                             \\  delete globalThis.__tsc_factory;
-                            \\} catch(e) {
-                            \\  // May fail during snapshot if IO is unavailable — keep factory for runtime
-                            \\}
+                            \\} catch(e) {}
                         ;
                         _ = v8.eval(isolate, ctx, init_code, "tsc_init.js") catch |err| {
                             std.debug.print("[snapshot-gen] WARNING: TSC init failed: {} (factory still available)\n", .{err});
