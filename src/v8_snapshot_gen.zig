@@ -115,6 +115,8 @@ pub fn main() !void {
                             \\globalThis.__fidNext = 0;
                             \\// Bitmap: 256×256 = 64KB, filled by Zig SIMD before Check
                             \\globalThis.__flagBitmap = new Uint8Array(65536);
+                            \\// Structural result caching proven unsafe — TSC's checker has side
+                            \\// effects that caching skips, causing diagnostic mismatches.
                             \\globalThis.__runTsc = function(__args) {
                             \\  ts.sys.args = __args;
                             \\  ts.sys.getExecutingFilePath = function() { return globalThis.__filename || '/usr/bin/tsc'; };
