@@ -113,18 +113,27 @@ pub fn main() !void {
                         };
                         std.debug.print("[snapshot-gen] Pre-compiled + initialized TSC in snapshot\n", .{});
 
-                        // Parse a few small files to warm Sparkplug for the parser,
-                        // without bloating the snapshot with full lib.d.ts ASTs.
-                        const warmup_parse_js =
+                        // Warm Sparkplug+Maglev: parse small files and run a micro type check.
+                        // Maglev requires execution feedback — calling checker functions
+                        // during snapshot triggers Maglev compilation, retained by kKeep.
+                        const warmup_js =
                             \\(function() {
                             \\  if (typeof ts === 'undefined' || !ts.createSourceFile) return;
                             \\  try {
+                            \\    // Warm parser (Sparkplug)
                             \\    ts.createSourceFile('w.ts', 'var x:number=1;interface A{a:string;b:number}', 99, true);
-                            \\    ts.createSourceFile('w2.ts', 'type T<X>={[K in keyof X]:X[K]};function f<T>(a:T):T{return a}', 99, true);
+                            \\    // Warm checker (Maglev) — micro type check with structural types
+                            \\    var src = 'interface X{a:number;b:string}interface Y{a:number;b:string;c:boolean}var v:X={a:1,b:""};var w:Y={a:1,b:"",c:true};var z:X=w;';
+                            \\    var sf = ts.createSourceFile('warmup.ts', src, 99, true);
+                            \\    var host = ts.createCompilerHost({target:99,module:99,strict:true});
+                            \\    var origGet = host.getSourceFile;
+                            \\    host.getSourceFile = function(n,l,e) { return n==='warmup.ts'?sf:origGet.call(host,n,l,e); };
+                            \\    var prog = ts.createProgram(['warmup.ts'], {target:99,module:99,strict:true,noEmit:true,skipLibCheck:true}, host);
+                            \\    prog.getSemanticDiagnostics(sf);
                             \\  } catch(e) {}
                             \\})();
                         ;
-                        _ = v8.eval(isolate, ctx, warmup_parse_js, "warmup_parse.js") catch {};
+                        _ = v8.eval(isolate, ctx, warmup_js, "warmup.js") catch {};
 
                         // Pump message loop to finalize Sparkplug compilations
                         if (v8.global_platform) |platform| {
