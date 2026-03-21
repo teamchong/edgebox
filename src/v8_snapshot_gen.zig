@@ -145,44 +145,7 @@ pub fn main() !void {
                         ;
                         _ = v8.eval(isolate, ctx, preparse_js, "preparse_lib.js") catch {};
 
-                        // Also warm the checker — run a mini type check to trigger TurboFan
-                        // optimization of isTypeRelatedTo, structuredTypeRelatedTo, etc.
-                        const warmup_js =
-                            \\(function() {
-                            \\  if (typeof ts === 'undefined' || !ts.createProgram) return;
-                            \\  try {
-                            \\    // Exercise structural type checking with generics, unions, interfaces
-                            \\    var src = [
-                            \\      'interface A { x: number; y: string; }',
-                            \\      'interface B extends A { z: boolean; }',
-                            \\      'type C = A | B | null | undefined;',
-                            \\      'type D<T> = { [K in keyof T]: T[K] extends string ? true : false };',
-                            \\      'function f<T extends A>(a: T, b: B): D<T> { return {} as any; }',
-                            \\      'const r: D<B> = f({x:1,y:"",z:true}, {x:2,y:"b",z:false});',
-                            \\      'type E = { [k: string]: number };',
-                            \\      'const e: E = {}; const n: number = e["x"];',
-                            \\      'type F = [number, string, ...boolean[]];',
-                            \\      'function g(...args: F): string { return args[1]; }',
-                            \\      'class G<T> { constructor(public val: T) {} get v(): T { return this.val; } }',
-                            \\      'const gi = new G<A>({x:1,y:""}); const gv: A = gi.v;',
-                            \\      'type Narrow<T, U> = T extends U ? T : never;',
-                            \\      'type H = Narrow<string | number | boolean, string>;',
-                            \\    ].join('\n');
-                            \\    var sf = ts.createSourceFile('warmup.ts', src, 99, true);
-                            \\    var host = ts.createCompilerHost({target:99,module:99,strict:true});
-                            \\    var origGet = host.getSourceFile;
-                            \\    host.getSourceFile = function(name,lang,err) {
-                            \\      if (name === 'warmup.ts') return sf;
-                            \\      return origGet.call(host, name, lang, err);
-                            \\    };
-                            \\    var prog = ts.createProgram(['warmup.ts'], {target:99,module:99,strict:true,noEmit:true,skipLibCheck:true}, host);
-                            \\    prog.getSemanticDiagnostics(sf);
-                            \\  } catch(e) {}
-                            \\})();
-                        ;
-                        _ = v8.eval(isolate, ctx, warmup_js, "warmup_checker.js") catch {};
-
-                        // Pump message loop to finalize TurboFan compilations before snapshot
+                        // Pump message loop to finalize Sparkplug compilations
                         if (v8.global_platform) |platform| {
                             var pumps: u32 = 0;
                             while (pumps < 100) : (pumps += 1) {
@@ -190,7 +153,7 @@ pub fn main() !void {
                             }
                         }
 
-                        std.debug.print("[snapshot-gen] Pre-parsed lib.d.ts + warmed checker in snapshot\n", .{});
+                        std.debug.print("[snapshot-gen] Pre-parsed lib.d.ts in snapshot\n", .{});
                     }
                 }
                 // Don't free src — external string references it
