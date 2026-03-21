@@ -288,9 +288,11 @@ function runTsc(cmd: string, args: string[], outDir: string, debug: boolean = fa
   });
   const elapsed = performance.now() - start;
 
-  // Count type errors from stdout (tsc prints "error TS" diagnostics to stdout)
+  // Count type errors from stdout AND stderr (tsc may output to either)
   const stdout = result.stdout?.toString() || "";
-  const diagnostics = (stdout.match(/error TS\d+/g) || []).length;
+  const stderr_str = result.stderr?.toString() || "";
+  const combined = stdout + stderr_str;
+  const diagnostics = (combined.match(/error TS\d+/g) || []).length;
 
   // Check for errors
   if (result.status !== 0 && result.status !== 2) {
