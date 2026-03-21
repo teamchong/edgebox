@@ -571,6 +571,9 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         }
 
         if (v8_io.deferred_exit_code) |code| {
+            // Flush stdout/stderr again before exit — TSC may have written
+            // diagnostics after the main flushAll() call.
+            v8_io.flushAll();
             std.process.exit(code);
         }
         return;
