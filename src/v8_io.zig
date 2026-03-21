@@ -455,6 +455,71 @@ fn batchPrefetchShard(items: []const []const u8, start: usize, end: usize) void 
         io_mutex.lock();
         raw_file_cache.put(alloc, path, data) catch {};
         io_mutex.unlock();
+
+        // Scan imports and pre-resolve relative paths.
+        // TSC probes: ./foo.ts, ./foo.tsx, ./foo.d.ts, ./foo/index.ts, etc.
+        // Pre-stat these paths so fileExists hits cache.
+        const dir = std.fs.path.dirname(path) orelse continue;
+        scanImportsAndPreResolve(data, dir);
+    }
+}
+
+/// Scan file content for import specifiers and pre-stat resolved paths.
+fn scanImportsAndPreResolve(content: []const u8, dir: []const u8) void {
+    // Fast scan: look for `from '` or `from "` patterns
+    var pos: usize = 0;
+    while (pos + 6 < content.len) : (pos += 1) {
+        // Match: from '...' or from "..."
+        if (content[pos] == 'f' and pos + 5 < content.len and
+            content[pos + 1] == 'r' and content[pos + 2] == 'o' and
+            content[pos + 3] == 'm' and content[pos + 4] == ' ')
+        {
+            const quote = content[pos + 5];
+            if (quote != '\'' and quote != '"') continue;
+            const spec_start = pos + 6;
+            var spec_end = spec_start;
+            while (spec_end < content.len and content[spec_end] != quote) : (spec_end += 1) {}
+            if (spec_end >= content.len) continue;
+            const specifier = content[spec_start..spec_end];
+
+            // Only resolve relative imports (./foo or ../foo)
+            if (specifier.len < 2 or specifier[0] != '.') continue;
+
+            // Resolve relative to the file's directory
+            resolveAndCacheExists(dir, specifier);
+            pos = spec_end;
+        }
+    }
+}
+
+/// Try common TS resolution extensions and cache exists results.
+fn resolveAndCacheExists(dir: []const u8, specifier: []const u8) void {
+    const extensions = [_][]const u8{ ".ts", ".tsx", ".d.ts", "/index.ts", "/index.tsx", "/index.d.ts", ".js", ".jsx" };
+    for (&extensions) |ext| {
+        const resolved = std.fmt.allocPrint(alloc, "{s}/{s}{s}", .{ dir, specifier, ext }) catch continue;
+        io_mutex.lock();
+        const cached = exists_cache.get(resolved) != null;
+        io_mutex.unlock();
+        if (cached) { alloc.free(resolved); continue; }
+
+        const exists = blk: {
+            _ = std.fs.cwd().statFile(resolved) catch break :blk false;
+            break :blk true;
+        };
+        io_mutex.lock();
+        exists_cache.put(alloc, resolved, exists) catch {};
+        io_mutex.unlock();
+
+        if (exists) {
+            // Also pre-read the resolved file
+            const f = std.fs.cwd().openFile(resolved, .{}) catch continue;
+            defer f.close();
+            const fdata = f.readToEndAlloc(alloc, 64 * 1024 * 1024) catch continue;
+            io_mutex.lock();
+            raw_file_cache.put(alloc, resolved, fdata) catch {};
+            io_mutex.unlock();
+            break; // Found — no need to try more extensions
+        }
     }
 }
 
