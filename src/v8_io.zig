@@ -436,9 +436,18 @@ pub fn readFileFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) v
     // Use external string (zero-copy) for pure-ASCII files.
     // Files with non-ASCII bytes MUST use fromUtf8 (copies, but handles UTF-8).
     // fromExternalOneByte treats bytes as Latin-1, corrupting multi-byte UTF-8.
+    // Fast ASCII check: process 8 bytes at a time using bitwise OR.
+    // Any byte >= 0x80 sets the high bit. OR accumulates → single check.
     const is_ascii = blk: {
-        for (content) |byte| {
-            if (byte >= 0x80) break :blk false;
+        var i: usize = 0;
+        // 8-byte fast path
+        while (i + 8 <= content.len) : (i += 8) {
+            const chunk = std.mem.readInt(u64, content[i..][0..8], .little);
+            if (chunk & 0x8080808080808080 != 0) break :blk false;
+        }
+        // Remaining bytes
+        while (i < content.len) : (i += 1) {
+            if (content[i] >= 0x80) break :blk false;
         }
         break :blk true;
     };
