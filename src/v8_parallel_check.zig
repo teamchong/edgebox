@@ -418,6 +418,12 @@ pub fn precomputeCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) voi
     // Build synchronously (async didn't cover all types)
     const type_flags = getTypeFlags() orelse { rv.setInt32(0); return; };
     buildFlagTable(type_flags, max_id);
+
+    // Also pump V8 message loop for TurboFan
+    if (v8.global_platform) |platform| {
+        while (v8.pumpMessageLoop(platform, isolate)) {}
+    }
+
     rv.setInt32(1);
 }
 
