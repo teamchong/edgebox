@@ -475,11 +475,10 @@ fn batchPrefetchShard(items: []const []const u8, start: usize, end: usize) void 
         raw_file_cache.put(alloc, path, data) catch {};
         io_mutex.unlock();
 
-        // Scan imports and pre-resolve relative paths.
-        // TSC probes: ./foo.ts, ./foo.tsx, ./foo.d.ts, ./foo/index.ts, etc.
-        // Pre-stat these paths so fileExists hits cache.
-        const dir = std.fs.path.dirname(path) orelse continue;
-        scanImportsAndPreResolve(data, dir);
+        // Import pre-resolution disabled — the 17K stat() calls from scanning
+        // 358 files × 6 imports × 8 extensions competed with V8 startup,
+        // making IO Read slower (0.10s vs 0.05s). Directory-scanned negative
+        // caching handles most module resolution probes already.
     }
 }
 
@@ -564,32 +563,6 @@ pub fn waitBatchPrefetch() void {
     }
     batch_thread_count = 0;
 
-    // Scan extra directories (from queueDirScan) for negative caching.
-    // These dirs weren't part of the file prefetch — just scan listings.
-    for (dir_scan_list.items) |dir| {
-        io_mutex.lock();
-        const already = scanned_dirs.get(dir) != null;
-        io_mutex.unlock();
-        if (already) continue;
-
-        var d = std.fs.cwd().openDir(dir, .{ .iterate = true }) catch continue;
-        defer d.close();
-        var iter = d.iterate();
-        while (iter.next() catch null) |entry| {
-            if (entry.kind != .file) continue;
-            const full = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, entry.name }) catch continue;
-            io_mutex.lock();
-            if (exists_cache.get(full) == null) {
-                exists_cache.put(alloc, full, true) catch {};
-            }
-            io_mutex.unlock();
-        }
-        const dir_key = alloc.dupe(u8, dir) catch continue;
-        io_mutex.lock();
-        scanned_dirs.put(alloc, dir_key, {}) catch {};
-        io_mutex.unlock();
-    }
-
     // All background threads done — single-threaded from here.
     // Skip mutex in IO callbacks for faster cache access.
     prefetch_complete = true;
@@ -599,16 +572,8 @@ pub fn readFileFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) v
     const isolate = v8.CallbackInfoApi.getIsolate(info);
     var rv = v8.CallbackInfoApi.getReturnValue(info);
 
-    // Pump on readFile — but less frequently than before.
-    // readFile is called ~400 times; pump every 128th call = ~3 pumps total.
-    {
-        pump_counter +%= 1;
-        if (!is_worker_thread and pump_counter & 127 == 0) {
-            if (v8.global_platform) |platform| {
-                while (v8.pumpMessageLoop(platform, isolate)) {}
-            }
-        }
-    }
+    // No pump in readFile — TurboFan pumping happens at Check phase boundaries
+    // via __edgebox_precompute_relations callback.
 
     if (v8.CallbackInfoApi.length(info) < 1) { rv.setUndefined(); return; }
     const arg0 = v8.CallbackInfoApi.get(info, 0) orelse { rv.setUndefined(); return; };
@@ -933,32 +898,6 @@ fn prefetchWorker(paths: []const []const u8, start: usize, end: usize) void {
         raw_file_cache.put(alloc, key, content) catch {};
         exists_cache.put(alloc, key, true) catch {};
         io_mutex.unlock();
-
-        // Mark directory as scanned — enables fast negative fileExists
-        const dir = std.fs.path.dirname(path) orelse continue;
-        io_mutex.lock();
-        const dir_already = scanned_dirs.get(dir) != null;
-        io_mutex.unlock();
-        if (!dir_already) {
-            // Scan directory listing — cache ALL entries (positive)
-            // Any path not in the listing is negative (doesn't exist)
-            var d = std.fs.cwd().openDir(dir, .{ .iterate = true }) catch continue;
-            defer d.close();
-            var iter = d.iterate();
-            while (iter.next() catch null) |entry| {
-                if (entry.kind != .file) continue;
-                const full = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, entry.name }) catch continue;
-                io_mutex.lock();
-                if (exists_cache.get(full) == null) {
-                    exists_cache.put(alloc, full, true) catch {};
-                }
-                io_mutex.unlock();
-            }
-            const dir_key = alloc.dupe(u8, dir) catch continue;
-            io_mutex.lock();
-            scanned_dirs.put(alloc, dir_key, {}) catch {};
-            io_mutex.unlock();
-        }
     }
 }
 

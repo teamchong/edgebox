@@ -145,11 +145,6 @@ pub fn main() !void {
             }
             if (std.mem.endsWith(u8, arg, ".ts") or std.mem.endsWith(u8, arg, ".tsx")) {
                 v8_io.prefetchFile(arg);
-                // Scan the file's directory for negative caching
-                const fdir = std.fs.path.dirname(arg);
-                if (fdir) |fd| {
-                    v8_io.queueDirScan(fd);
-                }
             }
         }
         // Start ALL prefetch on background threads — runs during V8 init
@@ -497,6 +492,12 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         );
         defer alloc.free(sp_globals);
         _ = v8.eval(isolate, context, sp_globals, "globals.js") catch {};
+
+        // Pump message loop once before TSC starts — flush any pending
+        // TurboFan background compilation tasks from snapshot initialization.
+        if (v8.global_platform) |platform| {
+            while (v8.pumpMessageLoop(platform, isolate)) {}
+        }
 
         const tsc_fast_js =
             \\(function() {
