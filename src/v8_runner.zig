@@ -335,9 +335,11 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
             }
         }
     }
-    // Use snapshot for all scripts. For TSC, snapshot has pre-initialized
-    // globalThis.ts with all source transforms applied.
-    const use_snapshot = embedded_snapshot.len > 0;
+    // Detect freeze-compiled modules (contain SOA markers from freeze pipeline)
+    const is_freeze_compiled = (std.mem.indexOf(u8, script_code, "__col_") orelse script_code.len) < script_code.len;
+    // Use snapshot for all scripts EXCEPT freeze-compiled modules
+    // (they include their own TSC; snapshot's TSC would conflict).
+    const use_snapshot = embedded_snapshot.len > 0 and !is_freeze_compiled;
     const isolate = if (use_snapshot)
         v8.SnapshotApi.createIsolateFromSnapshot(embedded_snapshot.ptr, @intCast(embedded_snapshot.len), getExternalRefs())
     else
@@ -507,7 +509,7 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
     var transformed: ?[]u8 = null;
     defer if (transformed) |t| alloc.free(t);
 
-    if (!g_use_compiled and script_code.len > 5 * 1024 * 1024) {
+    if (!g_use_compiled and !is_freeze_compiled and script_code.len > 5 * 1024 * 1024) {
         // Try to load cached transformed source
         const transform_cache_path = getCachePath(alloc, script_code) catch null;
         var cached_transform: ?[]u8 = null;
