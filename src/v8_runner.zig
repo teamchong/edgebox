@@ -120,30 +120,40 @@ pub fn main() !void {
 
     const disk_cache: ?[]u8 = null;
 
-    // Prefetch source files in parallel if running TSC with -p <tsconfig>
-    // This reads all .ts/.tsx/.js files into the IO cache using Zig threads
-    // BEFORE TSC starts, so all readFile calls hit cache instantly.
+    // Prefetch source files in parallel if running TSC.
+    // Reads .ts/.tsx/.js/.d.ts files into IO cache using Zig threads
+    // BEFORE V8 starts, so all readFile calls hit cache instantly.
     if (std.mem.endsWith(u8, script_path, "tsc.js") or std.mem.endsWith(u8, script_path, "_tsc.js")) {
         // Always prefetch TypeScript lib.d.ts files (TSC always reads these)
         const ts_lib_dir = std.fs.path.dirname(abs_path) orelse ".";
         v8_io.prefetchDirectory(ts_lib_dir);
 
-        // Find -p <path> in remaining args and prefetch project directory
+        // Find -p <path> or source file directories and prefetch them
         var peek_args = try std.process.argsWithAllocator(alloc);
         defer peek_args.deinit();
         var found_p = false;
+        var prefetched_dirs = std.StringHashMap(void).init(alloc);
+        defer prefetched_dirs.deinit();
         while (peek_args.next()) |arg| {
             if (found_p) {
                 var tsconfig_abs: [std.fs.max_path_bytes]u8 = undefined;
                 const tsconfig_real = std.fs.cwd().realpath(arg, &tsconfig_abs) catch arg;
                 const project_dir = std.fs.path.dirname(tsconfig_real) orelse ".";
                 v8_io.prefetchDirectory(project_dir);
-                break;
+                found_p = false;
+                continue;
             }
             if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--project")) {
                 found_p = true;
+                continue;
+            }
+            // Queue source files for batch prefetch
+            if (std.mem.endsWith(u8, arg, ".ts") or std.mem.endsWith(u8, arg, ".tsx")) {
+                v8_io.prefetchFile(arg);
             }
         }
+        // Start batch prefetch on background thread — overlaps with V8 init
+        v8_io.startBatchPrefetch();
     }
 
     // In-process parallel V8 isolates: infrastructure ready but V8 crashes
@@ -383,20 +393,14 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         const parallel_init_js = @embedFile("v8_parallel_init.js");
         _ = v8.eval(isolate, context, parallel_init_js, "v8_parallel_init.js") catch {};
     } else {
-        // For TSC: register precompute + trigger callbacks (no full SAB allocation)
+        // For TSC: register lightweight precompute callback (pumps V8 message loop
+        // before Check phase to flush pending TurboFan background compilations)
         const v8_parallel_check = @import("v8_parallel_check.zig");
         const global_obj = v8.ContextApi.global(context);
-
         const pc_tmpl = v8.FunctionTemplateApi.create(isolate, &v8_parallel_check.precomputeCallback) orelse return;
         const pc_func = v8.FunctionTemplateApi.getFunction(pc_tmpl, context) orelse return;
         const pc_key = v8.StringApi.fromUtf8(isolate, "__edgebox_precompute_relations") orelse return;
         _ = v8.ObjectApi.set(global_obj, context, @ptrCast(pc_key), @ptrCast(pc_func));
-
-        // Trigger callback: called from createType to start async build
-        const tb_tmpl = v8.FunctionTemplateApi.create(isolate, &v8_parallel_check.triggerBuildCallback) orelse return;
-        const tb_func = v8.FunctionTemplateApi.getFunction(tb_tmpl, context) orelse return;
-        const tb_key = v8.StringApi.fromUtf8(isolate, "__edgebox_trigger_build") orelse return;
-        _ = v8.ObjectApi.set(global_obj, context, @ptrCast(tb_key), @ptrCast(tb_func));
     }
 
     // For packed binaries: ensure process.argv has [exe, script, ...args] format

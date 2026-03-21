@@ -19,6 +19,21 @@ var io_mutex: std.Thread.Mutex = .{};
 /// Set to true in worker threads to skip PumpMessageLoop
 pub threadlocal var is_worker_thread: bool = false;
 
+/// Pump throttle — only call pumpMessageLoop every N IO callbacks.
+/// During Check phase, TurboFan has already compiled hot functions;
+/// pumping on every IO call wastes ~100µs per call × thousands of calls.
+var pump_counter: u32 = 0;
+const PUMP_INTERVAL: u32 = 64; // pump every 64th IO call
+
+inline fn maybePumpMessageLoop(isolate: *v8.Isolate) void {
+    if (is_worker_thread) return;
+    pump_counter +%= 1;
+    if (pump_counter & (PUMP_INTERVAL - 1) != 0) return;
+    if (v8.global_platform) |platform| {
+        while (v8.pumpMessageLoop(platform, isolate)) {}
+    }
+}
+
 /// Register __edgebox_io_sync, __edgebox_io_batch, and fast-path callbacks.
 pub fn registerGlobals(isolate: *v8.Isolate, context: *const v8.Context) void {
     const global = v8.ContextApi.global(context);
@@ -176,6 +191,7 @@ pub fn flushAll() void {
     flushStderr();
     if (stdout_flush_thread) |t| { t.join(); stdout_flush_thread = null; }
     if (prefetch_thread) |t| { t.join(); prefetch_thread = null; }
+    waitBatchPrefetch();
 }
 
 fn flushStderr() void {
@@ -392,15 +408,51 @@ fn triggerSpeculativePrefetch(path: []const u8) void {
 /// Raw file content cache (no JSON escaping — for fast callback)
 var raw_file_cache: std.StringHashMapUnmanaged([]const u8) = .{};
 
+/// Collect file paths for batch prefetch. Call prefetchFlush() to read them all.
+var prefetch_file_list: std.ArrayListUnmanaged([]const u8) = .{};
+
+/// Queue a file for batch prefetch.
+pub fn prefetchFile(path: []const u8) void {
+    const key = alloc.dupe(u8, path) catch return;
+    prefetch_file_list.append(alloc, key) catch {};
+}
+
+/// Background thread for batch prefetch
+var batch_prefetch_thread: ?std.Thread = null;
+
+fn batchPrefetchWorker() void {
+    for (prefetch_file_list.items) |path| {
+        io_mutex.lock();
+        const already = raw_file_cache.get(path) != null;
+        io_mutex.unlock();
+        if (already) continue;
+
+        const file = std.fs.cwd().openFile(path, .{}) catch continue;
+        defer file.close();
+        const data = file.readToEndAlloc(alloc, 64 * 1024 * 1024) catch continue;
+
+        io_mutex.lock();
+        raw_file_cache.put(alloc, path, data) catch {};
+        io_mutex.unlock();
+    }
+}
+
+/// Start batch prefetch on background thread. Non-blocking — V8 can start while files load.
+pub fn startBatchPrefetch() void {
+    if (prefetch_file_list.items.len == 0) return;
+    batch_prefetch_thread = std.Thread.spawn(.{}, batchPrefetchWorker, .{}) catch null;
+}
+
+/// Wait for batch prefetch to complete.
+pub fn waitBatchPrefetch() void {
+    if (batch_prefetch_thread) |t| { t.join(); batch_prefetch_thread = null; }
+}
+
 pub fn readFileFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
     const isolate = v8.CallbackInfoApi.getIsolate(info);
     var rv = v8.CallbackInfoApi.getReturnValue(info);
 
-    if (v8.global_platform) |platform| {
-        if (!is_worker_thread) {
-            while (v8.pumpMessageLoop(platform, isolate)) {}
-        }
-    }
+    maybePumpMessageLoop(isolate);
 
     if (v8.CallbackInfoApi.length(info) < 1) { rv.setUndefined(); return; }
     const arg0 = v8.CallbackInfoApi.get(info, 0) orelse { rv.setUndefined(); return; };
@@ -468,11 +520,7 @@ pub fn fileExistsFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c)
     const isolate = v8.CallbackInfoApi.getIsolate(info);
     var rv = v8.CallbackInfoApi.getReturnValue(info);
 
-    if (v8.global_platform) |platform| {
-        if (!is_worker_thread) {
-            while (v8.pumpMessageLoop(platform, isolate)) {}
-        }
-    }
+    maybePumpMessageLoop(isolate);
 
     if (v8.CallbackInfoApi.length(info) < 1) { rv.setUndefined(); return; }
     const arg0 = v8.CallbackInfoApi.get(info, 0) orelse { rv.setUndefined(); return; };
@@ -526,14 +574,8 @@ pub fn ioSyncCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
     const isolate: *v8.Isolate = v8.CallbackInfoApi.getIsolate(info);
     var rv = v8.CallbackInfoApi.getReturnValue(info);
 
-    // Pump V8 message loop — skip in worker threads (PumpMessageLoop
-    // dispatches to foreground task runner which is per-isolate but the
-    // platform mutex may not be thread-safe for concurrent pump calls).
-    if (v8.global_platform) |platform| {
-        if (!is_worker_thread) {
-            while (v8.pumpMessageLoop(platform, isolate)) {}
-        }
-    }
+    // Throttled pump — TurboFan background tasks drain every 64th IO call
+    maybePumpMessageLoop(isolate);
 
     // Get first argument (JSON string)
     if (v8.CallbackInfoApi.length(info) < 1) {
