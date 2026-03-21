@@ -12,7 +12,8 @@ const alloc = std.heap.page_allocator;
 
 /// Deferred exit code — set by process.exit(), checked by runner after execution.
 /// Allows code cache to be saved before termination.
-pub var deferred_exit_code: ?u8 = null;
+/// Thread-safe: multiple V8 isolates may call process.exit concurrently.
+pub threadlocal var deferred_exit_code: ?u8 = null;
 
 /// Register __edgebox_io_sync, __edgebox_io_batch, and fast-path callbacks.
 pub fn registerGlobals(isolate: *v8.Isolate, context: *const v8.Context) void {
@@ -75,7 +76,10 @@ pub fn registerGlobals(isolate: *v8.Isolate, context: *const v8.Context) void {
 
 /// Fast readFile: path → string (no JSON serialize/parse overhead)
 /// Buffered stdout — reduce syscalls for TSC diagnostic output (14K+ lines)
+/// Note: not thread-local because ArrayListUnmanaged uses page_allocator
+/// which is thread-safe. Multiple isolates write to same stdout.
 var stdout_buf: std.ArrayListUnmanaged(u8) = .{};
+var stdout_mutex: std.Thread.Mutex = .{};
 const STDOUT_BUF_SIZE: usize = 65536; // 64KB buffer, flush when full
 
 /// Background stdout flush thread

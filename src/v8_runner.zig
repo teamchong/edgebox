@@ -111,89 +111,132 @@ pub fn main() !void {
         }
     }
 
-    // Note: parallel process spawning was tested but each worker repeats
-    // the full TSC init (parse+bind 6.2MB), making it slower than single-process.
-    // True parallelism requires shared-memory type checking (Zig threads on SAB).
+    // In-process parallel V8 isolates: implemented but needs thread-safety fixes
+    // for IO callbacks (PumpMessageLoop, deferred_exit_code, stdout buffers).
+    // Enable with __EDGEBOX_PARALLEL=1 env var for testing.
 
     return runScript(alloc, script_code, disk_cache, abs_path, script_path, false);
 }
 
 /// Run TSC with parallel checkSourceFile sharding.
 /// Spawns N worker processes, each checking a subset of source files.
-fn runParallelTsc(alloc_: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]const u8, abs_path: []const u8, script_path: []const u8) !void {
-    _ = cache_bytes;
-    _ = script_code;
+/// Worker context for in-process parallel TSC checking.
+/// Each worker runs in its own V8 isolate on a Zig OS thread.
+/// Workers share the IO cache (same process address space).
+const WorkerContext = struct {
+    shard: usize,
+    total: usize,
+    abs_path: []const u8,
+    script_code: []const u8,
+    exit_code: std.atomic.Value(u8),
 
-    const cpu_count = std.Thread.getCpuCount() catch 4;
-    const num_workers = @min(cpu_count, 4); // Cap at 4 workers for TSC
+    fn run(self: *WorkerContext) void {
+        const alloc = std.heap.page_allocator;
 
-    // Get our own executable path
-    var self_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const self_path = std.fs.selfExePath(&self_path_buf) catch {
-        // Fallback to single-threaded
-        return runScript(alloc_, @constCast(std.fs.cwd().readFileAlloc(alloc_, script_path, 64 * 1024 * 1024) catch return error.ReadFailed), null, abs_path, script_path, false);
-    };
+        // Create worker V8 isolate from snapshot (TSC pre-initialized)
+        const worker_isolate = v8.SnapshotApi.createIsolateFromSnapshot(
+            embedded_snapshot.ptr,
+            @intCast(embedded_snapshot.len),
+            getExternalRefs(),
+        );
+        defer v8.IsolateApi.dispose(worker_isolate);
+        v8.IsolateApi.enter(worker_isolate);
+        defer v8.IsolateApi.exit(worker_isolate);
 
-    // Build the argv: [edgebox, _tsc.js, ...remaining args]
-    var original_args = try std.process.argsWithAllocator(alloc_);
-    defer original_args.deinit();
-    var argv_list: std.ArrayListUnmanaged([]const u8) = .{};
-    // Skip argv[0] (binary name)
-    _ = original_args.next();
-    // Collect all remaining args
-    while (original_args.next()) |arg| {
-        try argv_list.append(alloc_, arg);
-    }
+        var hs = v8.HandleScope.init(worker_isolate);
+        defer hs.deinit();
+        const ctx = v8.ContextApi.create(worker_isolate);
+        v8.ContextApi.enter(ctx);
+        defer v8.ContextApi.exit(ctx);
 
-    // Spawn workers
-    var workers: [4]?std.process.Child = .{ null, null, null, null };
+        // Refresh argv/env from snapshot
+        _ = v8.eval(worker_isolate, ctx, snapshot_init_js, "snapshot_init.js") catch {};
 
-    for (0..num_workers) |i| {
-        var env_map = std.process.EnvMap.init(alloc_);
-        // Copy existing env
-        const environ = std.process.getEnvMap(alloc_) catch continue;
-        var env_iter = environ.iterator();
-        while (env_iter.next()) |entry| {
-            env_map.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
-        }
+        // Register fast IO callbacks
+        v8_io.registerGlobals(worker_isolate, ctx);
 
         // Set shard env vars
-        var shard_buf: [8]u8 = undefined;
-        var total_buf: [8]u8 = undefined;
-        const shard_str = std.fmt.bufPrint(&shard_buf, "{d}", .{i}) catch continue;
-        const total_str = std.fmt.bufPrint(&total_buf, "{d}", .{num_workers}) catch continue;
-        env_map.put("__EDGEBOX_SHARD", shard_str) catch continue;
-        env_map.put("__EDGEBOX_TOTAL", total_str) catch continue;
+        var shard_js_buf: [256]u8 = undefined;
+        const shard_js = std.fmt.bufPrint(&shard_js_buf,
+            "process.env.__EDGEBOX_SHARD='{d}';process.env.__EDGEBOX_TOTAL='{d}';",
+            .{ self.shard, self.total },
+        ) catch return;
+        _ = v8.eval(worker_isolate, ctx, shard_js, "shard_env.js") catch {};
 
-        // Build full argv: [self_path, ...original_args]
-        var full_argv: std.ArrayListUnmanaged([]const u8) = .{};
-        full_argv.append(alloc_, self_path) catch continue;
-        for (argv_list.items) |a| full_argv.append(alloc_, a) catch {};
+        // Set __filename/__dirname
+        const dirname = std.fs.path.dirname(self.abs_path) orelse ".";
+        const globals_js = std.fmt.allocPrint(alloc,
+            "globalThis.__filename=\"{s}\";globalThis.__dirname=\"{s}\";",
+            .{ self.abs_path, dirname },
+        ) catch return;
+        defer alloc.free(globals_js);
+        _ = v8.eval(worker_isolate, ctx, globals_js, "globals.js") catch {};
 
-        var child = std.process.Child.init(full_argv.items, alloc_);
-        child.env_map = &env_map;
-        child.stderr_behavior = .Inherit;
-        child.stdout_behavior = .Inherit;
+        // Inject TSC shim
+        const shim = @embedFile("v8_tsc_shim.js");
+        _ = v8.eval(worker_isolate, ctx, shim, "v8_tsc_shim.js") catch {};
 
-        child.spawn() catch continue;
-        workers[i] = child;
+        // Run TSC using snapshot's pre-initialized globalThis.ts
+        const tsc_run =
+            \\(function() {
+            \\  if (!globalThis.ts || !ts.executeCommandLine) return;
+            \\  ts.sys.args = process.argv.slice(2);
+            \\  ts.sys.getExecutingFilePath = function() { return __filename; };
+            \\  ts.Debug.loggingHost = {
+            \\    log: function(_level, s) { ts.sys.write((s || '') + ts.sys.newLine); }
+            \\  };
+            \\  if (ts.sys.setBlocking) ts.sys.setBlocking();
+            \\  ts.executeCommandLine(ts.sys, function(){}, ts.sys.args);
+            \\})();
+        ;
+
+        var tc = v8.TryCatch.init(worker_isolate);
+        defer tc.deinit();
+
+        _ = v8.eval(worker_isolate, ctx, tsc_run, "tsc_worker.js") catch {};
+
+        if (v8_io.deferred_exit_code) |code| {
+            self.exit_code.store(code, .release);
+            v8_io.deferred_exit_code = null; // Reset for other workers
+        }
+
+        v8_io.flushAll();
+    }
+};
+
+fn runParallelTsc(alloc_: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]const u8, abs_path: []const u8, script_path: []const u8) !void {
+    _ = alloc_;
+    _ = cache_bytes;
+    _ = script_code;
+    _ = script_path;
+
+    const cpu_count = std.Thread.getCpuCount() catch 4;
+    const num_workers: usize = @min(cpu_count, 4);
+
+    var contexts: [4]WorkerContext = undefined;
+    var threads: [4]?std.Thread = .{ null, null, null, null };
+
+    for (0..num_workers) |i| {
+        contexts[i] = .{
+            .shard = i,
+            .total = num_workers,
+            .abs_path = abs_path,
+            .script_code = &.{}, // Workers use snapshot, not script_code
+            .exit_code = std.atomic.Value(u8).init(0),
+        };
+        threads[i] = std.Thread.spawn(.{}, WorkerContext.run, .{&contexts[i]}) catch null;
     }
 
-    // Wait for all workers
-    var exit_code: u8 = 0;
-    for (&workers) |*w| {
-        if (w.*) |*child| {
-            const result = child.wait() catch continue;
-            if (result.Exited != 0 and exit_code == 0) {
-                exit_code = @intCast(result.Exited);
-            }
-            w.* = null;
+    var max_exit: u8 = 0;
+    for (0..num_workers) |i| {
+        if (threads[i]) |t| {
+            t.join();
+            const code = contexts[i].exit_code.load(.acquire);
+            if (code > max_exit) max_exit = code;
         }
     }
 
-    if (exit_code != 0) {
-        std.process.exit(exit_code);
-    }
+    if (max_exit != 0) std.process.exit(max_exit);
 }
 
 /// Embedded V8 snapshot of the bootstrap context — generated at build time
