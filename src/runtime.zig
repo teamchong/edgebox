@@ -1633,7 +1633,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         };
         defer bytecode_file.close();
 
-        const bytecode_content = bytecode_file.readToEndAlloc(allocator, 1024 * 1024 * 1024) catch |err| { // 1GB limit
+        const bytecode_content = bytecode_file.readToEndAlloc(allocator, 4 * 1024 * 1024 * 1024) catch |err| { // 4GB limit
             std.debug.print("[warn] Could not read bundle_original.c: {}\n", .{err});
             break :blk false;
         };
