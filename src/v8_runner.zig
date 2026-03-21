@@ -120,13 +120,12 @@ pub fn main() !void {
 
     const disk_cache: ?[]u8 = null;
 
-    // Queue files for async prefetch — overlaps with V8 init + snapshot deserialization.
+    // Prefetch lib.d.ts + source files in parallel with V8 init.
     if (std.mem.endsWith(u8, script_path, "tsc.js") or std.mem.endsWith(u8, script_path, "_tsc.js")) {
-        // Queue lib.d.ts files (TSC always reads these)
         const ts_lib_dir = std.fs.path.dirname(abs_path) orelse ".";
         v8_io.queueDirectoryPrefetch(ts_lib_dir);
 
-        // Queue -p <path> project dirs and individual .ts files
+        // Queue source files from CLI args
         var peek_args = try std.process.argsWithAllocator(alloc);
         defer peek_args.deinit();
         var found_p = false;
@@ -147,7 +146,6 @@ pub fn main() !void {
                 v8_io.prefetchFile(arg);
             }
         }
-        // Start ALL prefetch on background threads — runs during V8 init
         v8_io.startBatchPrefetch();
     }
 
