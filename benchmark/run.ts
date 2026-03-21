@@ -183,20 +183,15 @@ function downloadProject(project: Project): string | null {
 }
 
 function buildEdgeboxTsc(): string | null {
-  const edgeboxPath = join(PROJECT_ROOT, "zig-out/bin/edgebox-compile");
+  const edgeboxRunner = join(PROJECT_ROOT, "zig-out/bin/edgebox");
+  const edgeboxCompile = join(PROJECT_ROOT, "zig-out/bin/edgebox-compile");
   const tscSourceAbs = join(BENCHMARK_DIR, "node_modules/typescript/lib/_tsc.js");
-  // Use relative path from PROJECT_ROOT to avoid path.join issues with absolute paths
   const tscSourceRel = relative(PROJECT_ROOT, tscSourceAbs);
   const outputDir = join(PROJECT_ROOT, "zig-out/bin", tscSourceRel);
   const workerJs = join(outputDir, "_tsc-worker.js");
 
-  // Check if already compiled
-  if (existsSync(workerJs)) {
-    return workerJs;
-  }
-
   // Build edgebox if needed
-  if (!existsSync(edgeboxPath)) {
+  if (!existsSync(edgeboxRunner)) {
     console.log("Building edgebox...");
     try {
       execSync("zig build cli -Doptimize=ReleaseFast", { cwd: PROJECT_ROOT, stdio: "inherit" });
@@ -206,20 +201,42 @@ function buildEdgeboxTsc(): string | null {
     }
   }
 
-  // Compile tsc with EdgeBox (worker path: .mjs + .wasm)
-  console.log("Compiling tsc with EdgeBox AOT (worker path)...");
-  try {
-    execSync(`"${edgeboxPath}" "${tscSourceRel}"`, {
-      cwd: PROJECT_ROOT,
-      stdio: "pipe",  // Suppress build output
-      timeout: 600000,
-    });
-  } catch {
-    console.error("Failed to compile tsc with EdgeBox");
-    return null;
+  // Try worker path first (has WASM kernels + incremental)
+  if (!existsSync(workerJs) && existsSync(edgeboxCompile)) {
+    console.log("Compiling tsc with EdgeBox AOT (worker path)...");
+    try {
+      execSync(`"${edgeboxCompile}" "${tscSourceRel}"`, {
+        cwd: PROJECT_ROOT,
+        stdio: "pipe",
+        timeout: 600000,
+      });
+    } catch {
+      console.log("Worker compilation failed, using V8 runner path");
+    }
   }
 
-  return existsSync(workerJs) ? workerJs : null;
+  if (existsSync(workerJs)) {
+    // Verify worker produces diagnostics by checking a file with a known error
+    try {
+      const testTs = join(outputDir, "__test_diag.ts");
+      writeFileSync(testTs, "let x: number = 'hello';"); // Type error
+      const testResult = spawnSync("node", [workerJs, "--noEmit", "--target", "ES2020", "--skipLibCheck", testTs], {
+        timeout: 30000, stdio: "pipe",
+      });
+      const stdout = testResult.stdout?.toString() || "";
+      rmSync(testTs, { force: true });
+      if (stdout.includes("error TS")) {
+        return workerJs;
+      }
+      console.log("Worker path broken (no diagnostics output), falling back to V8 runner");
+    } catch {
+      console.log("Worker path test failed, falling back to V8 runner");
+    }
+  }
+
+  // Fallback: use V8 runner directly (edgebox _tsc.js)
+  // The benchmark will call: edgebox _tsc.js [args] instead of: node _tsc-worker.js [args]
+  return existsSync(edgeboxRunner) ? `__v8runner__${tscSourceAbs}` : null;
 }
 
 // ============================================================================
@@ -449,8 +466,17 @@ function benchmarkProject(
   const incrCacheDir = "/tmp/edgebox-incr-cache";
   rmSync(incrCacheDir, { recursive: true, force: true });
 
+  // Determine if using V8 runner or worker path
+  const isV8Runner = edgeboxTsc.startsWith("__v8runner__");
+  const edgeboxCmd = isV8Runner ? join(PROJECT_ROOT, "zig-out/bin/edgebox") : "node";
+  const edgeboxArgs = isV8Runner ? [edgeboxTsc.slice("__v8runner__".length), ...tscArgs] : [edgeboxTsc, ...tscArgs];
+
   for (let i = 0; i < runs; i++) {
-    edgeboxResult = runTsc("node", [edgeboxTsc, ...tscArgs], edgeboxOutDir, debug);
+    if (isV8Runner) {
+      // Clean V8 cache for cold runs
+      rmSync(join(process.env.HOME || "/tmp", ".cache/edgebox/v8-cache"), { recursive: true, force: true });
+    }
+    edgeboxResult = runTsc(edgeboxCmd, edgeboxArgs, edgeboxOutDir, debug);
     if (!edgeboxResult.success) {
       console.log(`    EdgeBox: Failed - ${edgeboxResult.error}`);
       return null;
