@@ -10,6 +10,12 @@
     globalThis.__pc_typeFlags = new Int32Array(262144);
   if (typeof globalThis.__pc_objectFlags === 'undefined')
     globalThis.__pc_objectFlags = new Int32Array(131072);
+  // Direct-mapped type relation cache — O(1) lookup, no hash probes.
+  // Layout: keys[i] = packed source.id|target.id, vals[i] = result.
+  // 128K entries = 512KB keys + 128KB vals = 640KB total (fits L2).
+  var __RC_SIZE = 131072; // power of 2
+  globalThis.__rc_keys = new Int32Array(__RC_SIZE);
+  globalThis.__rc_vals = new Int8Array(__RC_SIZE);
   // Source file cache for createSourceFile memoization (T9-T10)
   globalThis.__sfCache = Object.create(null);
 })();
