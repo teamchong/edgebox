@@ -47,14 +47,16 @@ for (let y = 0; y < dstH; y++) {
   }
 }
 
-// Kitty graphics protocol (chunked)
+// Kitty graphics protocol — use image ID 1 so frames replace in-place
 const b64 = pixels.toString('base64');
 const CHUNK = 4096;
+// Delete previous image with same ID
+process.stdout.write('\x1b_Ga=d,d=i,i=1;\x1b\\');
 for (let i = 0; i < b64.length; i += CHUNK) {
   const chunk = b64.slice(i, i + CHUNK);
   const more = (i + CHUNK < b64.length) ? 1 : 0;
   if (i === 0) {
-    process.stdout.write(`\x1b_Gf=32,s=${dstW},v=${dstH},a=T,m=${more};${chunk}\x1b\\`);
+    process.stdout.write(`\x1b_Gi=1,f=32,s=${dstW},v=${dstH},a=T,m=${more};${chunk}\x1b\\`);
   } else {
     process.stdout.write(`\x1b_Gm=${more};${chunk}\x1b\\`);
   }

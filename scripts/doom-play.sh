@@ -10,35 +10,32 @@ EDGEBOX="$(cd "$(dirname "$0")/.." && pwd)/zig-out/bin/edgebox"
 RENDERER="$(cd "$(dirname "$0")" && pwd)/doom-extract-frame.js"
 PALETTE_RENDERER="$(cd "$(dirname "$0")" && pwd)/doom-render.js"
 
-# Render the title screen (pre-computed frame)
+clear
+
+# Save cursor position — all frames render at this spot
+printf '\e7'
+
+# Render the title screen first
 PALETTE="$DOOM_DIR/packages/playground/final-doom-pun-intended/palette-values.ts"
 if [ -f "$PALETTE" ]; then
-    clear
-    echo ""
+    printf '\e8'  # restore cursor
     "$EDGEBOX" "$PALETTE_RENDERER" "$PALETTE" "$SCALE"
-    echo ""
     echo "  DOOM in TypeScript Types — EdgeBox Renderer"
-    echo "  Title screen — computed by TypeScript type checker"
-    echo "  Press Enter for WASM machine state frames..."
-    read
+    sleep 3
 fi
 
-# Render each result file
+# Collect all frame files
 RESULTS=$(ls "$DOOM_DIR"/packages/playground/final-doom-pun-intended/data/result-*.ts 2>/dev/null | sort)
-FRAME=1
 TOTAL=$(echo "$RESULTS" | wc -l | tr -d ' ')
 
-for result in $RESULTS; do
-    clear
-    echo ""
-    echo "  Frame $FRAME/$TOTAL: $(basename $result)"
-    echo ""
-    "$EDGEBOX" "$RENDERER" "$result" "$SCALE" 2>/dev/null
-    echo ""
-    echo "  Press Enter for next frame..."
-    FRAME=$((FRAME + 1))
-    read
+# Loop frames forever
+while true; do
+    FRAME=1
+    for result in $RESULTS; do
+        printf '\e8'  # restore cursor to saved position
+        "$EDGEBOX" "$RENDERER" "$result" "$SCALE" 2>/dev/null
+        echo "  Frame $FRAME/$TOTAL — $(basename $result)"
+        FRAME=$((FRAME + 1))
+        sleep 1
+    done
 done
-
-echo ""
-echo "  All frames rendered."
