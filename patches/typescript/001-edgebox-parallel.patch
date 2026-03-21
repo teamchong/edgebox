@@ -1,5 +1,5 @@
 --- typescript/lib/typescript.js	2026-03-21 19:28:33.645544905 -0400
-+++ typescript/lib/typescript.js	2026-03-21 19:29:28.967841904 -0400
++++ typescript/lib/typescript.js	2026-03-21 19:38:04.280623870 -0400
 @@ -12123,7 +12123,7 @@
    var commentDirectives;
    var skipJsDocLeadingAsterisks = 0;
@@ -70,15 +70,15 @@
      return diagnostics.getDiagnostics();
    }
    function getGlobalDiagnostics() {
-@@ -127953,7 +127954,7 @@
-   function getSourceFileByPath(path) {
-     return filesByName.get(path) || void 0;
-   }
--  function getDiagnosticsHelper(sourceFile, getDiagnostics2, cancellationToken) {
-+  function getDiagnosticsHelper(sourceFile, getDiagnostics2, cancellationToken) {if(!sourceFile&&typeof __edgebox_worker_count!=="undefined"&&__edgebox_worker_count>1){var __af=program.getSourceFiles();var __wid=__edgebox_worker_id;var __wcnt=__edgebox_worker_count;return sortAndDeduplicateDiagnostics(flatMap(__af,function(sf,idx){if(idx%__wcnt!==__wid)return[];return getDiagnostics2(sf,cancellationToken);}));}
-     if (sourceFile) {
-       return sortAndDeduplicateDiagnostics(getDiagnostics2(sourceFile, cancellationToken));
-     }
+@@ -133724,7 +133725,7 @@
+   );
+   addRange(allDiagnostics, emitResult.diagnostics);
+   const diagnostics = sortAndDeduplicateDiagnostics(allDiagnostics);
+-  diagnostics.forEach(reportDiagnostic);
++  var __reportDiags=diagnostics;if(typeof __edgebox_worker_count!=="undefined"&&__edgebox_worker_count>1){var __sf2=program.getSourceFiles();var __mySet=new Set();for(var __di=0;__di<__sf2.length;__di++){if(__di%__edgebox_worker_count===__edgebox_worker_id)__mySet.add(__sf2[__di].fileName);}__reportDiags=diagnostics.filter(function(d){if(!d.file)return __edgebox_worker_id===0;return __mySet.has(d.file.fileName);});}__reportDiags.forEach(reportDiagnostic);
+   if (write) {
+     const currentDir = program.getCurrentDirectory();
+     forEach(emitResult.emittedFiles, (file) => {
 @@ -137203,6 +137204,7 @@
      configFileParsingDiagnostics: getConfigFileParsingDiagnostics(config)
    };
@@ -88,7 +88,7 @@
      program,
      reportDiagnostic,
 --- typescript/lib/_tsc.js	2026-03-21 19:28:33.655544958 -0400
-+++ typescript/lib/_tsc.js	2026-03-21 19:30:28.837163789 -0400
++++ typescript/lib/_tsc.js	2026-03-21 19:38:04.376624390 -0400
 @@ -8711,7 +8711,7 @@
    var commentDirectives;
    var skipJsDocLeadingAsterisks = 0;
@@ -159,15 +159,15 @@
      return diagnostics.getDiagnostics();
    }
    function getGlobalDiagnostics() {
-@@ -123103,7 +123104,7 @@
-   function getSourceFileByPath(path) {
-     return filesByName.get(path) || void 0;
-   }
--  function getDiagnosticsHelper(sourceFile, getDiagnostics, cancellationToken) {
-+  function getDiagnosticsHelper(sourceFile, getDiagnostics, cancellationToken) {if(!sourceFile&&typeof __edgebox_worker_count!=="undefined"&&__edgebox_worker_count>1){var __af=program.getSourceFiles();var __wid=__edgebox_worker_id;var __wcnt=__edgebox_worker_count;return sortAndDeduplicateDiagnostics(flatMap(__af,function(sf,idx){if(idx%__wcnt!==__wid)return[];return getDiagnostics(sf,cancellationToken);}));}
-     if (sourceFile) {
-       return sortAndDeduplicateDiagnostics(getDiagnostics(sourceFile, cancellationToken));
-     }
+@@ -128813,7 +128814,7 @@
+   );
+   addRange(allDiagnostics, emitResult.diagnostics);
+   const diagnostics = sortAndDeduplicateDiagnostics(allDiagnostics);
+-  diagnostics.forEach(reportDiagnostic);
++  var __reportDiags=diagnostics;if(typeof __edgebox_worker_count!=="undefined"&&__edgebox_worker_count>1){var __sf2=program.getSourceFiles();var __mySet=new Set();for(var __di=0;__di<__sf2.length;__di++){if(__di%__edgebox_worker_count===__edgebox_worker_id)__mySet.add(__sf2[__di].fileName);}__reportDiags=diagnostics.filter(function(d){if(!d.file)return __edgebox_worker_id===0;return __mySet.has(d.file.fileName);});}__reportDiags.forEach(reportDiagnostic);
+   if (write) {
+     const currentDir = program.getCurrentDirectory();
+     forEach(emitResult.emittedFiles, (file) => {
 @@ -132235,6 +132236,7 @@
      configFileParsingDiagnostics: getConfigFileParsingDiagnostics(config)
    };
