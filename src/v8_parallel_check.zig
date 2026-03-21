@@ -380,8 +380,8 @@ var async_build_max_id: usize = 0;
 var async_build_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 fn asyncBuildWorker() void {
-    const type_flags = getTypeFlags() orelse return;
-    buildFlagTable(type_flags, async_build_max_id);
+    // Flag table build disabled — Zig-side flag table not consulted from JS.
+    // Keep thread infrastructure for future Zig-native parallel check.
     async_build_done.store(true, .release);
 }
 
@@ -401,29 +401,12 @@ pub fn precomputeCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) voi
         if (val > 0) max_id = @intCast(val);
     }
 
-    // If async build was started and has the same or larger max_id, wait for it
-    if (async_build_done.load(.acquire)) {
-        // Async build already completed — check if it covers enough types
-        if (async_build_max_id >= max_id) {
-            // Join the thread if still active
-            if (async_build_thread) |t| { t.join(); async_build_thread = null; }
-            rv.setInt32(1);
-            return;
-        }
-    }
-
     // Join any pending async thread
     if (async_build_thread) |t| { t.join(); async_build_thread = null; }
 
-    // Build synchronously (async didn't cover all types)
-    const type_flags = getTypeFlags() orelse { rv.setInt32(0); return; };
-    buildFlagTable(type_flags, max_id);
-
-    // Pre-compute statistics for Zig-side analysis
-    const obj_flags = getObjFlags() orelse { rv.setInt32(1); return; };
-    _ = obj_flags;
-
-    // Pump V8 message loop for TurboFan
+    // Pump V8 message loop — flush pending TurboFan background compilations.
+    // This is critical for cold start: TurboFan compiles hot functions on
+    // background threads, pumping drains the queue so optimized code is ready.
     if (v8.global_platform) |platform| {
         while (v8.pumpMessageLoop(platform, isolate)) {}
     }

@@ -979,12 +979,12 @@ fn getCachePath(allocator: std.mem.Allocator, content: []const u8) ![]const u8 {
 const snapshot_init_js =
     \\(function() {
     \\  try {
-    \\    var r = JSON.parse(__edgebox_io_sync(JSON.stringify({op:'argv'})));
-    \\    if (r.ok) process.argv = r.data;
+    \\    var r = __edgebox_io_sync('{"op":"argv"}');
+    \\    if (r) { var d = JSON.parse(r); if (d.ok) process.argv = d.data; }
     \\  } catch(e) {}
     \\  try {
-    \\    var r = JSON.parse(__edgebox_io_sync(JSON.stringify({op:'env'})));
-    \\    if (r.ok) process.env = r.data;
+    \\    var r = __edgebox_io_sync('{"op":"env"}');
+    \\    if (r) { var d = JSON.parse(r); if (d.ok) process.env = d.data; }
     \\  } catch(e) {}
     \\})();
 ;
