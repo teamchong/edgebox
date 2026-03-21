@@ -242,3 +242,4 @@ scripts/refactoring/
 # Claude session/config files
 .claude/
 !src/tsc_standalone.wasm
+.tsbuildinfo
