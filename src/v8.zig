@@ -131,7 +131,7 @@ pub fn initPlatform() !*Platform {
         // GC tuning: larger semi-space reduces minor GC frequency.
     // TSC creates millions of short-lived objects (diagnostics, type instances).
     // Larger young generation → fewer scavenges → less GC overhead.
-    const flags = "--max-old-space-size=4096 --concurrent-recompilation --use-osr --always-sparkplug --no-lazy-feedback-allocation --max-semi-space-size=128";
+    const flags = "--max-old-space-size=4096 --concurrent-recompilation --use-osr --always-sparkplug --no-lazy-feedback-allocation --max-semi-space-size=128 --allow-natives-syntax";
     c.v8__V8__SetFlagsFromString(flags.ptr, flags.len);
 
     const platform = c.v8__Platform__NewDefaultPlatform(0, false) orelse

@@ -59,8 +59,9 @@ pub const transforms = [_]Transform{
     // T21: getObjectFlags SOA — DISABLED: objectFlags is mutated 39 times after createType,
     // SOA column has stale data. Reading stale objectFlags causes wrong type resolution.
     // .{ .needle = "function getObjectFlags(type) {", .replacement = "..." },
-    // checkSourceFile: for loop + pump TurboFan every 5 files during early Check.
-    .{ .needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));", .replacement = "{if(typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);const __files=host.getSourceFiles();for(let __i=0;__i<__files.length;__i++){checkSourceFileWithEagerDiagnostics(__files[__i]);if(__i<30&&__i%5===4&&typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);}}" },
+    // checkSourceFile: force TurboFan optimization of hot checker functions before Check.
+    // %PrepareFunctionForOptimization + %OptimizeFunctionOnNextCall = immediate TurboFan.
+    .{ .needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));", .replacement = "{if(typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);try{%PrepareFunctionForOptimization(isTypeRelatedTo);%PrepareFunctionForOptimization(isSimpleTypeRelatedTo);%PrepareFunctionForOptimization(checkTypeRelatedTo);%PrepareFunctionForOptimization(getRelationKey);%OptimizeFunctionOnNextCall(isTypeRelatedTo);%OptimizeFunctionOnNextCall(isSimpleTypeRelatedTo);%OptimizeFunctionOnNextCall(checkTypeRelatedTo);%OptimizeFunctionOnNextCall(getRelationKey);}catch(e){}const __files=host.getSourceFiles();for(let __i=0;__i<__files.length;__i++){checkSourceFileWithEagerDiagnostics(__files[__i]);if(__i<30&&__i%5===4&&typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);}}" },
 };
 
 /// Apply all TSC source transforms in a single pass.
