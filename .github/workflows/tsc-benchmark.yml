@@ -54,16 +54,10 @@ jobs:
           npm install -g @typescript/native-preview || echo "tsgo not available"
           which tsgo || echo "tsgo not in PATH"
 
-      - name: Run TSC Benchmark (Quick)
-        if: ${{ github.event.inputs.full_suite != 'true' }}
+      - name: Run TSC Benchmark
         run: |
           cd benchmark
-          npx tsx run.ts --no-vscode --runs 3 --include-bun --include-tsgo
-
-      - name: Run TSC Benchmark (Full)
-        if: ${{ github.event.inputs.full_suite == 'true' }}
-        run: |
-          cd benchmark
+          # Always include VS Code to show large-codebase performance
           npx tsx run.ts --runs 3 --include-bun --include-tsgo
 
       - name: Upload Results
