@@ -198,6 +198,21 @@ pub fn flushAll() void {
     waitBatchPrefetch();
 }
 
+/// Clear IO caches for --serve mode (between runs).
+/// Source files may have changed — clear file/exists caches.
+/// readdir and dir caches are also cleared.
+pub fn clearCaches() void {
+    io_mutex.lock();
+    defer io_mutex.unlock();
+    raw_file_cache = .{};
+    exists_cache = .{};
+    dir_exists_cache = .{};
+    readdir_cache = .{};
+    scanned_dirs = .{};
+    // Don't clear file_cache (JSON-escaped) — rarely used in fast path
+    prefetch_complete = false;
+}
+
 fn flushStderr() void {
     if (stderr_buf.items.len > 0) {
         const stderr = std.fs.File.stderr();

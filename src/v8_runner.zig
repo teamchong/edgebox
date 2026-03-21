@@ -501,9 +501,8 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         const tsc_fast_js =
             \\(function() {
             \\  if (typeof globalThis.ts === 'undefined' || !ts.executeCommandLine) return;
-            \\  var args = process.argv.slice(2);
+            \\  var args = process.argv.slice(2).filter(function(a){return a!=='--serve';});
             \\  // Auto-inject --incremental for faster warm runs (same as worker path).
-            \\  // Cache stored in /tmp/edgebox-incr-cache/ — cleaned per project.
             \\  if (args.indexOf('--incremental') === -1 && args.indexOf('-i') === -1) {
             \\    args.push('--incremental');
             \\    args.push('--tsBuildInfoFile', '/tmp/edgebox-incr-cache/tsinfo.json');
@@ -531,8 +530,57 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
 
         v8_io.flushAll();
 
-        // Save code cache for warm start path (compile _tsc.js in background)
-        // On next run, the warm path will be used instead of snapshot.
+        // Check for --serve mode: keep isolate alive, re-run on stdin "run" command.
+        // This enables sub-100ms warm runs by preserving __sfCache across invocations.
+        const serve_mode = blk: {
+            var sa = try std.process.argsWithAllocator(alloc);
+            defer sa.deinit();
+            while (sa.next()) |a| {
+                if (std.mem.eql(u8, a, "--serve")) break :blk true;
+            }
+            break :blk false;
+        };
+
+        if (serve_mode) {
+            // Signal ready
+            const stdout = std.fs.File.stdout();
+            stdout.writeAll("__EDGEBOX_READY__\n") catch {};
+
+            // Read commands from stdin (one line at a time)
+            var line_buf: [4096]u8 = undefined;
+            while (true) {
+                // Simple line reader: read until \n
+                var line_len: usize = 0;
+                while (line_len < line_buf.len - 1) {
+                    const n = std.posix.read(0, line_buf[line_len..][0..1]) catch break;
+                    if (n == 0) { line_len = 0; break; } // EOF
+                    if (line_buf[line_len] == '\n') break;
+                    line_len += 1;
+                }
+                if (line_len == 0) break;
+                const cmd = std.mem.trim(u8, line_buf[0..line_len], &[_]u8{ ' ', '\r', '\n' });
+
+                if (std.mem.eql(u8, cmd, "quit") or std.mem.eql(u8, cmd, "exit")) break;
+                if (!std.mem.eql(u8, cmd, "run")) continue;
+
+                // Clear IO caches for changed files (simple: clear all)
+                v8_io.clearCaches();
+                v8_io.deferred_exit_code = null;
+
+                // Re-run TSC — __sfCache still has parsed SourceFiles
+                var try_catch2 = v8.TryCatch.init(isolate);
+                defer try_catch2.deinit();
+
+                _ = v8.eval(isolate, context, tsc_fast_js, "tsc_rerun.js") catch {
+                    if (v8_io.deferred_exit_code == null) {
+                        reportException(&try_catch2, isolate, context);
+                    }
+                };
+                v8_io.flushAll();
+                stdout.writeAll("__EDGEBOX_READY__\n") catch {};
+            }
+            return;
+        }
 
         if (v8_io.deferred_exit_code) |code| {
             std.process.exit(code);
