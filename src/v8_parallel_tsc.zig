@@ -147,7 +147,7 @@ pub fn setupParallelCheck(
     tsc_fast_js: []const u8,
 ) bool {
     const cpu_count = std.Thread.getCpuCount() catch 4;
-    g_worker_count = @min(cpu_count, max_check_workers);
+    g_worker_count = @min(cpu_count, 4);
 
     if (g_worker_count <= 1 or embedded_snapshot.len == 0) return false;
 
