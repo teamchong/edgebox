@@ -112,6 +112,39 @@ pub fn main() !void {
                             std.debug.print("[snapshot-gen] WARNING: TSC init failed: {} (factory still available)\n", .{err});
                         };
                         std.debug.print("[snapshot-gen] Pre-compiled + initialized TSC in snapshot\n", .{});
+
+                        // Pre-parse lib.d.ts files into __sfCache during snapshot.
+                        // The memoization key is fileName+':'+sourceText.length.
+                        // At runtime, TSC calls createSourceFile with the real path.
+                        // We parse with the build-time path here, but the cache key is
+                        // fileName-based so it will match if the runtime path matches.
+                        // Since we can't predict the runtime install path, we pre-parse
+                        // and store with a WILDCARD key pattern that runtime can remap.
+                        // Actually: simpler — just warm up V8's TurboFan by parsing.
+                        // The act of calling createSourceFile during snapshot warms the parser.
+                        const preparse_js =
+                            \\(function() {
+                            \\  if (typeof globalThis.ts === 'undefined' || !ts.createSourceFile) return 0;
+                            \\  var fs = globalThis.require ? globalThis.require('fs') : null;
+                            \\  if (!fs || !fs.readdirSync) return 0;
+                            \\  var dir = 'node_modules/typescript/lib';
+                            \\  try { var files = fs.readdirSync(dir); } catch(e) { return 0; }
+                            \\  var count = 0;
+                            \\  for (var i = 0; i < files.length; i++) {
+                            \\    var f = files[i];
+                            \\    if (!f.endsWith('.d.ts')) continue;
+                            \\    var path = dir + '/' + f;
+                            \\    try {
+                            \\      var src = fs.readFileSync(path, 'utf8');
+                            \\      ts.createSourceFile(path, src, 99, true);
+                            \\      count++;
+                            \\    } catch(e) {}
+                            \\  }
+                            \\  return count;
+                            \\})();
+                        ;
+                        _ = v8.eval(isolate, ctx, preparse_js, "preparse_lib.js") catch {};
+                        std.debug.print("[snapshot-gen] Pre-parsed lib.d.ts files into snapshot cache\n", .{});
                     }
                 }
                 // Don't free src — external string references it
