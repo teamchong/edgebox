@@ -10,32 +10,38 @@ EDGEBOX="$(cd "$(dirname "$0")/.." && pwd)/zig-out/bin/edgebox"
 RENDERER="$(cd "$(dirname "$0")" && pwd)/doom-extract-frame.js"
 PALETTE_RENDERER="$(cd "$(dirname "$0")" && pwd)/doom-render.js"
 
-echo "DOOM in TypeScript Types — EdgeBox Renderer" >&2
-echo "  Scale: ${SCALE}x ($(( 320 * SCALE ))×$(( 200 * SCALE )))" >&2
-echo "" >&2
+clear
+echo ""
+echo "  DOOM in TypeScript Types — EdgeBox Renderer"
+echo "  Scale: ${SCALE}x ($(( 320 * SCALE ))×$(( 200 * SCALE )))"
+echo ""
 
 # Render the title screen (pre-computed frame)
 PALETTE="$DOOM_DIR/packages/playground/final-doom-pun-intended/palette-values.ts"
 if [ -f "$PALETTE" ]; then
-    echo "=== Title Screen ===" >&2
     "$EDGEBOX" "$PALETTE_RENDERER" "$PALETTE" "$SCALE"
-    echo "" >&2
-    echo "Press Enter for WASM machine state frames..." >&2
+    echo ""
+    echo "  Title screen — computed by TypeScript type checker"
+    echo "  Press Enter for WASM machine state frames..."
     read
 fi
 
-# Render each result file (real WASM machine states computed by TSC)
+# Render each result file
 RESULTS=$(ls "$DOOM_DIR"/packages/playground/final-doom-pun-intended/data/result-*.ts 2>/dev/null | sort)
 FRAME=1
-TOTAL=$(echo "$RESULTS" | wc -l)
+TOTAL=$(echo "$RESULTS" | wc -l | tr -d ' ')
 
 for result in $RESULTS; do
-    printf '\033[H' # cursor to top
-    echo "Frame $FRAME/$TOTAL: $(basename $result) — extracting framebuffer..." >&2
+    clear
+    echo ""
+    echo "  Frame $FRAME/$TOTAL: $(basename $result)"
+    echo ""
     "$EDGEBOX" "$RENDERER" "$result" "$SCALE" 2>/dev/null
+    echo ""
+    echo "  Press Enter for next frame..."
     FRAME=$((FRAME + 1))
-    sleep 1
+    read
 done
 
-echo "" >&2
-echo "All frames rendered." >&2
+echo ""
+echo "  All frames rendered."
