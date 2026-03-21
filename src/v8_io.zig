@@ -747,75 +747,20 @@ fn collectSourceFiles(dir_path: []const u8, paths: *std.ArrayListUnmanaged([]con
     }
 }
 
-/// Read a single file and populate the cache (thread-safe: each path is unique)
+/// Read files into raw_file_cache + exists_cache (for fast IO callbacks).
+/// Skips JSON-escape — the fast readFile callback uses raw content directly.
 fn prefetchWorker(paths: []const []const u8, start: usize, end: usize) void {
     for (start..end) |i| {
         const path = paths[i];
-
-        // Read file
         const file = std.fs.cwd().openFile(path, .{}) catch continue;
         defer file.close();
         const content = file.readToEndAlloc(alloc, 64 * 1024 * 1024) catch continue;
 
-        // JSON-escape (same logic as opReadFile)
-        var escape_count: usize = 0;
-        var control_count: usize = 0;
-        for (content) |byte| {
-            switch (byte) {
-                '"', '\\' => escape_count += 1,
-                '\n', '\r', '\t' => escape_count += 1,
-                else => if (byte < 0x20) { control_count += 1; },
-            }
-        }
-
-        const prefix = "{\"ok\":true,\"data\":\"";
-        const suffix = "\"}";
-        const total_len = prefix.len + content.len + escape_count + control_count * 5 + suffix.len;
-        const result = alloc.alloc(u8, total_len) catch continue;
-
-        @memcpy(result[0..prefix.len], prefix);
-        var pw: usize = prefix.len;
-
-        for (content) |byte| {
-            switch (byte) {
-                '"' => { result[pw] = '\\'; result[pw + 1] = '"'; pw += 2; },
-                '\\' => { result[pw] = '\\'; result[pw + 1] = '\\'; pw += 2; },
-                '\n' => { result[pw] = '\\'; result[pw + 1] = 'n'; pw += 2; },
-                '\r' => { result[pw] = '\\'; result[pw + 1] = 'r'; pw += 2; },
-                '\t' => { result[pw] = '\\'; result[pw + 1] = 't'; pw += 2; },
-                else => {
-                    if (byte < 0x20) {
-                        const hex = std.fmt.bufPrint(result[pw..][0..6], "\\u{x:0>4}", .{byte}) catch unreachable;
-                        pw += hex.len;
-                    } else {
-                        result[pw] = byte;
-                        pw += 1;
-                    }
-                },
-            }
-        }
-
-        @memcpy(result[pw..][0..suffix.len], suffix);
-        pw += suffix.len;
-
-        alloc.free(content);
-        const final = result[0..pw];
-
-        // Cache (using mutex for thread safety)
-        prefetch_mutex.lock();
-        defer prefetch_mutex.unlock();
         const key = alloc.dupe(u8, path) catch continue;
-        file_cache.put(alloc, key, final) catch {};
-
-        // Also cache in raw file cache (for fast readFile callback)
-        // Re-read the file for raw content (the 'content' was freed after JSON escape)
-        const raw_file = std.fs.cwd().openFile(path, .{}) catch continue;
-        defer raw_file.close();
-        const raw_content = raw_file.readToEndAlloc(alloc, 64 * 1024 * 1024) catch continue;
-        raw_file_cache.put(alloc, key, raw_content) catch {};
-
-        // Also cache exists=true
+        io_mutex.lock();
+        raw_file_cache.put(alloc, key, content) catch {};
         exists_cache.put(alloc, key, true) catch {};
+        io_mutex.unlock();
     }
 }
 
