@@ -127,10 +127,17 @@ fn flushStdout() void {
     // Wait for previous flush to complete
     if (stdout_flush_thread) |t| { t.join(); stdout_flush_thread = null; }
 
-    // Synchronous write — background flush caused data loss on macOS ARM64
-    // because _exit() terminates before the background thread completes.
-    const stdout_file = std.fs.File.stdout();
-    stdout_file.writeAll(stdout_buf.items) catch {};
+    // Synchronous write + fsync for cross-platform reliability.
+    // macOS ARM64: _exit() terminates before buffered writes complete.
+    const fd: std.posix.fd_t = 1; // stdout
+    var written: usize = 0;
+    while (written < stdout_buf.items.len) {
+        const n = std.posix.write(fd, stdout_buf.items[written..]) catch break;
+        if (n == 0) break;
+        written += n;
+    }
+    // fsync to ensure data reaches the pipe/terminal before _exit()
+    _ = std.posix.fsync(fd) catch {};
     stdout_buf.clearRetainingCapacity();
 }
 
