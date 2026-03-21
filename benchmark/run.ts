@@ -448,6 +448,17 @@ function benchmarkProject(
     edgeboxTimes.push(edgeboxResult.time);
   }
 
+  // If EdgeBox produced 0 diagnostics but Node.js didn't, log debug info
+  if (edgeboxResult.diagnostics === 0 && nodeResult.diagnostics > 0) {
+    console.log(`    EdgeBox DEBUG: 0 diagnostics (Node has ${nodeResult.diagnostics})`);
+    // Re-run once with debug to see what's happening
+    const debugResult = runTsc(edgeboxCmd, edgeboxArgs, edgeboxOutDir, true);
+    console.log(`    EdgeBox DEBUG: re-run got ${debugResult.diagnostics} diagnostics, status=${debugResult.success}`);
+    if (debugResult.diagnostics > 0) {
+      edgeboxResult = debugResult; // Use the debug run's result
+    }
+  }
+
   // Benchmark Bun tsc (optional)
   const bunOutDir = join(OUT_DIR, `${project.name}_bun`);
   let bunTimes: number[] = [];
