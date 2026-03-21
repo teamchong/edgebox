@@ -120,26 +120,22 @@ pub fn main() !void {
 
     const disk_cache: ?[]u8 = null;
 
-    // Prefetch source files in parallel if running TSC.
-    // Reads .ts/.tsx/.js/.d.ts files into IO cache using Zig threads
-    // BEFORE V8 starts, so all readFile calls hit cache instantly.
+    // Queue files for async prefetch — overlaps with V8 init + snapshot deserialization.
     if (std.mem.endsWith(u8, script_path, "tsc.js") or std.mem.endsWith(u8, script_path, "_tsc.js")) {
-        // Always prefetch TypeScript lib.d.ts files (TSC always reads these)
+        // Queue lib.d.ts files (TSC always reads these)
         const ts_lib_dir = std.fs.path.dirname(abs_path) orelse ".";
-        v8_io.prefetchDirectory(ts_lib_dir);
+        v8_io.queueDirectoryPrefetch(ts_lib_dir);
 
-        // Find -p <path> or source file directories and prefetch them
+        // Queue -p <path> project dirs and individual .ts files
         var peek_args = try std.process.argsWithAllocator(alloc);
         defer peek_args.deinit();
         var found_p = false;
-        var prefetched_dirs = std.StringHashMap(void).init(alloc);
-        defer prefetched_dirs.deinit();
         while (peek_args.next()) |arg| {
             if (found_p) {
                 var tsconfig_abs: [std.fs.max_path_bytes]u8 = undefined;
                 const tsconfig_real = std.fs.cwd().realpath(arg, &tsconfig_abs) catch arg;
                 const project_dir = std.fs.path.dirname(tsconfig_real) orelse ".";
-                v8_io.prefetchDirectory(project_dir);
+                v8_io.queueDirectoryPrefetch(project_dir);
                 found_p = false;
                 continue;
             }
@@ -147,12 +143,11 @@ pub fn main() !void {
                 found_p = true;
                 continue;
             }
-            // Queue source files for batch prefetch
             if (std.mem.endsWith(u8, arg, ".ts") or std.mem.endsWith(u8, arg, ".tsx")) {
                 v8_io.prefetchFile(arg);
             }
         }
-        // Start batch prefetch on background thread — overlaps with V8 init
+        // Start ALL prefetch on background threads — runs during V8 init
         v8_io.startBatchPrefetch();
     }
 

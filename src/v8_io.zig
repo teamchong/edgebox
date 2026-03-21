@@ -408,8 +408,13 @@ fn triggerSpeculativePrefetch(path: []const u8) void {
 /// Raw file content cache (no JSON escaping — for fast callback)
 var raw_file_cache: std.StringHashMapUnmanaged([]const u8) = .{};
 
-/// Collect file paths for batch prefetch. Call prefetchFlush() to read them all.
+/// Collect file paths for batch prefetch.
 var prefetch_file_list: std.ArrayListUnmanaged([]const u8) = .{};
+
+/// Queue all source files in a directory for batch prefetch.
+pub fn queueDirectoryPrefetch(dir_path: []const u8) void {
+    collectSourceFiles(dir_path, &prefetch_file_list);
+}
 
 /// Queue a file for batch prefetch.
 pub fn prefetchFile(path: []const u8) void {
