@@ -16,6 +16,10 @@ pub threadlocal var deferred_exit_code: ?u8 = null;
 /// Global IO mutex — protects all hash map caches for multi-isolate safety.
 var io_mutex: std.Thread.Mutex = .{};
 
+/// Set to true after batch prefetch completes — skips mutex in callbacks.
+/// Safe because V8 callbacks run single-threaded after prefetch joins.
+pub var prefetch_complete: bool = false;
+
 /// Set to true in worker threads to skip PumpMessageLoop
 pub threadlocal var is_worker_thread: bool = false;
 
@@ -570,6 +574,10 @@ pub fn waitBatchPrefetch() void {
         scanned_dirs.put(alloc, dir_key, {}) catch {};
         io_mutex.unlock();
     }
+
+    // All background threads done — single-threaded from here.
+    // Skip mutex in IO callbacks for faster cache access.
+    prefetch_complete = true;
 }
 
 pub fn readFileFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
@@ -601,10 +609,14 @@ pub fn readFileFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) v
     // Join speculative prefetch only if one is pending
     if (prefetch_thread) |t| { t.join(); prefetch_thread = null; }
 
-    // Check raw content cache (thread-safe via mutex)
-    io_mutex.lock();
-    const cached_content = raw_file_cache.get(path);
-    io_mutex.unlock();
+    // Check raw content cache — skip mutex after prefetch completes (single-threaded)
+    const cached_content = if (prefetch_complete)
+        raw_file_cache.get(path)
+    else blk: {
+        io_mutex.lock();
+        defer io_mutex.unlock();
+        break :blk raw_file_cache.get(path);
+    };
     const content = cached_content orelse blk: {
         const file = std.fs.cwd().openFile(path, .{}) catch { rv.setUndefined(); return; };
         defer file.close();
@@ -667,19 +679,24 @@ pub fn fileExistsFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c)
     const written = v8.StringApi.writeUtf8(str, isolate, &path_buf);
     const path = path_buf[0..written];
 
-    // Hot path: cache lookup (no mutex needed in single-threaded TSC mode —
-    // batch prefetch completed before TSC starts)
-    io_mutex.lock();
-    const cached = exists_cache.get(path);
-    const dir_check = if (cached == null) blk: {
-        // Fast negative: check if directory was scanned
-        const dir = std.fs.path.dirname(path);
-        if (dir) |d| {
-            break :blk scanned_dirs.get(d) != null;
+    // Hot path: cache lookup — skip mutex after prefetch completes
+    var cached: ?bool = null;
+    var dir_check: bool = false;
+    if (prefetch_complete) {
+        cached = exists_cache.get(path);
+        if (cached == null) {
+            const dir = std.fs.path.dirname(path);
+            if (dir) |d| dir_check = scanned_dirs.get(d) != null;
         }
-        break :blk false;
-    } else false;
-    io_mutex.unlock();
+    } else {
+        io_mutex.lock();
+        cached = exists_cache.get(path);
+        if (cached == null) {
+            const dir = std.fs.path.dirname(path);
+            if (dir) |d| dir_check = scanned_dirs.get(d) != null;
+        }
+        io_mutex.unlock();
+    }
 
     if (cached) |exists| {
         rv.setInt32(if (exists) 1 else 0);
