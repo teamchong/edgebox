@@ -473,7 +473,7 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         const tsc_fast_js =
             \\(function() {
             \\  if (typeof globalThis.ts === 'undefined' || !ts.executeCommandLine) return;
-            \\  // Inline shim (avoid separate v8.eval call)
+            \\  // Inline shim
             \\  globalThis.__FastRelationCache = Map;
             \\  globalThis.__typesById = [];
             \\  globalThis.__sfCache = Object.create(null);
