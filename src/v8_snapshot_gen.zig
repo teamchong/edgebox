@@ -113,37 +113,18 @@ pub fn main() !void {
                         };
                         std.debug.print("[snapshot-gen] Pre-compiled + initialized TSC in snapshot\n", .{});
 
-                        // Pre-parse lib.d.ts files into __sfCache during snapshot.
-                        // The memoization key is fileName+':'+sourceText.length.
-                        // At runtime, TSC calls createSourceFile with the real path.
-                        // We parse with the build-time path here, but the cache key is
-                        // fileName-based so it will match if the runtime path matches.
-                        // Since we can't predict the runtime install path, we pre-parse
-                        // and store with a WILDCARD key pattern that runtime can remap.
-                        // Actually: simpler — just warm up V8's TurboFan by parsing.
-                        // The act of calling createSourceFile during snapshot warms the parser.
-                        const preparse_js =
+                        // Parse a few small files to warm Sparkplug for the parser,
+                        // without bloating the snapshot with full lib.d.ts ASTs.
+                        const warmup_parse_js =
                             \\(function() {
-                            \\  if (typeof globalThis.ts === 'undefined' || !ts.createSourceFile) return 0;
-                            \\  var fs = globalThis.require ? globalThis.require('fs') : null;
-                            \\  if (!fs || !fs.readdirSync) return 0;
-                            \\  var dir = 'node_modules/typescript/lib';
-                            \\  try { var files = fs.readdirSync(dir); } catch(e) { return 0; }
-                            \\  var count = 0;
-                            \\  for (var i = 0; i < files.length; i++) {
-                            \\    var f = files[i];
-                            \\    if (!f.endsWith('.d.ts')) continue;
-                            \\    var path = dir + '/' + f;
-                            \\    try {
-                            \\      var src = fs.readFileSync(path, 'utf8');
-                            \\      ts.createSourceFile(path, src, 99, true);
-                            \\      count++;
-                            \\    } catch(e) {}
-                            \\  }
-                            \\  return count;
+                            \\  if (typeof ts === 'undefined' || !ts.createSourceFile) return;
+                            \\  try {
+                            \\    ts.createSourceFile('w.ts', 'var x:number=1;interface A{a:string;b:number}', 99, true);
+                            \\    ts.createSourceFile('w2.ts', 'type T<X>={[K in keyof X]:X[K]};function f<T>(a:T):T{return a}', 99, true);
+                            \\  } catch(e) {}
                             \\})();
                         ;
-                        _ = v8.eval(isolate, ctx, preparse_js, "preparse_lib.js") catch {};
+                        _ = v8.eval(isolate, ctx, warmup_parse_js, "warmup_parse.js") catch {};
 
                         // Pump message loop to finalize Sparkplug compilations
                         if (v8.global_platform) |platform| {
@@ -153,7 +134,7 @@ pub fn main() !void {
                             }
                         }
 
-                        std.debug.print("[snapshot-gen] Pre-parsed lib.d.ts in snapshot\n", .{});
+                        std.debug.print("[snapshot-gen] Warmed parser Sparkplug in snapshot\n", .{});
                     }
                 }
                 // Don't free src — external string references it
