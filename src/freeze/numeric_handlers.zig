@@ -1330,7 +1330,9 @@ pub fn detectAllocSites(instructions: anytype) ?AllocSiteInfo {
         info.is_constructor = true;
     }
 
-    if (info.field_count < 3) return null;
+    // Allow constructors with 1+ fields for SOA.
+    // Previously required 3+ fields, which excluded TSC's Type3/Symbol4/Signature2.
+    if (info.field_count == 0) return null;
     info.pass_through = all_get_arg;
     return info;
 }
