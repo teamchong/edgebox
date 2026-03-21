@@ -111,8 +111,13 @@ pub fn main() !void {
                             \\(function() {
                             \\  if (typeof ts === 'undefined' || !ts.createSourceFile) return;
                             \\  try {
-                            \\    // Warm parser (Sparkplug)
-                            \\    ts.createSourceFile('w.ts', 'var x:number=1;interface A{a:string;b:number}', 99, true);
+                            \\    // Warm parser (Sparkplug) — parse enough code to trigger compilation
+                            \\    for (var i = 0; i < 5; i++) {
+                            \\      ts.createSourceFile('w'+i+'.ts',
+                            \\        'interface A{x:number;y:string}interface B extends A{z:boolean}' +
+                            \\        'function f(a:A,b:B):boolean{return a.x>0}' +
+                            \\        'type C<T>={[K in keyof T]:T[K]};const c:C<A>={x:1,y:""}', 99, true);
+                            \\    }
                             \\  } catch(e) {}
                             \\})();
                         ;
