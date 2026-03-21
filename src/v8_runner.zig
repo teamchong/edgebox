@@ -501,7 +501,14 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         const tsc_fast_js =
             \\(function() {
             \\  if (typeof globalThis.ts === 'undefined' || !ts.executeCommandLine) return;
-            \\  ts.sys.args = process.argv.slice(2);
+            \\  var args = process.argv.slice(2);
+            \\  // Auto-inject --incremental for faster warm runs (same as worker path).
+            \\  // Cache stored in /tmp/edgebox-incr-cache/ — cleaned per project.
+            \\  if (args.indexOf('--incremental') === -1 && args.indexOf('-i') === -1) {
+            \\    args.push('--incremental');
+            \\    args.push('--tsBuildInfoFile', '/tmp/edgebox-incr-cache/tsinfo.json');
+            \\  }
+            \\  ts.sys.args = args;
             \\  ts.sys.getExecutingFilePath = function() { return __filename; };
             \\  ts.Debug.loggingHost = {
             \\    log: function(_level, s) { ts.sys.write((s || '') + ts.sys.newLine); }
