@@ -1,35 +1,41 @@
 #!/bin/bash
-# Play Doom in TSC via EdgeBox + Ghostty pixel rendering
+# Play Doom frames through EdgeBox — renders REAL WASM machine states
+# as pixels in Ghostty via Kitty graphics protocol
 #
-# Usage: ./scripts/doom-play.sh <path-to-ts-wasm-doom>
-#
-# Requires: Ghostty terminal (supports Kitty graphics protocol)
-#           EdgeBox built: zig build v8-run -Doptimize=ReleaseFast
+# Usage: ./scripts/doom-play.sh [path-to-ts-wasm-doom] [scale]
 
-set -e
+DOOM_DIR="${1:-$HOME/Downloads/repos/typescript-types-only-wasm-runtime}"
+SCALE="${2:-3}"
+EDGEBOX="$(cd "$(dirname "$0")/.." && pwd)/zig-out/bin/edgebox"
+RENDERER="$(cd "$(dirname "$0")" && pwd)/doom-extract-frame.js"
+PALETTE_RENDERER="$(cd "$(dirname "$0")" && pwd)/doom-render.js"
 
-DOOM_DIR="${1:-.}"
-EDGEBOX="$(dirname "$0")/../zig-out/bin/edgebox"
-TSC="$(dirname "$0")/../benchmark/node_modules/typescript/lib/_tsc.js"
-RENDERER="$(dirname "$0")/doom-render.js"
+echo "DOOM in TypeScript Types — EdgeBox Renderer" >&2
+echo "  Scale: ${SCALE}x ($(( 320 * SCALE ))×$(( 200 * SCALE )))" >&2
+echo "" >&2
 
-if [ ! -f "$EDGEBOX" ]; then
-    echo "Build EdgeBox first: zig build v8-run -Doptimize=ReleaseFast"
-    exit 1
+# Render the title screen (pre-computed frame)
+PALETTE="$DOOM_DIR/packages/playground/final-doom-pun-intended/palette-values.ts"
+if [ -f "$PALETTE" ]; then
+    echo "=== Title Screen ===" >&2
+    "$EDGEBOX" "$PALETTE_RENDERER" "$PALETTE" "$SCALE"
+    echo "" >&2
+    echo "Press Enter for WASM machine state frames..." >&2
+    read
 fi
 
-echo "🎮 Doom in TSC — EdgeBox Pixel Renderer"
-echo "  Doom dir: $DOOM_DIR"
-echo "  EdgeBox:  $EDGEBOX"
-echo ""
-echo "Each frame is type-checked by TSC and rendered via Kitty graphics."
-echo "Press Ctrl+C to stop."
-echo ""
+# Render each result file (real WASM machine states computed by TSC)
+RESULTS=$(ls "$DOOM_DIR"/packages/playground/final-doom-pun-intended/data/result-*.ts 2>/dev/null | sort)
+FRAME=1
+TOTAL=$(echo "$RESULTS" | wc -l)
 
-# Render each result file as a frame
-for result in "$DOOM_DIR"/packages/playground/final-doom-pun-intended/data/result-*.ts; do
-    echo -ne "\033[H" # Move cursor to top-left
-    # The palette values represent the frame pixels
-    node "$RENDERER" "$DOOM_DIR/packages/playground/final-doom-pun-intended/palette-values.ts" 2>/dev/null
-    sleep 0.033 # ~30fps timing
+for result in $RESULTS; do
+    printf '\033[H' # cursor to top
+    echo "Frame $FRAME/$TOTAL: $(basename $result) — extracting framebuffer..." >&2
+    "$EDGEBOX" "$RENDERER" "$result" "$SCALE" 2>/dev/null
+    FRAME=$((FRAME + 1))
+    sleep 1
 done
+
+echo "" >&2
+echo "All frames rendered." >&2
