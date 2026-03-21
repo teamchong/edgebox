@@ -765,6 +765,10 @@ const Request = struct {
 };
 
 fn handleRequest(msg: []const u8) ![]const u8 {
+    // NOTE: Individual cache operations use io_mutex internally.
+    // handleRequest itself is NOT locked — allows concurrent IO from parallel workers.
+    // Each op (opReadFile, opExists, etc.) locks around its own cache access.
+
     const parsed = std.json.parseFromSlice(Request, alloc, msg, .{ .ignore_unknown_fields = true }) catch {
         return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"invalid JSON\"}}", .{});
     };
@@ -910,10 +914,11 @@ var file_cache: std.StringHashMapUnmanaged([]const u8) = .{};
 fn opReadFile(req: Request) ![]const u8 {
     const path = req.path orelse return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"path required\"}}", .{});
 
-    // Check cache first
-    if (file_cache.get(path)) |cached| {
-        return cached;
-    }
+    // Check cache first (lock-free read for cache hits)
+    io_mutex.lock();
+    const cached = file_cache.get(path);
+    io_mutex.unlock();
+    if (cached) |c| return c;
 
     const file = std.fs.cwd().openFile(path, .{}) catch |err| {
         return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"{s}\",\"code\":\"ENOENT\"}}", .{@errorName(err)});
@@ -971,7 +976,9 @@ fn opReadFile(req: Request) ![]const u8 {
 
     // Cache the escaped result (path must be duped for map key)
     const key = try alloc.dupe(u8, path);
-    try file_cache.put(alloc, key, final);
+    io_mutex.lock();
+    file_cache.put(alloc, key, final) catch {};
+    io_mutex.unlock();
 
     return final;
 }
@@ -997,7 +1004,10 @@ var stat_cache: std.StringHashMapUnmanaged([]const u8) = .{};
 fn opStat(req: Request) ![]const u8 {
     const path = req.path orelse return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"path required\"}}", .{});
 
-    if (stat_cache.get(path)) |cached| return cached;
+    io_mutex.lock();
+    const stat_cached = stat_cache.get(path);
+    io_mutex.unlock();
+    if (stat_cached) |cached| return cached;
 
     const stat = std.fs.cwd().statFile(path) catch |err| {
         return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"{s}\",\"code\":\"ENOENT\"}}", .{@errorName(err)});
@@ -1008,7 +1018,9 @@ fn opStat(req: Request) ![]const u8 {
     const result = try std.fmt.allocPrint(alloc, "{{\"ok\":true,\"isFile\":{},\"isDirectory\":{},\"size\":{d}}}", .{ is_file, is_dir, stat.size });
 
     const key = alloc.dupe(u8, path) catch path;
+    io_mutex.lock();
     stat_cache.put(alloc, key, result) catch {};
+    io_mutex.unlock();
 
     return result;
 }
@@ -1019,7 +1031,10 @@ var readdir_cache: std.StringHashMapUnmanaged([]const u8) = .{};
 fn opReaddir(req: Request) ![]const u8 {
     const path = req.path orelse return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"path required\"}}", .{});
 
-    if (readdir_cache.get(path)) |cached| return cached;
+    io_mutex.lock();
+    const rd_cached = readdir_cache.get(path);
+    io_mutex.unlock();
+    if (rd_cached) |cached| return cached;
 
     var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |err| {
         return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"{s}\",\"code\":\"ENOENT\"}}", .{@errorName(err)});
@@ -1044,7 +1059,9 @@ fn opReaddir(req: Request) ![]const u8 {
     const final = try result.toOwnedSlice(alloc);
 
     const key = alloc.dupe(u8, path) catch path;
+    io_mutex.lock();
     readdir_cache.put(alloc, key, final) catch {};
+    io_mutex.unlock();
 
     return final;
 }
@@ -1055,7 +1072,10 @@ var realpath_cache: std.StringHashMapUnmanaged([]const u8) = .{};
 fn opRealpath(req: Request) ![]const u8 {
     const path = req.path orelse return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"path required\"}}", .{});
 
-    if (realpath_cache.get(path)) |cached| return cached;
+    io_mutex.lock();
+    const rp_cached = realpath_cache.get(path);
+    io_mutex.unlock();
+    if (rp_cached) |cached| return cached;
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const real = std.fs.cwd().realpath(path, &buf) catch |err| {
@@ -1064,7 +1084,9 @@ fn opRealpath(req: Request) ![]const u8 {
 
     const result = try std.fmt.allocPrint(alloc, "{{\"ok\":true,\"data\":\"{s}\"}}", .{real});
     const key = alloc.dupe(u8, path) catch path;
+    io_mutex.lock();
     realpath_cache.put(alloc, key, result) catch {};
+    io_mutex.unlock();
 
     return result;
 }
@@ -1090,8 +1112,11 @@ var exists_cache: std.StringHashMapUnmanaged(bool) = .{};
 fn opExists(req: Request) ![]const u8 {
     const path = req.path orelse return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"path required\"}}", .{});
 
-    // Check cache
-    if (exists_cache.get(path)) |exists| {
+    // Check cache (lock-free read for cache hits)
+    io_mutex.lock();
+    const cached_exists = exists_cache.get(path);
+    io_mutex.unlock();
+    if (cached_exists) |exists| {
         return if (exists) "{\"ok\":true,\"exists\":true}" else "{\"ok\":true,\"exists\":false}";
     }
 
@@ -1104,7 +1129,9 @@ fn opExists(req: Request) ![]const u8 {
 
     // Cache result
     const key = alloc.dupe(u8, path) catch path;
+    io_mutex.lock();
     exists_cache.put(alloc, key, exists) catch {};
+    io_mutex.unlock();
 
     return if (exists) "{\"ok\":true,\"exists\":true}" else "{\"ok\":true,\"exists\":false}";
 }

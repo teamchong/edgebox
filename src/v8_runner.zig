@@ -18,6 +18,7 @@
 const std = @import("std");
 const v8 = @import("v8.zig");
 const v8_io = @import("v8_io.zig");
+const v8_parallel_tsc = @import("v8_parallel_tsc.zig");
 
 /// Set when a freeze-compiled bundle is available for the current script.
 var g_use_compiled: bool = false;
@@ -507,15 +508,27 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         // Using inline eval instead: slightly slower but correct on all platforms.
         ;
 
-        var sp_try_catch = v8.TryCatch.init(isolate);
-        defer sp_try_catch.deinit();
+        // Try parallel type checking (multiple V8 isolates, each checks a file subset).
+        // Falls back to serial if single-core or no snapshot.
+        const used_parallel = v8_parallel_tsc.runParallelCheck(
+            isolate,
+            context,
+            abs_path,
+            tsc_fast_js,
+        );
 
-        _ = v8.eval(isolate, context, tsc_fast_js, "tsc_fast.js") catch {
-            if (v8_io.deferred_exit_code == null) {
-                reportException(&sp_try_catch, isolate, context);
-                std.process.exit(1);
-            }
-        };
+        if (!used_parallel) {
+            // Serial fallback
+            var sp_try_catch = v8.TryCatch.init(isolate);
+            defer sp_try_catch.deinit();
+
+            _ = v8.eval(isolate, context, tsc_fast_js, "tsc_fast.js") catch {
+                if (v8_io.deferred_exit_code == null) {
+                    reportException(&sp_try_catch, isolate, context);
+                    std.process.exit(1);
+                }
+            };
+        }
 
         v8_io.flushAll();
 

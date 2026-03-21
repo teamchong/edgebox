@@ -66,7 +66,10 @@ pub const transforms = [_]Transform{
     // Before Check: warm hot checker functions by calling with real types,
     // then pump to flush TurboFan compilations. Reduces JIT variance.
     // checkSourceFile: pump TurboFan before Check + periodic pump during early files
-    .{ .needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));", .replacement = "{if(typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);const __files=host.getSourceFiles();for(let __i=0;__i<__files.length;__i++){checkSourceFileWithEagerDiagnostics(__files[__i]);if(__i<30&&__i%5===4&&typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);}}" },
+    // Check loop: shard files across parallel workers.
+    // __edgebox_worker_id/count are set by v8_parallel_tsc.zig.
+    // When not set (single-threaded), defaults to id=0, count=1 → checks all files.
+    .{ .needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));", .replacement = "{if(typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);const __files=host.getSourceFiles();const __wid=typeof __edgebox_worker_id!=='undefined'?__edgebox_worker_id:0;const __wcnt=typeof __edgebox_worker_count!=='undefined'?__edgebox_worker_count:1;for(let __i=0;__i<__files.length;__i++){if(__i%__wcnt===__wid){checkSourceFileWithEagerDiagnostics(__files[__i]);}if(__i<30&&__i%5===4&&typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);}}" },
 };
 
 /// Apply all TSC source transforms in a single pass.
