@@ -502,6 +502,11 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
             \\(function() {
             \\  if (typeof globalThis.ts === 'undefined' || !ts.executeCommandLine) return;
             \\  var args = process.argv.slice(2).filter(function(a){return a!=='--serve';});
+            \\  // In --serve mode, auto-inject --incremental for fast warm runs.
+            \\  // Without serve, let the user control incremental explicitly.
+            \\  if (process.argv.indexOf('--serve')>=0 && args.indexOf('--incremental')===-1) {
+            \\    args.push('--incremental','--tsBuildInfoFile','/tmp/edgebox-incr-cache/tsinfo.json');
+            \\  }
             \\  ts.sys.args = args;
             \\  ts.sys.getExecutingFilePath = function() { return __filename; };
             \\  ts.Debug.loggingHost = {
