@@ -2648,7 +2648,12 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                                 if (c == '\n') clean_line_count += 1;
                             }
                         }
-                        const line_offset: i32 = @as(i32, @intCast(bundle_line_count)) - @as(i32, @intCast(clean_line_count));
+                        // Use zero offset — patches reference bundle.js lines.
+                        // The char_loop processes clean_content which may differ.
+                        // With zero offset, patches match bundle.js lines directly.
+                        // The clean_content is derived from bundle.js, so line numbers
+                        // should be close (off by polyfill stripping at the top).
+                        const line_offset: i32 = 0;
                         std.debug.print("[soa] Line offset: {d} (bundle={d}, clean={d})\n", .{ line_offset, bundle_line_count, clean_line_count });
 
                         // Filter patches by col_set and apply line offset
@@ -2663,6 +2668,21 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                             patch_set.put(line *% 1000003 + fh, pe.field) catch { w_errs += 1; };
                         }
                         std.debug.print("[soa] {d} patches active ({d} lines) after col_set + offset filter\n", .{ patch_set.count(), patch_lines.count() });
+                        // Debug: check first few patch lines
+                        {
+                            var dbg_iter = patch_lines.keyIterator();
+                            var dbg_count: u32 = 0;
+                            var min_l: u32 = 999999;
+                            var max_l: u32 = 0;
+                            while (dbg_iter.next()) |kp| {
+                                const l = kp.*;
+                                if (l < min_l) min_l = l;
+                                if (l > max_l) max_l = l;
+                                dbg_count += 1;
+                            }
+                            const cclen: usize = if (clean_content) |ccc| ccc.len else 0;
+                            std.debug.print("[soa] patch_lines range: {d}-{d} ({d} entries), clean_len={d}\n", .{ min_l, max_l, dbg_count, cclen });
+                        }
                     }
 
                     // Batch struct helpers: for each struct function with _batch variant,
@@ -3986,7 +4006,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         // soa_base now stored as VAR.__sb (property on array), not scoped variable.
                         // No need to disable for inter-procedural leaks — .__sb travels with the array.
 
-                        const rs_rewrite_count: u32 = 0;
+                        var rs_rewrite_count: u32 = 0;
 
                         // Pre-pass: build exact rewrite positions
                         const RewriteInfo = struct { dot_pos: u32, end_pos: u32, field: []const u8 };
