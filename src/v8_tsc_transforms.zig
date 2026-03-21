@@ -66,29 +66,17 @@ pub const transforms = [_]Transform{
     // Before Check: warm hot checker functions by calling with real types,
     // then pump to flush TurboFan compilations. Reduces JIT variance.
     // checkSourceFile: pump TurboFan before Check + periodic pump during early files
-    // T-PARALLEL: Main (worker_id=0) skips emit+check entirely when workers active.
-    // Main only does createProgram (parse) → spawns workers → exits with code 0.
-    // Workers do the actual type checking and report diagnostics.
-    .{ .needle = "const program = createProgram(programOptions);\n  const exitStatus = emitFilesAndReportErrorsAndGetExitStatus(", .replacement = "const program = createProgram(programOptions);\n  if(typeof __edgebox_spawn_check_workers==='function'){__edgebox_spawn_check_workers();if(__edgebox_worker_id===0&&__edgebox_worker_count>1){cb(0);return;}}\n  const exitStatus = emitFilesAndReportErrorsAndGetExitStatus(" },
-    // T-SHARD-ROOTS: Shard rootNames for workers (worker_id > 0) only.
-    // Main (worker_id=0) keeps ALL files for the full program.
-    // Workers only include files where fileIndex % count === id.
-    // TSC's module resolution still pulls in imported files as needed.
-    // T-SHARD-ROOTS: Workers parse only their assigned root files + skip module resolution.
-    // This makes workers parse ~46 files instead of 366 (with 8 workers).
-    // Main (worker_id=0) keeps ALL files for correct full-program diagnostics.
-    .{ .needle = "const programOptions = {\n    rootNames: fileNames,", .replacement = "var __rootNames=fileNames;if(typeof __edgebox_worker_id!=='undefined'&&__edgebox_worker_id>0&&__edgebox_worker_count>1){__rootNames=fileNames.filter(function(_,i){return i%__edgebox_worker_count===__edgebox_worker_id;});}\n  const programOptions = {\n    rootNames: __rootNames," },
-    // T-SKIP-IMPORTS: Workers skip module resolution (don't follow imports).
-    // Workers only parse root files — unresolved imports get `any` type.
-    // Main thread has full program and produces correct diagnostics.
-    .{ .needle = "function resolveModuleNamesReusingOldState(moduleNames, containingFile) {", .replacement = "function resolveModuleNamesReusingOldState(moduleNames, containingFile) {\n    if(typeof __edgebox_worker_id!=='undefined'&&__edgebox_worker_id>0)return moduleNames.map(function(){return{resolvedModule:void 0};});" },
+    // T-PARALLEL: Spawn workers AFTER main's createProgram.
+    // All workers have full programs — correct diagnostics.
+    .{ .needle = "const program = createProgram(programOptions);\n  const exitStatus = emitFilesAndReportErrorsAndGetExitStatus(", .replacement = "const program = createProgram(programOptions);\n  if(typeof __edgebox_spawn_check_workers==='function')__edgebox_spawn_check_workers();\n  const exitStatus = emitFilesAndReportErrorsAndGetExitStatus(" },
+    // T-SHARD-DIAGS: Filter diagnostics by worker shard.
+    // Each worker only reports diagnostics from its assigned files.
+    // Without this, every worker reports ALL diagnostics (duplicates).
+    .{ .needle = "const diagnostics = sortAndDeduplicateDiagnostics(allDiagnostics);\n  diagnostics.forEach(reportDiagnostic);", .replacement = "var diagnostics = sortAndDeduplicateDiagnostics(allDiagnostics);\n  if(typeof __edgebox_worker_count!=='undefined'&&__edgebox_worker_count>1){var __sf=program.getSourceFiles();var __myFiles=new Set();for(var __di=0;__di<__sf.length;__di++){if(__di%__edgebox_worker_count===__edgebox_worker_id)__myFiles.add(__sf[__di].fileName);}diagnostics=diagnostics.filter(function(d){return !d.file||__myFiles.has(d.file.fileName);});}\n  diagnostics.forEach(reportDiagnostic);" },
     // Check loop: shard files across parallel workers.
-    // __edgebox_worker_id/count are set by v8_parallel_tsc.zig.
+    // Each worker checks files where fileIndex % workerCount === workerId.
     // When not set (single-threaded), defaults to id=0, count=1 → checks all files.
-    // Check loop: worker_id=0 (main) SKIPS checking when workers are active.
-    // Workers (id>0) check their assigned files only.
-    // Main only does createProgram (parse) to populate file cache.
-    .{ .needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));", .replacement = "{if(typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);const __files=host.getSourceFiles();const __wid=typeof __edgebox_worker_id!=='undefined'?__edgebox_worker_id:0;const __wcnt=typeof __edgebox_worker_count!=='undefined'?__edgebox_worker_count:1;if(__wid===0&&__wcnt>1){/* main skips check — workers handle it */}else{for(let __i=0;__i<__files.length;__i++){if(__i%__wcnt===__wid){checkSourceFileWithEagerDiagnostics(__files[__i]);}}}}" },
+    .{ .needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));", .replacement = "{if(typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);const __files=host.getSourceFiles();const __wid=typeof __edgebox_worker_id!=='undefined'?__edgebox_worker_id:0;const __wcnt=typeof __edgebox_worker_count!=='undefined'?__edgebox_worker_count:1;for(let __i=0;__i<__files.length;__i++){if(__i%__wcnt===__wid){checkSourceFileWithEagerDiagnostics(__files[__i]);}if(__i<30&&__i%5===4&&typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);}}" },
 };
 
 /// Apply all TSC source transforms in a single pass.
