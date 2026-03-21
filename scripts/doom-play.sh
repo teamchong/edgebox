@@ -11,16 +11,17 @@ RENDERER="$(cd "$(dirname "$0")" && pwd)/doom-extract-frame.js"
 PALETTE_RENDERER="$(cd "$(dirname "$0")" && pwd)/doom-render.js"
 
 clear
-
-# Save cursor position — all frames render at this spot
+# Save cursor at top
 printf '\e7'
 
 # Render the title screen first
 PALETTE="$DOOM_DIR/packages/playground/final-doom-pun-intended/palette-values.ts"
 if [ -f "$PALETTE" ]; then
-    printf '\e8'  # restore cursor
+    printf '\e8'
     "$EDGEBOX" "$PALETTE_RENDERER" "$PALETTE" "$SCALE"
-    echo "  DOOM in TypeScript Types — EdgeBox Renderer"
+    # Clear line then print status
+    printf '\e[2K  DOOM in TypeScript Types — EdgeBox Renderer\n'
+    printf '\e[2K  Title screen — type-checked by TypeScript\n'
     sleep 3
 fi
 
@@ -28,13 +29,15 @@ fi
 RESULTS=$(ls "$DOOM_DIR"/packages/playground/final-doom-pun-intended/data/result-*.ts 2>/dev/null | sort)
 TOTAL=$(echo "$RESULTS" | wc -l | tr -d ' ')
 
-# Loop frames forever
+# Loop frames forever (Ctrl+C to stop)
 while true; do
     FRAME=1
     for result in $RESULTS; do
-        printf '\e8'  # restore cursor to saved position
+        printf '\e8'  # restore cursor to top
         "$EDGEBOX" "$RENDERER" "$result" "$SCALE" 2>/dev/null
-        echo "  Frame $FRAME/$TOTAL — $(basename $result)"
+        # Clear line before printing status (prevents text overlap)
+        printf '\e[2K  Frame %d/%d — %s\n' "$FRAME" "$TOTAL" "$(basename "$result")"
+        printf '\e[2K\n'
         FRAME=$((FRAME + 1))
         sleep 1
     done

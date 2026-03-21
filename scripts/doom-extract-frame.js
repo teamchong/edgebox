@@ -68,7 +68,6 @@ for (let y = 0; y < dH; y++) {
 
 // Kitty graphics protocol — image ID 1 for in-place replacement
 const b64 = rgba.toString('base64');
-process.stdout.write('\x1b_Ga=d,d=i,i=1;\x1b\\');
 for (let i = 0; i < b64.length; i += 4096) {
   const chunk = b64.slice(i, i + 4096);
   const more = (i + 4096 < b64.length) ? 1 : 0;
