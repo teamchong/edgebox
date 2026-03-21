@@ -137,14 +137,13 @@ runs:
       run: |
         ./scripts/download-v8.sh
 
-    # === Build EdgeBox CLI (if cache miss) ===
+    # === Build EdgeBox V8 runner (if cache miss) ===
     - name: Build EdgeBox
       if: steps.cache-edgebox.outputs.cache-hit != 'true'
       shell: bash
       run: |
-        # Use baseline CPU for portable binaries (avoid SIGILL on different runners)
-        # cli = EdgeBox compiler (worker .mjs + .wasm generation) — no WAMR needed
-        zig build cli -Doptimize=ReleaseFast -Dcpu=baseline
+        # Build V8 runner only (edgebox binary) — no worker/WASM compilation needed
+        zig build v8-run -Doptimize=ReleaseFast -Dcpu=baseline
 
     # === Build benchmarks (if cache miss and requested) ===
     - name: Build Benchmarks
