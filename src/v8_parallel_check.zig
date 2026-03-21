@@ -87,6 +87,119 @@ fn checkRelation(type_flags: [*]const i32, source_id: u32, target_id: u32) i32 {
     return 0;
 }
 
+/// SIMD batch isSimpleTypeRelatedTo — process 8 type pairs at once.
+/// Uses Zig's @Vector which maps to SSE4.2/AVX2 on x86_64, NEON on ARM64.
+/// Each lane checks one (source, target) pair. Result: 1=related, 0=unknown.
+const SimdWidth = 8;
+const Vi32 = @Vector(SimdWidth, i32);
+
+fn checkRelationSimd(
+    type_flags: [*]const i32,
+    source_ids: [SimdWidth]u32,
+    target_ids: [SimdWidth]u32,
+) [SimdWidth]i32 {
+    // Gather source and target flags from SOA column
+    var s: Vi32 = @splat(0);
+    var t: Vi32 = @splat(0);
+    inline for (0..SimdWidth) |i| {
+        if (source_ids[i] < MAX_TYPES) s[i] = type_flags[source_ids[i]];
+        if (target_ids[i] < MAX_TYPES) t[i] = type_flags[target_ids[i]];
+    }
+
+    // Check all flag patterns in parallel using SIMD bitwise ops.
+    // Any lane that matches sets result to 1.
+    var result: Vi32 = @splat(0);
+
+    // t & Any (1) || s & Never (131072)
+    const any_mask: Vi32 = @splat(1);
+    const never_mask: Vi32 = @splat(131072);
+    const t_any = t & any_mask;
+    const s_never = s & never_mask;
+    result |= @select(i32, t_any != @as(Vi32, @splat(0)), @as(Vi32, @splat(1)), @as(Vi32, @splat(0)));
+    result |= @select(i32, s_never != @as(Vi32, @splat(0)), @as(Vi32, @splat(1)), @as(Vi32, @splat(0)));
+
+    // t & Unknown (2) — related for non-identity relations
+    const unknown_mask: Vi32 = @splat(2);
+    const t_unknown = t & unknown_mask;
+    result |= @select(i32, t_unknown != @as(Vi32, @splat(0)), @as(Vi32, @splat(1)), @as(Vi32, @splat(0)));
+
+    // StringLike(402653316) → String(4)
+    const string_like: Vi32 = @splat(402653316);
+    const string_flag: Vi32 = @splat(4);
+    const s_str = s & string_like;
+    const t_str = t & string_flag;
+    const str_match = @select(i32, s_str != @as(Vi32, @splat(0)), t_str, @as(Vi32, @splat(0)));
+    result |= @select(i32, str_match != @as(Vi32, @splat(0)), @as(Vi32, @splat(1)), @as(Vi32, @splat(0)));
+
+    // NumberLike(296) → Number(8)
+    const num_like: Vi32 = @splat(296);
+    const num_flag: Vi32 = @splat(8);
+    const s_num = s & num_like;
+    const t_num = t & num_flag;
+    const num_match = @select(i32, s_num != @as(Vi32, @splat(0)), t_num, @as(Vi32, @splat(0)));
+    result |= @select(i32, num_match != @as(Vi32, @splat(0)), @as(Vi32, @splat(1)), @as(Vi32, @splat(0)));
+
+    // BigIntLike(2112) → BigInt(64)
+    const big_like: Vi32 = @splat(2112);
+    const big_flag: Vi32 = @splat(64);
+    const s_big = s & big_like;
+    const t_big = t & big_flag;
+    const big_match = @select(i32, s_big != @as(Vi32, @splat(0)), t_big, @as(Vi32, @splat(0)));
+    result |= @select(i32, big_match != @as(Vi32, @splat(0)), @as(Vi32, @splat(1)), @as(Vi32, @splat(0)));
+
+    // BooleanLike(528) → Boolean(16)
+    const bool_like: Vi32 = @splat(528);
+    const bool_flag: Vi32 = @splat(16);
+    const s_bool = s & bool_like;
+    const t_bool = t & bool_flag;
+    const bool_match = @select(i32, s_bool != @as(Vi32, @splat(0)), t_bool, @as(Vi32, @splat(0)));
+    result |= @select(i32, bool_match != @as(Vi32, @splat(0)), @as(Vi32, @splat(1)), @as(Vi32, @splat(0)));
+
+    // ESSymbolLike(12288) → ESSymbol(4096)
+    const sym_like: Vi32 = @splat(12288);
+    const sym_flag: Vi32 = @splat(4096);
+    const s_sym = s & sym_like;
+    const t_sym = t & sym_flag;
+    const sym_match = @select(i32, s_sym != @as(Vi32, @splat(0)), t_sym, @as(Vi32, @splat(0)));
+    result |= @select(i32, sym_match != @as(Vi32, @splat(0)), @as(Vi32, @splat(1)), @as(Vi32, @splat(0)));
+
+    return @as([SimdWidth]i32, result);
+}
+
+/// Batch check using SIMD — processes pairs in chunks of 8
+pub fn checkRelationBatchSimd(
+    type_flags: [*]const i32,
+    source_ids: [*]const i32,
+    target_ids: [*]const i32,
+    results: [*]i32,
+    count: usize,
+) void {
+    var i: usize = 0;
+    // SIMD path: process 8 pairs at a time
+    while (i + SimdWidth <= count) : (i += SimdWidth) {
+        var src_batch: [SimdWidth]u32 = undefined;
+        var tgt_batch: [SimdWidth]u32 = undefined;
+        inline for (0..SimdWidth) |j| {
+            src_batch[j] = if (source_ids[i + j] >= 0) @intCast(source_ids[i + j]) else 0;
+            tgt_batch[j] = if (target_ids[i + j] >= 0) @intCast(target_ids[i + j]) else 0;
+        }
+        const simd_results = checkRelationSimd(type_flags, src_batch, tgt_batch);
+        inline for (0..SimdWidth) |j| {
+            results[i + j] = simd_results[j];
+        }
+    }
+    // Scalar tail
+    while (i < count) : (i += 1) {
+        const raw_src = source_ids[i];
+        const raw_tgt = target_ids[i];
+        if (raw_src < 0 or raw_tgt < 0) {
+            results[i] = 0;
+        } else {
+            results[i] = checkRelation(type_flags, @intCast(raw_src), @intCast(raw_tgt));
+        }
+    }
+}
+
 // ============================================================
 // Thread Pool — pre-spawned workers, futex-based wake
 // ============================================================
