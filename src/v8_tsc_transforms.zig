@@ -15,9 +15,9 @@ const Transform = struct {
 pub const transforms = [_]Transform{
     // T1: createType → write flags to SAB-backed __pc_typeFlags + trigger async build
     .{ .needle = "typeCount++;\n    result.id = typeCount;", .replacement = "typeCount++;\n    result.id = typeCount;\n    if(typeof __pc_typeFlags!=='undefined'&&typeCount<262144){__pc_typeFlags[typeCount]=result.flags;if(result.objectFlags)__pc_objectFlags[typeCount]=result.objectFlags;if(typeCount===5000&&typeof __edgebox_trigger_build==='function')__edgebox_trigger_build(typeCount);}" },
-    // T2: isTypeRelatedTo → SAB flag fast-path for subtype widening.
-    // Compact: single bitmask check covers String←StringLike, Number←NumberLike,
-    // BigInt←BigIntLike, Boolean←BooleanLike, ESSymbol←ESSymbolLike, Any←*, *←Never.
+    // T2: isTypeRelatedTo → inline flag fast-path for safe primitive widening.
+    // Covers: Any←*, *←Never, StringLike→String, NumberLike→Number,
+    // BigIntLike→BigInt, BooleanLike→Boolean, ESSymbolLike→ESSymbol.
     .{ .needle = "function isTypeRelatedTo(source, target, relation) {\n    if (isFreshLiteralType(source)) {\n      source = source.regularType;\n    }\n    if (isFreshLiteralType(target)) {\n      target = target.regularType;\n    }\n    if (source === target) {\n      return true;\n    }", .replacement = "function isTypeRelatedTo(source, target, relation) {\n    if (isFreshLiteralType(source)) {\n      source = source.regularType;\n    }\n    if (isFreshLiteralType(target)) {\n      target = target.regularType;\n    }\n    if (source === target) {\n      return true;\n    }\n    var __tf=target.flags;if(__tf&1)return true;var __sf=source.flags;if(__sf&131072)return true;if(__sf&402653316&&__tf&4||__sf&296&&__tf&8||__sf&2112&&__tf&64||__sf&528&&__tf&16||__sf&12288&&__tf&4096)return true;" },
     // T3: getRelationKey → packed Smi (only when postFix is empty)
     .{ .needle = "isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : `${source.id},${target.id}${postFix}`", .replacement = "isTypeReferenceWithGenericArguments(source) && isTypeReferenceWithGenericArguments(target) ? getGenericTypeReferenceRelationKey(source, target, postFix, ignoreConstraints) : (!postFix&&source.id<32768&&target.id<32768) ? source.id * 32768 + target.id + 1 : `${source.id},${target.id}${postFix}`" },

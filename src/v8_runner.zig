@@ -401,14 +401,16 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         const sab_key = v8.StringApi.fromUtf8(isolate, "__pc_sab") orelse return;
         _ = v8.ObjectApi.set(global_obj, context, @ptrCast(sab_key), sab);
 
-        // Create typed array views on SAB
+        // Create typed array views on SAB — typeFlags, objectFlags, flagMap
         var init_buf: [1024]u8 = undefined;
         const init_js = std.fmt.bufPrint(&init_buf,
             "globalThis.__pc_typeFlags=new Int32Array(__pc_sab,0,{d});" ++
-                "globalThis.__pc_objectFlags=new Int32Array(__pc_sab,{d},{d});",
+                "globalThis.__pc_objectFlags=new Int32Array(__pc_sab,{d},{d});" ++
+                "globalThis.__pc_flagMap=new Int32Array(__pc_sab,{d},{d});",
             .{
-                v8_parallel_check.MAX_TYPES,
-                v8_parallel_check.MAX_TYPES * 4, v8_parallel_check.MAX_TYPES,
+                v8_parallel_check.MAX_TYPES, // typeFlags count
+                v8_parallel_check.MAX_TYPES * 4, v8_parallel_check.MAX_TYPES, // objectFlags offset+count
+                v8_parallel_check.FLAG_TABLE_OFFSET * 4, v8_parallel_check.FLAG_TABLE_ENTRIES, // flagMap offset+count
             },
         ) catch return;
         _ = v8.eval(isolate, context, init_js, "pc_init.js") catch {};

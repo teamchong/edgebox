@@ -31,7 +31,7 @@ pub const TOTAL_BYTES = TOTAL_I32 * @sizeOf(i32);
 
 const TYPE_FLAGS_OFFSET: usize = 0;
 const OBJ_FLAGS_OFFSET: usize = MAX_TYPES;
-const FLAG_TABLE_OFFSET: usize = MAX_TYPES * 2;
+pub const FLAG_TABLE_OFFSET: usize = MAX_TYPES * 2;
 const PAIRS_OFFSET: usize = MAX_TYPES * 2 + FLAG_TABLE_I32;
 const RESULTS_OFFSET: usize = MAX_TYPES * 2 + FLAG_TABLE_I32 + 2 * MAX_PAIRS;
 
@@ -273,7 +273,7 @@ pub fn parallelCheckCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) 
 // 64K entries × 3 i32 per entry = 768KB (fits in L2 cache).
 const FLAG_MAP_CAPACITY: usize = 65536; // power of 2 for fast modulo
 const FLAG_MAP_ENTRIES: usize = FLAG_MAP_CAPACITY * 3; // 3 i32 per entry: [sFlags, tFlags, result]
-const FLAG_TABLE_ENTRIES: usize = FLAG_MAP_ENTRIES;
+pub const FLAG_TABLE_ENTRIES: usize = FLAG_MAP_ENTRIES;
 
 fn getFlagTable() ?[*]i32 {
     const buf = getSharedBuffer() orelse return null;
@@ -380,8 +380,11 @@ var async_build_max_id: usize = 0;
 var async_build_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 fn asyncBuildWorker() void {
-    // Flag table build disabled — Zig-side flag table not consulted from JS.
-    // Keep thread infrastructure for future Zig-native parallel check.
+    const type_flags = getTypeFlags() orelse {
+        async_build_done.store(true, .release);
+        return;
+    };
+    buildFlagTable(type_flags, async_build_max_id);
     async_build_done.store(true, .release);
 }
 
@@ -401,12 +404,16 @@ pub fn precomputeCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) voi
         if (val > 0) max_id = @intCast(val);
     }
 
-    // Join any pending async thread
-    if (async_build_thread) |t| { t.join(); async_build_thread = null; }
+    // If async build completed with enough types, use it. Otherwise build sync.
+    if (async_build_done.load(.acquire) and async_build_max_id >= max_id) {
+        if (async_build_thread) |t| { t.join(); async_build_thread = null; }
+    } else {
+        if (async_build_thread) |t| { t.join(); async_build_thread = null; }
+        const type_flags = getTypeFlags() orelse { rv.setInt32(0); return; };
+        buildFlagTable(type_flags, max_id);
+    }
 
     // Pump V8 message loop — flush pending TurboFan background compilations.
-    // This is critical for cold start: TurboFan compiles hot functions on
-    // background threads, pumping drains the queue so optimized code is ready.
     if (v8.global_platform) |platform| {
         while (v8.pumpMessageLoop(platform, isolate)) {}
     }
