@@ -562,6 +562,24 @@ pub fn fileExistsFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c)
         return;
     }
 
+    // Fast negative: if the directory was fully scanned and path isn't in
+    // exists_cache, the file doesn't exist (no stat() syscall needed).
+    const dir = std.fs.path.dirname(path);
+    if (dir) |d| {
+        io_mutex.lock();
+        const dir_scanned = scanned_dirs.get(d) != null;
+        io_mutex.unlock();
+        if (dir_scanned) {
+            // Directory was scanned — path not in exists_cache = doesn't exist
+            const key = alloc.dupe(u8, path) catch path;
+            io_mutex.lock();
+            exists_cache.put(alloc, key, false) catch {};
+            io_mutex.unlock();
+            rv.setInt32(0);
+            return;
+        }
+    }
+
     const exists = blk: {
         _ = std.fs.cwd().statFile(path) catch break :blk false;
         break :blk true;
@@ -752,8 +770,10 @@ fn collectSourceFiles(dir_path: []const u8, paths: *std.ArrayListUnmanaged([]con
     }
 }
 
+/// Directories we've fully scanned — fileExists can skip stat() for paths in these dirs.
+var scanned_dirs: std.StringHashMapUnmanaged(void) = .{};
+
 /// Read files into raw_file_cache + exists_cache (for fast IO callbacks).
-/// Skips JSON-escape — the fast readFile callback uses raw content directly.
 fn prefetchWorker(paths: []const []const u8, start: usize, end: usize) void {
     for (start..end) |i| {
         const path = paths[i];
@@ -766,6 +786,32 @@ fn prefetchWorker(paths: []const []const u8, start: usize, end: usize) void {
         raw_file_cache.put(alloc, key, content) catch {};
         exists_cache.put(alloc, key, true) catch {};
         io_mutex.unlock();
+
+        // Mark directory as scanned — enables fast negative fileExists
+        const dir = std.fs.path.dirname(path) orelse continue;
+        io_mutex.lock();
+        const dir_already = scanned_dirs.get(dir) != null;
+        io_mutex.unlock();
+        if (!dir_already) {
+            // Scan directory listing — cache ALL entries (positive)
+            // Any path not in the listing is negative (doesn't exist)
+            var d = std.fs.cwd().openDir(dir, .{ .iterate = true }) catch continue;
+            defer d.close();
+            var iter = d.iterate();
+            while (iter.next() catch null) |entry| {
+                if (entry.kind != .file) continue;
+                const full = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, entry.name }) catch continue;
+                io_mutex.lock();
+                if (exists_cache.get(full) == null) {
+                    exists_cache.put(alloc, full, true) catch {};
+                }
+                io_mutex.unlock();
+            }
+            const dir_key = alloc.dupe(u8, dir) catch continue;
+            io_mutex.lock();
+            scanned_dirs.put(alloc, dir_key, {}) catch {};
+            io_mutex.unlock();
+        }
     }
 }
 

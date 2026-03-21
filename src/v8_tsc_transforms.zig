@@ -59,10 +59,8 @@ pub const transforms = [_]Transform{
     // T21: getObjectFlags SOA — DISABLED: objectFlags is mutated 39 times after createType,
     // SOA column has stale data. Reading stale objectFlags causes wrong type resolution.
     // .{ .needle = "function getObjectFlags(type) {", .replacement = "..." },
-    // checkSourceFile: for loop + pump TurboFan during early Check phase.
-    // Pump before start AND every 10 files during the first 50 files.
-    // TurboFan background compilations complete during this window.
-    .{ .needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));", .replacement = "{if(typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);const __files=host.getSourceFiles();for(let __i=0;__i<__files.length;__i++){checkSourceFileWithEagerDiagnostics(__files[__i]);if(__i<50&&__i%10===9&&typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);}}" },
+    // checkSourceFile: for loop + pump TurboFan every 5 files during early Check.
+    .{ .needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));", .replacement = "{if(typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);const __files=host.getSourceFiles();for(let __i=0;__i<__files.length;__i++){checkSourceFileWithEagerDiagnostics(__files[__i]);if(__i<30&&__i%5===4&&typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);}}" },
 };
 
 /// Apply all TSC source transforms in a single pass.
