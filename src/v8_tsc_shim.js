@@ -15,9 +15,16 @@
     globalThis.__pc_objectFlags = new Int32Array(262144);
   }
   // Hash map flag table for isSimpleTypeRelatedTo lookup
-  // 64K entries × 3 Int32 per entry = 768KB
   if (typeof globalThis.__pc_flagMap === 'undefined') {
     globalThis.__pc_flagMap = new Int32Array(65536 * 3);
+  }
+  // SOA columns for Node objects (indexed by node.id)
+  if (typeof globalThis.__pc_nodeKind === 'undefined') {
+    globalThis.__pc_nodeKind = new Int32Array(262144);
+  }
+  // SOA columns for Symbol objects (indexed by symbol.id)
+  if (typeof globalThis.__pc_symFlags === 'undefined') {
+    globalThis.__pc_symFlags = new Int32Array(262144);
   }
 
   // 2-way associative relation cache — zero-copy flat array
