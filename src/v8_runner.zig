@@ -410,8 +410,9 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         _ = v8.eval(isolate, context, argv_fix, "argv_fix.js") catch {};
     }
 
-    // Inject TSC shim — skip for freeze-compiled modules (they have their own)
-    if (!is_freeze_compiled) {
+    // Inject TSC shim — skip for freeze-compiled modules AND for TSC snapshot path
+    // (snapshot path combines shim init into tsc_fast_js to reduce eval calls)
+    if (!is_freeze_compiled and !(is_tsc and use_snapshot and !has_warm_cache)) {
         const tsc_shim_code = @embedFile("v8_tsc_shim.js");
         _ = v8.eval(isolate, context, tsc_shim_code, "v8_tsc_shim.js") catch {};
     }
@@ -472,6 +473,10 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         const tsc_fast_js =
             \\(function() {
             \\  if (typeof globalThis.ts === 'undefined' || !ts.executeCommandLine) return;
+            \\  // Inline shim (avoid separate v8.eval call)
+            \\  globalThis.__FastRelationCache = Map;
+            \\  globalThis.__typesById = [];
+            \\  globalThis.__sfCache = Object.create(null);
             \\  var args = process.argv.slice(2).filter(function(a){return a!=='--serve';});
             \\  // In --serve mode, auto-inject --incremental for fast warm runs.
             \\  // Without serve, let the user control incremental explicitly.
