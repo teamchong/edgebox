@@ -23,6 +23,7 @@ pub var prefetch_complete: bool = false;
 /// Set to true in worker threads to skip PumpMessageLoop
 pub threadlocal var is_worker_thread: bool = false;
 
+
 /// Pump throttle — only call pumpMessageLoop every N IO callbacks.
 /// During Check phase, TurboFan has already compiled hot functions;
 /// pumping on every IO call wastes ~100µs per call × thousands of calls.
@@ -572,8 +573,10 @@ pub fn readFileFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) v
     const written = v8.StringApi.writeUtf8(str, isolate, &path_buf);
     const path = path_buf[0..written];
 
-    // Join speculative prefetch only if one is pending
-    if (prefetch_thread) |t| { t.join(); prefetch_thread = null; }
+    // Join speculative prefetch only if one is pending (skip on worker threads)
+    if (!is_worker_thread) {
+        if (prefetch_thread) |t| { t.join(); prefetch_thread = null; }
+    }
 
     // Check raw content cache — skip mutex after prefetch completes (single-threaded)
     const cached_content = if (prefetch_complete)
@@ -672,7 +675,9 @@ pub fn fileExistsFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c)
     // Speculative prefetch: if file exists and is a source file,
     // start reading it on a background Zig thread.
     // TSC pattern: fileExists(path) → true → readFile(path)
-    if (exists and (std.mem.endsWith(u8, path, ".ts") or
+    // Speculative prefetch: if file exists and is source, pre-read on background thread.
+    // Skip on worker threads — they should hit the shared cache.
+    if (!is_worker_thread and exists and (std.mem.endsWith(u8, path, ".ts") or
         std.mem.endsWith(u8, path, ".tsx") or
         std.mem.endsWith(u8, path, ".d.ts") or
         std.mem.endsWith(u8, path, ".js") or
@@ -802,10 +807,13 @@ fn handleRequest(msg: []const u8) ![]const u8 {
         // Defer exit: save exit code, throw to unwind back to runner
         // so code cache can be saved before termination.
         deferred_exit_code = @intCast(code);
-        flushStdout();
-        flushStderr();
-        // Wait for async stdout flush to complete before exit
-        if (stdout_flush_thread) |t| { t.join(); stdout_flush_thread = null; }
+        // Skip flush on worker threads — worker function calls flushAll() at end.
+        // Flushing here can deadlock (stdout_mutex vs io_mutex across threads).
+        if (!is_worker_thread) {
+            flushStdout();
+            flushStderr();
+            if (stdout_flush_thread) |t| { t.join(); stdout_flush_thread = null; }
+        }
         return "{\"ok\":true,\"deferred_exit\":true}";
     } else if (std.mem.eql(u8, req.op, "argv")) {
         return opArgv();
@@ -914,11 +922,15 @@ var file_cache: std.StringHashMapUnmanaged([]const u8) = .{};
 fn opReadFile(req: Request) ![]const u8 {
     const path = req.path orelse return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"path required\"}}", .{});
 
-    // Check cache first (lock-free read for cache hits)
-    io_mutex.lock();
-    const cached = file_cache.get(path);
-    io_mutex.unlock();
-    if (cached) |c| return c;
+    // Lock-free read when prefetch is frozen (cache is read-only)
+    if (prefetch_complete) {
+        if (file_cache.get(path)) |c| return c;
+    } else {
+        io_mutex.lock();
+        const cached = file_cache.get(path);
+        io_mutex.unlock();
+        if (cached) |c| return c;
+    }
 
     const file = std.fs.cwd().openFile(path, .{}) catch |err| {
         return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"{s}\",\"code\":\"ENOENT\"}}", .{@errorName(err)});
@@ -1004,10 +1016,14 @@ var stat_cache: std.StringHashMapUnmanaged([]const u8) = .{};
 fn opStat(req: Request) ![]const u8 {
     const path = req.path orelse return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"path required\"}}", .{});
 
-    io_mutex.lock();
-    const stat_cached = stat_cache.get(path);
-    io_mutex.unlock();
-    if (stat_cached) |cached| return cached;
+    if (prefetch_complete) {
+        if (stat_cache.get(path)) |cached| return cached;
+    } else {
+        io_mutex.lock();
+        const stat_cached = stat_cache.get(path);
+        io_mutex.unlock();
+        if (stat_cached) |cached| return cached;
+    }
 
     const stat = std.fs.cwd().statFile(path) catch |err| {
         return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"{s}\",\"code\":\"ENOENT\"}}", .{@errorName(err)});
@@ -1112,7 +1128,12 @@ var exists_cache: std.StringHashMapUnmanaged(bool) = .{};
 fn opExists(req: Request) ![]const u8 {
     const path = req.path orelse return try std.fmt.allocPrint(alloc, "{{\"ok\":false,\"error\":\"path required\"}}", .{});
 
-    // Check cache (lock-free read for cache hits)
+    // Lock-free read when prefetch is frozen
+    if (prefetch_complete) {
+        if (exists_cache.get(path)) |exists| {
+            return if (exists) "{\"ok\":true,\"exists\":true}" else "{\"ok\":true,\"exists\":false}";
+        }
+    }
     io_mutex.lock();
     const cached_exists = exists_cache.get(path);
     io_mutex.unlock();
