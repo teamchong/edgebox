@@ -145,6 +145,11 @@ pub fn main() !void {
             }
             if (std.mem.endsWith(u8, arg, ".ts") or std.mem.endsWith(u8, arg, ".tsx")) {
                 v8_io.prefetchFile(arg);
+                // Also scan the file's directory for negative caching
+                const fdir = std.fs.path.dirname(arg);
+                if (fdir) |fd| {
+                    v8_io.queueDirScan(fd);
+                }
             }
         }
         // Start ALL prefetch on background threads — runs during V8 init

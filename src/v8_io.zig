@@ -416,6 +416,19 @@ pub fn queueDirectoryPrefetch(dir_path: []const u8) void {
     collectSourceFiles(dir_path, &prefetch_file_list);
 }
 
+/// Queue a directory for scanning (populate exists_cache + scanned_dirs).
+/// No file content is read — just the directory listing.
+var dir_scan_list: std.ArrayListUnmanaged([]const u8) = .{};
+
+pub fn queueDirScan(dir_path: []const u8) void {
+    // Deduplicate
+    for (dir_scan_list.items) |d| {
+        if (std.mem.eql(u8, d, dir_path)) return;
+    }
+    const key = alloc.dupe(u8, dir_path) catch return;
+    dir_scan_list.append(alloc, key) catch {};
+}
+
 /// Queue a file for batch prefetch.
 pub fn prefetchFile(path: []const u8) void {
     const key = alloc.dupe(u8, path) catch return;
@@ -460,12 +473,38 @@ pub fn startBatchPrefetch() void {
     }
 }
 
-/// Wait for batch prefetch to complete.
+/// Wait for batch prefetch to complete, then scan extra directories.
 pub fn waitBatchPrefetch() void {
     for (0..batch_thread_count) |i| {
         if (batch_threads[i]) |t| { t.join(); batch_threads[i] = null; }
     }
     batch_thread_count = 0;
+
+    // Scan extra directories (from queueDirScan) for negative caching.
+    // These dirs weren't part of the file prefetch — just scan listings.
+    for (dir_scan_list.items) |dir| {
+        io_mutex.lock();
+        const already = scanned_dirs.get(dir) != null;
+        io_mutex.unlock();
+        if (already) continue;
+
+        var d = std.fs.cwd().openDir(dir, .{ .iterate = true }) catch continue;
+        defer d.close();
+        var iter = d.iterate();
+        while (iter.next() catch null) |entry| {
+            if (entry.kind != .file) continue;
+            const full = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, entry.name }) catch continue;
+            io_mutex.lock();
+            if (exists_cache.get(full) == null) {
+                exists_cache.put(alloc, full, true) catch {};
+            }
+            io_mutex.unlock();
+        }
+        const dir_key = alloc.dupe(u8, dir) catch continue;
+        io_mutex.lock();
+        scanned_dirs.put(alloc, dir_key, {}) catch {};
+        io_mutex.unlock();
+    }
 }
 
 pub fn readFileFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
