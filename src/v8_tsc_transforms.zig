@@ -13,8 +13,8 @@ const Transform = struct {
 
 /// All TSC source transforms. Order matters — first match wins.
 pub const transforms = [_]Transform{
-    // T1: createType → write flags to SAB-backed __pc_typeFlags + trigger async build
-    .{ .needle = "typeCount++;\n    result.id = typeCount;", .replacement = "typeCount++;\n    result.id = typeCount;\n    if(typeof __pc_typeFlags!=='undefined'&&typeCount<262144){__pc_typeFlags[typeCount]=result.flags;if(result.objectFlags)__pc_objectFlags[typeCount]=result.objectFlags;if(typeCount===5000&&typeof __edgebox_trigger_build==='function')__edgebox_trigger_build(typeCount);}" },
+    // T1: createType → write objectFlags to SAB for T-SOA2 property count check
+    .{ .needle = "typeCount++;\n    result.id = typeCount;", .replacement = "typeCount++;\n    result.id = typeCount;\n    if(typeof __pc_objectFlags!=='undefined'&&typeCount<131072&&result.objectFlags)__pc_objectFlags[typeCount]=result.objectFlags;" },
     // T2: isTypeRelatedTo → inline flag fast-path for safe primitive widening.
     // Handles: Any←*, *←Never, StringLike→String, NumberLike→Number,
     // BigIntLike→BigInt, BooleanLike→Boolean, ESSymbolLike→ESSymbol.
