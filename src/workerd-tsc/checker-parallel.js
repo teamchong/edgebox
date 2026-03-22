@@ -1,5 +1,7 @@
 import './bootstrap.js';
-import ts from './typescript.js';
+// TypeScript loaded as CommonJS — sets globalThis.ts
+import './typescript.js';
+var ts = globalThis.ts;
 
 // Pre-check at module init — zero JSON in hot path
 (function() {
