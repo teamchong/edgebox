@@ -119,7 +119,7 @@ fn handleRequest(request: []const u8) ![]u8 {
             if (!first) try result.append(alloc, ',');
             first = false;
             try result.append(alloc, '"');
-            try result.appendSlice(alloc, entry.name);
+            try jsonEscape(result.writer(alloc), entry.name);
             try result.append(alloc, '"');
         }
         try result.appendSlice(alloc, "]}");
@@ -127,7 +127,7 @@ fn handleRequest(request: []const u8) ![]u8 {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const cwd = std.fs.cwd().realpath(".", &buf) catch ".";
         try result.appendSlice(alloc, "{\"ok\":true,\"data\":\"");
-        try result.appendSlice(alloc, cwd);
+        try jsonEscape(result.writer(alloc), cwd);
         try result.appendSlice(alloc, "\"}");
     } else if (std.mem.eql(u8, op, "argv")) {
         var args = try std.process.argsWithAllocator(alloc);
@@ -288,31 +288,31 @@ export fn edgebox_register_member(
 
 // ── SIMD Structural Check ──
 
-var check_total: u64 = 0;
-var check_flag_hits: u64 = 0;
-var check_structural_hits: u64 = 0;
+var check_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var check_flag_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var check_structural_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
 export fn edgebox_check_stats(out_total: *u64, out_flag: *u64, out_struct: *u64) void {
-    out_total.* = check_total;
-    out_flag.* = check_flag_hits;
-    out_struct.* = check_structural_hits;
+    out_total.* = check_total.load(.monotonic);
+    out_flag.* = check_flag_hits.load(.monotonic);
+    out_struct.* = check_structural_hits.load(.monotonic);
 }
 
 export fn edgebox_check_structural(source_id: u32, target_id: u32) u8 {
-    check_total += 1;
+    _ = check_total.fetchAdd(1, .monotonic);
     if (source_id >= type_count or target_id >= type_count) return 2;
 
     const src_flags = col_type_flags[source_id];
     const tgt_flags = col_type_flags[target_id];
 
     // Flag fast path
-    if (tgt_flags & 1 != 0) { check_flag_hits += 1; return 1; } // Any
-    if (src_flags & 131072 != 0) { check_flag_hits += 1; return 1; } // Undefined
-    if (tgt_flags & 2 != 0) { check_flag_hits += 1; return 1; } // Unknown
-    if (src_flags & (128 | 4) != 0 and tgt_flags & 4 != 0) { check_flag_hits += 1; return 1; } // String
-    if (src_flags & (256 | 8) != 0 and tgt_flags & 8 != 0) { check_flag_hits += 1; return 1; } // Number
-    if (src_flags & (512 | 16) != 0 and tgt_flags & 16 != 0) { check_flag_hits += 1; return 1; } // Boolean
-    if (src_flags & (2048 | 64) != 0 and tgt_flags & 64 != 0) { check_flag_hits += 1; return 1; } // BigInt
+    if (tgt_flags & 1 != 0) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; } // Any
+    if (src_flags & 131072 != 0) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; } // Undefined
+    if (tgt_flags & 2 != 0) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; } // Unknown
+    if (src_flags & (128 | 4) != 0 and tgt_flags & 4 != 0) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; } // String
+    if (src_flags & (256 | 8) != 0 and tgt_flags & 8 != 0) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; } // Number
+    if (src_flags & (512 | 16) != 0 and tgt_flags & 16 != 0) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; } // Boolean
+    if (src_flags & (2048 | 64) != 0 and tgt_flags & 64 != 0) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; } // BigInt
 
     // Structural: check member name overlap
     const src_offset = col_type_member_offset[source_id];
@@ -339,8 +339,8 @@ export fn edgebox_check_structural(source_id: u32, target_id: u32) u8 {
         if (!found) return 0;
     }
 
-    check_structural_hits += 1;
-    return if (matched == tgt_count) 1 else 2;
+    _ = check_structural_hits.fetchAdd(1, .monotonic);
+    return 1;
 }
 
 export fn edgebox_type_stats(out_types: *u32, out_members: *u32, out_strings: *u32) void {
