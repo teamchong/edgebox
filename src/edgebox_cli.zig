@@ -174,45 +174,34 @@ fn runTsc(args: []const []const u8) u8 {
     };
     defer stream.close();
 
-    // Send POST with project cwd
-    const body = std.fmt.allocPrint(alloc, "{{\"cwd\":\"{s}\"}}", .{cwd}) catch return 1;
-    defer alloc.free(body);
-    const header = std.fmt.allocPrint(alloc, "POST / HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n", .{body.len}) catch return 1;
-    defer alloc.free(header);
-    stream.writeAll(header) catch return 1;
-    stream.writeAll(body) catch return 1;
+    // Send POST request
+    const request = std.fmt.allocPrint(alloc,
+        "POST / HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ config.len, config },
+    ) catch return 1;
+    defer alloc.free(request);
+    stream.writeAll(request) catch return 1;
 
-    // Read full response (workerd sends small responses)
-    var response_buf: [1024 * 1024]u8 = undefined; // 1MB max
-    var total_read: usize = 0;
-    while (total_read < response_buf.len) {
-        const n = stream.read(response_buf[total_read..]) catch break;
+    // Shutdown write side — signals to workerd we're done sending
+    std.posix.shutdown(stream.handle, .send) catch {};
+
+    // Read response until connection closes (HTTP/1.0 = close after response)
+    var headers_done = false;
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const n = stream.read(&buf) catch break;
         if (n == 0) break;
-        total_read += n;
-        // Check if we have headers + full body
-        if (std.mem.indexOf(u8, response_buf[0..total_read], "\r\n\r\n")) |hdr_end| {
-            // Parse Content-Length from headers
-            const headers = response_buf[0..hdr_end];
-            var cl: usize = 0;
-            var it = std.mem.splitSequence(u8, headers, "\r\n");
-            while (it.next()) |line| {
-                if (line.len > 16 and (line[0] == 'C' or line[0] == 'c')) {
-                    if (std.ascii.startsWithIgnoreCase(line, "content-length: ")) {
-                        cl = std.fmt.parseInt(usize, line[16..], 10) catch 0;
-                    }
+        const data = buf[0..n];
+        if (!headers_done) {
+            if (std.mem.indexOf(u8, data, "\r\n\r\n")) |pos| {
+                headers_done = true;
+                if (pos + 4 < n) {
+                    _ = std.posix.write(1, data[pos + 4 ..]) catch {};
                 }
             }
-            const body_start = hdr_end + 4;
-            const body_so_far = total_read - body_start;
-            if (cl > 0 and body_so_far >= cl) break; // Got full body
-            if (cl == 0 and body_so_far > 0) break; // No CL but have some body
+        } else {
+            _ = std.posix.write(1, data) catch {};
         }
-    }
-
-    // Output body (skip headers)
-    if (std.mem.indexOf(u8, response_buf[0..total_read], "\r\n\r\n")) |hdr_end| {
-        const body = response_buf[hdr_end + 4 .. total_read];
-        _ = std.posix.write(1, body) catch {};
     }
 
     _ = args; // TODO: pass args to TSC via project config
