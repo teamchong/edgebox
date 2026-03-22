@@ -1,28 +1,48 @@
 diff --git a/src/workerd/api/global-scope.h b/src/workerd/api/global-scope.h
-index 3f59a4f53..7ea0cd303 100644
+index 3f59a4f53..a35ab482d 100644
 --- a/src/workerd/api/global-scope.h
 +++ b/src/workerd/api/global-scope.h
-@@ -488,6 +488,16 @@ class Immediate final: public jsg::Object {
+@@ -488,6 +488,35 @@ class Immediate final: public jsg::Object {
    TimeoutId timeoutId;
  };
  
 +extern "C" {
++  // Legacy JSON fallback
 +  const char* edgebox_io_sync(const char* request, int request_len, int* response_len);
 +  void edgebox_io_free(const char* ptr, int len);
++  // fs
++  const char* edgebox_read_file(const char* path, int path_len, int* out_len);
++  int edgebox_write_file(const char* path, int path_len, const char* data, int data_len);
++  int edgebox_file_exists(const char* path, int path_len);
++  int edgebox_dir_exists(const char* path, int path_len);
++  const char* edgebox_stat(const char* path, int path_len, int* out_len);
++  const char* edgebox_readdir(const char* path, int path_len, int* out_len);
++  const char* edgebox_realpath(const char* path, int path_len, int* out_len);
++  const char* edgebox_cwd(int* out_len);
++  // process
++  void edgebox_exit(int code);
++  // stdout/stderr
++  void edgebox_write_stdout(const char* data, int len);
++  void edgebox_write_stderr(const char* data, int len);
++  // crypto
++  int edgebox_hash(const char* algo, int algo_len, const char* data, int data_len, char* out, int out_cap);
++  int edgebox_random_bytes(char* out, int out_len);
++  // memory
++  void edgebox_free(const char* ptr, int len);
++  // type system
 +  void edgebox_register_type(unsigned int type_id, unsigned int flags, unsigned int object_flags);
 +  void edgebox_register_member(unsigned int type_id, const char* name, int name_len, unsigned int member_type_id, unsigned int member_flags);
 +  unsigned char edgebox_check_structural(unsigned int source_id, unsigned int target_id);
-+  void edgebox_write_stdout(const char* data, int len);
-+  void edgebox_write_stderr(const char* data, int len);
 +}
 +
  // Global object API exposed to JavaScript.
  class ServiceWorkerGlobalScope: public WorkerGlobalScope {
   public:
-@@ -621,6 +631,30 @@ class ServiceWorkerGlobalScope: public WorkerGlobalScope {
+@@ -621,6 +650,107 @@ class ServiceWorkerGlobalScope: public WorkerGlobalScope {
      return JSG_THIS;
    }
  
++  // ── Legacy JSON fallback ──
 +  kj::String __edgebox_io_sync(kj::String request) {
 +    int response_len = 0;
 +    const char* response = edgebox_io_sync(request.cStr(), request.size(), &response_len);
@@ -31,6 +51,88 @@ index 3f59a4f53..7ea0cd303 100644
 +    edgebox_io_free(response, response_len);
 +    return result;
 +  }
++  // ── fs: zero-copy typed methods ──
++  kj::String __edgebox_read_file(kj::String path) {
++    int out_len = 0;
++    const char* data = edgebox_read_file(path.cStr(), path.size(), &out_len);
++    if (data == nullptr || out_len <= 0) return kj::str("");
++    return kj::str(kj::StringPtr(data, out_len));
++    // Note: read_file returns cached pointer, do NOT free
++  }
++  double __edgebox_write_file(kj::String path, kj::String data) {
++    return (double)edgebox_write_file(path.cStr(), path.size(), data.cStr(), data.size());
++  }
++  double __edgebox_file_exists(kj::String path) {
++    return (double)edgebox_file_exists(path.cStr(), path.size());
++  }
++  double __edgebox_dir_exists(kj::String path) {
++    return (double)edgebox_dir_exists(path.cStr(), path.size());
++  }
++  kj::String __edgebox_stat(kj::String path) {
++    int out_len = 0;
++    const char* data = edgebox_stat(path.cStr(), path.size(), &out_len);
++    if (data == nullptr || out_len <= 0) return kj::str("");
++    auto result = kj::str(kj::StringPtr(data, out_len));
++    edgebox_free(data, out_len);
++    return result;
++  }
++  kj::String __edgebox_readdir(kj::String path) {
++    int out_len = 0;
++    const char* data = edgebox_readdir(path.cStr(), path.size(), &out_len);
++    if (data == nullptr || out_len <= 0) return kj::str("[]");
++    auto result = kj::str(kj::StringPtr(data, out_len));
++    edgebox_free(data, out_len);
++    return result;
++  }
++  kj::String __edgebox_realpath(kj::String path) {
++    int out_len = 0;
++    const char* data = edgebox_realpath(path.cStr(), path.size(), &out_len);
++    if (data == nullptr || out_len <= 0) return kj::str(path);
++    auto result = kj::str(kj::StringPtr(data, out_len));
++    edgebox_free(data, out_len);
++    return result;
++  }
++  kj::String __edgebox_cwd() {
++    int out_len = 0;
++    const char* data = edgebox_cwd(&out_len);
++    if (data == nullptr || out_len <= 0) return kj::str("/");
++    auto result = kj::str(kj::StringPtr(data, out_len));
++    edgebox_free(data, out_len);
++    return result;
++  }
++  // ── process ──
++  void __edgebox_exit(double code) {
++    edgebox_exit((int)code);
++  }
++  // ── stdout/stderr ──
++  void __edgebox_write_stdout(kj::String data) {
++    edgebox_write_stdout(data.cStr(), data.size());
++  }
++  void __edgebox_write_stderr(kj::String data) {
++    edgebox_write_stderr(data.cStr(), data.size());
++  }
++  // ── crypto ──
++  kj::String __edgebox_hash(kj::String algo, kj::String data) {
++    char out[128]; // max SHA-512 hex = 128 chars
++    int len = edgebox_hash(algo.cStr(), algo.size(), data.cStr(), data.size(), out, 128);
++    if (len <= 0) return kj::str("");
++    return kj::str(kj::StringPtr(out, len));
++  }
++  kj::String __edgebox_random_bytes(double size) {
++    int n = (int)size;
++    if (n <= 0 || n > 65536) return kj::str("");
++    char buf[65536];
++    edgebox_random_bytes(buf, n);
++    // Return as hex string
++    char hex[131072];
++    const char* h = "0123456789abcdef";
++    for (int i = 0; i < n; i++) {
++      hex[i*2] = h[(unsigned char)buf[i] >> 4];
++      hex[i*2+1] = h[(unsigned char)buf[i] & 0xf];
++    }
++    return kj::str(kj::StringPtr(hex, n*2));
++  }
++  // ── type system ──
 +  void __edgebox_register_type(double id, double flags) {
 +    edgebox_register_type((unsigned int)id, (unsigned int)flags, 0);
 +  }
@@ -40,17 +142,11 @@ index 3f59a4f53..7ea0cd303 100644
 +  double __edgebox_check_structural(double sourceId, double targetId) {
 +    return (double)edgebox_check_structural((unsigned int)sourceId, (unsigned int)targetId);
 +  }
-+  void __edgebox_write_stdout(kj::String data) {
-+    edgebox_write_stdout(data.cStr(), data.size());
-+  }
-+  void __edgebox_write_stderr(kj::String data) {
-+    edgebox_write_stderr(data.cStr(), data.size());
-+  }
 +
    // Implemented in global-scope.c++ to avoid including crypto.h
    jsg::Ref<Crypto> getCrypto(jsg::Lock& js);
  
-@@ -685,6 +719,12 @@ class ServiceWorkerGlobalScope: public WorkerGlobalScope {
+@@ -685,6 +815,27 @@ class ServiceWorkerGlobalScope: public WorkerGlobalScope {
  
      JSG_METHOD(btoa);
      JSG_METHOD(atob);
@@ -58,8 +154,23 @@ index 3f59a4f53..7ea0cd303 100644
 +    JSG_METHOD(__edgebox_register_type);
 +    JSG_METHOD(__edgebox_register_member);
 +    JSG_METHOD(__edgebox_check_structural);
++    // fs
++    JSG_METHOD(__edgebox_read_file);
++    JSG_METHOD(__edgebox_write_file);
++    JSG_METHOD(__edgebox_file_exists);
++    JSG_METHOD(__edgebox_dir_exists);
++    JSG_METHOD(__edgebox_stat);
++    JSG_METHOD(__edgebox_readdir);
++    JSG_METHOD(__edgebox_realpath);
++    JSG_METHOD(__edgebox_cwd);
++    // process
++    JSG_METHOD(__edgebox_exit);
++    // stdout/stderr
 +    JSG_METHOD(__edgebox_write_stdout);
 +    JSG_METHOD(__edgebox_write_stderr);
++    // crypto
++    JSG_METHOD(__edgebox_hash);
++    JSG_METHOD(__edgebox_random_bytes);
  
      JSG_METHOD(setTimeout);
      JSG_METHOD(clearTimeout);
