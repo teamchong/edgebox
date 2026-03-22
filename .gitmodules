@@ -10,3 +10,6 @@
 [submodule "vendor/binaryen"]
 	path = vendor/binaryen
 	url = https://github.com/WebAssembly/binaryen.git
+[submodule "vendor/workerd"]
+	path = vendor/workerd
+	url = https://github.com/cloudflare/workerd.git
