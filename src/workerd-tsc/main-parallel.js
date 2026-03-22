@@ -1,6 +1,11 @@
 import './bootstrap.js';
 import ts from './typescript.js';
 
+// Cache program on main too
+var cachedProgram = null;
+var cachedRootKey = '';
+var cachedSourceFiles = null;
+
 export default {
   async fetch(request, env) {
     var body = await request.json().catch(function() { return {}; });
@@ -17,12 +22,25 @@ export default {
       var configFile = ts.readConfigFile(configPath, ts.sys.readFile);
       var parsedConfig = ts.parseJsonConfigFileContent(configFile.config, ts.sys, projectDir);
 
-      var parseStart = Date.now();
-      var program = ts.createProgram(parsedConfig.fileNames, parsedConfig.options);
-      var sourceFiles = program.getSourceFiles();
-      var parseTime = Date.now() - parseStart;
+      var rootKey = parsedConfig.fileNames.join(',');
+      var parseTime;
+      var sourceFiles;
 
-      // Collect available checkers
+      if (cachedProgram && cachedRootKey === rootKey) {
+        // Reuse cached
+        parseTime = 0;
+        sourceFiles = cachedSourceFiles;
+      } else {
+        var parseStart = Date.now();
+        var program = ts.createProgram(parsedConfig.fileNames, parsedConfig.options);
+        sourceFiles = program.getSourceFiles();
+        cachedProgram = program;
+        cachedRootKey = rootKey;
+        cachedSourceFiles = sourceFiles;
+        parseTime = Date.now() - parseStart;
+      }
+
+      // Collect checkers
       var checkers = [];
       if (env.CHECKER_0) checkers.push(env.CHECKER_0);
       if (env.CHECKER_1) checkers.push(env.CHECKER_1);
@@ -63,10 +81,9 @@ export default {
       var workerTimes = [];
       for (var r = 0; r < results.length; r++) {
         if (results[r].diagnostics) allDiags = allDiags.concat(results[r].diagnostics);
-        workerTimes.push({parse: results[r].parseTime, check: results[r].checkTime, files: results[r].filesChecked});
+        workerTimes.push({parse: results[r].parseTime, check: results[r].checkTime, files: results[r].filesChecked, cached: results[r].cached});
       }
 
-      // Dedup
       var seen = {};
       var unique = [];
       for (var d = 0; d < allDiags.length; d++) {
