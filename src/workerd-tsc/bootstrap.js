@@ -87,8 +87,15 @@ var _fs = {
     return entries;
   },
   realpathSync: Object.assign(function(p) { return __edgebox_realpath(String(p)); }, { native: function(p) { return __edgebox_realpath(String(p)); } }),
+  openSync: function() { return -1; },
+  closeSync: function() {},
   watchFile: function() {}, unwatchFile: function() {},
   watch: function() { return { close: function(){} }; },
+  mkdirSync: function() {},
+  rmdirSync: function() {},
+  unlinkSync: function() {},
+  chmodSync: function() {},
+  accessSync: function(p) { if (!__edgebox_file_exists(String(p))) { var e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; } },
 };
 
 // ── path ──

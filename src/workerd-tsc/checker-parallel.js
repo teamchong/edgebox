@@ -55,6 +55,7 @@ var ts = globalThis.ts || globalThis.module.exports;
       var tsLibDir = __edgebox_cwd() + '/node_modules/typescript/lib';
       ts.sys.getExecutingFilePath = function() { return tsLibDir + '/typescript.js'; };
       ts.sys.write = function(s) { __edgebox_write_stdout(String(s)); };
+      ts.sys.writeFile = function(p, data) { __edgebox_write_file(resolvePath(p), data); };
       ts.sys.writeOutputIsTTY = function() { return false; };
       ts.sys.exit = function(code) { __edgebox_exit(code || 0); };
     }
