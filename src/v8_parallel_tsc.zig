@@ -98,7 +98,8 @@ fn checkWorkerFn(ctx: *CheckWorkerCtx) void {
     ) catch return;
     _ = v8.eval(iso, context, init_js, "check_worker_init.js") catch {};
 
-    // Run TSC — createProgram reads from Zig cache
+    // Workers run same tsc_fast_js as main (with transforms for sharding).
+    // Transforms shard the eager check loop + getDiagnosticsHelper.
     const t0 = std.time.milliTimestamp();
     std.debug.print("[worker-{d}] start (+{d}ms)\n", .{ ctx.worker_id, t0 - g_start_time });
     {
@@ -124,12 +125,13 @@ pub fn spawnCheckWorkersCallback(info: *const v8.FunctionCallbackInfo) callconv(
 
     if (g_worker_count <= 1) return;
 
-    std.debug.print("[parallel-tsc] spawning {d} workers (after createProgram)\n", .{g_worker_count - 1});
+    std.debug.print("[parallel-tsc] spawning {d} workers (after createProgram)\n", .{g_worker_count});
 
     // Freeze IO caches — workers can read lock-free
     v8_io.prefetch_complete = true;
 
-    for (1..g_worker_count) |i| {
+    // Spawn ALL workers (0..N). Main exits early, workers handle all checking.
+    for (0..g_worker_count) |i| {
         g_ctxs[i] = .{
             .worker_id = i,
             .worker_count = g_worker_count,

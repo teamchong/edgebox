@@ -71,7 +71,7 @@ pub const transforms = [_]Transform{
     // adds write overhead (~1.3M extra writes for 66K types) that cancels the read gain.
     // T-PARALLEL: Spawn workers AFTER main's createProgram.
     // All workers have full programs — correct diagnostics.
-    .{ .needle = "const program = createProgram(programOptions);\n  const exitStatus = emitFilesAndReportErrorsAndGetExitStatus(", .replacement = "const program = createProgram(programOptions);\n  if(typeof __edgebox_spawn_check_workers==='function')__edgebox_spawn_check_workers();\n  const exitStatus = emitFilesAndReportErrorsAndGetExitStatus(" },
+    .{ .needle = "const program = createProgram(programOptions);\n  const exitStatus = emitFilesAndReportErrorsAndGetExitStatus(", .replacement = "const program = createProgram(programOptions);\n  if(typeof __edgebox_spawn_check_workers==='function'&&typeof __edgebox_worker_count!=='undefined'&&__edgebox_worker_count>1){__edgebox_spawn_check_workers();process.exit(typeof __edgebox_parallel_exit!=='undefined'?__edgebox_parallel_exit:0);}\n  const exitStatus = emitFilesAndReportErrorsAndGetExitStatus(" },
     // T-SHARD-DIAGS: Shard getDiagnosticsHelper to only check assigned files.
     // Without this, getSemanticDiagnostics(undefined) checks ALL files via flatMap,
     // defeating the eager check loop sharding.
