@@ -9,7 +9,6 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # Check if any vendor submodules have staged changes
-VENDOR_CHANGES=$(git diff --cached --name-only | grep -E '^vendor/(quickjs-ng|wamr|binaryen|metal0)/' || true)
 
 if [ -n "$VENDOR_CHANGES" ]; then
     echo -e "${RED}ERROR: Direct modifications to vendor submodules detected!${NC}"
@@ -28,14 +27,12 @@ if [ -n "$VENDOR_CHANGES" ]; then
     echo ""
     echo "Existing patches:"
     echo "  patches/*.patch           - QuickJS patches"
-    echo "  patches/wamr/*.patch      - WAMR patches"
     echo ""
     echo "To bypass this check (NOT recommended): git commit --no-verify"
     exit 1
 fi
 
 # Check if submodule refs are being changed (this is OK, but warn)
-SUBMODULE_CHANGES=$(git diff --cached --name-only | grep -E '^vendor/(quickjs-ng|wamr|binaryen|metal0)$' || true)
 
 if [ -n "$SUBMODULE_CHANGES" ]; then
     echo -e "${YELLOW}WARNING: Submodule reference changes detected:${NC}"

@@ -1,5 +1,5 @@
 /// EdgeBox Build Tool
-/// Compiles JS to AOT WASM using WAMR with SIMD support
+/// Compiles JS to standalone WASM with SIMD support
 ///
 /// Usage:
 ///   edgebox build [app-directory]  - Build app (bundle + bytecode + AOT)
@@ -5546,7 +5546,6 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
 
         // Step 10: AOT compile (SIMD enabled to match WASM build)
         // Note: Wizer is skipped for AOT - native code initializes fast enough
-        std.debug.print("[build] AOT compiling with WAMR...\n", .{});
         const aot_compiler = @import("aot_compiler.zig");
         var aot_skipped = false;
         aot_compiler.compileWasmToAot(allocator, wasm_path, aot_path, true) catch |err| {

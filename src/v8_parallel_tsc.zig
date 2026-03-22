@@ -153,10 +153,12 @@ pub fn setupParallelCheck(
     tsc_fast_js: []const u8,
 ) bool {
     const cpu_count = std.Thread.getCpuCount() catch 4;
-    // Each V8 isolate uses ~4 threads (main + TurboFan + GC + platform)
-    // Workers = cores / threads_per_isolate, min 2 to benefit from parallelism
-    const threads_per_isolate: usize = 4;
-    g_worker_count = @max(cpu_count / threads_per_isolate, 2);
+    // V8 platform shares one background thread pool across ALL isolates
+    // (TurboFan, GC tasks shared — not duplicated per isolate).
+    // Each worker only needs 1 dedicated thread (JS execution).
+    // Reserve half of cores for V8 platform background work.
+    // workerd uses same pattern: shared platform, multiple isolates.
+    g_worker_count = @max(cpu_count / 2, 2);
 
     if (g_worker_count <= 1 or embedded_snapshot.len == 0) return false;
 

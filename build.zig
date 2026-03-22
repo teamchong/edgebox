@@ -29,8 +29,6 @@ pub fn build(b: *std.Build) void {
 
     const use_prebuilt = if (prebuilt_dir) |dir| blk: {
         const source_dirs = [_][]const u8{
-            "vendor/wamr/core",
-            "vendor/wamr/wamr-compiler",
             "vendor/binaryen/src",
         };
         const should_use = build_cache.shouldUsePrebuilt(b.allocator, dir, &source_dirs) catch false;
@@ -54,16 +52,6 @@ pub fn build(b: *std.Build) void {
             "for p in ../../patches/quickjs/*.patch; do test -f \"$p\" && patch -p1 --silent < \"$p\"; done",
     });
     apply_patches.setName("apply-quickjs-patches");
-
-    // Apply patches to WAMR (CoW memory, interpreter hooks, macOS ARM64 x18 fix)
-    // Critical: 003-macos-arm64-x18.patch reserves x18 register required for AOT on macOS
-    // Always reset to clean state and apply patches - prevents accidental edits to vendor/
-    const apply_wamr_patches = b.addSystemCommand(&.{
-        "sh", "-c",
-        "cd vendor/wamr && git checkout . 2>/dev/null; " ++
-            "for p in ../../patches/wamr/*.patch; do test -f \"$p\" && patch -p1 --silent < \"$p\"; done",
-    });
-    apply_wamr_patches.setName("apply-wamr-patches");
 
     // QuickJS files - dtoa.c is for the December 2025 version
     const quickjs_c_files = &[_][]const u8{
@@ -582,8 +570,7 @@ pub fn build(b: *std.Build) void {
     wasm_static_step.dependOn(&wasm_static_install.step);
 
     // ===================
-    // native-static - Native binary with pre-compiled bytecode (no WAMR, pure QuickJS)
-    // For large modules like TypeScript that exceed WAMR limits
+    // native-static - Native binary with pre-compiled bytecode (pure QuickJS)
     // ===================
     const native_static_exe = b.addExecutable(.{
         .name = runtime_output orelse "edgebox-native",
@@ -896,7 +883,7 @@ pub fn build(b: *std.Build) void {
     native_static_exe.step.dependOn(&apply_patches.step);
 
     const native_static_install = b.addInstallArtifact(native_static_exe, .{});
-    const native_static_step = b.step("native-static", "Build native binary with pre-compiled bytecode (no WAMR)");
+    const native_static_step = b.step("native-static", "Build native binary with pre-compiled bytecode");
     native_static_step.dependOn(&native_static_install.step);
 
     // ===================
@@ -1169,7 +1156,7 @@ pub fn build(b: *std.Build) void {
 
     // ===================
     // wasm-standalone - Standalone WASM for WASI runtimes (wasmtime, wasmer)
-    // Embeds bytecode directly, no WAMR host needed
+    // Embeds bytecode directly, runs on any WASI runtime
     // ===================
     if (bytecode_path) |bc_path| {
         // Use WriteFile to copy bytecode and generate embedding module
@@ -1352,328 +1339,34 @@ pub fn build(b: *std.Build) void {
     }
 
     // ===================
-    // edgebox - minimal fast runner using WAMR (for <10ms cold start)
-    // Statically links libiwasm.a (~1MB) for fast startup
+    // Binaryen library path (used by edgebox-compile AOT compiler)
     // ===================
-    const wamr_dir = "vendor/wamr";
-
-    // Platform-specific WAMR library path
-    const wamr_platform = if (target.result.os.tag == .macos)
-        "darwin"
-    else if (target.result.os.tag == .linux)
-        "linux"
-    else
-        "linux"; // fallback
-
-    // Use prebuilt or source build paths
-    const wamr_lib_path = if (use_prebuilt and prebuilt_dir != null)
-        b.fmt("{s}/wamr/libiwasm.a", .{prebuilt_dir.?})
-    else
-        b.fmt("{s}/product-mini/platforms/{s}/build/libiwasm.a", .{ wamr_dir, wamr_platform });
-    const wamr_aot_lib_path = if (use_prebuilt and prebuilt_dir != null)
-        b.fmt("{s}/wamr/libaotclib.a", .{prebuilt_dir.?})
-    else
-        b.fmt("{s}/wamr-compiler/build/libaotclib.a", .{wamr_dir});
-    const wamr_vm_lib_path = if (use_prebuilt and prebuilt_dir != null)
-        b.fmt("{s}/wamr/libvmlib.a", .{prebuilt_dir.?})
-    else
-        b.fmt("{s}/wamr-compiler/build/libvmlib.a", .{wamr_dir});
     const binaryen_lib_path = if (use_prebuilt and prebuilt_dir != null)
         b.fmt("{s}/binaryen", .{prebuilt_dir.?})
     else
         "vendor/binaryen/build/lib";
 
-    const run_exe = b.addExecutable(.{
-        .name = "edgebox-runner",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/edgebox_wamr.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-        }),
-    });
-    run_exe.stack_size = 8 * 1024 * 1024; // 8MB native stack for AOT execution
-
-    // Add WAMR include path
-    run_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
-    // Static link WAMR for fast startup (platform-specific)
-    run_exe.addObjectFile(b.path(wamr_lib_path));
-    run_exe.linkLibC();
-    run_exe.linkSystemLibrary("pthread");
-    // WAMR Fast JIT uses asmjit (C++) - need libstdc++ on Linux
-    if (target.result.os.tag == .linux) {
-        run_exe.linkSystemLibrary("stdc++");
-    }
-    run_exe.step.dependOn(&apply_patches.step); // Apply patches before compiling
-
-    b.installArtifact(run_exe);
-
-    const runner_step = b.step("runner", "Build edgebox-runner (WAMR runtime for --with-binary)");
-    runner_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
-
     // ===================
-    // metal0 shared modules (for HTTP/2 + TLS 1.3)
-    // Only included on macOS - Linux builds skip this to avoid libdeflate AVX-512 issues
-    // Uses metal0 submodule directly at vendor/metal0
-    // Used by native CLI only (not WASM)
+    // Binaryen prebuilt save (for future builds)
     // ===================
-    const metal0_dir = "vendor/metal0";
-
-    // Utility modules from metal0
-    const hashmap_helper = b.addModule("utils.hashmap_helper", .{
-        .root_source_file = b.path(metal0_dir ++ "/src/utils/hashmap_helper.zig"),
-    });
-    const allocator_helper = b.addModule("utils.allocator_helper", .{
-        .root_source_file = b.path(metal0_dir ++ "/src/utils/allocator_helper.zig"),
-    });
-
-    // gzip module with libdeflate (use edgebox's copy since metal0's submodule may not be init'd)
-    const gzip_module = b.addModule("gzip", .{
-        .root_source_file = b.path(metal0_dir ++ "/packages/runtime/src/Modules/gzip/gzip.zig"),
-    });
-    gzip_module.addIncludePath(b.path("vendor/libdeflate"));
-
-    // green_thread module (goroutine-style concurrency)
-    const green_thread_mod = b.addModule("green_thread", .{
-        .root_source_file = b.path(metal0_dir ++ "/packages/runtime/src/runtime/green_thread.zig"),
-    });
-    green_thread_mod.addImport("utils.allocator_helper", allocator_helper);
-
-    // netpoller module (epoll/kqueue async I/O)
-    const netpoller_mod = b.addModule("netpoller", .{
-        .root_source_file = b.path(metal0_dir ++ "/packages/runtime/src/runtime/netpoller.zig"),
-    });
-    netpoller_mod.addImport("utils.allocator_helper", allocator_helper);
-    netpoller_mod.addImport("green_thread", green_thread_mod);
-
-    // HTTP/2 + TLS 1.3 client from metal0
-    const h2_mod = b.addModule("h2", .{
-        .root_source_file = b.path(metal0_dir ++ "/packages/shared/http/h2/Client.zig"),
-    });
-    h2_mod.addImport("gzip", gzip_module);
-    h2_mod.addImport("utils.hashmap_helper", hashmap_helper);
-    h2_mod.addImport("netpoller", netpoller_mod);
-    h2_mod.addImport("green_thread", green_thread_mod);
-
-    // Add h2 to run_exe (edgebox CLI) for HTTP/2 fetch support
-    run_exe.root_module.addImport("h2", h2_mod);
-    run_exe.root_module.addIncludePath(b.path("vendor/libdeflate"));
-    // libdeflate C sources - disable advanced x86 features that Zig's backend can't handle
-    // This is needed for Docker/QEMU where the emulated CPU reports features Zig doesn't support
-    const is_x86 = target.result.cpu.arch == .x86_64 or target.result.cpu.arch == .x86;
-    const libdeflate_flags: []const []const u8 = if (is_x86)
-        &.{
-            "-O3",
-            "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI",
-            "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX_VNNI",
-            "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ",
-        }
-    else
-        &.{"-O3"};
-    const cpu_features_file: []const u8 = if (is_x86) "x86/cpu_features.c" else "arm/cpu_features.c";
-    run_exe.root_module.addCSourceFiles(.{
-        .root = b.path("vendor/libdeflate/lib"),
-        .files = &.{
-            "deflate_compress.c",
-            "deflate_decompress.c",
-            "gzip_compress.c",
-            "gzip_decompress.c",
-            "zlib_compress.c",
-            "zlib_decompress.c",
-            "adler32.c",
-            "crc32.c",
-            "utils.c",
-            cpu_features_file,
-        },
-        .flags = libdeflate_flags,
-    });
-
-    // libbrotli for Brotli compression support
-    if (target.result.os.tag == .macos) {
-        run_exe.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-        run_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-    }
-    run_exe.linkSystemLibrary("brotlienc");
-    run_exe.linkSystemLibrary("brotlidec");
-    run_exe.linkSystemLibrary("brotlicommon");
-
-    // ===================
-    // edgebox-rosetta - x86_64 runner for Rosetta 2 (Fast JIT on ARM64 Mac)
-    // On Apple Silicon Macs, this binary runs under Rosetta 2 with ~95% native speed
-    // and enables WAMR Fast JIT which isn't available on ARM64
-    // Only needed on ARM64 Mac - on x86_64 platforms, regular edgebox has Fast JIT
-    // ===================
-    const x64_target = b.resolveTargetQuery(.{
-        .cpu_arch = .x86_64,
-        .os_tag = .macos,
-    });
-
-    const run_x64_exe = b.addExecutable(.{
-        .name = "edgebox-rosetta",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/edgebox_wamr.zig"),
-            .target = x64_target,
-            .optimize = .ReleaseFast,
-        }),
-    });
-
-    // Add WAMR include path
-    run_x64_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
-    // Static link x86_64 WAMR with Fast JIT
-    run_x64_exe.addObjectFile(b.path(wamr_dir ++ "/product-mini/platforms/darwin/build-x64/libiwasm.a"));
-    run_x64_exe.linkLibC();
-    run_x64_exe.linkSystemLibrary("pthread");
-    // WAMR Fast JIT uses asmjit (C++) - need libc++ on macOS x86_64
-    run_x64_exe.linkLibCpp();
-
-    // Add h2 module for HTTP/2 support
-    run_x64_exe.root_module.addImport("h2", h2_mod);
-    run_x64_exe.root_module.addIncludePath(b.path("vendor/libdeflate"));
-    // libdeflate for x86_64 - disable AVX-512 features
-    run_x64_exe.root_module.addCSourceFiles(.{
-        .root = b.path("vendor/libdeflate/lib"),
-        .files = &.{
-            "deflate_compress.c",
-            "deflate_decompress.c",
-            "gzip_compress.c",
-            "gzip_decompress.c",
-            "zlib_compress.c",
-            "zlib_decompress.c",
-            "adler32.c",
-            "crc32.c",
-            "utils.c",
-            "x86/cpu_features.c", // x86 CPU features detection
-        },
-        .flags = &.{
-            "-O3",
-            "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI",
-            "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX_VNNI",
-            "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ",
-        },
-    });
-
-    // libbrotli for x86_64 Brotli compression support
-    run_x64_exe.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/local/include" });
-    run_x64_exe.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
-    run_x64_exe.linkSystemLibrary("brotlienc");
-    run_x64_exe.linkSystemLibrary("brotlidec");
-    run_x64_exe.linkSystemLibrary("brotlicommon");
-
-    const runner_rosetta_step = b.step("runner-rosetta", "Build edgebox-rosetta for Rosetta 2 (Fast JIT on ARM64 Mac)");
-    runner_rosetta_step.dependOn(&b.addInstallArtifact(run_x64_exe, .{}).step);
-
-    // ===================
-    // edgebox-arm64 - Native ARM64 runner with Fast Interpreter
-    // This is the RECOMMENDED runner for Apple Silicon Macs
-    // Fast Interpreter uses computed gotos - very efficient on ARM64
-    // No Rosetta overhead, instant startup, works great with host functions
-    // ===================
-    const arm64_target = b.resolveTargetQuery(.{
-        .cpu_arch = .aarch64,
-        .os_tag = .macos,
-    });
-
-    const run_arm64_exe = b.addExecutable(.{
-        .name = "edgebox-arm64",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/edgebox_wamr.zig"),
-            .target = arm64_target,
-            .optimize = .ReleaseFast,
-        }),
-    });
-
-    // Add WAMR include path
-    run_arm64_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
-    // Static link ARM64 WAMR with Fast Interpreter
-    run_arm64_exe.addObjectFile(b.path(wamr_dir ++ "/product-mini/platforms/darwin/build-arm64/libiwasm.a"));
-    run_arm64_exe.linkLibC();
-    run_arm64_exe.linkSystemLibrary("pthread");
-    // No libstdc++ needed - Fast Interpreter doesn't use asmjit
-
-    // Add h2 module for HTTP/2 support
-    run_arm64_exe.root_module.addImport("h2", h2_mod);
-    run_arm64_exe.root_module.addIncludePath(b.path("vendor/libdeflate"));
-    // libdeflate for ARM64 - use ARM NEON features
-    run_arm64_exe.root_module.addCSourceFiles(.{
-        .root = b.path("vendor/libdeflate/lib"),
-        .files = &.{
-            "deflate_compress.c",
-            "deflate_decompress.c",
-            "gzip_compress.c",
-            "gzip_decompress.c",
-            "zlib_compress.c",
-            "zlib_decompress.c",
-            "adler32.c",
-            "crc32.c",
-            "utils.c",
-            "arm/cpu_features.c", // ARM NEON detection
-        },
-        .flags = libdeflate_flags,
-    });
-
-    // libbrotli for ARM64 Brotli compression support
-    if (target.result.os.tag == .macos) {
-        run_arm64_exe.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-        run_arm64_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-    }
-    run_arm64_exe.linkSystemLibrary("brotlienc");
-    run_arm64_exe.linkSystemLibrary("brotlidec");
-    run_arm64_exe.linkSystemLibrary("brotlicommon");
-
-    const runner_arm64_step = b.step("runner-arm64", "Build edgebox-arm64 for native ARM64 Mac (Fast Interpreter)");
-    runner_arm64_step.dependOn(&b.addInstallArtifact(run_arm64_exe, .{}).step);
-
-    // ===================
-    // WAMR AOT compiler libraries (requires LLVM)
-    // Build libaotclib.a and libvmlib.a for integrated AOT compilation
-    // ===================
-    const aot_lib_build = b.addSystemCommand(&.{
-        "sh", "-c",
-        \\if [ ! -f build/libaotclib.a ]; then \
-        \\  mkdir -p build && cd build && \
-        \\  if [ "$(uname)" = "Darwin" ]; then \
-        \\    cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_SIMD=1 \
-        \\      -DWAMR_BUILD_LIBC_WASI=1 \
-        \\      -DWAMR_BUILD_WITH_CUSTOM_LLVM=1 \
-        \\      -DCMAKE_PREFIX_PATH=/opt/homebrew/opt/llvm@20 && \
-        \\    make -j$(sysctl -n hw.ncpu); \
-        \\  else \
-        \\    cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_SIMD=1 \
-        \\      -DWAMR_BUILD_LIBC_WASI=1 \
-        \\      -DWAMR_BUILD_WITH_CUSTOM_LLVM=1 \
-        \\      -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm && \
-        \\    make -j$(nproc); \
-        \\  fi; \
-        \\fi
-    });
-    aot_lib_build.setCwd(b.path("vendor/wamr/wamr-compiler"));
-    aot_lib_build.setName("build-aot-libs");
-    aot_lib_build.step.dependOn(&apply_wamr_patches.step); // Apply WAMR patches before building
-
-    // Copy built libraries to prebuilt dir and save source hash (for future builds)
     if (!use_prebuilt and prebuilt_dir != null) {
         const is_darwin = std.mem.indexOf(u8, prebuilt_dir.?, "darwin") != null;
         const binaryen_lib = if (is_darwin) "libbinaryen.dylib" else "libbinaryen.so";
-        const wamr_platform_dir = if (is_darwin) "darwin" else "linux";
 
         const save_prebuilt = b.addSystemCommand(&.{
             "sh", "-c",
             b.fmt(
-                \\mkdir -p {s}/wamr {s}/binaryen && \
-                \\cp vendor/wamr/product-mini/platforms/{s}/build/libiwasm.a {s}/wamr/ && \
-                \\cp vendor/wamr/wamr-compiler/build/*.a {s}/wamr/ && \
+                \\mkdir -p {s}/binaryen && \
                 \\cp vendor/binaryen/build/lib/{s} {s}/binaryen/ && \
-                \\echo "[build] Saved prebuilt libraries to {s}"
+                \\echo "[build] Saved prebuilt binaryen to {s}"
             ,
-                .{ prebuilt_dir.?, prebuilt_dir.?, wamr_platform_dir, prebuilt_dir.?, prebuilt_dir.?, binaryen_lib, prebuilt_dir.?, prebuilt_dir.? },
+                .{ prebuilt_dir.?, binaryen_lib, prebuilt_dir.?, prebuilt_dir.? },
             ),
         });
-        save_prebuilt.step.dependOn(&aot_lib_build.step);
         save_prebuilt.setName("save-prebuilt-libs");
 
         // Save source hash
         const source_dirs = [_][]const u8{
-            "vendor/wamr/core",
-            "vendor/wamr/wamr-compiler",
             "vendor/binaryen/src",
         };
         build_cache.saveSourceHash(b.allocator, prebuilt_dir.?, &source_dirs) catch |err| {
@@ -1695,10 +1388,6 @@ pub fn build(b: *std.Build) void {
     });
     build_exe.stack_size = 64 * 1024 * 1024; // 64MB native stack for AOT compilation
 
-    // AOT compiler library dependency (skip if using prebuilt)
-    if (!use_prebuilt) {
-        build_exe.step.dependOn(&aot_lib_build.step);
-    }
     build_exe.step.dependOn(&apply_patches.step); // Apply patches before compiling
 
     // Add QuickJS sources (needed for embedded qjsc)
@@ -1733,16 +1422,6 @@ pub fn build(b: *std.Build) void {
         .flags = &.{"-D_GNU_SOURCE"},
     });
 
-    // Link WAMR AOT compiler libraries (embedded - no wamrc CLI needed)
-    // Note: We use libaotclib.a + libvmlib.a from wamr-compiler, NOT libiwasm.a
-    // libvmlib.a includes the runtime needed for module loading
-    build_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
-    build_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/shared/utils"));
-    build_exe.addObjectFile(b.path(wamr_aot_lib_path));
-    build_exe.addObjectFile(b.path(wamr_vm_lib_path));
-    build_exe.linkLibC();
-    build_exe.linkSystemLibrary("pthread");
-
     // Link Binaryen for wasm-opt integration (vendored or prebuilt)
     build_exe.root_module.addIncludePath(b.path("vendor/binaryen/src"));
     build_exe.addLibraryPath(b.path(binaryen_lib_path));
@@ -1766,8 +1445,7 @@ pub fn build(b: *std.Build) void {
         build_exe.root_module.addIncludePath(.{ .cwd_relative = "/usr/lib/llvm-20/include" });
         build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/llvm-20/lib" });
         build_exe.linkSystemLibrary("LLVM-20");
-        // WAMR AOT libs compiled with GCC need libstdc++ and libgcc.
-        // Link them as object files to prevent Zig from substituting libc++.
+        // Link libstdc++ and libgcc as object files to prevent Zig from substituting libc++.
         build_exe.addObjectFile(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/libstdc++.so.6" });
         build_exe.addObjectFile(.{ .cwd_relative = "/usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a" });
         build_exe.linkSystemLibrary("gcc_s");
@@ -1863,29 +1541,6 @@ pub fn build(b: *std.Build) void {
     sandbox_step.dependOn(&b.addInstallArtifact(sandbox_exe, .{}).step);
 
     // ===================
-    // edgebox-wizer - Pure Zig Wizer (WASM pre-initializer) using WAMR
-    // Uses WAMR fast-interpreter with SIMD support via SIMDe
-    // ===================
-    const wizer_exe = b.addExecutable(.{
-        .name = "edgebox-wizer",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/wizer_wamr.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-        }),
-    });
-
-    // Link WAMR for wizer (same build as runtime - fast-interpreter with SIMDe)
-    wizer_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
-    wizer_exe.addObjectFile(b.path(b.fmt("{s}/product-mini/platforms/{s}/build/libiwasm.a", .{ wamr_dir, wamr_platform })));
-    wizer_exe.linkLibC();
-    wizer_exe.linkSystemLibrary("pthread");
-
-
-    const wizer_step = b.step("wizer", "Build edgebox-wizer (pure Zig WASM pre-initializer)");
-    wizer_step.dependOn(&b.addInstallArtifact(wizer_exe, .{}).step);
-
-    // ===================
     // edgebox-wasm-opt - Pure Zig wasm-opt (WASM optimizer)
     // Uses Binaryen C API, replaces wasm-opt CLI dependency
     // ===================
@@ -1910,43 +1565,6 @@ pub fn build(b: *std.Build) void {
 
     const wasm_opt_step = b.step("wasm-opt", "Build edgebox-wasm-opt (pure Zig WASM optimizer)");
     wasm_opt_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
-
-    // ===================
-    // edgebox-aot - AOT compiler tool (WASM to native)
-    // ===================
-    const aot_tool_exe = b.addExecutable(.{
-        .name = "edgebox-aot",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/aot_tool.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-        }),
-    });
-
-    // Link WAMR AOT compiler
-    aot_tool_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
-    aot_tool_exe.addObjectFile(b.path(b.fmt("{s}/wamr-compiler/build/libaotclib.a", .{wamr_dir})));
-    aot_tool_exe.addObjectFile(b.path(b.fmt("{s}/wamr-compiler/build/libvmlib.a", .{wamr_dir})));
-
-    // Link LLVM (for AOT compilation)
-    aot_tool_exe.linkLibC();
-    if (target.result.os.tag == .macos) {
-        aot_tool_exe.linkSystemLibrary("c++");
-        aot_tool_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@20/lib" });
-        aot_tool_exe.addRPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@20/lib" });
-        aot_tool_exe.linkSystemLibrary("LLVM-20");
-        aot_tool_exe.linkFramework("Security");
-        aot_tool_exe.linkFramework("CoreFoundation");
-    } else {
-        // Linux
-        aot_tool_exe.linkSystemLibrary("LLVM-20");
-        aot_tool_exe.linkSystemLibrary("gcc");
-        aot_tool_exe.linkSystemLibrary("gcc_s");
-        aot_tool_exe.linkSystemLibrary("stdc++");
-    }
-
-    const aot_tool_step = b.step("aot-tool", "Build edgebox-aot (AOT compiler tool)");
-    aot_tool_step.dependOn(&b.addInstallArtifact(aot_tool_exe, .{}).step);
 
     // ===================
     // Freeze is built-in to edgebox (no separate CLI needed)
@@ -2004,9 +1622,8 @@ pub fn build(b: *std.Build) void {
     cli_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
 
-    // cli-full: also builds WAMR runner, sandbox, etc. (legacy tools)
-    const cli_full_step = b.step("cli-full", "Build all tools including legacy WAMR runner and sandbox");
-    cli_full_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
+    // cli-full: also builds sandbox and other legacy tools
+    const cli_full_step = b.step("cli-full", "Build all tools including sandbox");
     cli_full_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
     cli_full_step.dependOn(&b.addInstallArtifact(sandbox_exe, .{}).step);
     cli_full_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
@@ -2027,121 +1644,6 @@ pub fn build(b: *std.Build) void {
     });
     const test262_step = b.step("test262", "Build edgebox-test262 runner for comparing JS engines");
     test262_step.dependOn(&b.addInstallArtifact(test262_exe, .{}).step);
-
-    // ===================
-    // edgebox-embedded - Single binary with embedded WASM (no file loading)
-    // For instant cold start like Bun/Go
-    // Usage: zig build embedded -Daot-path=path/to/app.wasm [-Dname=myapp]
-    // ===================
-    const aot_path_str = b.option([]const u8, "aot-path", "Path to WASM file to embed");
-    const embedded_name = b.option([]const u8, "name", "Output binary name (default: derived from aot-path)");
-
-    if (aot_path_str) |aot_path| {
-        // Derive name from aot-path if not specified (e.g., "myapp.wasm" -> "myapp")
-        const output_name = embedded_name orelse blk: {
-            const basename = std.fs.path.basename(aot_path);
-            const name_end = std.mem.lastIndexOfScalar(u8, basename, '.') orelse basename.len;
-            break :blk basename[0..name_end];
-        };
-
-        // Use WriteFile to copy the WASM and generate a module that embeds it
-        const write_files = b.addWriteFiles();
-
-        // Copy WASM file to build cache with known name
-        const aot_copy = write_files.addCopyFile(.{ .cwd_relative = aot_path }, "aot_module.bin");
-
-        // Generate a Zig module that @embedFile's the copied WASM
-        const aot_data_zig = write_files.add("aot_data.zig",
-            \\pub const data = @embedFile("aot_module.bin");
-            \\
-        );
-
-        // Create the aot_data module from generated source
-        const aot_data_module = b.createModule(.{
-            .root_source_file = aot_data_zig,
-        });
-
-        // The generated module needs to resolve the embedFile relative to itself
-        // So we need to add the directory containing aot_module.bin
-        _ = aot_copy; // Used implicitly by the generated Zig file
-
-        const embedded_exe = b.addExecutable(.{
-            .name = output_name,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/edgebox_embedded.zig"),
-                .target = target,
-                .optimize = .ReleaseFast,
-                .strip = true,
-                .imports = &.{
-                    .{ .name = "aot_data", .module = aot_data_module },
-                },
-            }),
-        });
-
-        // Link WAMR
-        embedded_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
-        embedded_exe.addObjectFile(b.path(b.fmt("{s}/product-mini/platforms/{s}/build/libiwasm.a", .{ wamr_dir, wamr_platform })));
-        embedded_exe.linkLibC();
-        embedded_exe.linkSystemLibrary("pthread");
-        if (target.result.os.tag == .macos) {
-            embedded_exe.linkFramework("Security");
-            embedded_exe.linkFramework("CoreFoundation");
-        }
-
-        const embedded_step = b.step("embedded", "Build single binary with embedded AOT");
-        embedded_step.dependOn(&b.addInstallArtifact(embedded_exe, .{}).step);
-
-        // ===================
-        // embedded-daemon - Daemon with embedded WASM (no file loading)
-        // ===================
-        const daemon_name = if (embedded_name) |name|
-            b.fmt("{s}-daemon", .{name})
-        else blk: {
-            const basename = std.fs.path.basename(aot_path);
-            const name_end = std.mem.lastIndexOfScalar(u8, basename, '.') orelse basename.len;
-            break :blk b.fmt("{s}-daemon", .{basename[0..name_end]});
-        };
-
-        // Build options for daemon - enable embedded mode
-        const daemon_build_options = b.addOptions();
-        daemon_build_options.addOption(bool, "embedded_mode", true);
-
-        const embedded_daemon_exe = b.addExecutable(.{
-            .name = daemon_name,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/edgeboxd_wamr.zig"),
-                .target = target,
-                .optimize = .ReleaseFast,
-                .strip = true,
-                .imports = &.{
-                    .{ .name = "aot_data", .module = aot_data_module },
-                },
-            }),
-        });
-        embedded_daemon_exe.root_module.addOptions("build_options", daemon_build_options);
-
-        // Link WAMR
-        embedded_daemon_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
-        embedded_daemon_exe.addObjectFile(b.path(b.fmt("{s}/product-mini/platforms/{s}/build/libiwasm.a", .{ wamr_dir, wamr_platform })));
-        embedded_daemon_exe.linkLibC();
-        embedded_daemon_exe.linkSystemLibrary("pthread");
-        if (target.result.os.tag == .macos) {
-            embedded_daemon_exe.linkFramework("Security");
-            embedded_daemon_exe.linkFramework("CoreFoundation");
-        }
-
-        const embedded_daemon_step = b.step("embedded-daemon", "Build daemon with embedded AOT");
-        embedded_daemon_step.dependOn(&b.addInstallArtifact(embedded_daemon_exe, .{}).step);
-    } else {
-        // Create a dummy step that errors if no AOT path provided
-        const embedded_step = b.step("embedded", "Build single binary with embedded AOT (requires -Daot-path=...)");
-        const fail_step = b.addFail("embedded target requires -Daot-path=<path/to/app.aot>");
-        embedded_step.dependOn(&fail_step.step);
-
-        const embedded_daemon_step = b.step("embedded-daemon", "Build daemon with embedded AOT (requires -Daot-path=...)");
-        const fail_daemon_step = b.addFail("embedded-daemon target requires -Daot-path=<path/to/app.aot>");
-        embedded_daemon_step.dependOn(&fail_daemon_step.step);
-    }
 
     // Make cli step also verify frozen functions codegen (catches errors early)
     // Build a test frozen function if bench/ exists - this is what CI runs

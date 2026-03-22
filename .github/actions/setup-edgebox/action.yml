@@ -15,7 +15,6 @@ inputs:
     required: false
     default: 'false'
   build-test262:
-    description: 'Build test262 runner (requires WAMR)'
     required: false
     default: 'false'
   build-benchmarks:
@@ -99,7 +98,6 @@ runs:
           /usr/lib/llvm-20/bin/opt --version || { echo "ERROR: LLVM 20 opt not found"; exit 1; }
         fi
 
-    # === Cache build outputs (no WAMR — worker path only) ===
     - name: Cache EdgeBox build
       id: cache-edgebox
       uses: actions/cache@v4
@@ -177,21 +175,16 @@ runs:
           sudo ldconfig
         fi
 
-    # === Build WAMR + test262 (only when requested — weekly CI) ===
-    - name: Build WAMR (for test262)
       if: inputs.build-test262 == 'true'
       shell: bash
-      run: ./scripts/build-wamr.sh
 
     - name: Build test262
       if: inputs.build-test262 == 'true'
       shell: bash
       run: zig build test262 -Doptimize=ReleaseFast -Dcpu=baseline
 
-    - name: Build WAMR compiler (for test262 AOT)
       if: inputs.build-test262 == 'true'
       shell: bash
-      run: ./scripts/build-wamr-compiler.sh
 
     - name: Build AOT base module
       if: inputs.build-test262 == 'true'

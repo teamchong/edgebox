@@ -22,8 +22,6 @@ echo "=== Applying EdgeBox patches ==="
 for pkg_dir in "$PATCHES_DIR"/*/; do
     pkg_name=$(basename "$pkg_dir")
 
-    # Skip non-npm packages (quickjs, wamr are vendor patches)
-    if [ "$pkg_name" = "quickjs" ] || [ "$pkg_name" = "wamr" ]; then
         continue
     fi
 
