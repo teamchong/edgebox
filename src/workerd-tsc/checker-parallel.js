@@ -48,7 +48,9 @@ var ts = globalThis.ts || globalThis.module.exports;
       };
       ts.sys.realpath = function(p) { return __edgebox_realpath(resolvePath(p)); };
       ts.sys.getCurrentDirectory = function() { return projectCwd; };
-      ts.sys.getExecutingFilePath = function() { return __filename; };
+      // TSC derives lib.d.ts path from getExecutingFilePath — point to typescript/lib/
+      var tsLibDir = __edgebox_cwd() + '/node_modules/typescript/lib';
+      ts.sys.getExecutingFilePath = function() { return tsLibDir + '/typescript.js'; };
       ts.sys.write = function(s) { __edgebox_write_stdout(String(s)); };
       ts.sys.writeOutputIsTTY = function() { return false; };
       ts.sys.exit = function(code) { __edgebox_exit(code || 0); };
