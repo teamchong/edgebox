@@ -153,14 +153,10 @@ pub fn setupParallelCheck(
     tsc_fast_js: []const u8,
 ) bool {
     const cpu_count = std.Thread.getCpuCount() catch 4;
-    // EDGEBOX_WORKERS env var overrides auto-detection
-    const env_workers = std.process.getEnvVarOwned(alloc, "EDGEBOX_WORKERS") catch null;
-    if (env_workers) |w| {
-        g_worker_count = std.fmt.parseInt(usize, w, 10) catch @min(cpu_count, 4);
-        alloc.free(w);
-    } else {
-        g_worker_count = @min(cpu_count, 4);
-    }
+    // Each V8 isolate uses ~4 threads (main + TurboFan + GC + platform)
+    // Workers = cores / threads_per_isolate, min 2 to benefit from parallelism
+    const threads_per_isolate: usize = 4;
+    g_worker_count = @max(cpu_count / threads_per_isolate, 2);
 
     if (g_worker_count <= 1 or embedded_snapshot.len == 0) return false;
 
