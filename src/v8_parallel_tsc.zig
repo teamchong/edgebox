@@ -150,14 +150,18 @@ pub fn setupParallelCheck(
     tsc_path: []const u8,
     tsc_fast_js: []const u8,
 ) bool {
-    // Parallel disabled: each worker runs full TSC pipeline (parse+check),
-    // so 2 workers = 2x CPU for only ~30% check savings = net loss.
-    // Re-enable when we can share parsed program state across isolates.
-    g_worker_count = 1;
+    const cpu_count = std.Thread.getCpuCount() catch 4;
+    // EDGEBOX_WORKERS env var overrides auto-detection
+    const env_workers = std.process.getEnvVarOwned(alloc, "EDGEBOX_WORKERS") catch null;
+    if (env_workers) |w| {
+        g_worker_count = std.fmt.parseInt(usize, w, 10) catch @min(cpu_count, 4);
+        alloc.free(w);
+    } else {
+        g_worker_count = @min(cpu_count, 4);
+    }
 
     if (g_worker_count <= 1 or embedded_snapshot.len == 0) return false;
 
-    const cpu_count = std.Thread.getCpuCount() catch 4;
     g_start_time = std.time.milliTimestamp();
     std.debug.print("[parallel-tsc] {d} cores, {d} workers (deferred spawn)\n", .{ cpu_count, g_worker_count });
 

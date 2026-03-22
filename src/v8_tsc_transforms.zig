@@ -66,13 +66,16 @@ pub const transforms = [_]Transform{
     // Before Check: warm hot checker functions by calling with real types,
     // then pump to flush TurboFan compilations. Reduces JIT variance.
     // checkSourceFile: pump TurboFan before Check + periodic pump during early files
+    // T-SHAPE: DISABLED — V8 megamorphic LoadIC is from varied call sites seeing
+    // different shapes, not just from Type3 constructor. Pre-initializing properties
+    // adds write overhead (~1.3M extra writes for 66K types) that cancels the read gain.
     // T-PARALLEL: Spawn workers AFTER main's createProgram.
     // All workers have full programs — correct diagnostics.
     .{ .needle = "const program = createProgram(programOptions);\n  const exitStatus = emitFilesAndReportErrorsAndGetExitStatus(", .replacement = "const program = createProgram(programOptions);\n  if(typeof __edgebox_spawn_check_workers==='function')__edgebox_spawn_check_workers();\n  const exitStatus = emitFilesAndReportErrorsAndGetExitStatus(" },
-    // T-SHARD-DIAGS: Filter diagnostics by worker shard.
-    // Each worker only reports diagnostics from its assigned files.
-    // Without this, every worker reports ALL diagnostics (duplicates).
-    .{ .needle = "const diagnostics = sortAndDeduplicateDiagnostics(allDiagnostics);\n  diagnostics.forEach(reportDiagnostic);", .replacement = "var diagnostics = sortAndDeduplicateDiagnostics(allDiagnostics);\n  if(typeof __edgebox_worker_count!=='undefined'&&__edgebox_worker_count>1){var __sf=program.getSourceFiles();var __myFiles=new Set();for(var __di=0;__di<__sf.length;__di++){if(__di%__edgebox_worker_count===__edgebox_worker_id)__myFiles.add(__sf[__di].fileName);}diagnostics=diagnostics.filter(function(d){return !d.file||__myFiles.has(d.file.fileName);});}\n  diagnostics.forEach(reportDiagnostic);" },
+    // T-SHARD-DIAGS: Shard getDiagnosticsHelper to only check assigned files.
+    // Without this, getSemanticDiagnostics(undefined) checks ALL files via flatMap,
+    // defeating the eager check loop sharding.
+    .{ .needle = "return sortAndDeduplicateDiagnostics(flatMap(program.getSourceFiles(), (sourceFile2) => {\n      if (cancellationToken) {\n        cancellationToken.throwIfCancellationRequested();\n      }\n      return getDiagnostics2(sourceFile2, cancellationToken);\n    }));", .replacement = "var __allFiles=program.getSourceFiles();if(typeof __edgebox_worker_count!=='undefined'&&__edgebox_worker_count>1){var __wid=__edgebox_worker_id,__wcnt=__edgebox_worker_count;__allFiles=__allFiles.filter(function(_,i){return i%__wcnt===__wid;});}return sortAndDeduplicateDiagnostics(flatMap(__allFiles, (sourceFile2) => {\n      if (cancellationToken) {\n        cancellationToken.throwIfCancellationRequested();\n      }\n      return getDiagnostics2(sourceFile2, cancellationToken);\n    }));" },
     // Check loop: shard files across parallel workers.
     // Each worker checks files where fileIndex % workerCount === workerId.
     // When not set (single-threaded), defaults to id=0, count=1 → checks all files.
