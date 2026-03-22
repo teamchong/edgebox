@@ -175,16 +175,10 @@ runs:
           sudo ldconfig
         fi
 
-      if: inputs.build-test262 == 'true'
-      shell: bash
-
     - name: Build test262
       if: inputs.build-test262 == 'true'
       shell: bash
       run: zig build test262 -Doptimize=ReleaseFast -Dcpu=baseline
-
-      if: inputs.build-test262 == 'true'
-      shell: bash
 
     - name: Build AOT base module
       if: inputs.build-test262 == 'true'
