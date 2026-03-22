@@ -101,7 +101,11 @@ fn checkWorkerFn(ctx: *CheckWorkerCtx) void {
     // Run TSC — createProgram reads from Zig cache
     const t0 = std.time.milliTimestamp();
     std.debug.print("[worker-{d}] start (+{d}ms)\n", .{ ctx.worker_id, t0 - g_start_time });
-    _ = v8.eval(iso, context, ctx.tsc_fast_js, "tsc_check_worker.js") catch {};
+    {
+        var tc = v8.TryCatch.init(iso);
+        defer tc.deinit();
+        _ = v8.eval(iso, context, ctx.tsc_fast_js, "tsc_check_worker.js") catch {};
+    }
     const t1 = std.time.milliTimestamp();
     std.debug.print("[worker-{d}] done ({d}ms total, +{d}ms)\n", .{ ctx.worker_id, t1 - t0, t1 - g_start_time });
 
@@ -146,11 +150,14 @@ pub fn setupParallelCheck(
     tsc_path: []const u8,
     tsc_fast_js: []const u8,
 ) bool {
-    const cpu_count = std.Thread.getCpuCount() catch 4;
-    g_worker_count = @min(cpu_count, 2);
+    // Parallel disabled: each worker runs full TSC pipeline (parse+check),
+    // so 2 workers = 2x CPU for only ~30% check savings = net loss.
+    // Re-enable when we can share parsed program state across isolates.
+    g_worker_count = 1;
 
     if (g_worker_count <= 1 or embedded_snapshot.len == 0) return false;
 
+    const cpu_count = std.Thread.getCpuCount() catch 4;
     g_start_time = std.time.milliTimestamp();
     std.debug.print("[parallel-tsc] {d} cores, {d} workers (deferred spawn)\n", .{ cpu_count, g_worker_count });
 
