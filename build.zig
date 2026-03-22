@@ -1671,41 +1671,7 @@ pub fn build(b: *std.Build) void {
             else => null,
         };
 
-        if (v8_lib_name) |lib_name| {
-            const v8_test_exe = b.addExecutable(.{
-                .name = "edgebox-v8-test",
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path("src/v8_test.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                }),
-            });
-
-            // Link prebuilt librusty_v8.a (V8 engine + binding.cc extern "C" functions)
-            v8_test_exe.addObjectFile(b.path(b.fmt("vendor/v8/{s}", .{lib_name})));
-
-            // C++ bridge — handles CreateParams allocator setup, struct sizes
-            v8_test_exe.root_module.addCSourceFile(.{
-                .file = b.path("src/v8_bridge.cpp"),
-                .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti" },
-            });
-            v8_test_exe.root_module.addIncludePath(b.path("vendor/v8/include"));
-            v8_test_exe.root_module.addIncludePath(b.path("vendor/v8"));
-
-            // Stub implementations for Rust callbacks (temporal_rs, inspector, etc.)
-            v8_test_exe.root_module.addCSourceFile(.{
-                .file = b.path("src/v8_stubs.c"),
-                .flags = &.{},
-            });
-
-            // V8 dependencies
-            v8_test_exe.linkLibC();
-            v8_test_exe.linkLibCpp();
-            v8_test_exe.linkSystemLibrary("pthread");
-
-            const v8_test_step = b.step("v8-test", "Build V8 embedding test (Phases 1+2)");
-            v8_test_step.dependOn(&b.addInstallArtifact(v8_test_exe, .{}).step);
-
+        if (v8_lib_name) |_| {
             // V8 runner REMOVED — workerd is the only runtime.
             // Build Zig IO library for workerd instead.
             const v8_run_step = b.step("v8-run", "REMOVED — use workerd (see src/workerd-tsc/)");

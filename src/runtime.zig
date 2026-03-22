@@ -2348,9 +2348,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         // Detects TSC by checking for assignableRelation in source
                         if (clean_content) |detect_cc| {
                             if (std.mem.indexOf(u8, detect_cc, "var assignableRelation") != null) {
-                                w.writeAll(@embedFile("v8_tsc_shim.js")) catch { w_errs += 1; };
-                                w.writeAll("\n") catch { w_errs += 1; };
-                                std.debug.print("[soa] Injected FastRelationCache shim into compiled worker\n", .{});
+                                // v8_tsc_shim.js removed — workerd path doesn't need relation cache shim
+                                std.debug.print("[soa] TSC detected (workerd handles type checking)\n", .{});
                             }
                         }
                     }
