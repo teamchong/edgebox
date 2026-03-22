@@ -69,16 +69,8 @@ pub const transforms = [_]Transform{
     // T-SHAPE: DISABLED — V8 megamorphic LoadIC is from varied call sites seeing
     // different shapes, not just from Type3 constructor. Pre-initializing properties
     // adds write overhead (~1.3M extra writes for 66K types) that cancels the read gain.
-    // T-PARALLEL: Spawn workers AFTER main's createProgram.
-    // All workers have full programs — correct diagnostics.
-    .{ .needle = "const program = createProgram(programOptions);\n  const exitStatus = emitFilesAndReportErrorsAndGetExitStatus(", .replacement = "const program = createProgram(programOptions);\n  if(typeof __edgebox_spawn_check_workers==='function'&&typeof __edgebox_worker_count!=='undefined'&&__edgebox_worker_count>1){__edgebox_spawn_check_workers();process.exit(typeof __edgebox_parallel_exit!=='undefined'?__edgebox_parallel_exit:0);}\n  const exitStatus = emitFilesAndReportErrorsAndGetExitStatus(" },
-    // T-SHARD-DIAGS: REMOVED — workers now write to per-worker Zig buffers.
-    // No need to shard getDiagnosticsHelper in JS. Each worker runs TSC normally,
-    // its stdout goes to a separate buffer, main merges after all workers finish.
-    // Check loop: shard files across parallel workers.
-    // Each worker checks files where fileIndex % workerCount === workerId.
-    // When not set (single-threaded), defaults to id=0, count=1 → checks all files.
-    .{ .needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));", .replacement = "{if(typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);const __files=host.getSourceFiles();const __wid=typeof __edgebox_worker_id!=='undefined'?__edgebox_worker_id:0;const __wcnt=typeof __edgebox_worker_count!=='undefined'?__edgebox_worker_count:1;for(let __i=0;__i<__files.length;__i++){if(__i%__wcnt===__wid){checkSourceFileWithEagerDiagnostics(__files[__i]);}if(__i<30&&__i%5===4&&typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);}}" },
+    // T-PRECOMPUTE: pump SIMD bitmap before Check phase (serial only, parallel via workerd)
+    .{ .needle = "forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));", .replacement = "{if(typeof __edgebox_precompute_relations==='function')__edgebox_precompute_relations(typeCount);forEach(host.getSourceFiles(), (file) => checkSourceFileWithEagerDiagnostics(file));}" },
 };
 
 /// Apply all TSC source transforms in a single pass.

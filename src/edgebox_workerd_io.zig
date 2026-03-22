@@ -304,18 +304,23 @@ const CheckWorkerArgs = struct {
     tsconfig_path: []const u8,
 };
 
-fn checkWorkerThread(args: *const CheckWorkerArgs) void {
-    const wid = args.worker_id;
-
-    // Each worker: read files from Zig cache, create program, check shard.
-    // For now, delegate to a single-threaded TSC check per worker.
-    // The key: files are already in Zig cache (zero-copy reads).
-
-    // Build a simple result for this worker's shard
-    // (Full V8 isolate creation requires linking against V8 — done in workerd)
-    // For now, signal completion
-    _ = worker_done_count.fetchAdd(1, .release);
-    _ = wid;
+/// Pre-warm file cache by reading all files in a directory tree.
+/// Called from parallelCheck to ensure Zig cache is hot before workers start.
+fn prewarmFileCache(dir_path: []const u8) void {
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+    var it = dir.iterate();
+    while (it.next() catch null) |entry| {
+        if (entry.kind == .file and (std.mem.endsWith(u8, entry.name, ".ts") or std.mem.endsWith(u8, entry.name, ".d.ts"))) {
+            const full = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+            defer alloc.free(full);
+            _ = cacheReadFile(full) catch {};
+        } else if (entry.kind == .directory and !std.mem.eql(u8, entry.name, "node_modules") and !std.mem.eql(u8, entry.name, ".git")) {
+            const sub = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+            defer alloc.free(sub);
+            prewarmFileCache(sub);
+        }
+    }
 }
 
 fn parallelCheckImpl(request: []const u8) ![]u8 {
@@ -328,52 +333,19 @@ fn parallelCheckImpl(request: []const u8) ![]u8 {
         }
     }
 
-    // Pre-warm file cache: read tsconfig and source files
-    const tsconfig_path_buf = try std.fmt.allocPrint(alloc, "{s}/tsconfig.json", .{cwd});
-    defer alloc.free(tsconfig_path_buf);
+    // Pre-warm file cache: recursively read all .ts files
+    // This is the Zig zero-copy advantage — all files in mmap cache before check
+    const t0 = std.time.milliTimestamp();
+    prewarmFileCache(cwd);
+    const cache_time = std.time.milliTimestamp() - t0;
 
-    // Read tsconfig to warm cache
-    _ = cacheReadFile(tsconfig_path_buf) catch {};
-
-    const worker_count: u32 = max_parallel_workers;
-    worker_done_count.store(0, .release);
-
-    // Clear diagnostic buffers
-    for (0..worker_count) |w| {
-        worker_diag_bufs[w].clearRetainingCapacity();
-    }
-
-    // Spawn workers
-    var threads: [max_parallel_workers]?std.Thread = .{null} ** max_parallel_workers;
-    var worker_args: [max_parallel_workers]CheckWorkerArgs = undefined;
-
-    for (0..worker_count) |i| {
-        worker_args[i] = .{
-            .worker_id = @intCast(i),
-            .worker_count = worker_count,
-            .cwd = cwd,
-            .tsconfig_path = tsconfig_path_buf,
-        };
-        threads[i] = std.Thread.spawn(.{}, checkWorkerThread, .{&worker_args[i]}) catch null;
-    }
-
-    // Wait for all workers
-    for (&threads) |*t| {
-        if (t.*) |thread| {
-            thread.join();
-            t.* = null;
-        }
-    }
-
-    // Collect results
-    var total_diags: usize = 0;
-    for (0..worker_count) |w| {
-        total_diags += worker_diag_bufs[w].items.len;
-    }
-
+    // Return cache stats — actual parallel checking needs V8 isolates
+    // which are created by workerd (not by this Zig library directly).
+    // The Zig parallel path: workerd spawns multiple services on separate sockets,
+    // Zig pre-warms the file cache so ALL workers read from mmap (zero IO).
     return try std.fmt.allocPrint(alloc,
-        "{{\"ok\":true,\"workers\":{d},\"diagnostics\":0,\"cwd\":\"{s}\",\"cacheFiles\":{d}}}",
-        .{ worker_count, cwd, file_cache.count() },
+        "{{\"ok\":true,\"cacheFiles\":{d},\"cacheTimeMs\":{d},\"cwd\":\"{s}\"}}",
+        .{ file_cache.count(), cache_time, cwd },
     );
 }
 
