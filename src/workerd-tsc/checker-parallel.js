@@ -33,44 +33,55 @@ var preCheckTime = 0;
     preCheckTime = Date.now() - t0;
     preCheckDone = true;
     
-    // Register types in Zig flat arrays (batch)
+    // Extract types + members to Zig
     var checker = cachedProgram.getTypeChecker();
-    // Walk all source files and collect type info
     var typeBatch = [];
-    for (var fi = 0; fi < files.length; fi++) {
-      // Get all identifiers and their types
-      ts.forEachChild(files[fi], function visit(node) {
-        try {
-          var type = checker.getTypeAtLocation(node);
-          if (type && type.id && type.flags) {
-            typeBatch.push(type.id + ',' + type.flags);
-            if (typeBatch.length >= 1000) {
-              __edgebox_io_sync(JSON.stringify({op:'batchRegisterTypes', data: typeBatch.join(',')}));
-              typeBatch = [];
-            }
+    var memberBatch = [];
+    var seenTypes = {};
+    
+    function registerType(type) {
+      if (!type || !type.id || seenTypes[type.id]) return;
+      seenTypes[type.id] = true;
+      typeBatch.push(type.id + ',' + (type.flags || 0));
+      
+      try {
+        var props = checker.getPropertiesOfType(type);
+        for (var p = 0; p < props.length && p < 50; p++) {
+          var prop = props[p];
+          var propType = checker.getTypeOfSymbol(prop);
+          var name = prop.escapedName || '';
+          if (name && propType && propType.id) {
+            memberBatch.push(type.id + '|' + name + '|' + propType.id + '|' + (prop.flags || 0));
           }
-        } catch(e) {}
+        }
+      } catch(e) {}
+      
+      if (typeBatch.length >= 500) {
+        __edgebox_io_sync(JSON.stringify({op:'batchRegisterTypes', data: typeBatch.join(',')}));
+        typeBatch = [];
+      }
+      if (memberBatch.length >= 200) {
+        __edgebox_io_sync(JSON.stringify({op:'batchRegisterMembers', data: memberBatch.join(';')}));
+        memberBatch = [];
+      }
+    }
+    
+    for (var fi = 0; fi < files.length; fi++) {
+      ts.forEachChild(files[fi], function visit(node) {
+        try { registerType(checker.getTypeAtLocation(node)); } catch(e) {}
         ts.forEachChild(node, visit);
       });
     }
-    if (typeBatch.length > 0) {
-      __edgebox_io_sync(JSON.stringify({op:'batchRegisterTypes', data: typeBatch.join(',')}));
-    }
-    
-    // Log stats
-    var stats = JSON.parse(__edgebox_io_sync(JSON.stringify({op:'typeStats'})));
-    // stats logged to stderr for debugging
+    if (typeBatch.length > 0) __edgebox_io_sync(JSON.stringify({op:'batchRegisterTypes', data: typeBatch.join(',')}));
+    if (memberBatch.length > 0) __edgebox_io_sync(JSON.stringify({op:'batchRegisterMembers', data: memberBatch.join(';')}));
   } catch(e) {}
 })();
 
 export default {
   async fetch(request) {
     var body = await request.json().catch(function() { return {}; });
-    var start = Date.now();
     var wid = body.workerId || 0;
     var wcnt = body.workerCount || 1;
-    
-    // Return type stats along with diagnostics
     var stats = JSON.parse(__edgebox_io_sync(JSON.stringify({op:'typeStats'})));
     
     if (preCheckDone && cachedDiagsByFile) {
@@ -84,13 +95,10 @@ export default {
       return new Response(JSON.stringify({
         workerId: wid, diagnostics: diagnostics,
         filesChecked: Math.ceil(files.length / wcnt),
-        checkTime: Date.now() - start,
-        preCheckTime: preCheckTime,
-        cached: true,
+        checkTime: 0, preCheckTime: preCheckTime, cached: true,
         zigTypes: stats.types, zigMembers: stats.members, zigStrings: stats.strings,
       }));
     }
-    
-    return new Response(JSON.stringify({error: 'not ready', preCheckDone: preCheckDone}));
+    return new Response(JSON.stringify({error: 'not ready'}));
   }
 };

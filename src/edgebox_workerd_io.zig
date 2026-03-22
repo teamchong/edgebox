@@ -325,6 +325,30 @@ fn handleRequest(request: []const u8) ![]u8 {
             }
         }
         try result.writer(alloc).print("{{\"ok\":true,\"types\":{d}}}", .{type_count});
+    } else if (std.mem.eql(u8, op, "batchRegisterMembers")) {
+        // Batch register members: "typeId|propName|memberTypeId|memberFlags;..."
+        // Uses ; as record separator (not \n — JSON escapes it)
+        if (std.mem.indexOf(u8, request, "\"data\":\"")) |data_start| {
+            const s = data_start + 8;
+            if (std.mem.indexOfPos(u8, request, s, "\"")) |end| {
+                const data = request[s..end];
+                var lines = std.mem.splitScalar(u8, data, ';');
+                while (lines.next()) |line| {
+                    if (line.len == 0) continue;
+                    // Parse: typeId|propName|memberTypeId|memberFlags
+                    var parts = std.mem.splitScalar(u8, line, '|');
+                    const tid_str = parts.next() orelse continue;
+                    const name_str = parts.next() orelse continue;
+                    const mtid_str = parts.next() orelse continue;
+                    const mflags_str = parts.next() orelse continue;
+                    const tid = std.fmt.parseInt(u32, tid_str, 10) catch continue;
+                    const mtid = std.fmt.parseInt(u32, mtid_str, 10) catch continue;
+                    const mflags = std.fmt.parseInt(u32, mflags_str, 10) catch continue;
+                    edgebox_register_member(tid, name_str.ptr, @intCast(name_str.len), mtid, mflags);
+                }
+            }
+        }
+        try result.writer(alloc).print("{{\"ok\":true,\"members\":{d}}}", .{member_count});
     } else if (std.mem.eql(u8, op, "typeStats")) {
         var t: u32 = 0;
         var m: u32 = 0;
