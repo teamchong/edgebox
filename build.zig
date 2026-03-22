@@ -1695,6 +1695,12 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
+        // Link V8 bridge (C++) and rusty_v8 library
+        edgebox_cli.addCSourceFile(.{ .file = b.path("src/v8_bridge_pool.cpp"), .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti" } });
+        edgebox_cli.addCSourceFile(.{ .file = b.path("src/v8_stubs.c"), .flags = &.{} });
+        edgebox_cli.addIncludePath(b.path("vendor/v8/include"));
+        edgebox_cli.addObjectFile(b.path("vendor/v8/librusty_v8_release_x86_64-unknown-linux-gnu.a"));
+        edgebox_cli.linkLibCpp();
         const install_cli = b.addInstallArtifact(edgebox_cli, .{});
         const edgebox_cli_step = b.step("edgebox-cli", "Build edgebox CLI (daemon + tsc)");
         edgebox_cli_step.dependOn(&install_cli.step);

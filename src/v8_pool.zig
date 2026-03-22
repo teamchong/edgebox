@@ -12,10 +12,12 @@
 const std = @import("std");
 const alloc = std.heap.page_allocator;
 
-// V8 C API from rusty_v8
-const c = @cImport({
-    @cInclude("v8/include/v8.h");
-});
+// V8 bridge (C ABI from v8_bridge_pool.cpp)
+extern fn edgebox_v8_init() void;
+extern fn edgebox_v8_create_isolate() ?*anyopaque;
+extern fn edgebox_v8_enter_isolate(?*anyopaque) void;
+extern fn edgebox_v8_exit_isolate(?*anyopaque) void;
+extern fn edgebox_v8_dispose_isolate(?*anyopaque) void;
 
 const MAX_WORKERS = 16;
 
@@ -46,9 +48,8 @@ pub fn init(worker_count: u32) !void {
     const n = @min(worker_count, MAX_WORKERS);
     pool_size = n;
 
-    // TODO: Initialize V8 platform (once, before any isolate creation)
-    // v8::V8::InitializePlatform(platform);
-    // v8::V8::Initialize();
+    // Initialize V8 platform (once, before any isolate creation)
+    edgebox_v8_init();
 
     // Spawn worker threads
     for (0..n) |i| {
@@ -131,11 +132,14 @@ pub fn collect() ![]const u8 {
 fn workerLoop(worker_id: u32) void {
     const wid: usize = @intCast(worker_id);
 
-    // TODO: Create V8 isolate for this thread
-    // auto isolate = v8::Isolate::New(create_params);
-    // Load TypeScript, patch sys, etc.
+    // Create V8 isolate for this thread
+    const isolate = edgebox_v8_create_isolate();
+    if (isolate == null) return;
+    edgebox_v8_enter_isolate(isolate);
 
-    // For now: stub — read work, run TSC via edgebox_workerd_io functions, submit result
+    // TODO: Create context, load TypeScript, register IO globals
+    // For now: isolate is created and entered
+
     while (!workers[wid].shutdown.load(.acquire)) {
         // Park on condvar
         work_mutex.lock();
@@ -163,5 +167,7 @@ fn workerLoop(worker_id: u32) void {
         work_mutex.unlock();
     }
 
-    // TODO: Dispose V8 isolate
+    // Cleanup V8 isolate
+    edgebox_v8_exit_isolate(isolate);
+    edgebox_v8_dispose_isolate(isolate);
 }
