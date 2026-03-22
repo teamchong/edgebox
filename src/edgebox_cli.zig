@@ -231,9 +231,6 @@ fn generateCapnpConfig(worker_count: usize) !void {
     try w.writeAll("const config :Workerd.Config = (\n");
     try w.writeAll("  services = [\n");
     try w.writeAll("    (name = \"main\", worker = .mainWorker),\n");
-    for (0..worker_count) |i| {
-        try w.print("    (name = \"worker{d}\", worker = .worker{d}),\n", .{ i, i });
-    }
     try w.writeAll("  ],\n");
     try w.print("  sockets = [(name = \"main\", address = \"*:{d}\", service = \"main\")],\n", .{DAEMON_PORT});
     try w.writeAll(");\n");
@@ -242,28 +239,9 @@ fn generateCapnpConfig(worker_count: usize) !void {
     try w.writeAll("    (name = \"worker\", esModule = embed \"src/workerd-tsc/main-daemon.js\"),\n");
     try w.writeAll("    (name = \"bootstrap.js\", esModule = embed \"src/workerd-tsc/bootstrap.js\"),\n");
     try w.writeAll("  ],\n");
-    // Service bindings for parallel dispatch (zero-copy inside same process)
-    if (worker_count > 0) {
-        try w.writeAll("  bindings = [\n");
-        for (0..worker_count) |i| {
-            try w.print("    (name = \"WORKER_{d}\", service = \"worker{d}\"),\n", .{ i, i });
-        }
-        try w.writeAll("  ],\n");
-    }
     try w.writeAll("  compatibilityDate = \"2024-01-01\",\n");
     try w.writeAll(");\n");
-
-    // Generate N worker services for parallel
-    for (0..worker_count) |i| {
-        try w.print("const worker{d} :Workerd.Worker = (\n", .{i});
-        try w.writeAll("  modules = [\n");
-        try w.writeAll("    (name = \"worker\", esModule = embed \"src/workerd-tsc/checker-parallel.js\"),\n");
-        try w.writeAll("    (name = \"bootstrap.js\", esModule = embed \"src/workerd-tsc/bootstrap.js\"),\n");
-        try w.writeAll("    (name = \"typescript.js\", esModule = embed \"node_modules/typescript/lib/typescript.js\"),\n");
-        try w.writeAll("  ],\n");
-        try w.writeAll("  compatibilityDate = \"2024-01-01\",\n");
-        try w.writeAll(");\n");
-    }
+    // Parallel handled by Zig threads (edgebox_parallel_run), not workerd services
 
     const content = try config.toOwnedSlice(alloc);
     defer alloc.free(content);

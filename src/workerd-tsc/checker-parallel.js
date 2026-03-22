@@ -33,7 +33,7 @@ function patchSys(projectCwd) {
 
 export default {
   async fetch(request) {
-    if (!ts || !ts.executeCommandLine) return new Response('TSC not loaded', { status: 500 });
+    if (!ts || !ts.createProgram) return new Response('TSC not loaded', { status: 500 });
 
     var body = {};
     try { body = await request.json(); } catch(e) {}
@@ -45,28 +45,37 @@ export default {
 
     patchSys(projectCwd);
 
-    // Capture output
+    // Parse tsconfig and create program (every worker does this — file cache shared via Zig)
+    var configFile = ts.readConfigFile(projectCwd + '/tsconfig.json', ts.sys.readFile);
+    if (configFile.error) return new Response('tsconfig error', { status: 400 });
+    var parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, projectCwd);
+    var program = ts.createProgram(parsed.fileNames, parsed.options);
+
+    // Get all source files and shard them
+    var files = program.getSourceFiles();
     var output = [];
-    ts.sys.write = function(s) { output.push(String(s)); };
-    ts.sys.exit = function() {};
-    ts.sys.args = ['--noEmit', '-p', projectCwd + '/tsconfig.json'];
 
-    try {
-      ts.executeCommandLine(ts.sys, ts.noop, ts.sys.args);
-    } catch(e) {
-      output.push('error: ' + e.message + '\n');
-    }
-
-    // Filter diagnostics to this worker's shard
-    if (workerCount > 1) {
-      var all = output.join('').split('\n');
-      var sharded = [];
-      for (var i = 0; i < all.length; i++) {
-        if (i % workerCount === workerId) sharded.push(all[i]);
+    // Global diagnostics (only worker 0 reports these)
+    if (workerId === 0) {
+      var globalDiags = ts.getPreEmitDiagnostics(program).filter(function(d) { return !d.file; });
+      for (var g = 0; g < globalDiags.length; g++) {
+        output.push(ts.flattenDiagnosticMessageText(globalDiags[g].messageText, '\n'));
       }
-      return new Response(sharded.join('\n'), { headers: { 'Content-Type': 'text/plain' } });
     }
 
-    return new Response(output.join(''), { headers: { 'Content-Type': 'text/plain' } });
+    // Check only this worker's shard of files
+    for (var i = 0; i < files.length; i++) {
+      if (i % workerCount !== workerId) continue;
+      var diags = program.getSemanticDiagnostics(files[i]);
+      for (var k = 0; k < diags.length; k++) {
+        var d = diags[k];
+        if (d.file) {
+          var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
+          output.push(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' '));
+        }
+      }
+    }
+
+    return new Response(output.join('\n'), { headers: { 'Content-Type': 'text/plain' } });
   }
 };

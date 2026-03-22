@@ -1,8 +1,8 @@
 diff --git a/src/workerd/api/global-scope.h b/src/workerd/api/global-scope.h
-index 3f59a4f53..a35ab482d 100644
+index 3f59a4f53..01e74b9fa 100644
 --- a/src/workerd/api/global-scope.h
 +++ b/src/workerd/api/global-scope.h
-@@ -488,6 +488,35 @@ class Immediate final: public jsg::Object {
+@@ -488,6 +488,37 @@ class Immediate final: public jsg::Object {
    TimeoutId timeoutId;
  };
  
@@ -27,6 +27,8 @@ index 3f59a4f53..a35ab482d 100644
 +  // crypto
 +  int edgebox_hash(const char* algo, int algo_len, const char* data, int data_len, char* out, int out_cap);
 +  int edgebox_random_bytes(char* out, int out_len);
++  // parallel
++  const char* edgebox_parallel_run(const char* cwd, int cwd_len, int worker_count, int* out_len);
 +  // memory
 +  void edgebox_free(const char* ptr, int len);
 +  // type system
@@ -38,7 +40,7 @@ index 3f59a4f53..a35ab482d 100644
  // Global object API exposed to JavaScript.
  class ServiceWorkerGlobalScope: public WorkerGlobalScope {
   public:
-@@ -621,6 +650,107 @@ class ServiceWorkerGlobalScope: public WorkerGlobalScope {
+@@ -621,6 +652,117 @@ class ServiceWorkerGlobalScope: public WorkerGlobalScope {
      return JSG_THIS;
    }
  
@@ -113,9 +115,10 @@ index 3f59a4f53..a35ab482d 100644
 +  }
 +  // ── crypto ──
 +  kj::String __edgebox_hash(kj::String algo, kj::String data) {
-+    char out[128]; // max SHA-512 hex = 128 chars
++    char out[129]; // max SHA-512 hex = 128 chars + NUL
 +    int len = edgebox_hash(algo.cStr(), algo.size(), data.cStr(), data.size(), out, 128);
 +    if (len <= 0) return kj::str("");
++    out[len] = '\0';
 +    return kj::str(kj::StringPtr(out, len));
 +  }
 +  kj::String __edgebox_random_bytes(double size) {
@@ -123,14 +126,23 @@ index 3f59a4f53..a35ab482d 100644
 +    if (n <= 0 || n > 65536) return kj::str("");
 +    char buf[65536];
 +    edgebox_random_bytes(buf, n);
-+    // Return as hex string
-+    char hex[131072];
++    char hex[131073]; // +1 for NUL
 +    const char* h = "0123456789abcdef";
 +    for (int i = 0; i < n; i++) {
 +      hex[i*2] = h[(unsigned char)buf[i] >> 4];
 +      hex[i*2+1] = h[(unsigned char)buf[i] & 0xf];
 +    }
++    hex[n*2] = '\0';
 +    return kj::str(kj::StringPtr(hex, n*2));
++  }
++  // ── parallel ──
++  kj::String __edgebox_parallel_run(kj::String cwd, double workerCount) {
++    int out_len = 0;
++    const char* data = edgebox_parallel_run(cwd.cStr(), cwd.size(), (int)workerCount, &out_len);
++    if (data == nullptr || out_len <= 0) return kj::str("");
++    auto result = kj::str(kj::StringPtr(data, out_len));
++    edgebox_free(data, out_len);
++    return result;
 +  }
 +  // ── type system ──
 +  void __edgebox_register_type(double id, double flags) {
@@ -146,7 +158,7 @@ index 3f59a4f53..a35ab482d 100644
    // Implemented in global-scope.c++ to avoid including crypto.h
    jsg::Ref<Crypto> getCrypto(jsg::Lock& js);
  
-@@ -685,6 +815,27 @@ class ServiceWorkerGlobalScope: public WorkerGlobalScope {
+@@ -685,6 +827,29 @@ class ServiceWorkerGlobalScope: public WorkerGlobalScope {
  
      JSG_METHOD(btoa);
      JSG_METHOD(atob);
@@ -171,6 +183,8 @@ index 3f59a4f53..a35ab482d 100644
 +    // crypto
 +    JSG_METHOD(__edgebox_hash);
 +    JSG_METHOD(__edgebox_random_bytes);
++    // parallel
++    JSG_METHOD(__edgebox_parallel_run);
  
      JSG_METHOD(setTimeout);
      JSG_METHOD(clearTimeout);
