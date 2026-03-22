@@ -206,7 +206,6 @@ pub fn setupParallelCheck(
     // Workers now use per-file getSemanticDiagnostics (not executeCommandLine).
     // Each worker only outputs diagnostics for its assigned files.
     // Per-worker stdout buffers in v8_io.zig prevent diagnostic doubling.
-    const cpu_count = std.Thread.getCpuCount() catch 4;
     g_worker_count = 1; // workerd parallel is production path
 
     if (g_worker_count <= 1 or embedded_snapshot.len == 0) return false;
