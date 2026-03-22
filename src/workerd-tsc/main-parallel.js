@@ -10,7 +10,6 @@ export default {
     try {
       if (!ts.sys) return new Response(JSON.stringify({error: 'ts.sys null'}));
 
-      // Parse config
       var configPath = projectDir + '/tsconfig.json';
       if (!ts.sys.fileExists(configPath)) {
         return new Response(JSON.stringify({error: 'No tsconfig.json'}));
@@ -18,15 +17,20 @@ export default {
       var configFile = ts.readConfigFile(configPath, ts.sys.readFile);
       var parsedConfig = ts.parseJsonConfigFileContent(configFile.config, ts.sys, projectDir);
 
-      // Create program (parse all files — serial, but Zig cache warms for workers)
       var parseStart = Date.now();
       var program = ts.createProgram(parsedConfig.fileNames, parsedConfig.options);
       var sourceFiles = program.getSourceFiles();
       var parseTime = Date.now() - parseStart;
 
-      // Shard files to checker workers
-      var checkers = [env.CHECKER_0, env.CHECKER_1];
+      // Collect available checkers
+      var checkers = [];
+      if (env.CHECKER_0) checkers.push(env.CHECKER_0);
+      if (env.CHECKER_1) checkers.push(env.CHECKER_1);
+      if (env.CHECKER_2) checkers.push(env.CHECKER_2);
+      if (env.CHECKER_3) checkers.push(env.CHECKER_3);
       var workerCount = checkers.length;
+
+      // Shard files
       var shards = [];
       for (var w = 0; w < workerCount; w++) {
         var files = [];
@@ -36,7 +40,7 @@ export default {
         shards.push(files);
       }
 
-      // Dispatch to workers in parallel via service bindings
+      // Dispatch in parallel
       var checkStart = Date.now();
       var promises = checkers.map(function(checker, idx) {
         return checker.fetch(new Request('http://check/', {
@@ -55,7 +59,6 @@ export default {
       var results = await Promise.all(promises);
       var checkTime = Date.now() - checkStart;
 
-      // Merge diagnostics
       var allDiags = [];
       var workerTimes = [];
       for (var r = 0; r < results.length; r++) {
@@ -63,7 +66,7 @@ export default {
         workerTimes.push({parse: results[r].parseTime, check: results[r].checkTime, files: results[r].filesChecked});
       }
 
-      // Dedup by file+start+code
+      // Dedup
       var seen = {};
       var unique = [];
       for (var d = 0; d < allDiags.length; d++) {
@@ -76,14 +79,13 @@ export default {
         workers: workerCount,
         totalFiles: sourceFiles.length,
         diagnostics: unique.length,
-        messages: unique.map(function(d) { return d.message; }),
         parseTime: parseTime,
         checkTime: checkTime,
         totalTime: Date.now() - start,
         workerTimes: workerTimes,
       }));
     } catch(e) {
-      return new Response(JSON.stringify({error: e.message, stack: e.stack && e.stack.slice(0,500)}));
+      return new Response(JSON.stringify({error: e.message}));
     }
   }
 };

@@ -1,21 +1,35 @@
 import './bootstrap.js';
 import ts from './typescript.js';
 
+// Cache: reuse program if rootNames + options match
+var cachedProgram = null;
+var cachedRootKey = '';
+
 export default {
   async fetch(request) {
     var body = await request.json();
     var start = Date.now();
 
     try {
-      // Create own program (parse from Zig cache — files already warm from main)
-      var program = ts.createProgram(body.rootNames, body.options);
-      var parseTime = Date.now() - start;
+      // Cache key: rootNames hash
+      var rootKey = body.rootNames.join(',');
+      var program;
+      
+      if (cachedProgram && cachedRootKey === rootKey) {
+        // Reuse cached program — skip parse entirely!
+        program = cachedProgram;
+        var parseTime = 0;
+      } else {
+        // First run: create program (parse from Zig cache)
+        program = ts.createProgram(body.rootNames, body.options);
+        cachedProgram = program;
+        cachedRootKey = rootKey;
+        var parseTime = Date.now() - start;
+      }
 
-      // Build assigned file set
       var assigned = {};
       for (var i = 0; i < body.files.length; i++) assigned[body.files[i]] = true;
 
-      // Check only assigned files
       var checkStart = Date.now();
       var diagnostics = [];
       var sourceFiles = program.getSourceFiles();
@@ -40,6 +54,7 @@ export default {
         filesChecked: body.files.length,
         parseTime: parseTime,
         checkTime: Date.now() - checkStart,
+        cached: cachedRootKey === rootKey && parseTime === 0,
       }));
     } catch(e) {
       return new Response(JSON.stringify({error: e.message, workerId: body.workerId}));
