@@ -291,8 +291,12 @@ function runTsc(cmd: string, args: string[], outDir: string, debug: boolean = fa
   // Count type errors from stdout AND stderr (tsc may output to either)
   const stdout = result.stdout?.toString() || "";
   const stderr_str = result.stderr?.toString() || "";
-  const combined = stdout + stderr_str;
-  const diagnostics = (combined.match(/error TS\d+/g) || []).length;
+  const stdoutDiags = (stdout.match(/error TS\d+/g) || []).length;
+  const stderrDiags = (stderr_str.match(/error TS\d+/g) || []).length;
+  const diagnostics = stdoutDiags + stderrDiags;
+  if (debug && (stdoutDiags > 0 || stderrDiags > 0)) {
+    console.log(`    DEBUG stdout (${stdoutDiags}), stderr (${stderrDiags})`);
+  }
 
   // Check for errors
   if (result.status !== 0 && result.status !== 2) {
@@ -448,13 +452,13 @@ function benchmarkProject(
     edgeboxTimes.push(edgeboxResult.time);
   }
 
-  // If EdgeBox produced 0 diagnostics but Node.js didn't, log debug info
-  if (edgeboxResult.diagnostics === 0 && nodeResult.diagnostics > 0) {
-    console.log(`    EdgeBox DEBUG: 0 diagnostics (Node has ${nodeResult.diagnostics})`);
-    // Re-run once with debug to see what's happening
+  // If EdgeBox diagnostics don't match Node.js, log debug info
+  if (edgeboxResult.diagnostics !== nodeResult.diagnostics) {
+    console.log(`    EdgeBox DEBUG: ${edgeboxResult.diagnostics} diagnostics (Node has ${nodeResult.diagnostics})`);
+    // Re-run once with debug to see stdout vs stderr split
     const debugResult = runTsc(edgeboxCmd, edgeboxArgs, edgeboxOutDir, true);
     console.log(`    EdgeBox DEBUG: re-run got ${debugResult.diagnostics} diagnostics, status=${debugResult.success}`);
-    if (debugResult.diagnostics > 0) {
+    if (edgeboxResult.diagnostics === 0 && debugResult.diagnostics > 0) {
       edgeboxResult = debugResult; // Use the debug run's result
     }
   }
