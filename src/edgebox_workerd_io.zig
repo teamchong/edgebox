@@ -239,51 +239,112 @@ export fn edgebox_free(ptr: ?[*]const u8, len: c_int) void {
     }
 }
 
-// ── Parallel Check: Zig threads spawn N workerd child processes ──
-// Each child checks a shard. File cache shared via same mmap.
-// Results collected via stdout pipes. Zero HTTP between workers.
+// ── Zero-Copy Parallel Dispatch (Zig green thread channels) ──
+// Workers (separate V8 isolates in same workerd process) block on condvar.
+// Main dispatches work → signals condvar → workers wake → check shard → submit.
+// ALL communication via shared memory. ZERO HTTP. ZERO serialization.
 
-const ParallelResult = struct {
-    output: []const u8,
-    exit_code: u8,
+const MAX_WORKERS = 16;
+
+const WorkItem = struct {
+    cwd: ?[]const u8 = null,
+    worker_count: u32 = 0,
+    ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    result: ?[]const u8 = null,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
-export fn edgebox_parallel_run(
-    cwd_ptr: [*]const u8, cwd_len: c_int,
-    worker_count: c_int,
-    out_len: *c_int,
-) ?[*]const u8 {
-    if (cwd_len <= 0 or worker_count <= 0) { out_len.* = 0; return null; }
+var work_items: [MAX_WORKERS]WorkItem = [_]WorkItem{.{}} ** MAX_WORKERS;
+var work_mutex: std.Thread.Mutex = .{};
+var work_cond: std.Thread.Condition = .{};
+var dispatch_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+/// Called by main service: dispatch work to all workers.
+/// Workers are blocked on edgebox_wait_for_work — this wakes them.
+export fn edgebox_dispatch_work(cwd_ptr: [*]const u8, cwd_len: c_int, worker_count: c_int) void {
+    if (cwd_len <= 0 or worker_count <= 0) return;
     const cwd = cwd_ptr[0..@intCast(cwd_len)];
-    const n: usize = @intCast(@min(worker_count, 16));
+    const n: u32 = @intCast(@min(worker_count, MAX_WORKERS));
 
-    // Find workerd binary
-    const workerd_path = "vendor/workerd/bazel-bin/src/workerd/server/workerd";
-    std.fs.cwd().access(workerd_path, .{}) catch { out_len.* = 0; return null; };
-
-    // Pre-warm file cache for all workers
-    prewarmProjectFiles(cwd);
-
-    // Spawn N workers as threads (each runs workerd child process)
-    var threads: [16]?std.Thread = [_]?std.Thread{null} ** 16;
-    var results: [16]?[]const u8 = [_]?[]const u8{null} ** 16;
-
+    // Set work for each worker
     for (0..n) |i| {
-        const ctx = alloc.create(WorkerCtx) catch continue;
-        ctx.* = .{ .worker_id = @intCast(i), .worker_count = @intCast(n), .cwd = cwd, .result = &results[i] };
-        threads[i] = std.Thread.spawn(.{}, runWorkerThread, .{ctx}) catch null;
+        work_items[i].cwd = cwd;
+        work_items[i].worker_count = n;
+        work_items[i].result = null;
+        work_items[i].done.store(false, .release);
+        work_items[i].ready.store(true, .release);
     }
 
-    // Wait for all threads
-    for (0..n) |i| {
-        if (threads[i]) |t| t.join();
+    // Bump generation and wake all workers
+    _ = dispatch_generation.fetchAdd(1, .release);
+    work_mutex.lock();
+    work_cond.broadcast();
+    work_mutex.unlock();
+}
+
+/// Called by worker service at module init: blocks until work is available.
+/// Returns cwd pointer+len. Worker reads workerId/workerCount from work_items.
+export fn edgebox_wait_for_work(worker_id: c_int, out_cwd_len: *c_int, out_worker_count: *c_int) ?[*]const u8 {
+    if (worker_id < 0 or worker_id >= MAX_WORKERS) { out_cwd_len.* = 0; return null; }
+    const wid: usize = @intCast(worker_id);
+
+    // Block until work is ready
+    work_mutex.lock();
+    while (!work_items[wid].ready.load(.acquire)) {
+        work_cond.timedWait(&work_mutex, 100 * std.time.ns_per_ms) catch {};
     }
+    work_mutex.unlock();
+
+    // Clear ready flag (consumed)
+    work_items[wid].ready.store(false, .release);
+
+    if (work_items[wid].cwd) |cwd| {
+        out_cwd_len.* = @intCast(cwd.len);
+        out_worker_count.* = @intCast(work_items[wid].worker_count);
+        return cwd.ptr;
+    }
+    out_cwd_len.* = 0;
+    out_worker_count.* = 0;
+    return null;
+}
+
+/// Called by worker after checking its shard: submit results.
+export fn edgebox_submit_result(worker_id: c_int, data_ptr: [*]const u8, data_len: c_int) void {
+    if (worker_id < 0 or worker_id >= MAX_WORKERS or data_len < 0) return;
+    const wid: usize = @intCast(worker_id);
+    if (data_len > 0) {
+        const copy = alloc.alloc(u8, @intCast(data_len)) catch return;
+        @memcpy(copy, data_ptr[0..@intCast(data_len)]);
+        work_items[wid].result = copy;
+    }
+    work_items[wid].done.store(true, .release);
+    work_mutex.lock();
+    work_cond.broadcast();
+    work_mutex.unlock();
+}
+
+/// Called by main after dispatch: blocks until all workers done, returns merged results.
+export fn edgebox_collect_results(worker_count: c_int, out_len: *c_int) ?[*]const u8 {
+    if (worker_count <= 0) { out_len.* = 0; return null; }
+    const n: usize = @intCast(@min(worker_count, MAX_WORKERS));
+
+    // Wait for all workers to submit
+    work_mutex.lock();
+    while (true) {
+        var all_done = true;
+        for (0..n) |i| {
+            if (!work_items[i].done.load(.acquire)) { all_done = false; break; }
+        }
+        if (all_done) break;
+        work_cond.timedWait(&work_mutex, 100 * std.time.ns_per_ms) catch {};
+    }
+    work_mutex.unlock();
 
     // Merge results (dedup by exact line)
     var merged: std.ArrayListUnmanaged(u8) = .{};
     var seen = std.StringHashMapUnmanaged(void){};
     for (0..n) |i| {
-        if (results[i]) |data| {
+        if (work_items[i].result) |data| {
             var lines = std.mem.splitScalar(u8, data, '\n');
             while (lines.next()) |line| {
                 if (line.len == 0) continue;
@@ -299,113 +360,6 @@ export fn edgebox_parallel_run(
     const output = merged.toOwnedSlice(alloc) catch { out_len.* = 0; return null; };
     out_len.* = @intCast(output.len);
     return output.ptr;
-}
-
-const WorkerCtx = struct {
-    worker_id: u32,
-    worker_count: u32,
-    cwd: []const u8,
-    result: *?[]const u8,
-};
-
-fn runWorkerThread(ctx: *WorkerCtx) void {
-    defer alloc.destroy(ctx);
-
-    // Generate single-worker capnp config
-    const config_path = std.fmt.allocPrint(alloc, "/tmp/edgebox-worker-{d}.capnp", .{ctx.worker_id}) catch return;
-    defer alloc.free(config_path);
-
-    // Write project config for this worker
-    const proj_config = std.fmt.allocPrint(alloc, "/tmp/edgebox-worker-{d}-config.json", .{ctx.worker_id}) catch return;
-    defer alloc.free(proj_config);
-    const proj_json = std.fmt.allocPrint(alloc, "{{\"cwd\":\"{s}\",\"workerId\":{d},\"workerCount\":{d}}}", .{ ctx.cwd, ctx.worker_id, ctx.worker_count }) catch return;
-    defer alloc.free(proj_json);
-    std.fs.cwd().writeFile(.{ .sub_path = proj_config, .data = proj_json }) catch return;
-
-    // Generate capnp for this worker
-    const capnp = std.fmt.allocPrint(alloc,
-        \\using Workerd = import "/workerd/workerd.capnp";
-        \\const config :Workerd.Config = (
-        \\  services = [(name = "main", worker = .w)],
-        \\  sockets = [(name = "main", address = "*:{d}", service = "main")],
-        \\);
-        \\const w :Workerd.Worker = (
-        \\  modules = [
-        \\    (name = "worker", esModule = embed "src/workerd-tsc/checker-parallel.js"),
-        \\    (name = "bootstrap.js", esModule = embed "src/workerd-tsc/bootstrap.js"),
-        \\    (name = "typescript.js", esModule = embed "node_modules/typescript/lib/typescript.js"),
-        \\  ],
-        \\  compatibilityDate = "2024-01-01",
-        \\);
-    , .{@as(u16, 19000) + @as(u16, @intCast(ctx.worker_id))}) catch return;
-    defer alloc.free(capnp);
-    std.fs.cwd().writeFile(.{ .sub_path = config_path, .data = capnp }) catch return;
-
-    // Spawn workerd child process
-    const argv = [_][]const u8{ "vendor/workerd/bazel-bin/src/workerd/server/workerd", "serve", config_path };
-    var child = std.process.Child.init(&argv, alloc);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    child.spawn() catch return;
-
-    // Wait for it to start, send request, read response
-    std.Thread.sleep(3 * std.time.ns_per_s);
-
-    // Send check request via TCP
-    const port: u16 = 19000 + @as(u16, @intCast(ctx.worker_id));
-    const stream = std.net.tcpConnectToHost(alloc, "127.0.0.1", port) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return;
-    };
-    defer stream.close();
-
-    const req = std.fmt.allocPrint(alloc, "POST / HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ proj_json.len, proj_json }) catch return;
-    defer alloc.free(req);
-    stream.writeAll(req) catch return;
-    std.posix.shutdown(stream.handle, .send) catch {};
-
-    // Read response
-    var resp: std.ArrayListUnmanaged(u8) = .{};
-    var buf: [8192]u8 = undefined;
-    while (true) {
-        const n2 = stream.read(&buf) catch break;
-        if (n2 == 0) break;
-        resp.appendSlice(alloc, buf[0..n2]) catch break;
-    }
-
-    // Extract body (skip HTTP headers)
-    const full = resp.toOwnedSlice(alloc) catch return;
-    if (std.mem.indexOf(u8, full, "\r\n\r\n")) |hdr_end| {
-        ctx.result.* = full[hdr_end + 4 ..];
-    } else {
-        ctx.result.* = full;
-    }
-
-    // Kill worker
-    _ = child.kill() catch {};
-    _ = child.wait() catch {};
-}
-
-fn prewarmProjectFiles(cwd: []const u8) void {
-    prewarmDir(cwd);
-}
-
-fn prewarmDir(dir_path: []const u8) void {
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-    defer dir.close();
-    var it = dir.iterate();
-    while (it.next() catch null) |entry| {
-        if (entry.kind == .file and (std.mem.endsWith(u8, entry.name, ".ts") or std.mem.endsWith(u8, entry.name, ".d.ts") or std.mem.endsWith(u8, entry.name, ".json"))) {
-            const full = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
-            defer alloc.free(full);
-            _ = cacheReadFile(full) catch {};
-        } else if (entry.kind == .directory and !std.mem.eql(u8, entry.name, "node_modules") and !std.mem.eql(u8, entry.name, ".git") and entry.name[0] != '.') {
-            const sub = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
-            defer alloc.free(sub);
-            prewarmDir(sub);
-        }
-    }
 }
 
 // ── Legacy: __edgebox_io_sync JSON fallback (kept for backward compat) ──

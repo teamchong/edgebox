@@ -114,6 +114,20 @@ fn daemonStart() u8 {
     std.fs.cwd().writeFile(.{ .sub_path = PID_FILE, .data = pid_str }) catch {};
 
     std.debug.print("Daemon started (PID {d}, {d} workers, port {d})\n", .{ child.id, worker_count, DAEMON_PORT });
+
+    // Wait for workerd to start listening
+    std.Thread.sleep(3 * std.time.ns_per_s);
+
+    // Wake up all worker services by connecting to their sockets
+    // This triggers their fetch handler → doWork() → blocks on Zig condvar
+    for (0..worker_count) |i| {
+        const port: u16 = 19001 + @as(u16, @intCast(i));
+        const wake = std.net.tcpConnectToHost(alloc, "127.0.0.1", port) catch continue;
+        wake.writeAll("GET / HTTP/1.0\r\nHost: localhost\r\n\r\n") catch {};
+        wake.close();
+    }
+
+    std.debug.print("Workers initialized\n", .{});
     return 0;
 }
 
@@ -231,9 +245,19 @@ fn generateCapnpConfig(worker_count: usize) !void {
     try w.writeAll("const config :Workerd.Config = (\n");
     try w.writeAll("  services = [\n");
     try w.writeAll("    (name = \"main\", worker = .mainWorker),\n");
+    for (0..worker_count) |i| {
+        try w.print("    (name = \"worker{d}\", worker = .worker{d}),\n", .{ i, i });
+    }
     try w.writeAll("  ],\n");
-    try w.print("  sockets = [(name = \"main\", address = \"*:{d}\", service = \"main\")],\n", .{DAEMON_PORT});
+    // Main socket + one socket per worker (each socket = own thread = own V8 isolate)
+    try w.writeAll("  sockets = [\n");
+    try w.print("    (name = \"main\", address = \"*:{d}\", service = \"main\"),\n", .{DAEMON_PORT});
+    for (0..worker_count) |i| {
+        try w.print("    (name = \"worker{d}\", address = \"*:{d}\", service = \"worker{d}\"),\n", .{ i, @as(u16, 19001) + @as(u16, @intCast(i)), i });
+    }
+    try w.writeAll("  ],\n");
     try w.writeAll(");\n");
+    // Main service (dispatcher)
     try w.writeAll("const mainWorker :Workerd.Worker = (\n");
     try w.writeAll("  modules = [\n");
     try w.writeAll("    (name = \"worker\", esModule = embed \"src/workerd-tsc/main-daemon.js\"),\n");
@@ -241,7 +265,21 @@ fn generateCapnpConfig(worker_count: usize) !void {
     try w.writeAll("  ],\n");
     try w.writeAll("  compatibilityDate = \"2024-01-01\",\n");
     try w.writeAll(");\n");
-    // Parallel handled by Zig threads (edgebox_parallel_run), not workerd services
+    // Worker services (each on own socket = own thread)
+    for (0..worker_count) |i| {
+        try w.print("const worker{d} :Workerd.Worker = (\n", .{i});
+        try w.writeAll("  modules = [\n");
+        try w.writeAll("    (name = \"worker\", esModule = embed \"src/workerd-tsc/checker-parallel.js\"),\n");
+        try w.writeAll("    (name = \"bootstrap.js\", esModule = embed \"src/workerd-tsc/bootstrap.js\"),\n");
+        try w.writeAll("    (name = \"typescript.js\", esModule = embed \"node_modules/typescript/lib/typescript.js\"),\n");
+        try w.writeAll("  ],\n");
+        // Inject worker ID
+        try w.writeAll("  bindings = [\n");
+        try w.print("    (name = \"__EDGEBOX_WORKER_ID\", text = \"{d}\"),\n", .{i});
+        try w.writeAll("  ],\n");
+        try w.writeAll("  compatibilityDate = \"2024-01-01\",\n");
+        try w.writeAll(");\n");
+    }
 
     const content = try config.toOwnedSlice(alloc);
     defer alloc.free(content);
