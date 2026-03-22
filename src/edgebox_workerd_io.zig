@@ -291,6 +291,47 @@ fn handleRequest(request: []const u8) ![]u8 {
         // Format: {"op":"dispatchWork","shards":["shard0json","shard1json",...]}
         // For now, just signal readiness and wait
         try result.appendSlice(alloc, "{\"ok\":true,\"status\":\"dispatch_ready\"}");
+    } else if (std.mem.eql(u8, op, "registerType")) {
+        // Register type flags in Zig flat array
+        var tid: u32 = 0;
+        var flags_val: u32 = 0;
+        if (std.mem.indexOf(u8, request, "\"id\":")) |id_start| {
+            const s = id_start + 5;
+            var e = s;
+            while (e < request.len and request[e] >= '0' and request[e] <= '9') : (e += 1) {}
+            tid = std.fmt.parseInt(u32, request[s..e], 10) catch 0;
+        }
+        if (std.mem.indexOf(u8, request, "\"flags\":")) |f_start| {
+            const s = f_start + 8;
+            var e = s;
+            while (e < request.len and request[e] >= '0' and request[e] <= '9') : (e += 1) {}
+            flags_val = std.fmt.parseInt(u32, request[s..e], 10) catch 0;
+        }
+        edgebox_register_type(tid, flags_val, 0);
+        try result.appendSlice(alloc, "{\"ok\":true}");
+    } else if (std.mem.eql(u8, op, "typeStats")) {
+        var t: u32 = 0;
+        var m: u32 = 0;
+        var s: u32 = 0;
+        edgebox_type_stats(&t, &m, &s);
+        try result.writer(alloc).print("{{\"ok\":true,\"types\":{d},\"members\":{d},\"strings\":{d}}}", .{ t, m, s });
+    } else if (std.mem.eql(u8, op, "checkStructural")) {
+        var src: u32 = 0;
+        var tgt: u32 = 0;
+        if (std.mem.indexOf(u8, request, "\"src\":")) |s_start| {
+            const s2 = s_start + 6;
+            var e = s2;
+            while (e < request.len and request[e] >= '0' and request[e] <= '9') : (e += 1) {}
+            src = std.fmt.parseInt(u32, request[s2..e], 10) catch 0;
+        }
+        if (std.mem.indexOf(u8, request, "\"tgt\":")) |t_start| {
+            const s2 = t_start + 6;
+            var e = s2;
+            while (e < request.len and request[e] >= '0' and request[e] <= '9') : (e += 1) {}
+            tgt = std.fmt.parseInt(u32, request[s2..e], 10) catch 0;
+        }
+        const r = edgebox_check_structural(src, tgt);
+        try result.writer(alloc).print("{{\"ok\":true,\"result\":{d}}}", .{r});
     } else if (std.mem.eql(u8, op, "parallelCheck")) {
         // Spawn N Zig threads, each runs V8 isolate + TSC checker on a file shard.
         // Collect diagnostics via thread-safe buffer, return combined result.
@@ -541,4 +582,126 @@ export fn edgebox_get_flag_bitmap(out_len: *c_int) ?[*]const u8 {
     buildFlagBitmap();
     out_len.* = 256 * 256;
     return &flag_bitmap;
+}
+
+// ── Zero-Copy Type Data Model ──
+// Flat columnar storage for TypeScript types in Zig mmap.
+// All workers share the same memory — zero copy across isolates.
+// SIMD operates directly on these columns.
+
+const MAX_TYPES: u32 = 200_000; // TSC creates ~60K types for playwright
+const MAX_MEMBERS: u32 = 2_000_000; // Total property slots across all types
+const MAX_STRINGS: u32 = 500_000; // Interned string table size
+
+// Type columns (SOA layout — cache-friendly for SIMD)
+var col_type_flags: [MAX_TYPES]u32 = [_]u32{0} ** MAX_TYPES;
+var col_type_member_offset: [MAX_TYPES]u32 = [_]u32{0} ** MAX_TYPES;
+var col_type_member_count: [MAX_TYPES]u16 = [_]u16{0} ** MAX_TYPES;
+var col_type_object_flags: [MAX_TYPES]u32 = [_]u32{0} ** MAX_TYPES;
+var type_count: u32 = 0;
+
+// Member columns (flat array of all type members)
+var col_member_name_id: [MAX_MEMBERS]u32 = [_]u32{0} ** MAX_MEMBERS;
+var col_member_type_id: [MAX_MEMBERS]u32 = [_]u32{0} ** MAX_MEMBERS;
+var col_member_flags: [MAX_MEMBERS]u32 = [_]u32{0} ** MAX_MEMBERS;
+var member_count: u32 = 0;
+
+// String intern table (property names → integer IDs)
+var string_table: std.StringHashMapUnmanaged(u32) = .{};
+var string_count: u32 = 0;
+var type_data_mutex: std.Thread.Mutex = .{};
+
+/// Register a type: called from TSC's createType transform
+/// Returns the Zig-side type slot index
+export fn edgebox_register_type(type_id: u32, flags: u32, object_flags: u32) void {
+    if (type_id >= MAX_TYPES) return;
+    col_type_flags[type_id] = flags;
+    col_type_object_flags[type_id] = object_flags;
+    if (type_id >= type_count) type_count = type_id + 1;
+}
+
+/// Register members for a type: called after resolveStructuredTypeMembers
+/// name_ptr/name_len: property name string
+/// member_type_id: the type ID of the member
+/// member_flags: SymbolFlags of the member
+export fn edgebox_register_member(
+    type_id: u32,
+    name_ptr: [*]const u8,
+    name_len: c_int,
+    member_type_id: u32,
+    member_flags: u32,
+) void {
+    if (type_id >= MAX_TYPES or member_count >= MAX_MEMBERS) return;
+    if (name_len <= 0) return;
+
+    const name = name_ptr[0..@intCast(name_len)];
+
+    // Intern the property name
+    type_data_mutex.lock();
+    defer type_data_mutex.unlock();
+
+    const name_id = blk: {
+        if (string_table.get(name)) |id| break :blk id;
+        const id = string_count;
+        string_count += 1;
+        // Dupe the string for the hash map key
+        const key = alloc.dupe(u8, name) catch return;
+        string_table.put(alloc, key, id) catch return;
+        break :blk id;
+    };
+
+    // Set member offset if this is the first member for this type
+    if (col_type_member_count[type_id] == 0) {
+        col_type_member_offset[type_id] = member_count;
+    }
+
+    const idx = member_count;
+    col_member_name_id[idx] = name_id;
+    col_member_type_id[idx] = member_type_id;
+    col_member_flags[idx] = member_flags;
+    member_count += 1;
+    col_type_member_count[type_id] += 1;
+}
+
+/// SIMD structural check: are all members of type A present in type B?
+/// Returns: 1 = structurally compatible, 0 = not compatible, 2 = unknown (needs full check)
+export fn edgebox_check_structural(source_id: u32, target_id: u32) u8 {
+    if (source_id >= type_count or target_id >= type_count) return 2;
+
+    const src_offset = col_type_member_offset[source_id];
+    const src_count = col_type_member_count[source_id];
+    const tgt_offset = col_type_member_offset[target_id];
+    const tgt_count = col_type_member_count[target_id];
+
+    // No members = can't determine structurally
+    if (src_count == 0 or tgt_count == 0) return 2;
+
+    // Quick reject: target has more required members than source
+    if (tgt_count > src_count * 2) return 0;
+
+    // Check: every target member name must exist in source
+    var matched: u32 = 0;
+    var ti: u32 = 0;
+    while (ti < tgt_count) : (ti += 1) {
+        const tgt_name = col_member_name_id[tgt_offset + ti];
+        var found = false;
+        var si: u32 = 0;
+        while (si < src_count) : (si += 1) {
+            if (col_member_name_id[src_offset + si] == tgt_name) {
+                found = true;
+                matched += 1;
+                break;
+            }
+        }
+        if (!found) return 0; // Target has member not in source
+    }
+
+    return if (matched == tgt_count) 1 else 2;
+}
+
+/// Get type data stats
+export fn edgebox_type_stats(out_types: *u32, out_members: *u32, out_strings: *u32) void {
+    out_types.* = type_count;
+    out_members.* = member_count;
+    out_strings.* = string_count;
 }
