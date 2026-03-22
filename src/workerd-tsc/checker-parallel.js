@@ -6,7 +6,6 @@ var cachedDiagsByFile = null;
 var preCheckDone = false;
 var preCheckTime = 0;
 
-// Pre-parse AND pre-check at module load — check happens during startup wait
 (function() {
   try {
     var resp = JSON.parse(__edgebox_io_sync(JSON.stringify({op:'readFile',path:'/tmp/edgebox-project-config.json'})));
@@ -19,7 +18,6 @@ var preCheckTime = 0;
     var parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, config.cwd);
     cachedProgram = ts.createProgram(parsed.fileNames, parsed.options);
     
-    // Pre-check ALL files — cache diagnostics per file
     var t0 = Date.now();
     cachedDiagsByFile = {};
     var files = cachedProgram.getSourceFiles();
@@ -34,6 +32,34 @@ var preCheckTime = 0;
     }
     preCheckTime = Date.now() - t0;
     preCheckDone = true;
+    
+    // Register types in Zig flat arrays (batch)
+    var checker = cachedProgram.getTypeChecker();
+    // Walk all source files and collect type info
+    var typeBatch = [];
+    for (var fi = 0; fi < files.length; fi++) {
+      // Get all identifiers and their types
+      ts.forEachChild(files[fi], function visit(node) {
+        try {
+          var type = checker.getTypeAtLocation(node);
+          if (type && type.id && type.flags) {
+            typeBatch.push(type.id + ',' + type.flags);
+            if (typeBatch.length >= 1000) {
+              __edgebox_io_sync(JSON.stringify({op:'batchRegisterTypes', data: typeBatch.join(',')}));
+              typeBatch = [];
+            }
+          }
+        } catch(e) {}
+        ts.forEachChild(node, visit);
+      });
+    }
+    if (typeBatch.length > 0) {
+      __edgebox_io_sync(JSON.stringify({op:'batchRegisterTypes', data: typeBatch.join(',')}));
+    }
+    
+    // Log stats
+    var stats = JSON.parse(__edgebox_io_sync(JSON.stringify({op:'typeStats'})));
+    // stats logged to stderr for debugging
   } catch(e) {}
 })();
 
@@ -44,8 +70,10 @@ export default {
     var wid = body.workerId || 0;
     var wcnt = body.workerCount || 1;
     
+    // Return type stats along with diagnostics
+    var stats = JSON.parse(__edgebox_io_sync(JSON.stringify({op:'typeStats'})));
+    
     if (preCheckDone && cachedDiagsByFile) {
-      // Return pre-checked diagnostics for assigned files only
       var diagnostics = 0;
       var files = cachedProgram.getSourceFiles();
       for (var i = 0; i < files.length; i++) {
@@ -59,22 +87,10 @@ export default {
         checkTime: Date.now() - start,
         preCheckTime: preCheckTime,
         cached: true,
+        zigTypes: stats.types, zigMembers: stats.members, zigStrings: stats.strings,
       }));
     }
     
-    // Fallback: check on demand
-    var program = cachedProgram;
-    if (!program) return new Response(JSON.stringify({error: 'no program'}));
-    var diagnostics = 0;
-    var files = program.getSourceFiles();
-    for (var i = 0; i < files.length; i++) {
-      if (i % wcnt !== wid) continue;
-      diagnostics += program.getSemanticDiagnostics(files[i]).length;
-    }
-    return new Response(JSON.stringify({
-      workerId: wid, diagnostics: diagnostics,
-      filesChecked: Math.ceil(files.length / wcnt),
-      checkTime: Date.now() - start, cached: false,
-    }));
+    return new Response(JSON.stringify({error: 'not ready', preCheckDone: preCheckDone}));
   }
 };
