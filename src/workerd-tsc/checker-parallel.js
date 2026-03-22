@@ -21,6 +21,8 @@ var preCheckTime = 0;
     var t0 = Date.now();
     cachedDiagsByFile = {};
     var files = cachedProgram.getSourceFiles();
+    
+    // Check FIRST (no type registration yet — pure vanilla TSC)
     for (var i = 0; i < files.length; i++) {
       var diags = cachedProgram.getSemanticDiagnostics(files[i]);
       if (diags.length > 0) {
@@ -33,33 +35,26 @@ var preCheckTime = 0;
     preCheckTime = Date.now() - t0;
     preCheckDone = true;
     
-    // Extract types + members to Zig via ZERO-COPY typed calls (no JSON)
+    // Register types AFTER checking (read-only extraction, no side effects)
     var checker = cachedProgram.getTypeChecker();
     var seenTypes = {};
-    
-    function registerType(type) {
-      if (!type || !type.id || seenTypes[type.id]) return;
-      seenTypes[type.id] = true;
-      // Direct call — JS double → C unsigned int → Zig u32. No JSON.
-      __edgebox_register_type(type.id, type.flags || 0);
-      
-      try {
-        var props = checker.getPropertiesOfType(type);
-        for (var p = 0; p < props.length && p < 50; p++) {
-          var prop = props[p];
-          var propType = checker.getTypeOfSymbol(prop);
-          var name = prop.escapedName || '';
-          if (name && propType && propType.id) {
-            // Direct call — string passed as kj::String, zero copy
-            __edgebox_register_member(type.id, name, propType.id, prop.flags || 0);
-          }
-        }
-      } catch(e) {}
-    }
-    
     for (var fi = 0; fi < files.length; fi++) {
       ts.forEachChild(files[fi], function visit(node) {
-        try { registerType(checker.getTypeAtLocation(node)); } catch(e) {}
+        try {
+          var type = checker.getTypeAtLocation(node);
+          if (type && type.id && !seenTypes[type.id]) {
+            seenTypes[type.id] = true;
+            __edgebox_register_type(type.id, type.flags || 0);
+            var props = checker.getPropertiesOfType(type);
+            for (var p = 0; p < props.length && p < 50; p++) {
+              var prop = props[p];
+              var pt = checker.getTypeOfSymbol(prop);
+              if (prop.escapedName && pt && pt.id) {
+                __edgebox_register_member(type.id, prop.escapedName, pt.id, prop.flags || 0);
+              }
+            }
+          }
+        } catch(e) {}
         ts.forEachChild(node, visit);
       });
     }
@@ -72,7 +67,6 @@ export default {
     var wid = body.workerId || 0;
     var wcnt = body.workerCount || 1;
     var stats = JSON.parse(__edgebox_io_sync(JSON.stringify({op:'typeStats'})));
-    
     if (preCheckDone && cachedDiagsByFile) {
       var diagnostics = 0;
       var files = cachedProgram.getSourceFiles();
