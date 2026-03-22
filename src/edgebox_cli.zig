@@ -114,6 +114,23 @@ fn daemonStart() u8 {
     std.fs.cwd().writeFile(.{ .sub_path = PID_FILE, .data = pid_str }) catch {};
 
     std.debug.print("Daemon started (PID {d}, {d} workers, port {d})\n", .{ child.id, worker_count, DAEMON_PORT });
+
+    // Wait for workerd to start, then trigger each worker's fetch handler ONCE.
+    // Workers block on Zig condvar inside fetch handler — after this, ALL
+    // communication is via Zig shared memory. Zero HTTP for actual work.
+    std.Thread.sleep(3 * std.time.ns_per_s);
+    for (0..worker_count) |i| {
+        const port: u16 = 19001 + @as(u16, @intCast(i));
+        // Try IPv6 first (workerd binds to * which includes ::1)
+        const addr6 = std.net.Address.initIp6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, port, 0, 0);
+        const s = std.posix.socket(std.posix.AF.INET6, std.posix.SOCK.STREAM, 0) catch continue;
+        std.posix.connect(s, &addr6.any, addr6.getOsSockLen()) catch { std.posix.close(s); continue; };
+        // Send minimal request to trigger fetch handler
+        _ = std.posix.write(s, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n") catch {};
+        // Don't close — keep connection alive so fetch handler stays running
+        // (worker blocks on condvar inside fetch handler)
+    }
+    std.debug.print("Workers ready\n", .{});
     return 0;
 }
 

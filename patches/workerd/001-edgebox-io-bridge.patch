@@ -220,3 +220,48 @@ index 9ad33ce5f..6da4f855d 100644
      ],
  )
  
+diff --git a/src/workerd/server/server.c++ b/src/workerd/server/server.c++
+index 43b84c8be..f19e11805 100644
+--- a/src/workerd/server/server.c++
++++ b/src/workerd/server/server.c++
+@@ -5882,7 +5882,25 @@ kj::Promise<void> Server::listenOnSockets(config::Config::Reader config,
+       }
+       co_await listenHttp(kj::mv(listener), kj::mv(service), physicalProtocol, kj::mv(rewriter));
+     });
+-    tasks.add(handle(kj::mv(listener)).exclusiveJoin(forkedDrainWhen.addBranch()));
++    // EdgeBox: worker sockets get their own thread for parallel execution.
++    // This allows blocking C calls (like condvar wait) without deadlocking.
++    if (kj::StringPtr(name).startsWith("worker")) {
++      // Run this socket's listener on a separate OS thread
++      auto* handlePtr = new auto(kj::mv(handle));
++      auto* listenerPtr = new auto(kj::mv(listener));
++      auto thread = kj::heap<kj::Thread>([handlePtr, listenerPtr]() noexcept {
++        auto io = kj::setupAsyncIo();
++        auto& waitScope = io.waitScope;
++        auto h = kj::mv(*handlePtr);
++        auto l = kj::mv(*listenerPtr);
++        delete handlePtr;
++        delete listenerPtr;
++        h(kj::mv(l)).wait(waitScope);
++      });
++      workerThreads.add(kj::mv(thread));
++    } else {
++      tasks.add(handle(kj::mv(listener)).exclusiveJoin(forkedDrainWhen.addBranch()));
++    }
+   }
+ 
+   // Start debug port if configured
+diff --git a/src/workerd/server/server.h b/src/workerd/server/server.h
+index 6162b1107..c395668ba 100644
+--- a/src/workerd/server/server.h
++++ b/src/workerd/server/server.h
+@@ -222,6 +222,9 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
+   // Especially includes server loop tasks to listen on sockets. Any error is considered fatal.
+   kj::TaskSet tasks;
+ 
++  // EdgeBox: worker threads for parallel execution (each runs own event loop)
++  kj::Vector<kj::Own<kj::Thread>> workerThreads;
++
+   // Reports an exception thrown by a task in `tasks`.
+   void taskFailed(kj::Exception&& exception) override;
+ 

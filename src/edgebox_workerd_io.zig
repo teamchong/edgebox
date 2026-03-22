@@ -259,6 +259,7 @@ var work_cond: std.Thread.Condition = .{};
 
 /// Main calls this: set work for all workers, signal condvar.
 export fn edgebox_dispatch_work(cwd_ptr: [*]const u8, cwd_len: c_int, worker_count: c_int) void {
+    _ = std.posix.write(2, "[zig] dispatch_work\n") catch {};
     if (cwd_len <= 0 or worker_count <= 0) return;
     const cwd = cwd_ptr[0..@intCast(cwd_len)];
     const n: u32 = @intCast(@min(worker_count, MAX_WORKERS));
@@ -278,6 +279,7 @@ export fn edgebox_dispatch_work(cwd_ptr: [*]const u8, cwd_len: c_int, worker_cou
 
 /// Worker calls this: blocks until work ready. Returns "cwd|workerId|workerCount".
 export fn edgebox_wait_for_work(worker_id: c_int, out_len: *c_int) ?[*]const u8 {
+    _ = std.posix.write(2, "[zig] wait_for_work ENTER\n") catch {};
     if (worker_id < 0 or worker_id >= MAX_WORKERS) { out_len.* = 0; return null; }
     const wid: usize = @intCast(worker_id);
 
@@ -286,6 +288,7 @@ export fn edgebox_wait_for_work(worker_id: c_int, out_len: *c_int) ?[*]const u8 
         work_cond.timedWait(&work_mutex, 100 * std.time.ns_per_ms) catch {};
     }
     work_mutex.unlock();
+    _ = std.posix.write(2, "[zig] wait_for_work WOKE\n") catch {};
 
     work_slots[wid].ready.store(false, .release);
 
