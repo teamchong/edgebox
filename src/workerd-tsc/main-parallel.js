@@ -6,24 +6,13 @@ var cachedRootKey = '';
 var cachedSourceFiles = null;
 var cachedParsedConfig = null;
 
-// Pre-parse at module load from config file
-(function earlyParse() {
+(function() {
   try {
-    var configResp = JSON.parse(__edgebox_io_sync(JSON.stringify({
-      op: 'readFile', path: '/tmp/edgebox-project-config.json'
-    })));
-    if (!configResp.ok) return;
-    var projectConfig = JSON.parse(configResp.data);
-    var cwd = projectConfig.cwd;
-    
-    var tsconfigResp = JSON.parse(__edgebox_io_sync(JSON.stringify({
-      op: 'readFile', path: cwd + '/tsconfig.json'
-    })));
-    if (!tsconfigResp.ok) return;
-    
-    var configFile = ts.readConfigFile(cwd + '/tsconfig.json', ts.sys.readFile);
-    cachedParsedConfig = ts.parseJsonConfigFileContent(configFile.config, ts.sys, cwd);
-    
+    var resp = JSON.parse(__edgebox_io_sync(JSON.stringify({op:'readFile',path:'/tmp/edgebox-project-config.json'})));
+    if (!resp.ok) return;
+    var config = JSON.parse(resp.data);
+    var configFile = ts.readConfigFile(config.cwd + '/tsconfig.json', ts.sys.readFile);
+    cachedParsedConfig = ts.parseJsonConfigFileContent(configFile.config, ts.sys, config.cwd);
     cachedProgram = ts.createProgram(cachedParsedConfig.fileNames, cachedParsedConfig.options);
     cachedSourceFiles = cachedProgram.getSourceFiles();
     cachedRootKey = cachedParsedConfig.fileNames.join(',');
@@ -33,44 +22,30 @@ var cachedParsedConfig = null;
 export default {
   async fetch(request, env) {
     var body = await request.json().catch(function() { return {}; });
-    var projectDir = body.cwd || '/tmp/ts-test-project';
+    var projectDir = body.cwd || '/tmp/big-ts-1k';
     var start = Date.now();
-
     try {
       if (!ts.sys) return new Response(JSON.stringify({error: 'ts.sys null'}));
-
       var configPath = projectDir + '/tsconfig.json';
-      if (!ts.sys.fileExists(configPath)) {
-        return new Response(JSON.stringify({error: 'No tsconfig.json'}));
-      }
-
-      var parsedConfig;
-      if (cachedParsedConfig && body.cwd === '/tmp/big-ts-1k') {
-        parsedConfig = cachedParsedConfig;
-      } else {
+      if (!ts.sys.fileExists(configPath)) return new Response(JSON.stringify({error: 'No tsconfig.json'}));
+      
+      var parsedConfig = cachedParsedConfig;
+      if (!parsedConfig) {
         var configFile = ts.readConfigFile(configPath, ts.sys.readFile);
         parsedConfig = ts.parseJsonConfigFileContent(configFile.config, ts.sys, projectDir);
       }
 
-      // Write config for future worker restarts
-      var configData = JSON.stringify({rootNames: parsedConfig.fileNames, options: parsedConfig.options, cwd: projectDir});
-      __edgebox_io_sync(JSON.stringify({op: 'setConfig', data: configData}));
-
       var rootKey = parsedConfig.fileNames.join(',');
-      var parseTime;
-      var sourceFiles;
-
-      if (cachedProgram && cachedRootKey === rootKey) {
-        parseTime = 0;
-        sourceFiles = cachedSourceFiles;
-      } else {
-        var parseStart = Date.now();
+      var parseTime = 0;
+      var sourceFiles = cachedSourceFiles;
+      if (!sourceFiles || cachedRootKey !== rootKey) {
+        var t = Date.now();
         var program = ts.createProgram(parsedConfig.fileNames, parsedConfig.options);
         sourceFiles = program.getSourceFiles();
         cachedProgram = program;
         cachedRootKey = rootKey;
         cachedSourceFiles = sourceFiles;
-        parseTime = Date.now() - parseStart;
+        parseTime = Date.now() - t;
       }
 
       var checkers = [];
@@ -79,11 +54,17 @@ export default {
       if (env.CHECKER_2) checkers.push(env.CHECKER_2);
       if (env.CHECKER_3) checkers.push(env.CHECKER_3);
 
+      // Shard source files (not lib.d.ts — skip those)
+      var userFiles = [];
+      for (var i = 0; i < sourceFiles.length; i++) {
+        userFiles.push(sourceFiles[i].fileName);
+      }
+
       var shards = [];
       for (var w = 0; w < checkers.length; w++) {
         var files = [];
-        for (var i = w; i < sourceFiles.length; i += checkers.length) {
-          files.push(sourceFiles[i].fileName);
+        for (var j = w; j < userFiles.length; j += checkers.length) {
+          files.push(userFiles[j]);
         }
         shards.push(files);
       }
@@ -93,7 +74,7 @@ export default {
         return checker.fetch(new Request('http://check/', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({workerId: idx, files: shards[idx], rootNames: parsedConfig.fileNames, options: parsedConfig.options, cwd: projectDir})
+          body: JSON.stringify({workerId: idx, files: shards[idx], rootNames: parsedConfig.fileNames, options: parsedConfig.options})
         })).then(function(r) { return r.json(); });
       });
 
@@ -106,6 +87,7 @@ export default {
         workerTimes.push({parse: results[r].parseTime, check: results[r].checkTime, files: results[r].filesChecked, cached: results[r].cached});
       }
 
+      // Dedup by file:start:code
       var seen = {}, unique = [];
       for (var d = 0; d < allDiags.length; d++) {
         var key = allDiags[d].file + ':' + allDiags[d].start + ':' + allDiags[d].code;
