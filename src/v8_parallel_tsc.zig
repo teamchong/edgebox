@@ -152,13 +152,11 @@ pub fn setupParallelCheck(
     tsc_path: []const u8,
     tsc_fast_js: []const u8,
 ) bool {
-    const cpu_count = std.Thread.getCpuCount() catch 4;
-    // V8 platform shares one background thread pool across ALL isolates
-    // (TurboFan, GC tasks shared — not duplicated per isolate).
-    // Each worker only needs 1 dedicated thread (JS execution).
-    // Reserve half of cores for V8 platform background work.
-    // workerd uses same pattern: shared platform, multiple isolates.
-    g_worker_count = @max(cpu_count / 2, 2);
+    // Parallel disabled on V8 runner path — workerd parallel is the correct approach.
+    // V8 runner parallel has diagnostic doubling bug (T-SHARD-DIAGS needle mismatch
+    // causes getSemanticDiagnostics to return ALL diagnostics from both workers).
+    // The workerd path (src/workerd-tsc/) handles parallel correctly via service bindings.
+    g_worker_count = 1;
 
     if (g_worker_count <= 1 or embedded_snapshot.len == 0) return false;
 
