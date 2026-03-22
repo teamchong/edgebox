@@ -33,18 +33,21 @@ var ts = globalThis.ts || globalThis.module.exports;
         return entries.filter(function(e) { return __edgebox_dir_exists(rp + '/' + e) === 1; });
       };
       ts.sys.readDirectory = function(rootDir, extensions, excludes, includes, depth) {
-        // Use TSC's built-in matchFiles with our fs callbacks
-        return ts.matchFiles(rootDir, extensions, excludes, includes, true, resolvePath(rootDir), depth, function(p) {
-          var rp = resolvePath(p);
-          var entries = JSON.parse(__edgebox_readdir(rp));
+        return ts.matchFiles(rootDir, extensions, excludes, includes, true, projectCwd, depth, function(p) {
+          // p is an absolute path from matchFiles
+          var rp = p || '.';
+          var json = __edgebox_readdir(rp);
+          if (!json || json === '[]') return { files: [], directories: [] };
+          var entries = JSON.parse(json);
           var files = [], dirs = [];
           for (var i = 0; i < entries.length; i++) {
+            if (entries[i] === '.' || entries[i] === '..') continue;
             var full = rp + '/' + entries[i];
             if (__edgebox_dir_exists(full) === 1) dirs.push(entries[i]);
             else files.push(entries[i]);
           }
           return { files: files, directories: dirs };
-        }, function(p) { return __edgebox_realpath(resolvePath(p)); });
+        }, function(p) { return __edgebox_realpath(p); });
       };
       ts.sys.realpath = function(p) { return __edgebox_realpath(resolvePath(p)); };
       ts.sys.getCurrentDirectory = function() { return projectCwd; };
@@ -56,29 +59,12 @@ var ts = globalThis.ts || globalThis.module.exports;
       ts.sys.exit = function(code) { __edgebox_exit(code || 0); };
     }
 
-    // Parse tsconfig and create program
-    var configFile = ts.readConfigFile(projectCwd + '/tsconfig.json', ts.sys.readFile);
-    var parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, projectCwd);
-    console.log('[checker] ' + parsed.fileNames.length + ' root files');
-    var program = ts.createProgram(parsed.fileNames, parsed.options);
-
+    // Use ts.executeCommandLine — identical behavior to `npx tsc`
     var t0 = Date.now();
-    var files = program.getSourceFiles();
-    var diagCount = 0;
-
-    for (var i = 0; i < files.length; i++) {
-      var diags = program.getSemanticDiagnostics(files[i]);
-      diagCount += diags.length;
-      for (var k = 0; k < diags.length; k++) {
-        var d = diags[k];
-        if (d.file) {
-          var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
-          __edgebox_write_stdout(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' ') + '\n');
-        }
-      }
-    }
+    ts.sys.args = ['--noEmit', '-p', projectCwd + '/tsconfig.json'];
+    ts.executeCommandLine(ts.sys, ts.noop, ts.sys.args);
     var checkTime = Date.now() - t0;
-    console.log('[checker] ' + diagCount + ' diagnostics, ' + files.length + ' files, ' + checkTime + 'ms');
+    console.log('[checker] check completed in ' + checkTime + 'ms');
   } catch(e) {
     console.log('[checker] error: ' + e.message);
     console.log(e.stack || '');
