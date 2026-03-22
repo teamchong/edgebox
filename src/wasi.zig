@@ -215,13 +215,13 @@ pub const WasiContext = struct {
                 continue;
             };
 
+            dir.close();
             try self.fds.put(preopen.fd, .{
                 .path = try allocator.dupe(u8, preopen.path),
                 .file = null, // Dirs don't have file handles in WASI
                 .is_dir = true,
                 .preopen_idx = idx,
             });
-            _ = dir;
         }
 
         return self;
