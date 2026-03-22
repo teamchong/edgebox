@@ -135,21 +135,22 @@ runs:
       run: |
         ./scripts/download-v8.sh
 
-    # === Install TypeScript for snapshot (needs typescript.js at build time) ===
-    - name: Install TypeScript for snapshot
+    # === Install TypeScript (needed for workerd TSC benchmark) ===
+    - name: Install TypeScript
       if: steps.cache-edgebox.outputs.cache-hit != 'true'
       shell: bash
       run: |
         npm install typescript@5.9.3 --no-save 2>/dev/null || npm install typescript --no-save
-        ls node_modules/typescript/lib/typescript.js && echo "TypeScript installed for snapshot"
+        ls node_modules/typescript/lib/typescript.js && echo "TypeScript installed"
 
-    # === Build EdgeBox V8 runner (if cache miss) ===
-    - name: Build EdgeBox
+    # === Build Zig IO library for workerd ===
+    - name: Build Zig IO
       if: steps.cache-edgebox.outputs.cache-hit != 'true'
       shell: bash
       run: |
-        # Build V8 runner only (edgebox binary) — no worker/WASM compilation needed
-        zig build v8-run -Doptimize=ReleaseFast -Dcpu=baseline
+        mkdir -p zig-out/lib
+        zig build-lib src/edgebox_workerd_io.zig -target x86_64-linux-gnu -OReleaseFast --name edgebox_io -fPIC -femit-bin=zig-out/lib/libedgebox_io.a
+        echo "Built libedgebox_io.a ($(du -h zig-out/lib/libedgebox_io.a | cut -f1))"
 
     # === Build benchmarks (if cache miss and requested) ===
     - name: Build Benchmarks

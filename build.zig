@@ -1713,73 +1713,15 @@ pub fn build(b: *std.Build) void {
             const v8_bridge_file = b.path("src/v8_bridge.cpp");
             const v8_stubs_file = b.path("src/v8_stubs.c");
 
-            // Step 1: Build snapshot generator (links V8, runs at build time)
-            const snapshot_gen_exe = b.addExecutable(.{
-                .name = "v8-snapshot-gen",
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path("src/v8_snapshot_gen.zig"),
-                    .target = b.graph.host, // Always build for HOST (runs at build time)
-                    .optimize = .ReleaseFast,
-                }),
-            });
-            snapshot_gen_exe.addObjectFile(v8_lib_path);
-            snapshot_gen_exe.root_module.addCSourceFile(.{
-                .file = v8_bridge_file,
-                .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti" },
-            });
-            snapshot_gen_exe.root_module.addIncludePath(v8_inc_path);
-            snapshot_gen_exe.root_module.addIncludePath(v8_root_path);
-            snapshot_gen_exe.root_module.addCSourceFile(.{
-                .file = v8_stubs_file,
-                .flags = &.{},
-            });
-            snapshot_gen_exe.linkLibC();
-            snapshot_gen_exe.linkLibCpp();
-            snapshot_gen_exe.linkSystemLibrary("pthread");
+            // V8 runner REMOVED — workerd is the only runtime.
+            // Build Zig IO library for workerd instead.
+            const v8_run_step = b.step("v8-run", "REMOVED — use workerd (see src/workerd-tsc/)");
+            const v8_run_fail = b.addFail("v8-run removed. Use workerd: ./scripts/apply-workerd-patches.sh && bazelisk build //src/workerd/server:workerd");
+            v8_run_step.dependOn(&v8_run_fail.step);
 
-            // Step 2: Run snapshot-gen → writes snapshot to src/ for @embedFile
-            const run_snapshot_gen = b.addRunArtifact(snapshot_gen_exe);
-            run_snapshot_gen.addArg("src/v8_bootstrap.snapshot");
-
-            // Step 3: Build edgebox with embedded snapshot
-            // Usage: ./zig-out/bin/edgebox <script.js> [args...]
-            // Default to ReleaseFast for edgebox runner — Debug mode causes V8 GC
-            // segfaults (Zig safety checks interfere with V8's conservative stack scanning).
-            // Users can still override with -Doptimize=Debug if needed.
-            const v8_optimize = if (optimize == .Debug) .ReleaseFast else optimize;
-            const v8_run_exe = b.addExecutable(.{
-                .name = "edgebox",
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path("src/v8_runner.zig"),
-                    .target = target,
-                    .optimize = v8_optimize,
-                }),
-            });
-            // Snapshot-gen must run before compiling edgebox
-            v8_run_exe.step.dependOn(&run_snapshot_gen.step);
-            v8_run_exe.addObjectFile(v8_lib_path);
-            v8_run_exe.root_module.addCSourceFile(.{
-                .file = v8_bridge_file,
-                .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti" },
-            });
-            v8_run_exe.root_module.addIncludePath(v8_inc_path);
-            v8_run_exe.root_module.addIncludePath(v8_root_path);
-            v8_run_exe.root_module.addCSourceFile(.{
-                .file = v8_stubs_file,
-                .flags = &.{},
-            });
-            v8_run_exe.linkLibC();
-            v8_run_exe.linkLibCpp();
-            v8_run_exe.linkSystemLibrary("pthread");
-
-            const v8_run_step = b.step("v8-run", "Build edgebox V8 runner");
-            v8_run_step.dependOn(&b.addInstallArtifact(v8_run_exe, .{}).step);
-
-            const snapshot_gen_step = b.step("v8-snapshot-gen", "Build V8 snapshot generator");
-            snapshot_gen_step.dependOn(&b.addInstallArtifact(snapshot_gen_exe, .{}).step);
-
-            // cli step depends on V8 runner as the primary binary
-            cli_step.dependOn(&b.addInstallArtifact(v8_run_exe, .{}).step);
+            const snapshot_gen_step = b.step("v8-snapshot-gen", "REMOVED — workerd manages V8");
+            const sg_fail = b.addFail("v8-snapshot-gen removed. workerd manages V8 isolates.");
+            snapshot_gen_step.dependOn(&sg_fail.step);
         } else {
             const v8_test_step = b.step("v8-test", "Build V8 embedding test (unsupported platform)");
             const v8_fail = b.addFail("v8-test: unsupported platform (need x86_64/aarch64 linux/macos)");
