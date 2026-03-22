@@ -99,14 +99,64 @@ fn checkWorkerFn(ctx: *CheckWorkerCtx) void {
     ) catch return;
     _ = v8.eval(iso, context, init_js, "check_worker_init.js") catch {};
 
-    // Workers run same tsc_fast_js as main (with transforms for sharding).
-    // Transforms shard the eager check loop + getDiagnosticsHelper.
+    // Ensure ts.sys.write uses our fast callback (snapshot ref may be stale)
+    _ = v8.eval(iso, context,
+        "if(typeof ts!=='undefined'&&ts.sys){ts.sys.write=function(s){" ++
+        "if(typeof __edgebox_write_stdout==='function')__edgebox_write_stdout(s);" ++
+        "else process.stdout.write(s);};}",
+        "fix_sys_write.js",
+    ) catch {};
+
+    // Workers use per-file getSemanticDiagnostics (not executeCommandLine).
+    // This correctly shards — each worker only outputs its assigned files' errors.
+    const worker_check_js =
+        \\(function() {
+        \\  if (typeof ts === 'undefined' || !ts.sys) {
+        \\    if(typeof __edgebox_write_stderr==='function') __edgebox_write_stderr('[worker] ts=' + typeof ts + ' sys=' + (typeof ts!=='undefined'?!!ts.sys:'N/A') + '\n');
+        \\    return;
+        \\  }
+        \\  var args = process.argv.slice(2).filter(function(a){return a!=='--serve';});
+        \\  // Parse tsconfig from args
+        \\  var configPath = null;
+        \\  for (var i = 0; i < args.length; i++) {
+        \\    if (args[i] === '-p' && i+1 < args.length) { configPath = args[i+1]; break; }
+        \\  }
+        \\  if (!configPath) return;
+        \\  var configFile = ts.readConfigFile(configPath, ts.sys.readFile);
+        \\  if (!configFile.config) return;
+        \\  var parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys,
+        \\    require('path').dirname(configPath));
+        \\  var program = ts.createProgram(parsed.fileNames, parsed.options);
+        \\  var files = program.getSourceFiles();
+        \\  var wid = __edgebox_worker_id, wcnt = __edgebox_worker_count;
+        \\  var host = { getCanonicalFileName: function(f){return f;},
+        \\    getCurrentDirectory: function(){return ts.sys.getCurrentDirectory();},
+        \\    getNewLine: function(){return '\n';} };
+        \\  // Build set of my assigned file names
+        \\  var myFiles = {};
+        \\  for (var j = 0; j < files.length; j++) {
+        \\    if (j % wcnt === wid) myFiles[files[j].fileName] = true;
+        \\  }
+        \\  for (var i = 0; i < files.length; i++) {
+        \\    if (i % wcnt !== wid) continue;
+        \\    var diags = program.getSemanticDiagnostics(files[i]);
+        \\    // Filter: only output diagnostics from MY files
+        \\    var myDiags = [];
+        \\    for (var d = 0; d < diags.length; d++) {
+        \\      if (!diags[d].file || myFiles[diags[d].file.fileName]) myDiags.push(diags[d]);
+        \\    }
+        \\    if (myDiags.length > 0) {
+        \\      ts.sys.write(ts.formatDiagnosticsWithColorAndContext(myDiags, host));
+        \\    }
+        \\  }
+        \\})();
+    ;
     const t0 = std.time.milliTimestamp();
     std.debug.print("[worker-{d}] start (+{d}ms)\n", .{ ctx.worker_id, t0 - g_start_time });
     {
         var tc = v8.TryCatch.init(iso);
         defer tc.deinit();
-        _ = v8.eval(iso, context, ctx.tsc_fast_js, "tsc_check_worker.js") catch {};
+        _ = v8.eval(iso, context, worker_check_js, "tsc_check_worker.js") catch {};
     }
     const t1 = std.time.milliTimestamp();
     std.debug.print("[worker-{d}] done ({d}ms total, +{d}ms)\n", .{ ctx.worker_id, t1 - t0, t1 - g_start_time });
@@ -153,11 +203,11 @@ pub fn setupParallelCheck(
     tsc_path: []const u8,
     tsc_fast_js: []const u8,
 ) bool {
-    // V8 runner parallel disabled — workerd parallel is the production path.
-    // Per-worker stdout buffers work but ts.executeCommandLine outputs ALL diagnostics
-    // (not just sharded files), so each worker produces full diagnostic set.
-    // The workerd path uses per-file getSemanticDiagnostics which shards correctly.
-    g_worker_count = 1;
+    // Workers now use per-file getSemanticDiagnostics (not executeCommandLine).
+    // Each worker only outputs diagnostics for its assigned files.
+    // Per-worker stdout buffers in v8_io.zig prevent diagnostic doubling.
+    const cpu_count = std.Thread.getCpuCount() catch 4;
+    g_worker_count = 1; // workerd parallel is production path
 
     if (g_worker_count <= 1 or embedded_snapshot.len == 0) return false;
 
@@ -200,7 +250,8 @@ pub fn waitForWorkers() void {
     // Merge worker stdout buffers to real stdout
     // Workers wrote to per-worker buffers, main wrote to stdout directly.
     // Now write all worker output (diagnostics are already sharded by worker).
-    for (1..g_worker_count) |w| {
+    std.debug.print("[parallel-tsc] merging {d} worker buffers\n", .{g_worker_count});
+    for (0..g_worker_count) |w| {
         const output = v8_io.getWorkerStdout(@intCast(w));
         if (output.len > 0) {
             var written: usize = 0;
