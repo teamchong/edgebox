@@ -1,49 +1,69 @@
 import './bootstrap.js';
-// TypeScript loaded as CommonJS — writes to module.exports
 import './typescript.js';
 var ts = globalThis.ts || globalThis.module.exports;
 
-// Pre-check at module init — zero JSON in hot path
 (function() {
   try {
     if (!ts || !ts.createProgram) {
-      __edgebox_write_stderr('[checker] TypeScript not loaded\n');
+      console.log('[checker] TypeScript not loaded');
       return;
     }
 
-    // Set up ts.sys to use Zig IO
+    // Read project config FIRST
+    var configJson = __edgebox_read_file('/tmp/edgebox-project-config.json');
+    if (!configJson) { console.log('[checker] no config'); return; }
+    var config = JSON.parse(configJson);
+    var projectCwd = config.cwd;
+
+    // Resolve relative paths against project cwd
+    function resolvePath(p) {
+      p = String(p);
+      if (p.charAt(0) !== '/') p = projectCwd + '/' + p;
+      return p;
+    }
+
+    // Patch ts.sys with Zig IO (all paths resolved against project cwd)
     if (ts.sys) {
-      ts.sys.readFile = function(p) { return __edgebox_read_file(String(p)) || undefined; };
-      ts.sys.fileExists = function(p) { return __edgebox_file_exists(String(p)) === 1; };
-      ts.sys.directoryExists = function(p) { return __edgebox_dir_exists(String(p)) === 1; };
+      ts.sys.readFile = function(p) { var c = __edgebox_read_file(resolvePath(p)); return c || undefined; };
+      ts.sys.fileExists = function(p) { return __edgebox_file_exists(resolvePath(p)) === 1; };
+      ts.sys.directoryExists = function(p) { return __edgebox_dir_exists(resolvePath(p)) === 1; };
       ts.sys.getDirectories = function(p) {
-        var entries = JSON.parse(__edgebox_readdir(String(p)));
-        return entries.filter(function(e) { return __edgebox_dir_exists(String(p) + '/' + e) === 1; });
+        var rp = resolvePath(p);
+        var entries = JSON.parse(__edgebox_readdir(rp));
+        return entries.filter(function(e) { return __edgebox_dir_exists(rp + '/' + e) === 1; });
       };
-      ts.sys.readDirectory = function(p) {
-        return JSON.parse(__edgebox_readdir(String(p)));
+      ts.sys.readDirectory = function(rootDir, extensions, excludes, includes, depth) {
+        // Use TSC's built-in matchFiles with our fs callbacks
+        return ts.matchFiles(rootDir, extensions, excludes, includes, true, resolvePath(rootDir), depth, function(p) {
+          var rp = resolvePath(p);
+          var entries = JSON.parse(__edgebox_readdir(rp));
+          var files = [], dirs = [];
+          for (var i = 0; i < entries.length; i++) {
+            var full = rp + '/' + entries[i];
+            if (__edgebox_dir_exists(full) === 1) dirs.push(entries[i]);
+            else files.push(entries[i]);
+          }
+          return { files: files, directories: dirs };
+        }, function(p) { return __edgebox_realpath(resolvePath(p)); });
       };
-      ts.sys.realpath = function(p) { return __edgebox_realpath(String(p)); };
-      ts.sys.getCurrentDirectory = function() { return __edgebox_cwd(); };
+      ts.sys.realpath = function(p) { return __edgebox_realpath(resolvePath(p)); };
+      ts.sys.getCurrentDirectory = function() { return projectCwd; };
       ts.sys.getExecutingFilePath = function() { return __filename; };
       ts.sys.write = function(s) { __edgebox_write_stdout(String(s)); };
       ts.sys.writeOutputIsTTY = function() { return false; };
       ts.sys.exit = function(code) { __edgebox_exit(code || 0); };
     }
 
-    // Read project config
-    var configJson = __edgebox_read_file('/tmp/edgebox-project-config.json');
-    if (!configJson) return;
-    var config = JSON.parse(configJson);
-    var configFile = ts.readConfigFile(config.cwd + '/tsconfig.json', ts.sys.readFile);
-    var parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, config.cwd);
+    // Parse tsconfig and create program
+    var configFile = ts.readConfigFile(projectCwd + '/tsconfig.json', ts.sys.readFile);
+    var parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, projectCwd);
+    console.log('[checker] ' + parsed.fileNames.length + ' root files');
     var program = ts.createProgram(parsed.fileNames, parsed.options);
 
     var t0 = Date.now();
     var files = program.getSourceFiles();
     var diagCount = 0;
 
-    // Check all files — write diagnostics directly via Zig
     for (var i = 0; i < files.length; i++) {
       var diags = program.getSemanticDiagnostics(files[i]);
       diagCount += diags.length;
@@ -56,33 +76,10 @@ var ts = globalThis.ts || globalThis.module.exports;
       }
     }
     var checkTime = Date.now() - t0;
-
-    // Register types AFTER check (zero copy)
-    var checker = program.getTypeChecker();
-    var seenTypes = {};
-    for (var fi = 0; fi < files.length; fi++) {
-      ts.forEachChild(files[fi], function visit(node) {
-        try {
-          var type = checker.getTypeAtLocation(node);
-          if (type && type.id && !seenTypes[type.id]) {
-            seenTypes[type.id] = true;
-            __edgebox_register_type(type.id, type.flags || 0);
-            var props = checker.getPropertiesOfType(type);
-            for (var p = 0; p < props.length && p < 50; p++) {
-              var prop = props[p];
-              var pt = checker.getTypeOfSymbol(prop);
-              if (prop.escapedName && pt && pt.id)
-                __edgebox_register_member(type.id, prop.escapedName, pt.id, prop.flags || 0);
-            }
-          }
-        } catch(e) {}
-        ts.forEachChild(node, visit);
-      });
-    }
-
-    __edgebox_write_stderr('[checker] ' + diagCount + ' diagnostics, ' + files.length + ' files, ' + checkTime + 'ms\n');
+    console.log('[checker] ' + diagCount + ' diagnostics, ' + files.length + ' files, ' + checkTime + 'ms');
   } catch(e) {
-    __edgebox_write_stderr('[checker] error: ' + e.message + '\n' + (e.stack || '') + '\n');
+    console.log('[checker] error: ' + e.message);
+    console.log(e.stack || '');
   }
 })();
 
