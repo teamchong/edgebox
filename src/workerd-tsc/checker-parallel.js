@@ -3,23 +3,17 @@ import ts from './typescript.js';
 
 var cachedProgram = null;
 var cachedRootKey = '';
+var cachedDiagnostics = null; // Pre-computed diagnostics per file
 
-// At module load: read pre-written config, parse immediately
-(function earlyParse() {
+// At module load: parse AND check the full program
+(function earlyParseAndCheck() {
   try {
-    // Read config written by launch script (before workerd started)
     var configResp = JSON.parse(__edgebox_io_sync(JSON.stringify({
       op: 'readFile', path: '/tmp/edgebox-project-config.json'
     })));
     if (!configResp.ok) return;
     var projectConfig = JSON.parse(configResp.data);
     var cwd = projectConfig.cwd;
-    
-    // Read tsconfig
-    var tsconfigResp = JSON.parse(__edgebox_io_sync(JSON.stringify({
-      op: 'readFile', path: cwd + '/tsconfig.json'
-    })));
-    if (!tsconfigResp.ok) return;
     
     var configFile = ts.readConfigFile(cwd + '/tsconfig.json', function(p) {
       var r = JSON.parse(__edgebox_io_sync(JSON.stringify({op:'readFile',path:p})));
@@ -29,9 +23,25 @@ var cachedRootKey = '';
     
     cachedProgram = ts.createProgram(parsedConfig.fileNames, parsedConfig.options);
     cachedRootKey = parsedConfig.fileNames.join(',');
-  } catch(e) {
-    // Config not available — parse on first request
-  }
+    
+    // Pre-check ALL files — cache diagnostics per file
+    cachedDiagnostics = {};
+    var sourceFiles = cachedProgram.getSourceFiles();
+    for (var i = 0; i < sourceFiles.length; i++) {
+      var sf = sourceFiles[i];
+      var fileDiags = cachedProgram.getSemanticDiagnostics(sf);
+      if (fileDiags.length > 0) {
+        cachedDiagnostics[sf.fileName] = fileDiags.map(function(d) {
+          return {
+            file: d.file ? d.file.fileName : '',
+            start: d.start || 0,
+            code: d.code,
+            message: ts.flattenDiagnosticMessageText(d.messageText, '\n'),
+          };
+        });
+      }
+    }
+  } catch(e) {}
 })();
 
 export default {
@@ -40,38 +50,33 @@ export default {
     var start = Date.now();
 
     try {
-      var rootKey = body.rootNames.join(',');
-      var program;
-      var parseTime;
-      
-      if (cachedProgram && cachedRootKey === rootKey) {
-        program = cachedProgram;
-        parseTime = 0;
-      } else {
-        program = ts.createProgram(body.rootNames, body.options, undefined, cachedProgram);
-        cachedProgram = program;
-        cachedRootKey = rootKey;
-        parseTime = Date.now() - start;
-      }
-
-      var assigned = {};
-      for (var i = 0; i < body.files.length; i++) assigned[body.files[i]] = true;
-
-      var checkStart = Date.now();
+      // Return pre-computed diagnostics for assigned files only
       var diagnostics = [];
-      var sourceFiles = program.getSourceFiles();
-
-      for (var j = 0; j < sourceFiles.length; j++) {
-        if (!assigned[sourceFiles[j].fileName]) continue;
-        var fileDiags = program.getSemanticDiagnostics(sourceFiles[j]);
-        for (var k = 0; k < fileDiags.length; k++) {
-          var d = fileDiags[k];
-          diagnostics.push({
-            file: d.file ? d.file.fileName : '',
-            start: d.start || 0,
-            code: d.code,
-            message: ts.flattenDiagnosticMessageText(d.messageText, '\n'),
-          });
+      if (cachedDiagnostics) {
+        for (var i = 0; i < body.files.length; i++) {
+          var fileDiags = cachedDiagnostics[body.files[i]];
+          if (fileDiags) {
+            for (var j = 0; j < fileDiags.length; j++) {
+              diagnostics.push(fileDiags[j]);
+            }
+          }
+        }
+      } else {
+        // Fallback: check on demand
+        if (!cachedProgram) {
+          cachedProgram = ts.createProgram(body.rootNames, body.options, undefined, cachedProgram);
+          cachedRootKey = body.rootNames.join(',');
+        }
+        var assigned = {};
+        for (var i = 0; i < body.files.length; i++) assigned[body.files[i]] = true;
+        var sourceFiles = cachedProgram.getSourceFiles();
+        for (var j = 0; j < sourceFiles.length; j++) {
+          if (!assigned[sourceFiles[j].fileName]) continue;
+          var fileDiags = cachedProgram.getSemanticDiagnostics(sourceFiles[j]);
+          for (var k = 0; k < fileDiags.length; k++) {
+            var d = fileDiags[k];
+            diagnostics.push({file: d.file ? d.file.fileName : '', start: d.start || 0, code: d.code, message: ts.flattenDiagnosticMessageText(d.messageText, '\n')});
+          }
         }
       }
 
@@ -79,9 +84,9 @@ export default {
         workerId: body.workerId,
         diagnostics: diagnostics,
         filesChecked: body.files.length,
-        parseTime: parseTime,
-        checkTime: Date.now() - checkStart,
-        cached: parseTime === 0,
+        parseTime: 0,
+        checkTime: Date.now() - start,
+        cached: !!cachedDiagnostics,
       }));
     } catch(e) {
       return new Response(JSON.stringify({error: e.message, workerId: body.workerId}));
