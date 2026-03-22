@@ -33,16 +33,15 @@ var preCheckTime = 0;
     preCheckTime = Date.now() - t0;
     preCheckDone = true;
     
-    // Extract types + members to Zig
+    // Extract types + members to Zig via ZERO-COPY typed calls (no JSON)
     var checker = cachedProgram.getTypeChecker();
-    var typeBatch = [];
-    var memberBatch = [];
     var seenTypes = {};
     
     function registerType(type) {
       if (!type || !type.id || seenTypes[type.id]) return;
       seenTypes[type.id] = true;
-      typeBatch.push(type.id + ',' + (type.flags || 0));
+      // Direct call — JS double → C unsigned int → Zig u32. No JSON.
+      __edgebox_register_type(type.id, type.flags || 0);
       
       try {
         var props = checker.getPropertiesOfType(type);
@@ -51,19 +50,11 @@ var preCheckTime = 0;
           var propType = checker.getTypeOfSymbol(prop);
           var name = prop.escapedName || '';
           if (name && propType && propType.id) {
-            memberBatch.push(type.id + '|' + name + '|' + propType.id + '|' + (prop.flags || 0));
+            // Direct call — string passed as kj::String, zero copy
+            __edgebox_register_member(type.id, name, propType.id, prop.flags || 0);
           }
         }
       } catch(e) {}
-      
-      if (typeBatch.length >= 500) {
-        __edgebox_io_sync(JSON.stringify({op:'batchRegisterTypes', data: typeBatch.join(',')}));
-        typeBatch = [];
-      }
-      if (memberBatch.length >= 200) {
-        __edgebox_io_sync(JSON.stringify({op:'batchRegisterMembers', data: memberBatch.join(';')}));
-        memberBatch = [];
-      }
     }
     
     for (var fi = 0; fi < files.length; fi++) {
@@ -72,8 +63,6 @@ var preCheckTime = 0;
         ts.forEachChild(node, visit);
       });
     }
-    if (typeBatch.length > 0) __edgebox_io_sync(JSON.stringify({op:'batchRegisterTypes', data: typeBatch.join(',')}));
-    if (memberBatch.length > 0) __edgebox_io_sync(JSON.stringify({op:'batchRegisterMembers', data: memberBatch.join(';')}));
   } catch(e) {}
 })();
 
