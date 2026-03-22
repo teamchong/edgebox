@@ -1,7 +1,7 @@
 #!/bin/bash
 # Conformance test: EdgeBox workerd TSC vs Node.js TSC
 # Verifies diagnostic counts match exactly on all benchmark projects.
-set -euo pipefail
+set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORKERD="$ROOT/vendor/workerd/bazel-bin/src/workerd/server/workerd"
 CAPNP="$ROOT/workerd-test.capnp"
