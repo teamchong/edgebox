@@ -355,6 +355,12 @@ fn handleRequest(request: []const u8) ![]u8 {
         var s: u32 = 0;
         edgebox_type_stats(&t, &m, &s);
         try result.writer(alloc).print("{{\"ok\":true,\"types\":{d},\"members\":{d},\"strings\":{d}}}", .{ t, m, s });
+    } else if (std.mem.eql(u8, op, "checkStats")) {
+        var total: u64 = 0;
+        var flag: u64 = 0;
+        var structural: u64 = 0;
+        edgebox_check_stats(&total, &flag, &structural);
+        try result.writer(alloc).print("{{\"ok\":true,\"total\":{d},\"flagHits\":{d},\"structHits\":{d},\"hitRate\":\"{d}%\"}}", .{ total, flag, structural, if (total > 0) flag * 100 / total else 0 });
     } else if (std.mem.eql(u8, op, "checkStructural")) {
         var src: u32 = 0;
         var tgt: u32 = 0;
@@ -705,8 +711,35 @@ export fn edgebox_register_member(
 
 /// SIMD structural check: are all members of type A present in type B?
 /// Returns: 1 = structurally compatible, 0 = not compatible, 2 = unknown (needs full check)
+/// Counters for hit rate measurement
+var check_total: u64 = 0;
+var check_flag_hits: u64 = 0;
+var check_structural_hits: u64 = 0;
+
+export fn edgebox_check_stats(out_total: *u64, out_flag: *u64, out_struct: *u64) void {
+    out_total.* = check_total;
+    out_flag.* = check_flag_hits;
+    out_struct.* = check_structural_hits;
+}
+
 export fn edgebox_check_structural(source_id: u32, target_id: u32) u8 {
+    check_total += 1;
     if (source_id >= type_count or target_id >= type_count) return 2;
+
+    // Fast path: flag bitmap check (covers ~5% of calls)
+    const src_flags = col_type_flags[source_id];
+    const tgt_flags = col_type_flags[target_id];
+    if (tgt_flags & 1 != 0) { check_flag_hits += 1; return 1; } // Any
+    if (src_flags & 131072 != 0) { check_flag_hits += 1; return 1; } // Undefined
+    if (tgt_flags & 2 != 0) { check_flag_hits += 1; return 1; } // Unknown
+    // String literal → String
+    if (src_flags & (128 | 4) != 0 and tgt_flags & 4 != 0) { check_flag_hits += 1; return 1; }
+    // Number literal → Number
+    if (src_flags & (256 | 8) != 0 and tgt_flags & 8 != 0) { check_flag_hits += 1; return 1; }
+    // Boolean literal → Boolean
+    if (src_flags & (512 | 16) != 0 and tgt_flags & 16 != 0) { check_flag_hits += 1; return 1; }
+    // BigInt literal → BigInt
+    if (src_flags & (2048 | 64) != 0 and tgt_flags & 64 != 0) { check_flag_hits += 1; return 1; }
 
     const src_offset = col_type_member_offset[source_id];
     const src_count = col_type_member_count[source_id];

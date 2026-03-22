@@ -21,8 +21,6 @@ var preCheckTime = 0;
     var t0 = Date.now();
     cachedDiagsByFile = {};
     var files = cachedProgram.getSourceFiles();
-    
-    // Check FIRST (no type registration yet — pure vanilla TSC)
     for (var i = 0; i < files.length; i++) {
       var diags = cachedProgram.getSemanticDiagnostics(files[i]);
       if (diags.length > 0) {
@@ -35,7 +33,7 @@ var preCheckTime = 0;
     preCheckTime = Date.now() - t0;
     preCheckDone = true;
     
-    // Register types AFTER checking (read-only extraction, no side effects)
+    // Register types + members AFTER check (read-only)
     var checker = cachedProgram.getTypeChecker();
     var seenTypes = {};
     for (var fi = 0; fi < files.length; fi++) {
@@ -67,6 +65,7 @@ export default {
     var wid = body.workerId || 0;
     var wcnt = body.workerCount || 1;
     var stats = JSON.parse(__edgebox_io_sync(JSON.stringify({op:'typeStats'})));
+    var cstats = JSON.parse(__edgebox_io_sync(JSON.stringify({op:'checkStats'})));
     if (preCheckDone && cachedDiagsByFile) {
       var diagnostics = 0;
       var files = cachedProgram.getSourceFiles();
@@ -78,8 +77,9 @@ export default {
       return new Response(JSON.stringify({
         workerId: wid, diagnostics: diagnostics,
         filesChecked: Math.ceil(files.length / wcnt),
-        checkTime: 0, preCheckTime: preCheckTime, cached: true,
-        zigTypes: stats.types, zigMembers: stats.members, zigStrings: stats.strings,
+        preCheckTime: preCheckTime, cached: true,
+        zigTypes: stats.types, zigMembers: stats.members,
+        checkTotal: cstats.total, checkFlagHits: cstats.flagHits, checkHitRate: cstats.hitRate,
       }));
     }
     return new Response(JSON.stringify({error: 'not ready'}));
