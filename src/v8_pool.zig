@@ -260,7 +260,7 @@ fn workerLoop(worker_id: u32) void {
                 \\  ts.sys.directoryExists = function(p) {{ return __edgebox_dir_exists(rp(p)) === 1; }};
                 \\  ts.sys.getCurrentDirectory = function() {{ return cwd; }};
                 \\  ts.sys.realpath = function(p) {{ return __edgebox_realpath(rp(p)); }};
-                \\  ts.sys.getExecutingFilePath = function() {{ return cwd + '/node_modules/typescript/lib/typescript.js'; }};
+                \\  ts.sys.getExecutingFilePath = function() {{ return __edgebox_cwd() + '/node_modules/typescript/lib/typescript.js'; }};
                 \\  ts.sys.write = function(s) {{ __edgebox_write_stdout(String(s)); }};
                 \\  ts.sys.writeFile = function() {{}};
                 \\  ts.sys.exit = function() {{}};
