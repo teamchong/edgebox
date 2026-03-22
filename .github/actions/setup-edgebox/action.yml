@@ -109,7 +109,7 @@ runs:
           zig-out/cache/
           vendor/binaryen/
           vendor/v8/
-        key: edgebox-v10-${{ runner.os }}-${{ hashFiles('build.zig', 'src/**/*.zig', 'src/freeze/*.zig', 'src/*.js', 'bench/*.js', 'src/polyfills/*.js') }}
+        key: edgebox-v11-${{ runner.os }}-${{ hashFiles('build.zig', 'src/**/*.zig', 'src/freeze/*.zig', 'src/*.js', 'bench/*.js', 'src/polyfills/*.js') }}
 
     # === Build Binaryen (if cache miss) ===
     - name: Build Binaryen
@@ -136,6 +136,14 @@ runs:
       shell: bash
       run: |
         ./scripts/download-v8.sh
+
+    # === Install TypeScript for snapshot (needs typescript.js at build time) ===
+    - name: Install TypeScript for snapshot
+      if: steps.cache-edgebox.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        npm install typescript@5.9.3 --no-save 2>/dev/null || npm install typescript --no-save
+        ls node_modules/typescript/lib/typescript.js && echo "TypeScript installed for snapshot"
 
     # === Build EdgeBox V8 runner (if cache miss) ===
     - name: Build EdgeBox
