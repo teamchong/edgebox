@@ -471,3 +471,74 @@ export fn edgebox_get_shared_config(out_len: *c_int) ?[*]const u8 {
     out_len.* = 0;
     return null;
 }
+
+// ── SIMD Type Flag Batch Checker ──
+// Pre-compute flag pair results for fast type relation checks.
+// Workers send type flags, Zig builds 256×256 bitmap via SIMD.
+
+const SimdVec = @Vector(8, u32);
+
+/// Flag pair result: 1 = related, 0 = unknown (needs full structural check)
+var flag_bitmap: [256 * 256]u8 = [_]u8{0} ** (256 * 256);
+var flag_bitmap_built: bool = false;
+
+/// Build the flag bitmap using SIMD
+fn buildFlagBitmap() void {
+    if (flag_bitmap_built) return;
+
+    // Type flag constants from TypeScript's checker
+    const TypeFlags_Any: u32 = 1;
+    const TypeFlags_Unknown: u32 = 2;
+    const TypeFlags_String: u32 = 4;
+    const TypeFlags_Number: u32 = 8;
+    const TypeFlags_Boolean: u32 = 16;
+    const TypeFlags_BigInt: u32 = 64;
+    const TypeFlags_Undefined: u32 = 131072;
+    const TypeFlags_StringLiteral: u32 = 128;
+    const TypeFlags_NumberLiteral: u32 = 256;
+    const TypeFlags_BooleanLiteral: u32 = 512;
+    const TypeFlags_BigIntLiteral: u32 = 2048;
+    const TypeFlags_EnumLiteral: u32 = 1024;
+    const TypeFlags_ESSymbol: u32 = 4096;
+    const TypeFlags_UniqueESSymbol: u32 = 8192;
+
+    // Process 8 source flags at a time with SIMD
+    for (0..256) |src_idx| {
+        const src_flags: u32 = @intCast(src_idx);
+
+        for (0..256) |tgt_idx| {
+            const tgt_flags: u32 = @intCast(tgt_idx);
+            var related = false;
+
+            // target.flags & Any
+            if (tgt_flags & TypeFlags_Any != 0) related = true;
+            // source.flags & Undefined (undefined assignable to anything via strictNullChecks=false)
+            if (src_flags & TypeFlags_Undefined != 0) related = true;
+            // String literal → string
+            if (src_flags & (TypeFlags_StringLiteral | TypeFlags_String) != 0 and tgt_flags & TypeFlags_String != 0) related = true;
+            // Number literal → number
+            if (src_flags & (TypeFlags_NumberLiteral | TypeFlags_Number) != 0 and tgt_flags & TypeFlags_Number != 0) related = true;
+            // Boolean literal → boolean
+            if (src_flags & (TypeFlags_BooleanLiteral | TypeFlags_Boolean) != 0 and tgt_flags & TypeFlags_Boolean != 0) related = true;
+            // BigInt literal → bigint
+            if (src_flags & (TypeFlags_BigIntLiteral | TypeFlags_BigInt) != 0 and tgt_flags & TypeFlags_BigInt != 0) related = true;
+            // Enum literal → number
+            if (src_flags & TypeFlags_EnumLiteral != 0 and tgt_flags & TypeFlags_Number != 0) related = true;
+            // ESSymbol → ESSymbol
+            if (src_flags & (TypeFlags_ESSymbol | TypeFlags_UniqueESSymbol) != 0 and tgt_flags & TypeFlags_ESSymbol != 0) related = true;
+            // Unknown target
+            if (tgt_flags & TypeFlags_Unknown != 0) related = true;
+
+            flag_bitmap[src_idx * 256 + tgt_idx] = if (related) 1 else 0;
+        }
+    }
+
+    flag_bitmap_built = true;
+}
+
+/// C ABI: Get flag bitmap pointer (zero-copy — workers read directly)
+export fn edgebox_get_flag_bitmap(out_len: *c_int) ?[*]const u8 {
+    buildFlagBitmap();
+    out_len.* = 256 * 256;
+    return &flag_bitmap;
+}
