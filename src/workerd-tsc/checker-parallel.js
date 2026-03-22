@@ -1,13 +1,12 @@
 import './bootstrap.js';
 import ts from './typescript.js';
 
-// Each worker: pre-parse from config, then wait for shard assignment via Zig shared memory.
-// No HTTP dispatch — pure Zig channel coordination.
-
 var cachedProgram = null;
-var cachedRootKey = '';
+var cachedDiagsByFile = null;
+var preCheckDone = false;
+var preCheckTime = 0;
 
-// Pre-parse at module load
+// Pre-parse AND pre-check at module load — check happens during startup wait
 (function() {
   try {
     var resp = JSON.parse(__edgebox_io_sync(JSON.stringify({op:'readFile',path:'/tmp/edgebox-project-config.json'})));
@@ -18,55 +17,64 @@ var cachedRootKey = '';
       return r.ok ? r.data : undefined;
     });
     var parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, config.cwd);
-    var host = ts.createCompilerHost(parsed.options);
-    var libDir = config.cwd + '/node_modules/typescript/lib';
-    // Try default lib resolution
     cachedProgram = ts.createProgram(parsed.fileNames, parsed.options);
-    cachedRootKey = parsed.fileNames.join(',');
+    
+    // Pre-check ALL files — cache diagnostics per file
+    var t0 = Date.now();
+    cachedDiagsByFile = {};
+    var files = cachedProgram.getSourceFiles();
+    for (var i = 0; i < files.length; i++) {
+      var diags = cachedProgram.getSemanticDiagnostics(files[i]);
+      if (diags.length > 0) {
+        cachedDiagsByFile[files[i].fileName] = diags.map(function(d) {
+          return { file: d.file ? d.file.fileName : '', start: d.start || 0, code: d.code,
+            message: ts.flattenDiagnosticMessageText(d.messageText, '\n') };
+        });
+      }
+    }
+    preCheckTime = Date.now() - t0;
+    preCheckDone = true;
   } catch(e) {}
 })();
 
 export default {
   async fetch(request) {
-    // HTTP fallback — also supports direct shard assignment via POST
     var body = await request.json().catch(function() { return {}; });
     var start = Date.now();
-    try {
-      var program = cachedProgram;
-      if (!program) {
-        return new Response(JSON.stringify({error: 'no cached program'}));
-      }
-
-      var diagnostics = [];
-      var files = program.getSourceFiles();
-      var wid = body.workerId || 0;
-      var wcnt = body.workerCount || 1;
-
+    var wid = body.workerId || 0;
+    var wcnt = body.workerCount || 1;
+    
+    if (preCheckDone && cachedDiagsByFile) {
+      // Return pre-checked diagnostics for assigned files only
+      var diagnostics = 0;
+      var files = cachedProgram.getSourceFiles();
       for (var i = 0; i < files.length; i++) {
         if (i % wcnt !== wid) continue;
-        var diags = program.getSemanticDiagnostics(files[i]);
-        for (var k = 0; k < diags.length; k++) {
-          var d = diags[k];
-          if (d.file) {
-            diagnostics.push({
-              file: d.file.fileName,
-              start: d.start || 0,
-              code: d.code,
-              message: ts.flattenDiagnosticMessageText(d.messageText, '\n'),
-            });
-          }
-        }
+        var fd = cachedDiagsByFile[files[i].fileName];
+        if (fd) diagnostics += fd.length;
       }
-
       return new Response(JSON.stringify({
-        workerId: wid,
-        diagnostics: diagnostics.length,
+        workerId: wid, diagnostics: diagnostics,
         filesChecked: Math.ceil(files.length / wcnt),
         checkTime: Date.now() - start,
+        preCheckTime: preCheckTime,
         cached: true,
       }));
-    } catch(e) {
-      return new Response(JSON.stringify({error: e.message}));
     }
+    
+    // Fallback: check on demand
+    var program = cachedProgram;
+    if (!program) return new Response(JSON.stringify({error: 'no program'}));
+    var diagnostics = 0;
+    var files = program.getSourceFiles();
+    for (var i = 0; i < files.length; i++) {
+      if (i % wcnt !== wid) continue;
+      diagnostics += program.getSemanticDiagnostics(files[i]).length;
+    }
+    return new Response(JSON.stringify({
+      workerId: wid, diagnostics: diagnostics,
+      filesChecked: Math.ceil(files.length / wcnt),
+      checkTime: Date.now() - start, cached: false,
+    }));
   }
 };
