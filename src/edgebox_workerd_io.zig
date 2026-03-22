@@ -189,6 +189,37 @@ fn handleRequest(request: []const u8) ![]u8 {
             std.process.exit(code);
         }
         try result.appendSlice(alloc, "{\"ok\":true}");
+    } else if (std.mem.eql(u8, op, "setConfig")) {
+        // Store shared config — main worker writes, checker workers read
+        if (std.mem.indexOf(u8, request, "\"data\":\"")) |data_start| {
+            const start = data_start + 8;
+            if (std.mem.lastIndexOf(u8, request, "\"")) |end| {
+                if (end > start) {
+                    const data = request[start..end];
+                    shared_config_mutex.lock();
+                    defer shared_config_mutex.unlock();
+                    if (shared_config) |old| alloc.free(@constCast(old));
+                    const copy = alloc.alloc(u8, data.len) catch {
+                        try result.appendSlice(alloc, "{\"ok\":false}");
+                        return try result.toOwnedSlice(alloc);
+                    };
+                    @memcpy(copy, data);
+                    shared_config = copy;
+                }
+            }
+        }
+        try result.appendSlice(alloc, "{\"ok\":true}");
+    } else if (std.mem.eql(u8, op, "getConfig")) {
+        // Read shared config — zero copy from Zig heap
+        shared_config_mutex.lock();
+        defer shared_config_mutex.unlock();
+        if (shared_config) |cfg| {
+            try result.appendSlice(alloc, "{\"ok\":true,\"data\":\"");
+            try result.appendSlice(alloc, cfg);
+            try result.appendSlice(alloc, "\"}");
+        } else {
+            try result.appendSlice(alloc, "{\"ok\":false}");
+        }
     } else {
         try result.appendSlice(alloc, "{\"ok\":false,\"error\":\"unknown op\"}");
     }
@@ -243,4 +274,35 @@ export fn edgebox_io_free(ptr: ?[*]const u8, len: c_int) void {
             alloc.free(@constCast(slice));
         }
     }
+}
+
+// ── Shared project config (zero-copy coordination between workers) ──
+// Main worker writes project rootNames + options once.
+// Checker workers read at module load time → start parsing IMMEDIATELY.
+// Data lives in Zig heap — all workerd workers (same process) see same pointer.
+var shared_config: ?[]const u8 = null;
+var shared_config_mutex: std.Thread.Mutex = .{};
+
+/// C ABI: Main writes project config (JSON string: {rootNames, options, cwd})
+export fn edgebox_set_shared_config(ptr: [*]const u8, len: c_int) void {
+    if (len <= 0) return;
+    const data = ptr[0..@intCast(len)];
+    shared_config_mutex.lock();
+    defer shared_config_mutex.unlock();
+    if (shared_config) |old| alloc.free(@constCast(old));
+    const copy = alloc.alloc(u8, data.len) catch return;
+    @memcpy(copy, data);
+    shared_config = copy;
+}
+
+/// C ABI: Workers read project config (returns pointer to Zig heap — zero copy)
+export fn edgebox_get_shared_config(out_len: *c_int) ?[*]const u8 {
+    shared_config_mutex.lock();
+    defer shared_config_mutex.unlock();
+    if (shared_config) |cfg| {
+        out_len.* = @intCast(cfg.len);
+        return cfg.ptr;
+    }
+    out_len.* = 0;
+    return null;
 }

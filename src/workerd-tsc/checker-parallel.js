@@ -1,9 +1,38 @@
 import './bootstrap.js';
 import ts from './typescript.js';
 
-// Cache: reuse program if rootNames match, pass oldProgram for incremental
 var cachedProgram = null;
 var cachedRootKey = '';
+
+// At module load: read pre-written config, parse immediately
+(function earlyParse() {
+  try {
+    // Read config written by launch script (before workerd started)
+    var configResp = JSON.parse(__edgebox_io_sync(JSON.stringify({
+      op: 'readFile', path: '/tmp/edgebox-project-config.json'
+    })));
+    if (!configResp.ok) return;
+    var projectConfig = JSON.parse(configResp.data);
+    var cwd = projectConfig.cwd;
+    
+    // Read tsconfig
+    var tsconfigResp = JSON.parse(__edgebox_io_sync(JSON.stringify({
+      op: 'readFile', path: cwd + '/tsconfig.json'
+    })));
+    if (!tsconfigResp.ok) return;
+    
+    var configFile = ts.readConfigFile(cwd + '/tsconfig.json', function(p) {
+      var r = JSON.parse(__edgebox_io_sync(JSON.stringify({op:'readFile',path:p})));
+      return r.ok ? r.data : undefined;
+    });
+    var parsedConfig = ts.parseJsonConfigFileContent(configFile.config, ts.sys, cwd);
+    
+    cachedProgram = ts.createProgram(parsedConfig.fileNames, parsedConfig.options);
+    cachedRootKey = parsedConfig.fileNames.join(',');
+  } catch(e) {
+    // Config not available — parse on first request
+  }
+})();
 
 export default {
   async fetch(request) {
@@ -16,17 +45,10 @@ export default {
       var parseTime;
       
       if (cachedProgram && cachedRootKey === rootKey) {
-        // Exact match — reuse cached program (skip parse + check)
         program = cachedProgram;
         parseTime = 0;
       } else {
-        // Create program — pass oldProgram for incremental lib.d.ts reuse
-        program = ts.createProgram(
-          body.rootNames,
-          body.options,
-          undefined, // host
-          cachedProgram // oldProgram — TSC reuses unchanged SourceFiles
-        );
+        program = ts.createProgram(body.rootNames, body.options, undefined, cachedProgram);
         cachedProgram = program;
         cachedRootKey = rootKey;
         parseTime = Date.now() - start;
