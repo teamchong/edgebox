@@ -103,11 +103,9 @@ runs:
       uses: actions/cache@v4
       with:
         path: |
-          zig-out/bin/
-          zig-out/cache/
+          zig-out/
           vendor/binaryen/
-          vendor/v8/
-        key: edgebox-v11-${{ runner.os }}-${{ hashFiles('build.zig', 'src/**/*.zig', 'src/freeze/*.zig', 'src/*.js', 'bench/*.js', 'src/polyfills/*.js') }}
+        key: edgebox-v12-${{ runner.os }}-${{ hashFiles('build.zig', 'src/**/*.zig', 'src/freeze/*.zig', 'src/*.js', 'src/workerd-tsc/*.js', 'src/polyfills/*.js') }}
 
     # === Build Binaryen (if cache miss) ===
     - name: Build Binaryen
@@ -128,13 +126,6 @@ runs:
           sudo ldconfig
         fi
 
-    # === Download V8 library for current platform (if cache miss) ===
-    - name: Download V8 (rusty_v8)
-      if: steps.cache-edgebox.outputs.cache-hit != 'true'
-      shell: bash
-      run: |
-        ./scripts/download-v8.sh
-
     # === Install TypeScript (needed for workerd TSC benchmark) ===
     - name: Install TypeScript
       if: steps.cache-edgebox.outputs.cache-hit != 'true'
@@ -152,18 +143,6 @@ runs:
         zig build-lib src/edgebox_workerd_io.zig -target x86_64-linux-gnu -OReleaseFast --name edgebox_io -fPIC -femit-bin=zig-out/lib/libedgebox_io.a
         echo "Built libedgebox_io.a ($(du -h zig-out/lib/libedgebox_io.a | cut -f1))"
 
-    # === Build benchmarks (if cache miss and requested) ===
-    - name: Build Benchmarks
-      if: steps.cache-edgebox.outputs.cache-hit != 'true' && inputs.build-benchmarks == 'true'
-      shell: bash
-      run: |
-        echo "Building all benchmarks..."
-        for bench in hello memory fib loop tail_recursive typed_array mandelbrot prime_factors gaussian_blur average path_trace; do
-          echo "Building $bench..."
-          ./zig-out/bin/edgebox-compile build bench/$bench.js
-        done
-        ls -la zig-out/bin/bench/
-
     # === Install binaryen system-wide (on cache hit, since build step is skipped) ===
     - name: Install Binaryen (cache hit)
       if: steps.cache-edgebox.outputs.cache-hit == 'true'
@@ -180,15 +159,6 @@ runs:
       if: inputs.build-test262 == 'true'
       shell: bash
       run: zig build test262 -Doptimize=ReleaseFast -Dcpu=baseline
-
-    - name: Build AOT base module
-      if: inputs.build-test262 == 'true'
-      shell: bash
-      run: |
-        echo "Building AOT compiler and base AOT module..."
-        zig build aot-tool -Doptimize=ReleaseFast -Dcpu=baseline
-        ./zig-out/bin/edgebox-aot zig-out/bin/edgebox-base.wasm zig-out/bin/edgebox-base.aot
-        ls -lh zig-out/bin/edgebox-base.aot
 
     # === Setup environment (always needed, even on cache hit) ===
     - name: Setup paths
