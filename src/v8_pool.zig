@@ -144,17 +144,56 @@ fn workerLoop(worker_id: u32) void {
     const context = edgebox_v8_setup_context(isolate);
     if (context == null) { edgebox_v8_dispose_isolate(isolate); return; }
 
-    // Load bootstrap.js (sets up process, require, fs polyfills)
-    const bootstrap_path = "src/workerd-tsc/bootstrap.js";
-    var bs_len: c_int = 0;
-    const bootstrap = edgebox_read_file(bootstrap_path.ptr, @intCast(bootstrap_path.len), &bs_len);
-    if (bootstrap != null and bs_len > 0) {
-        var eval_len: c_int = 0;
-        const r = edgebox_v8_eval_in_context(isolate, context, bootstrap.?, bs_len, &eval_len);
+    // Set up module shim + require + process before loading TypeScript
+    const module_shim =
+        "globalThis.module = { exports: {} };" ++
+        "globalThis.__filename = '/edgebox/worker.js';" ++
+        "globalThis.__dirname = '/edgebox';" ++
+        "globalThis.process = { argv:['edgebox'], env:{}, platform:'linux', " ++
+        "cwd:function(){return __edgebox_cwd();}, " ++
+        "exit:function(){}, " ++
+        "stdout:{write:function(s){__edgebox_write_stdout(String(s));return true;},isTTY:false,columns:80}, " ++
+        "stderr:{write:function(s){__edgebox_write_stderr(String(s));return true;},isTTY:false}, " ++
+        "versions:{node:'20.0.0'}, nextTick:function(cb){Promise.resolve().then(cb);}, " ++
+        "hrtime:Object.assign(function(){var t=Date.now();return[Math.floor(t/1000),(t%1000)*1e6];},{bigint:function(){return BigInt(Date.now())*1000000n;}}), " ++
+        "on:function(){return process;}, once:function(){return process;}, removeListener:function(){return process;}, emit:function(){return false;}, binding:function(){return{};} };" ++
+        "globalThis.require = function(name) {" ++
+        "  name = String(name).replace(/^node:/, '');" ++
+        "  if(name==='fs') return {" ++
+        "    readFileSync:function(p){return __edgebox_read_file(String(p))||null;}," ++
+        "    writeFileSync:function(){}," ++
+        "    existsSync:function(p){return __edgebox_file_exists(String(p))===1||__edgebox_dir_exists(String(p))===1;}," ++
+        "    statSync:function(p){var j=__edgebox_stat(String(p));if(!j){var e=new Error('ENOENT');e.code='ENOENT';throw e;}var s=JSON.parse(j);return{isFile:function(){return s.isFile;},isDirectory:function(){return s.isDirectory;},isSymbolicLink:function(){return false;},size:s.size,mtime:new Date()};}," ++
+        "    lstatSync:function(p){return require('fs').statSync(p);}," ++
+        "    readdirSync:function(p){return JSON.parse(__edgebox_readdir(String(p)));}," ++
+        "    realpathSync:Object.assign(function(p){return __edgebox_realpath(String(p));},{native:function(p){return __edgebox_realpath(String(p));}})," ++
+        "    openSync:function(){return -1;},closeSync:function(){},watchFile:function(){},unwatchFile:function(){},watch:function(){return{close:function(){}};}" ++
+        "  };" ++
+        "  if(name==='path') return {" ++
+        "    join:function(){return Array.prototype.slice.call(arguments).join('/').replace(/\\/+/g,'/');}," ++
+        "    dirname:function(p){var i=String(p).lastIndexOf('/');return i>=0?String(p).slice(0,i):'.';}," ++
+        "    basename:function(p,e){p=String(p);var b=p.slice(p.lastIndexOf('/')+1);if(e&&b.endsWith(e))b=b.slice(0,-e.length);return b;}," ++
+        "    resolve:function(){var a=Array.prototype.slice.call(arguments),r='';for(var i=a.length-1;i>=0;i--){r=String(a[i])+(r?'/'+r:'');if(String(a[i]).charAt(0)==='/')break;}if(r.charAt(0)!=='/'){r='/'+r;}return r.replace(/\\/+/g,'/');}," ++
+        "    normalize:function(p){return String(p).replace(/\\/+/g,'/');}," ++
+        "    isAbsolute:function(p){return String(p).charAt(0)==='/';}," ++
+        "    extname:function(p){p=String(p);var i=p.lastIndexOf('.');return i>=0?p.slice(i):'';}," ++
+        "    sep:'/',delimiter:':'" ++
+        "  };" ++
+        "  if(name==='os') return {EOL:'\\n',platform:function(){return'linux';},tmpdir:function(){return'/tmp';},homedir:function(){return'/tmp';},cpus:function(){return[{model:'edgebox'}];},arch:function(){return'x64';}};" ++
+        "  if(name==='crypto') return {createHash:function(a){var d='';return{update:function(s){d+=String(s);return this;},digest:function(){return __edgebox_hash(a,d);}};},randomBytes:function(n){return{toString:function(){return'';}};}};" ++
+        "  if(name==='perf_hooks') return {performance:{now:function(){return Date.now();},mark:function(){},measure:function(){}}};" ++
+        "  if(name==='buffer') return {Buffer:{from:function(s){return s;},isBuffer:function(){return false;},alloc:function(n){return new Uint8Array(n);}}};" ++
+        "  return {};" ++
+        "};" ++
+        "if(typeof Buffer==='undefined') globalThis.Buffer={from:function(s){return s;},isBuffer:function(){return false;},alloc:function(n){return new Uint8Array(n);},concat:function(b){return b[0]||new Uint8Array(0);},byteLength:function(s){return typeof s==='string'?s.length:0;},isEncoding:function(){return true;}};"
+    ;
+    {
+        var el: c_int = 0;
+        const r = edgebox_v8_eval_in_context(isolate, context, module_shim.ptr, @intCast(module_shim.len), &el);
         if (r) |rr| edgebox_v8_free(rr);
     }
 
-    // Load TypeScript
+    // Load TypeScript (writes to module.exports)
     const ts_path = "node_modules/typescript/lib/typescript.js";
     var ts_len: c_int = 0;
     const ts_src = edgebox_read_file(ts_path.ptr, @intCast(ts_path.len), &ts_len);
@@ -164,6 +203,26 @@ fn workerLoop(worker_id: u32) void {
         if (r2) |rr| edgebox_v8_free(rr);
     }
 
+    // Set ts = module.exports
+    const ts_alias = "globalThis.ts = globalThis.module.exports;";
+    {
+        var el2: c_int = 0;
+        const r3 = edgebox_v8_eval_in_context(isolate, context, ts_alias.ptr, @intCast(ts_alias.len), &el2);
+        if (r3) |rr| edgebox_v8_free(rr);
+    }
+
+    // Verify TypeScript loaded
+    const verify = "typeof ts !== 'undefined' ? 'ts:' + typeof ts.createProgram : 'ts undefined, module.exports keys: ' + Object.keys(module.exports).length";
+    {
+        var vl: c_int = 0;
+        const vr = edgebox_v8_eval_in_context(isolate, context, verify.ptr, @intCast(verify.len), &vl);
+        if (vr) |v| {
+            _ = std.posix.write(2, "[v8pool] ") catch {};
+            _ = std.posix.write(2, v[0..@intCast(vl)]) catch {};
+            _ = std.posix.write(2, "\n") catch {};
+            edgebox_v8_free(v);
+        }
+    }
     _ = std.posix.write(2, "[v8pool] worker ready\n") catch {};
 
     while (!workers[wid].shutdown.load(.acquire)) {

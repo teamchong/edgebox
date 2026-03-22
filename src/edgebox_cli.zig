@@ -53,11 +53,11 @@ fn printUsage() void {
 // ── Daemon ──
 
 fn isDaemonRunning() bool {
-    const pid_data = std.fs.cwd().readFileAlloc(alloc, PID_FILE, 64) catch return false;
-    defer alloc.free(pid_data);
-    const pid_str = std.mem.trim(u8, pid_data, &[_]u8{ ' ', '\n', '\r' });
-    const pid = std.fmt.parseInt(i32, pid_str, 10) catch return false;
-    std.posix.kill(@intCast(pid), 0) catch return false;
+    // Check socket exists AND is connectable
+    const addr = std.net.Address.initUnix(SOCKET_PATH) catch return false;
+    const fd = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch return false;
+    defer std.posix.close(fd);
+    std.posix.connect(fd, &addr.any, addr.getOsSockLen()) catch return false;
     return true;
 }
 
