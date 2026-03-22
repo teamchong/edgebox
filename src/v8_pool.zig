@@ -245,12 +245,12 @@ fn workerLoop(worker_id: u32) void {
         workers[wid].work_ready.store(false, .release);
 
         if (workers[wid].cwd) |cwd| {
-            // Run TSC check on this shard
+            // Run TSC check on this shard — caches program between requests
             const check_code = std.fmt.allocPrint(alloc,
                 \\(function() {{
                 \\  var ts = globalThis.ts || globalThis.module.exports;
                 \\  if (!ts || !ts.createProgram) return 'no tsc';
-                \\  if (!ts.sys) return 'ts.sys is ' + typeof ts.sys + ', ts.version=' + ts.version;
+                \\  if (!ts.sys) return 'ts.sys is ' + typeof ts.sys;
                 \\  var cwd = '{s}';
                 \\  var wid = {d};
                 \\  var wcount = {d};
@@ -283,7 +283,14 @@ fn workerLoop(worker_id: u32) void {
                 \\  var cf = ts.readConfigFile(cwd + '/tsconfig.json', ts.sys.readFile);
                 \\  if (cf.error) return 'config error';
                 \\  var parsed = ts.parseJsonConfigFileContent(cf.config, ts.sys, cwd);
-                \\  var program = ts.createProgram(parsed.fileNames, parsed.options);
+                \\  // Cache program across requests — skip createProgram on warm runs
+                \\  var cacheKey = cwd + ':' + parsed.fileNames.length;
+                \\  if (!globalThis.__programCache) globalThis.__programCache = {{}};
+                \\  var program = globalThis.__programCache[cacheKey];
+                \\  if (!program) {{
+                \\    program = ts.createProgram(parsed.fileNames, parsed.options);
+                \\    globalThis.__programCache[cacheKey] = program;
+                \\  }}
                 \\  var files = program.getSourceFiles();
                 \\  var output = [];
                 \\  if (wid === 0) {{
