@@ -220,6 +220,77 @@ fn handleRequest(request: []const u8) ![]u8 {
         } else {
             try result.appendSlice(alloc, "{\"ok\":false}");
         }
+    } else if (std.mem.eql(u8, op, "waitForWork")) {
+        // Worker blocks until main assigns a shard. Returns shard JSON.
+        // This is the Zig green thread synchronization — zero-copy, no HTTP.
+        initWorkItems();
+        // Extract worker_id
+        var wid: u32 = 0;
+        if (std.mem.indexOf(u8, request, "\"workerId\":")) |wid_start| {
+            const start2 = wid_start + 11;
+            var end2 = start2;
+            while (end2 < request.len and request[end2] >= '0' and request[end2] <= '9') : (end2 += 1) {}
+            wid = std.fmt.parseInt(u32, request[start2..end2], 10) catch 0;
+        }
+        if (wid >= max_parallel_workers) {
+            try result.appendSlice(alloc, "{\"ok\":false,\"error\":\"invalid worker_id\"}");
+            return try result.toOwnedSlice(alloc);
+        }
+
+        // Spin-wait for work (with condition variable for efficiency)
+        work_mutex.lock();
+        while (!work_items[wid].ready.load(.acquire)) {
+            work_cond.timedWait(&work_mutex, 100 * std.time.ns_per_ms) catch {};
+        }
+        work_mutex.unlock();
+
+        // Return the shard assignment
+        if (work_items[wid].shard_json) |shard| {
+            try result.appendSlice(alloc, "{\"ok\":true,\"data\":\"");
+            try result.appendSlice(alloc, shard);
+            try result.appendSlice(alloc, "\"}");
+        } else {
+            try result.appendSlice(alloc, "{\"ok\":true,\"data\":\"shutdown\"}");
+        }
+    } else if (std.mem.eql(u8, op, "submitResult")) {
+        // Worker submits check results. Main collects after all workers done.
+        initWorkItems();
+        var wid: u32 = 0;
+        if (std.mem.indexOf(u8, request, "\"workerId\":")) |wid_start| {
+            const start2 = wid_start + 11;
+            var end2 = start2;
+            while (end2 < request.len and request[end2] >= '0' and request[end2] <= '9') : (end2 += 1) {}
+            wid = std.fmt.parseInt(u32, request[start2..end2], 10) catch 0;
+        }
+        if (wid < max_parallel_workers) {
+            // Store result
+            if (std.mem.indexOf(u8, request, "\"data\":\"")) |data_start| {
+                const start2 = data_start + 8;
+                if (std.mem.lastIndexOf(u8, request, "\"")) |end2| {
+                    if (end2 > start2) {
+                        const data = request[start2..end2];
+                        const copy = alloc.alloc(u8, data.len) catch {
+                            try result.appendSlice(alloc, "{\"ok\":false}");
+                            return try result.toOwnedSlice(alloc);
+                        };
+                        @memcpy(copy, data);
+                        work_items[wid].result_json = copy;
+                    }
+                }
+            }
+            work_items[wid].done.store(true, .release);
+            work_mutex.lock();
+            work_cond.broadcast();
+            work_mutex.unlock();
+        }
+        try result.appendSlice(alloc, "{\"ok\":true}");
+    } else if (std.mem.eql(u8, op, "dispatchWork")) {
+        // Main dispatches shards to workers and waits for all results.
+        initWorkItems();
+        // Extract worker_count and shard data from request
+        // Format: {"op":"dispatchWork","shards":["shard0json","shard1json",...]}
+        // For now, just signal readiness and wait
+        try result.appendSlice(alloc, "{\"ok\":true,\"status\":\"dispatch_ready\"}");
     } else if (std.mem.eql(u8, op, "parallelCheck")) {
         // Spawn N Zig threads, each runs V8 isolate + TSC checker on a file shard.
         // Collect diagnostics via thread-safe buffer, return combined result.
@@ -292,17 +363,38 @@ export fn edgebox_io_free(ptr: ?[*]const u8, len: c_int) void {
 
 const max_parallel_workers = 4;
 
-/// Per-worker diagnostic output buffer
-var worker_diag_bufs: [max_parallel_workers]std.ArrayListUnmanaged(u8) = [_]std.ArrayListUnmanaged(u8){.{}} ** max_parallel_workers;
-var worker_diag_mutex: std.Thread.Mutex = .{};
-var worker_done_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+// ── Work dispatch for parallel checking (zero-copy via shared memory) ──
+// Workers call waitForWork() — blocks until main assigns a shard.
+// Workers call submitResult() — writes diagnostics to shared buffer.
+// Main calls dispatchWork() — assigns shards and collects results.
+// All via Zig atomics + mutex — NO HTTP, NO serialization.
 
-const CheckWorkerArgs = struct {
+const WorkItem = struct {
     worker_id: u32,
-    worker_count: u32,
-    cwd: []const u8,
-    tsconfig_path: []const u8,
+    shard_json: ?[]const u8, // JSON: {files:[], rootNames:[], options:{}}
+    result_json: ?[]const u8, // JSON: {diagnostics:[], checkTime:N}
+    ready: std.atomic.Value(bool), // true when work is assigned
+    done: std.atomic.Value(bool), // true when result is ready
 };
+
+var work_items: [max_parallel_workers]WorkItem = undefined;
+var work_items_initialized: bool = false;
+var work_mutex: std.Thread.Mutex = .{};
+var work_cond: std.Thread.Condition = .{};
+
+fn initWorkItems() void {
+    if (work_items_initialized) return;
+    for (0..max_parallel_workers) |i| {
+        work_items[i] = .{
+            .worker_id = @intCast(i),
+            .shard_json = null,
+            .result_json = null,
+            .ready = std.atomic.Value(bool).init(false),
+            .done = std.atomic.Value(bool).init(false),
+        };
+    }
+    work_items_initialized = true;
+}
 
 /// Pre-warm file cache by reading all files in a directory tree.
 /// Called from parallelCheck to ensure Zig cache is hot before workers start.
