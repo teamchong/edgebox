@@ -6,7 +6,7 @@
 ///   edgebox daemon status    Check if daemon is running
 ///   edgebox tsc [args...]    Run TypeScript compiler via daemon
 ///
-/// The daemon starts workerd with N parallel checker services
+/// The daemon starts workerd with N parallel worker services
 /// (N = cpu_count / 2, formula-based). CLI sends HTTP to daemon.
 /// First `edgebox tsc` auto-starts daemon if not running.
 
@@ -162,7 +162,7 @@ fn runTsc(args: []const []const u8) u8 {
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd = std.fs.cwd().realpath(".", &cwd_buf) catch "/tmp";
 
-    // Write project config for the checker
+    // Write project config for the worker
     const config = std.fmt.allocPrint(alloc, "{{\"cwd\":\"{s}\"}}", .{cwd}) catch return 1;
     defer alloc.free(config);
     std.fs.cwd().writeFile(.{ .sub_path = PROJECT_CONFIG, .data = config }) catch return 1;
@@ -231,21 +231,41 @@ fn generateCapnpConfig(worker_count: usize) !void {
     try w.writeAll("const config :Workerd.Config = (\n");
     try w.writeAll("  services = [\n");
     try w.writeAll("    (name = \"main\", worker = .mainWorker),\n");
+    for (0..worker_count) |i| {
+        try w.print("    (name = \"worker{d}\", worker = .worker{d}),\n", .{ i, i });
+    }
     try w.writeAll("  ],\n");
     try w.print("  sockets = [(name = \"main\", address = \"*:{d}\", service = \"main\")],\n", .{DAEMON_PORT});
     try w.writeAll(");\n");
     try w.writeAll("const mainWorker :Workerd.Worker = (\n");
     try w.writeAll("  modules = [\n");
-    try w.writeAll("    (name = \"worker\", esModule = embed \"src/workerd-tsc/checker-parallel.js\"),\n");
+    try w.writeAll("    (name = \"worker\", esModule = embed \"src/workerd-tsc/main-daemon.js\"),\n");
     try w.writeAll("    (name = \"bootstrap.js\", esModule = embed \"src/workerd-tsc/bootstrap.js\"),\n");
-    try w.writeAll("    (name = \"typescript.js\", esModule = embed \"node_modules/typescript/lib/typescript.js\"),\n");
     try w.writeAll("  ],\n");
+    // Service bindings for parallel dispatch (zero-copy inside same process)
+    if (worker_count > 0) {
+        try w.writeAll("  bindings = [\n");
+        for (0..worker_count) |i| {
+            try w.print("    (name = \"WORKER_{d}\", service = \"worker{d}\"),\n", .{ i, i });
+        }
+        try w.writeAll("  ],\n");
+    }
     try w.writeAll("  compatibilityDate = \"2024-01-01\",\n");
     try w.writeAll(");\n");
+
+    // Generate N worker services for parallel
+    for (0..worker_count) |i| {
+        try w.print("const worker{d} :Workerd.Worker = (\n", .{i});
+        try w.writeAll("  modules = [\n");
+        try w.writeAll("    (name = \"worker\", esModule = embed \"src/workerd-tsc/checker-parallel.js\"),\n");
+        try w.writeAll("    (name = \"bootstrap.js\", esModule = embed \"src/workerd-tsc/bootstrap.js\"),\n");
+        try w.writeAll("    (name = \"typescript.js\", esModule = embed \"node_modules/typescript/lib/typescript.js\"),\n");
+        try w.writeAll("  ],\n");
+        try w.writeAll("  compatibilityDate = \"2024-01-01\",\n");
+        try w.writeAll(");\n");
+    }
 
     const content = try config.toOwnedSlice(alloc);
     defer alloc.free(content);
     try std.fs.cwd().writeFile(.{ .sub_path = getConfigFile(), .data = content });
-
-    _ = worker_count; // TODO: generate N checker services for parallel
 }
