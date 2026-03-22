@@ -18,6 +18,12 @@ extern fn edgebox_v8_create_isolate() ?*anyopaque;
 extern fn edgebox_v8_enter_isolate(?*anyopaque) void;
 extern fn edgebox_v8_exit_isolate(?*anyopaque) void;
 extern fn edgebox_v8_dispose_isolate(?*anyopaque) void;
+extern fn edgebox_v8_setup_context(?*anyopaque) ?*anyopaque;
+extern fn edgebox_v8_eval_in_context(?*anyopaque, ?*anyopaque, [*]const u8, c_int, *c_int) ?[*]const u8;
+extern fn edgebox_v8_free(?[*]const u8) void;
+
+// IO functions from edgebox_workerd_io.zig (shared across all workers)
+extern fn edgebox_read_file([*]const u8, c_int, *c_int) ?[*]const u8;
 
 const MAX_WORKERS = 16;
 
@@ -132,13 +138,33 @@ pub fn collect() ![]const u8 {
 fn workerLoop(worker_id: u32) void {
     const wid: usize = @intCast(worker_id);
 
-    // Create V8 isolate for this thread
+    // Create V8 isolate + context with IO globals
     const isolate = edgebox_v8_create_isolate();
     if (isolate == null) return;
-    edgebox_v8_enter_isolate(isolate);
+    const context = edgebox_v8_setup_context(isolate);
+    if (context == null) { edgebox_v8_dispose_isolate(isolate); return; }
 
-    // TODO: Create context, load TypeScript, register IO globals
-    // For now: isolate is created and entered
+    // Load bootstrap.js (sets up process, require, fs polyfills)
+    const bootstrap_path = "src/workerd-tsc/bootstrap.js";
+    var bs_len: c_int = 0;
+    const bootstrap = edgebox_read_file(bootstrap_path.ptr, @intCast(bootstrap_path.len), &bs_len);
+    if (bootstrap != null and bs_len > 0) {
+        var eval_len: c_int = 0;
+        const r = edgebox_v8_eval_in_context(isolate, context, bootstrap.?, bs_len, &eval_len);
+        if (r) |rr| edgebox_v8_free(rr);
+    }
+
+    // Load TypeScript
+    const ts_path = "node_modules/typescript/lib/typescript.js";
+    var ts_len: c_int = 0;
+    const ts_src = edgebox_read_file(ts_path.ptr, @intCast(ts_path.len), &ts_len);
+    if (ts_src != null and ts_len > 0) {
+        var eval_len2: c_int = 0;
+        const r2 = edgebox_v8_eval_in_context(isolate, context, ts_src.?, ts_len, &eval_len2);
+        if (r2) |rr| edgebox_v8_free(rr);
+    }
+
+    _ = std.posix.write(2, "[v8pool] worker ready\n") catch {};
 
     while (!workers[wid].shutdown.load(.acquire)) {
         // Park on condvar
@@ -154,10 +180,81 @@ fn workerLoop(worker_id: u32) void {
         workers[wid].work_ready.store(false, .release);
 
         if (workers[wid].cwd) |cwd| {
-            // TODO: Run TSC on this shard using the V8 isolate
-            // For now: placeholder
-            _ = cwd;
-            workers[wid].result = null;
+            // Run TSC check on this shard
+            const check_code = std.fmt.allocPrint(alloc,
+                \\(function() {{
+                \\  var ts = globalThis.ts || globalThis.module.exports;
+                \\  if (!ts || !ts.createProgram) return 'no tsc';
+                \\  var cwd = '{s}';
+                \\  var wid = {d};
+                \\  var wcount = {d};
+                \\  function rp(p) {{ p = String(p); return p.charAt(0) !== '/' ? cwd + '/' + p : p; }}
+                \\  ts.sys.readFile = function(p) {{ var c = __edgebox_read_file(rp(p)); return c || undefined; }};
+                \\  ts.sys.fileExists = function(p) {{ return __edgebox_file_exists(rp(p)) === 1; }};
+                \\  ts.sys.directoryExists = function(p) {{ return __edgebox_dir_exists(rp(p)) === 1; }};
+                \\  ts.sys.getCurrentDirectory = function() {{ return cwd; }};
+                \\  ts.sys.realpath = function(p) {{ return __edgebox_realpath(rp(p)); }};
+                \\  ts.sys.getExecutingFilePath = function() {{ return cwd + '/node_modules/typescript/lib/typescript.js'; }};
+                \\  ts.sys.write = function(s) {{ __edgebox_write_stdout(String(s)); }};
+                \\  ts.sys.writeFile = function() {{}};
+                \\  ts.sys.exit = function() {{}};
+                \\  ts.sys.getDirectories = function(p) {{
+                \\    var rr = rp(p); var entries = JSON.parse(__edgebox_readdir(rr));
+                \\    return entries.filter(function(e) {{ return __edgebox_dir_exists(rr + '/' + e) === 1; }});
+                \\  }};
+                \\  ts.sys.readDirectory = function(rootDir, ext, exc, inc, depth) {{
+                \\    return ts.matchFiles(rootDir, ext, exc, inc, true, cwd, depth, function(p) {{
+                \\      var rr = p || '.'; var json = __edgebox_readdir(rr);
+                \\      if (!json || json === '[]') return {{ files: [], directories: [] }};
+                \\      var entries = JSON.parse(json); var files = [], dirs = [];
+                \\      for (var i = 0; i < entries.length; i++) {{
+                \\        if (entries[i] === '.' || entries[i] === '..') continue;
+                \\        if (__edgebox_dir_exists(rr + '/' + entries[i]) === 1) dirs.push(entries[i]); else files.push(entries[i]);
+                \\      }}
+                \\      return {{ files: files, directories: dirs }};
+                \\    }}, function(p) {{ return __edgebox_realpath(p); }});
+                \\  }};
+                \\  var cf = ts.readConfigFile(cwd + '/tsconfig.json', ts.sys.readFile);
+                \\  if (cf.error) return 'config error';
+                \\  var parsed = ts.parseJsonConfigFileContent(cf.config, ts.sys, cwd);
+                \\  var program = ts.createProgram(parsed.fileNames, parsed.options);
+                \\  var files = program.getSourceFiles();
+                \\  var output = [];
+                \\  if (wid === 0) {{
+                \\    var gd = ts.getPreEmitDiagnostics(program).filter(function(d) {{ return !d.file; }});
+                \\    for (var g = 0; g < gd.length; g++) output.push(ts.flattenDiagnosticMessageText(gd[g].messageText, '\\n'));
+                \\  }}
+                \\  for (var i = 0; i < files.length; i++) {{
+                \\    if (i % wcount !== wid) continue;
+                \\    var diags = program.getSemanticDiagnostics(files[i]);
+                \\    for (var k = 0; k < diags.length; k++) {{
+                \\      var d = diags[k];
+                \\      if (d.file) {{
+                \\        var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
+                \\        output.push(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' '));
+                \\      }}
+                \\    }}
+                \\  }}
+                \\  return output.join('\\n');
+                \\}})()
+            , .{ cwd, wid, workers[wid].worker_count }) catch {
+                workers[wid].result = null;
+                continue;
+            };
+            defer alloc.free(check_code);
+
+            var out_len: c_int = 0;
+            const result = edgebox_v8_eval_in_context(isolate, context, check_code.ptr, @intCast(check_code.len), &out_len);
+            if (result) |r| {
+                if (out_len > 0) {
+                    const copy = alloc.alloc(u8, @intCast(out_len)) catch null;
+                    if (copy) |c| {
+                        @memcpy(c, r[0..@intCast(out_len)]);
+                        workers[wid].result = c;
+                    }
+                }
+                edgebox_v8_free(r);
+            }
         }
 
         // Signal done
