@@ -1,24 +1,23 @@
 import './bootstrap.js';
 import ts from './typescript.js';
 
-// Pre-check at module init — results submitted to Zig shared memory
+// Pre-check at module init — zero JSON in hot path
 (function() {
   try {
-    var resp = JSON.parse(__edgebox_io_sync(JSON.stringify({op:'readFile',path:'/tmp/edgebox-project-config.json'})));
+    // IO still uses __edgebox_io_sync for file reads (needs JSON for path)
+    // TODO: add __edgebox_read_file(path) direct typed method
+    var resp = JSON.parse(__edgebox_io_sync('{"op":"readFile","path":"/tmp/edgebox-project-config.json"}'));
     if (!resp.ok) return;
     var config = JSON.parse(resp.data);
-    var configFile = ts.readConfigFile(config.cwd + '/tsconfig.json', function(p) {
-      var r = JSON.parse(__edgebox_io_sync(JSON.stringify({op:'readFile',path:p})));
-      return r.ok ? r.data : undefined;
-    });
+    var configFile = ts.readConfigFile(config.cwd + '/tsconfig.json', ts.sys.readFile);
     var parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, config.cwd);
     var program = ts.createProgram(parsed.fileNames, parsed.options);
-    
+
     var t0 = Date.now();
     var files = program.getSourceFiles();
     var diagCount = 0;
-    var diagLines = [];
-    
+
+    // Check all files — write diagnostics directly to stdout (zero copy)
     for (var i = 0; i < files.length; i++) {
       var diags = program.getSemanticDiagnostics(files[i]);
       diagCount += diags.length;
@@ -26,13 +25,14 @@ import ts from './typescript.js';
         var d = diags[k];
         if (d.file) {
           var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
-          diagLines.push(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' '));
+          // Direct write — kj::String → Zig posix.write(1, ...) — ZERO JSON
+          __edgebox_write_stdout(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' ') + '\n');
         }
       }
     }
     var checkTime = Date.now() - t0;
-    
-    // Register types AFTER check (read-only)
+
+    // Register types AFTER check (read-only, zero copy)
     var checker = program.getTypeChecker();
     var seenTypes = {};
     for (var fi = 0; fi < files.length; fi++) {
@@ -54,30 +54,14 @@ import ts from './typescript.js';
         ts.forEachChild(node, visit);
       });
     }
-    
-    // Submit results to Zig shared memory — NO HTTP
-    __edgebox_io_sync(JSON.stringify({
-      op: 'submitResult',
-      workerId: 0,
-      data: JSON.stringify({
-        diagnostics: diagCount,
-        checkTime: checkTime,
-        files: files.length,
-        lines: diagLines,
-      })
-    }));
-    
-    // Write diagnostics to stderr (visible in terminal)
-    __edgebox_io_sync(JSON.stringify({
-      op: 'writeErr',
-      data: '[checker] ' + diagCount + ' diagnostics, ' + files.length + ' files, ' + checkTime + 'ms\n'
-    }));
+
+    // Status to stderr — direct write, zero JSON
+    __edgebox_write_stderr('[checker] ' + diagCount + ' diagnostics, ' + files.length + ' files, ' + checkTime + 'ms\n');
   } catch(e) {
-    __edgebox_io_sync(JSON.stringify({op:'writeErr', data:'[checker] error: ' + e.message + '\n'}));
+    __edgebox_write_stderr('[checker] error: ' + e.message + '\n');
   }
 })();
 
-// Dummy fetch handler (workerd requires it but we don't use HTTP)
 export default {
   fetch() { return new Response('edgebox-checker'); }
 };

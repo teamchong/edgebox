@@ -1,8 +1,8 @@
 diff --git a/src/workerd/api/global-scope.h b/src/workerd/api/global-scope.h
-index 3f59a4f53..668f5604a 100644
+index 3f59a4f53..7ea0cd303 100644
 --- a/src/workerd/api/global-scope.h
 +++ b/src/workerd/api/global-scope.h
-@@ -488,6 +488,14 @@ class Immediate final: public jsg::Object {
+@@ -488,6 +488,16 @@ class Immediate final: public jsg::Object {
    TimeoutId timeoutId;
  };
  
@@ -12,12 +12,14 @@ index 3f59a4f53..668f5604a 100644
 +  void edgebox_register_type(unsigned int type_id, unsigned int flags, unsigned int object_flags);
 +  void edgebox_register_member(unsigned int type_id, const char* name, int name_len, unsigned int member_type_id, unsigned int member_flags);
 +  unsigned char edgebox_check_structural(unsigned int source_id, unsigned int target_id);
++  void edgebox_write_stdout(const char* data, int len);
++  void edgebox_write_stderr(const char* data, int len);
 +}
 +
  // Global object API exposed to JavaScript.
  class ServiceWorkerGlobalScope: public WorkerGlobalScope {
   public:
-@@ -621,6 +629,24 @@ class ServiceWorkerGlobalScope: public WorkerGlobalScope {
+@@ -621,6 +631,30 @@ class ServiceWorkerGlobalScope: public WorkerGlobalScope {
      return JSG_THIS;
    }
  
@@ -38,11 +40,17 @@ index 3f59a4f53..668f5604a 100644
 +  double __edgebox_check_structural(double sourceId, double targetId) {
 +    return (double)edgebox_check_structural((unsigned int)sourceId, (unsigned int)targetId);
 +  }
++  void __edgebox_write_stdout(kj::String data) {
++    edgebox_write_stdout(data.cStr(), data.size());
++  }
++  void __edgebox_write_stderr(kj::String data) {
++    edgebox_write_stderr(data.cStr(), data.size());
++  }
 +
    // Implemented in global-scope.c++ to avoid including crypto.h
    jsg::Ref<Crypto> getCrypto(jsg::Lock& js);
  
-@@ -685,6 +711,10 @@ class ServiceWorkerGlobalScope: public WorkerGlobalScope {
+@@ -685,6 +719,12 @@ class ServiceWorkerGlobalScope: public WorkerGlobalScope {
  
      JSG_METHOD(btoa);
      JSG_METHOD(atob);
@@ -50,6 +58,8 @@ index 3f59a4f53..668f5604a 100644
 +    JSG_METHOD(__edgebox_register_type);
 +    JSG_METHOD(__edgebox_register_member);
 +    JSG_METHOD(__edgebox_check_structural);
++    JSG_METHOD(__edgebox_write_stdout);
++    JSG_METHOD(__edgebox_write_stderr);
  
      JSG_METHOD(setTimeout);
      JSG_METHOD(clearTimeout);

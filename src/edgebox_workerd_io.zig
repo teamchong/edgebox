@@ -220,6 +220,17 @@ fn handleRequest(request: []const u8) ![]u8 {
         } else {
             try result.appendSlice(alloc, "{\"ok\":false}");
         }
+    } else if (std.mem.eql(u8, op, "setWorkerCount")) {
+        var count: u32 = 1;
+        if (std.mem.indexOf(u8, request, "\"count\":")) |c_start| {
+            const s = c_start + 8;
+            var e = s;
+            while (e < request.len and request[e] >= '0' and request[e] <= '9') : (e += 1) {}
+            count = std.fmt.parseInt(u32, request[s..e], 10) catch 1;
+        }
+        expected_worker_count = count;
+        initWorkItems();
+        try result.writer(alloc).print("{{\"ok\":true,\"count\":{d}}}", .{count});
     } else if (std.mem.eql(u8, op, "waitForWork")) {
         // Worker blocks until main assigns a shard. Returns shard JSON.
         // This is the Zig green thread synchronization — zero-copy, no HTTP.
@@ -279,6 +290,29 @@ fn handleRequest(request: []const u8) ![]u8 {
                 }
             }
             work_items[wid].done.store(true, .release);
+
+            // Count completed workers
+            var done_count: u32 = 0;
+            for (0..max_parallel_workers) |w| {
+                if (work_items[w].done.load(.acquire)) done_count += 1;
+            }
+
+            // Auto-output when all workers done
+            if (done_count >= expected_worker_count) {
+                // All workers submitted — output merged diagnostics to stdout
+                const stdout = std.fs.File.stdout();
+                for (0..max_parallel_workers) |w| {
+                    if (work_items[w].result_json) |res| {
+                        // Extract "lines" array from result JSON and output each line
+                        // Result format: {"diagnostics":N,"lines":["line1","line2",...]}
+                        // For now, output raw result to stderr for debugging
+                        stdout.writeAll(res) catch {};
+                        stdout.writeAll("\n") catch {};
+                    }
+                }
+                std.debug.print("[edgebox] All {d} workers done\n", .{done_count});
+            }
+
             work_mutex.lock();
             work_cond.broadcast();
             work_mutex.unlock();
@@ -434,6 +468,30 @@ export fn edgebox_io_batch(
     return buf.ptr;
 }
 
+/// C ABI: Direct stdout write — zero copy, no JSON
+export fn edgebox_write_stdout(ptr: [*]const u8, len: c_int) void {
+    if (len <= 0) return;
+    const data = ptr[0..@intCast(len)];
+    var written: usize = 0;
+    while (written < data.len) {
+        const n = std.posix.write(1, data[written..]) catch break;
+        if (n == 0) break;
+        written += n;
+    }
+}
+
+/// C ABI: Direct stderr write — zero copy, no JSON
+export fn edgebox_write_stderr(ptr: [*]const u8, len: c_int) void {
+    if (len <= 0) return;
+    const data = ptr[0..@intCast(len)];
+    var written: usize = 0;
+    while (written < data.len) {
+        const n = std.posix.write(2, data[written..]) catch break;
+        if (n == 0) break;
+        written += n;
+    }
+}
+
 /// C ABI: Free response buffer
 export fn edgebox_io_free(ptr: ?[*]const u8, len: c_int) void {
     if (ptr) |p| {
@@ -468,6 +526,8 @@ var work_items: [max_parallel_workers]WorkItem = undefined;
 var work_items_initialized: bool = false;
 var work_mutex: std.Thread.Mutex = .{};
 var work_cond: std.Thread.Condition = .{};
+// Formula: set by first worker or by setConfig
+var expected_worker_count: u32 = 1;
 
 fn initWorkItems() void {
     if (work_items_initialized) return;
