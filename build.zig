@@ -1706,13 +1706,6 @@ pub fn build(b: *std.Build) void {
             const v8_test_step = b.step("v8-test", "Build V8 embedding test (Phases 1+2)");
             v8_test_step.dependOn(&b.addInstallArtifact(v8_test_exe, .{}).step);
 
-            // Helper function to add V8 library + bridge to an executable
-            const v8_lib_path = b.path(b.fmt("vendor/v8/{s}", .{lib_name}));
-            const v8_inc_path = b.path("vendor/v8/include");
-            const v8_root_path = b.path("vendor/v8");
-            const v8_bridge_file = b.path("src/v8_bridge.cpp");
-            const v8_stubs_file = b.path("src/v8_stubs.c");
-
             // V8 runner REMOVED — workerd is the only runtime.
             // Build Zig IO library for workerd instead.
             const v8_run_step = b.step("v8-run", "REMOVED — use workerd (see src/workerd-tsc/)");
