@@ -114,20 +114,6 @@ fn daemonStart() u8 {
     std.fs.cwd().writeFile(.{ .sub_path = PID_FILE, .data = pid_str }) catch {};
 
     std.debug.print("Daemon started (PID {d}, {d} workers, port {d})\n", .{ child.id, worker_count, DAEMON_PORT });
-
-    // Wait for workerd to start listening
-    std.Thread.sleep(3 * std.time.ns_per_s);
-
-    // Wake up all worker services by connecting to their sockets
-    // This triggers their fetch handler → doWork() → blocks on Zig condvar
-    for (0..worker_count) |i| {
-        const port: u16 = 19001 + @as(u16, @intCast(i));
-        const wake = std.net.tcpConnectToHost(alloc, "127.0.0.1", port) catch continue;
-        wake.writeAll("GET / HTTP/1.0\r\nHost: localhost\r\n\r\n") catch {};
-        wake.close();
-    }
-
-    std.debug.print("Workers initialized\n", .{});
     return 0;
 }
 

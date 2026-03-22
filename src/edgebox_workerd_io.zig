@@ -239,14 +239,13 @@ export fn edgebox_free(ptr: ?[*]const u8, len: c_int) void {
     }
 }
 
-// ── Zero-Copy Parallel Dispatch (Zig green thread channels) ──
-// Workers (separate V8 isolates in same workerd process) block on condvar.
-// Main dispatches work → signals condvar → workers wake → check shard → submit.
-// ALL communication via shared memory. ZERO HTTP. ZERO serialization.
+// ── Zero-Copy Parallel (Zig condvar + shared memory) ──
+// Workers block on condvar. Main signals. Workers wake, do work, submit.
+// ALL in shared memory. ZERO HTTP. ZERO TCP. ZERO serialization.
 
 const MAX_WORKERS = 16;
 
-const WorkItem = struct {
+const WorkSlot = struct {
     cwd: ?[]const u8 = null,
     worker_count: u32 = 0,
     ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -254,97 +253,92 @@ const WorkItem = struct {
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
-var work_items: [MAX_WORKERS]WorkItem = [_]WorkItem{.{}} ** MAX_WORKERS;
+var work_slots: [MAX_WORKERS]WorkSlot = [_]WorkSlot{.{}} ** MAX_WORKERS;
 var work_mutex: std.Thread.Mutex = .{};
 var work_cond: std.Thread.Condition = .{};
-var dispatch_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
-/// Called by main service: dispatch work to all workers.
-/// Workers are blocked on edgebox_wait_for_work — this wakes them.
+/// Main calls this: set work for all workers, signal condvar.
 export fn edgebox_dispatch_work(cwd_ptr: [*]const u8, cwd_len: c_int, worker_count: c_int) void {
     if (cwd_len <= 0 or worker_count <= 0) return;
     const cwd = cwd_ptr[0..@intCast(cwd_len)];
     const n: u32 = @intCast(@min(worker_count, MAX_WORKERS));
 
-    // Set work for each worker
     for (0..n) |i| {
-        work_items[i].cwd = cwd;
-        work_items[i].worker_count = n;
-        work_items[i].result = null;
-        work_items[i].done.store(false, .release);
-        work_items[i].ready.store(true, .release);
+        work_slots[i].cwd = cwd;
+        work_slots[i].worker_count = n;
+        work_slots[i].result = null;
+        work_slots[i].done.store(false, .release);
+        work_slots[i].ready.store(true, .release);
     }
 
-    // Bump generation and wake all workers
-    _ = dispatch_generation.fetchAdd(1, .release);
     work_mutex.lock();
     work_cond.broadcast();
     work_mutex.unlock();
 }
 
-/// Called by worker service at module init: blocks until work is available.
-/// Returns cwd pointer+len. Worker reads workerId/workerCount from work_items.
-export fn edgebox_wait_for_work(worker_id: c_int, out_cwd_len: *c_int, out_worker_count: *c_int) ?[*]const u8 {
-    if (worker_id < 0 or worker_id >= MAX_WORKERS) { out_cwd_len.* = 0; return null; }
+/// Worker calls this: blocks until work ready. Returns "cwd|workerId|workerCount".
+export fn edgebox_wait_for_work(worker_id: c_int, out_len: *c_int) ?[*]const u8 {
+    if (worker_id < 0 or worker_id >= MAX_WORKERS) { out_len.* = 0; return null; }
     const wid: usize = @intCast(worker_id);
 
-    // Block until work is ready
     work_mutex.lock();
-    while (!work_items[wid].ready.load(.acquire)) {
+    while (!work_slots[wid].ready.load(.acquire)) {
         work_cond.timedWait(&work_mutex, 100 * std.time.ns_per_ms) catch {};
     }
     work_mutex.unlock();
 
-    // Clear ready flag (consumed)
-    work_items[wid].ready.store(false, .release);
+    work_slots[wid].ready.store(false, .release);
 
-    if (work_items[wid].cwd) |cwd| {
-        out_cwd_len.* = @intCast(cwd.len);
-        out_worker_count.* = @intCast(work_items[wid].worker_count);
-        return cwd.ptr;
+    if (work_slots[wid].cwd) |cwd| {
+        // Return "cwd|workerId|workerCount" as NUL-terminated string
+        const info = std.fmt.allocPrint(alloc, "{s}|{d}|{d}", .{ cwd, wid, work_slots[wid].worker_count }) catch { out_len.* = 0; return null; };
+        // Append NUL for kj::StringPtr
+        const buf = alloc.alloc(u8, info.len + 1) catch { alloc.free(info); out_len.* = 0; return null; };
+        @memcpy(buf[0..info.len], info);
+        buf[info.len] = 0;
+        alloc.free(info);
+        out_len.* = @intCast(info.len);
+        return buf.ptr;
     }
-    out_cwd_len.* = 0;
-    out_worker_count.* = 0;
+    out_len.* = 0;
     return null;
 }
 
-/// Called by worker after checking its shard: submit results.
+/// Worker calls this: submit results to shared buffer.
 export fn edgebox_submit_result(worker_id: c_int, data_ptr: [*]const u8, data_len: c_int) void {
     if (worker_id < 0 or worker_id >= MAX_WORKERS or data_len < 0) return;
     const wid: usize = @intCast(worker_id);
     if (data_len > 0) {
         const copy = alloc.alloc(u8, @intCast(data_len)) catch return;
         @memcpy(copy, data_ptr[0..@intCast(data_len)]);
-        work_items[wid].result = copy;
+        work_slots[wid].result = copy;
     }
-    work_items[wid].done.store(true, .release);
+    work_slots[wid].done.store(true, .release);
     work_mutex.lock();
     work_cond.broadcast();
     work_mutex.unlock();
 }
 
-/// Called by main after dispatch: blocks until all workers done, returns merged results.
+/// Main calls this: blocks until all workers done, returns merged results.
 export fn edgebox_collect_results(worker_count: c_int, out_len: *c_int) ?[*]const u8 {
     if (worker_count <= 0) { out_len.* = 0; return null; }
     const n: usize = @intCast(@min(worker_count, MAX_WORKERS));
 
-    // Wait for all workers to submit
     work_mutex.lock();
     while (true) {
         var all_done = true;
         for (0..n) |i| {
-            if (!work_items[i].done.load(.acquire)) { all_done = false; break; }
+            if (!work_slots[i].done.load(.acquire)) { all_done = false; break; }
         }
         if (all_done) break;
         work_cond.timedWait(&work_mutex, 100 * std.time.ns_per_ms) catch {};
     }
     work_mutex.unlock();
 
-    // Merge results (dedup by exact line)
     var merged: std.ArrayListUnmanaged(u8) = .{};
     var seen = std.StringHashMapUnmanaged(void){};
     for (0..n) |i| {
-        if (work_items[i].result) |data| {
+        if (work_slots[i].result) |data| {
             var lines = std.mem.splitScalar(u8, data, '\n');
             while (lines.next()) |line| {
                 if (line.len == 0) continue;
