@@ -122,7 +122,12 @@ fn checkWorkerFn(ctx: *CheckWorkerCtx) void {
         \\  if (!configFile.config) return;
         \\  var parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys,
         \\    require('path').dirname(configPath));
-        \\  var program = ts.createProgram(parsed.fileNames, parsed.options);
+        \\  // Ensure lib.d.ts resolves correctly — use same path as main
+        \\  var host = ts.createCompilerHost(parsed.options);
+        \\  var libDir = require('path').dirname(__filename);
+        \\  host.getDefaultLibLocation = function() { return libDir; };
+        \\  host.getDefaultLibFileName = function(o) { return require('path').join(libDir, ts.getDefaultLibFileName(o)); };
+        \\  var program = ts.createProgram(parsed.fileNames, parsed.options, host);
         \\  var files = program.getSourceFiles();
         \\  var wid = __edgebox_worker_id, wcnt = __edgebox_worker_count;
         \\  var seen = {};
