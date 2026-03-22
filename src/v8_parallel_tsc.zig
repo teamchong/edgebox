@@ -207,7 +207,7 @@ pub fn setupParallelCheck(
     // Workers use per-file getSemanticDiagnostics, output to per-worker buffers.
     // Main deduplicates after all workers finish.
     const cpu_count = std.Thread.getCpuCount() catch 4;
-    g_worker_count = @min(@max(cpu_count / 2, 2), max_check_workers);
+    g_worker_count = 1; // DISABLED — workerd is production path
 
     if (g_worker_count <= 1 or embedded_snapshot.len == 0) return false;
 
