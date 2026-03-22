@@ -18,19 +18,26 @@ fn cacheReadFile(path: []const u8) ![]const u8 {
         defer cache_mutex.unlock();
         if (file_cache.get(path)) |cached| return cached;
     }
-    const content = std.fs.cwd().readFileAlloc(alloc, path, 50 * 1024 * 1024) catch |err| return err;
+    const raw = std.fs.cwd().readFileAlloc(alloc, path, 50 * 1024 * 1024) catch |err| return err;
+    // Append NUL terminator for kj::StringPtr compatibility (workerd requires it)
+    const content = try alloc.alloc(u8, raw.len + 1);
+    @memcpy(content[0..raw.len], raw);
+    content[raw.len] = 0;
+    alloc.free(raw);
     const key = try alloc.dupe(u8, path);
     {
         cache_mutex.lock();
         defer cache_mutex.unlock();
-        file_cache.put(alloc, key, content) catch {};
+        // Store slice WITHOUT the NUL (len = raw content length)
+        // But the NUL is there at content[raw.len] for kj::StringPtr
+        file_cache.put(alloc, key, content[0..raw.len]) catch {};
     }
-    return content;
+    return content[0..raw.len];
 }
 
 // ── fs: readFile, writeFile, stat, exists, readdir, realpath ──
 
-/// Read file contents. Returns pointer+len, caller frees via edgebox_free.
+/// Read file contents. Returns NUL-terminated pointer+len. Cached — do NOT free.
 export fn edgebox_read_file(path_ptr: [*]const u8, path_len: c_int, out_len: *c_int) ?[*]const u8 {
     if (path_len <= 0) { out_len.* = 0; return null; }
     const path = path_ptr[0..@intCast(path_len)];
