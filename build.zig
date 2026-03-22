@@ -1673,22 +1673,35 @@ pub fn build(b: *std.Build) void {
 
         if (v8_lib_name) |_| {
             // V8 runner REMOVED — workerd is the only runtime.
-            // Build Zig IO library for workerd instead.
-            const v8_run_step = b.step("v8-run", "REMOVED — use workerd (see src/workerd-tsc/)");
-            const v8_run_fail = b.addFail("v8-run removed. Use workerd: ./scripts/apply-workerd-patches.sh && bazelisk build //src/workerd/server:workerd");
+            const v8_run_step = b.step("v8-run", "REMOVED — use `zig build edgebox-cli`");
+            const v8_run_fail = b.addFail("v8-run removed. Use: zig build edgebox-cli");
             v8_run_step.dependOn(&v8_run_fail.step);
-
-            const snapshot_gen_step = b.step("v8-snapshot-gen", "REMOVED — workerd manages V8");
-            const sg_fail = b.addFail("v8-snapshot-gen removed. workerd manages V8 isolates.");
-            snapshot_gen_step.dependOn(&sg_fail.step);
         } else {
-            const v8_test_step = b.step("v8-test", "Build V8 embedding test (unsupported platform)");
-            const v8_fail = b.addFail("v8-test: unsupported platform (need x86_64/aarch64 linux/macos)");
-            v8_test_step.dependOn(&v8_fail.step);
-
-            const v8_run_step = b.step("v8-run", "Build edgebox V8 runner (unsupported platform)");
-            const v8_run_fail = b.addFail("v8-run: unsupported platform (need x86_64/aarch64 linux/macos)");
+            const v8_run_step = b.step("v8-run", "REMOVED — use `zig build edgebox-cli`");
+            const v8_run_fail = b.addFail("v8-run removed. Use: zig build edgebox-cli");
             v8_run_step.dependOn(&v8_run_fail.step);
         }
+    }
+
+    // ===================
+    // edgebox CLI — daemon-based runtime (workerd + Zig)
+    // ===================
+    {
+        const edgebox_cli = b.addExecutable(.{
+            .name = "edgebox",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/edgebox_cli.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        const install_cli = b.addInstallArtifact(edgebox_cli, .{});
+        const edgebox_cli_step = b.step("edgebox-cli", "Build edgebox CLI (daemon + tsc)");
+        edgebox_cli_step.dependOn(&install_cli.step);
+
+        // Also build Zig IO library for workerd
+        const io_lib_step = b.step("workerd-io", "Build Zig IO library for workerd");
+        const io_lib_fail = b.addFail("Use: zig build-lib src/edgebox_workerd_io.zig -target x86_64-linux-gnu -OReleaseFast --name edgebox_io -fPIC");
+        io_lib_step.dependOn(&io_lib_fail.step);
     }
 }
