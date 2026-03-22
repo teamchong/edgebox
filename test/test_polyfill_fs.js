@@ -33,8 +33,6 @@ if (fs) {
     // ============================================
     console.log('\n--- existsSync ---');
 
-    // Test with current file (this test file should exist)
-    const thisFile = '/Users/steven_chong/Downloads/repos/edgebox/test/test_polyfill_fs.js';
     // Can't guarantee path, so test with a guaranteed existing path
     assertTrue(fs.existsSync('/'), 'existsSync returns true for /');
     assertTrue(fs.existsSync('/tmp') || fs.existsSync('/var'), 'existsSync for /tmp or /var');
