@@ -1,7 +1,7 @@
 import './bootstrap.js';
 import ts from './typescript.js';
 
-// Cache: reuse program if rootNames + options match
+// Cache: reuse program if rootNames match, pass oldProgram for incremental
 var cachedProgram = null;
 var cachedRootKey = '';
 
@@ -11,20 +11,25 @@ export default {
     var start = Date.now();
 
     try {
-      // Cache key: rootNames hash
       var rootKey = body.rootNames.join(',');
       var program;
+      var parseTime;
       
       if (cachedProgram && cachedRootKey === rootKey) {
-        // Reuse cached program — skip parse entirely!
+        // Exact match — reuse cached program (skip parse + check)
         program = cachedProgram;
-        var parseTime = 0;
+        parseTime = 0;
       } else {
-        // First run: create program (parse from Zig cache)
-        program = ts.createProgram(body.rootNames, body.options);
+        // Create program — pass oldProgram for incremental lib.d.ts reuse
+        program = ts.createProgram(
+          body.rootNames,
+          body.options,
+          undefined, // host
+          cachedProgram // oldProgram — TSC reuses unchanged SourceFiles
+        );
         cachedProgram = program;
         cachedRootKey = rootKey;
-        var parseTime = Date.now() - start;
+        parseTime = Date.now() - start;
       }
 
       var assigned = {};
@@ -54,7 +59,7 @@ export default {
         filesChecked: body.files.length,
         parseTime: parseTime,
         checkTime: Date.now() - checkStart,
-        cached: cachedRootKey === rootKey && parseTime === 0,
+        cached: parseTime === 0,
       }));
     } catch(e) {
       return new Response(JSON.stringify({error: e.message, workerId: body.workerId}));
