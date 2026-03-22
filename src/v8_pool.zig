@@ -185,7 +185,13 @@ fn workerLoop(worker_id: u32) void {
         "  if(name==='buffer') return {Buffer:{from:function(s){return s;},isBuffer:function(){return false;},alloc:function(n){return new Uint8Array(n);}}};" ++
         "  return {};" ++
         "};" ++
-        "if(typeof Buffer==='undefined') globalThis.Buffer={from:function(s){return s;},isBuffer:function(){return false;},alloc:function(n){return new Uint8Array(n);},concat:function(b){return b[0]||new Uint8Array(0);},byteLength:function(s){return typeof s==='string'?s.length:0;},isEncoding:function(){return true;}};"
+        "if(typeof Buffer==='undefined') globalThis.Buffer={from:function(s){return s;},isBuffer:function(){return false;},alloc:function(n){return new Uint8Array(n);},concat:function(b){return b[0]||new Uint8Array(0);},byteLength:function(s){return typeof s==='string'?s.length:0;},isEncoding:function(){return true;}};" ++
+        "if(typeof setTimeout==='undefined') globalThis.setTimeout=function(f,t){f();return 0;};" ++
+        "if(typeof clearTimeout==='undefined') globalThis.clearTimeout=function(){};" ++
+        "if(typeof setInterval==='undefined') globalThis.setInterval=function(){return 0;};" ++
+        "if(typeof clearInterval==='undefined') globalThis.clearInterval=function(){};" ++
+        "if(typeof queueMicrotask==='undefined') globalThis.queueMicrotask=function(f){Promise.resolve().then(f);};" ++
+        "if(typeof console==='undefined') globalThis.console={log:function(){},warn:function(){},error:function(){},info:function(){},debug:function(){}};"
     ;
     {
         var el: c_int = 0;
@@ -211,8 +217,8 @@ fn workerLoop(worker_id: u32) void {
         if (r3) |rr| edgebox_v8_free(rr);
     }
 
-    // Verify TypeScript loaded
-    const verify = "typeof ts !== 'undefined' ? 'ts:' + typeof ts.createProgram : 'ts undefined, module.exports keys: ' + Object.keys(module.exports).length";
+    // Verify environment
+    const verify = "typeof ts !== 'undefined' ? 'ts:' + typeof ts.createProgram + ' sys:' + typeof ts.sys : 'ts undef, require:' + typeof require + ' process:' + typeof process + ' isNode:' + (typeof process !== 'undefined' && !!process.nextTick && !process.browser && typeof require !== 'undefined')";
     {
         var vl: c_int = 0;
         const vr = edgebox_v8_eval_in_context(isolate, context, verify.ptr, @intCast(verify.len), &vl);
@@ -244,6 +250,7 @@ fn workerLoop(worker_id: u32) void {
                 \\(function() {{
                 \\  var ts = globalThis.ts || globalThis.module.exports;
                 \\  if (!ts || !ts.createProgram) return 'no tsc';
+                \\  if (!ts.sys) return 'ts.sys is ' + typeof ts.sys + ', ts.version=' + ts.version;
                 \\  var cwd = '{s}';
                 \\  var wid = {d};
                 \\  var wcount = {d};
