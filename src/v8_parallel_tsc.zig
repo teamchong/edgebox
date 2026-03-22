@@ -161,7 +161,7 @@ pub fn setupParallelCheck(
     if (g_worker_count <= 1 or embedded_snapshot.len == 0) return false;
 
     g_start_time = std.time.milliTimestamp();
-    std.debug.print("[parallel-tsc] {d} cores, {d} workers (deferred spawn)\n", .{ cpu_count, g_worker_count });
+    std.debug.print("[parallel-tsc] {d} workers (deferred spawn)\n", .{g_worker_count});
 
     g_tsc_path = tsc_path;
     g_tsc_dir = std.fs.path.dirname(tsc_path) orelse ".";
