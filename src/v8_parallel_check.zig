@@ -591,6 +591,27 @@ pub fn precomputeCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) voi
     rv.setInt32(1);
 }
 
+/// V8 fast callback: __edgebox_register_type(id, flags)
+/// Called from T1 transform on every createType. Writes type.flags into SAB
+/// at typeFlags[id] — zero-copy, workers read directly via Int32Array view.
+pub fn registerTypeCallback(info: *const v8.FunctionCallbackInfo) callconv(.c) void {
+    if (v8.CallbackInfoApi.length(info) < 2) return;
+    const id_arg = v8.CallbackInfoApi.get(info, 0) orelse return;
+    const flags_arg = v8.CallbackInfoApi.get(info, 1) orelse return;
+    const isolate = v8.CallbackInfoApi.getIsolate(info);
+    const ctx = v8.ContextApi.create(isolate);
+
+    if (!v8.ValueApi.isInt32(id_arg) or !v8.ValueApi.isInt32(flags_arg)) return;
+    const id = v8.ValueApi.int32Value(id_arg, ctx) orelse return;
+    const flags = v8.ValueApi.int32Value(flags_arg, ctx) orelse return;
+
+    if (id < 0 or id >= @as(i32, @intCast(MAX_TYPES))) return;
+    const uid: usize = @intCast(id);
+
+    const type_flags = getTypeFlags() orelse return;
+    type_flags[uid] = flags;
+}
+
 /// Trigger async flag table build from createType (called early during bind).
 /// Spawns a Zig thread that builds the table while V8 continues binding.
 pub fn triggerAsyncBuild(max_id: usize) void {

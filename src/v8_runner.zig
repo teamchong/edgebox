@@ -399,13 +399,19 @@ fn runScript(alloc: std.mem.Allocator, script_code: []const u8, cache_bytes: ?[]
         const sab_key = v8.StringApi.fromUtf8(isolate, "__pc_sab") orelse return;
         _ = v8.ObjectApi.set(global_obj, context, @ptrCast(sab_key), sab);
 
-        // Create typeFlags view (256 slots — one per distinct flag value)
-        var init_buf: [256]u8 = undefined;
+        // Create typeFlags view (full MAX_TYPES slots — indexed by type.id)
+        var init_buf: [512]u8 = undefined;
         const init_js = std.fmt.bufPrint(&init_buf,
-            "globalThis.__pc_typeFlags=new Int32Array(__pc_sab,0,256);",
-            .{},
+            "globalThis.__pc_typeFlags=new Int32Array(__pc_sab,0,{d});",
+            .{v8_parallel_check.MAX_TYPES},
         ) catch return;
         _ = v8.eval(isolate, context, init_js, "pc_init.js") catch {};
+
+        // Register __edgebox_register_type(id, flags) — called from createType (T1)
+        const rt_tmpl = v8.FunctionTemplateApi.create(isolate, &v8_parallel_check.registerTypeCallback) orelse return;
+        const rt_func = v8.FunctionTemplateApi.getFunction(rt_tmpl, context) orelse return;
+        const rt_key = v8.StringApi.fromUtf8(isolate, "__edgebox_register_type") orelse return;
+        _ = v8.ObjectApi.set(global_obj, context, @ptrCast(rt_key), @ptrCast(rt_func));
 
         // Register precompute callback (builds bitmap + pumps TurboFan)
         const pc_tmpl = v8.FunctionTemplateApi.create(isolate, &v8_parallel_check.precomputeCallback) orelse return;
