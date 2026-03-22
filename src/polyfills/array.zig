@@ -68,7 +68,7 @@ fn nativeForEach(ctx: ?*JSContext, this: JSValue, argc: c_int, argv: [*c]JSValue
 
     // Iterate and call callback for each element
     var i: u32 = 0;
-    while (i < @as(u32, @intCast(len))) : (i += 1) {
+    while (i < @as(u32, @intCast(@max(0, @min(len, std.math.maxInt(u32)))))) : (i += 1) {
         // Check if property exists (sparse array support)
         const atom = JS_NewAtomUInt32(ctx, i);
         defer JS_FreeAtom(ctx, atom);
@@ -115,7 +115,7 @@ fn nativeMap(ctx: ?*JSContext, this: JSValue, argc: c_int, argv: [*c]JSValue) ca
     if (JS_IsException(result_array)) return result_array;
 
     var i: u32 = 0;
-    while (i < @as(u32, @intCast(len))) : (i += 1) {
+    while (i < @as(u32, @intCast(@max(0, @min(len, std.math.maxInt(u32)))))) : (i += 1) {
         const atom = JS_NewAtomUInt32(ctx, i);
         defer JS_FreeAtom(ctx, atom);
         const has_prop = JS_HasProperty(ctx, this, atom);
@@ -164,7 +164,7 @@ fn nativeFilter(ctx: ?*JSContext, this: JSValue, argc: c_int, argv: [*c]JSValue)
 
     var result_idx: u32 = 0;
     var i: u32 = 0;
-    while (i < @as(u32, @intCast(len))) : (i += 1) {
+    while (i < @as(u32, @intCast(@max(0, @min(len, std.math.maxInt(u32)))))) : (i += 1) {
         const atom = JS_NewAtomUInt32(ctx, i);
         defer JS_FreeAtom(ctx, atom);
         const has_prop = JS_HasProperty(ctx, this, atom);
@@ -233,7 +233,7 @@ fn nativeReduce(ctx: ?*JSContext, this: JSValue, argc: c_int, argv: [*c]JSValue)
     }
 
     var i: u32 = start_idx;
-    while (i < @as(u32, @intCast(len))) : (i += 1) {
+    while (i < @as(u32, @intCast(@max(0, @min(len, std.math.maxInt(u32)))))) : (i += 1) {
         const atom = JS_NewAtomUInt32(ctx, i);
         defer JS_FreeAtom(ctx, atom);
         const has_prop = JS_HasProperty(ctx, this, atom);
@@ -277,7 +277,7 @@ fn nativeFind(ctx: ?*JSContext, this: JSValue, argc: c_int, argv: [*c]JSValue) c
     _ = JS_ToInt64(ctx, &len, len_val);
 
     var i: u32 = 0;
-    while (i < @as(u32, @intCast(len))) : (i += 1) {
+    while (i < @as(u32, @intCast(@max(0, @min(len, std.math.maxInt(u32)))))) : (i += 1) {
         const elem = JS_GetPropertyUint32(ctx, this, i);
 
         // callback(element, index, array)
@@ -322,7 +322,7 @@ fn nativeFindIndex(ctx: ?*JSContext, this: JSValue, argc: c_int, argv: [*c]JSVal
     _ = JS_ToInt64(ctx, &len, len_val);
 
     var i: u32 = 0;
-    while (i < @as(u32, @intCast(len))) : (i += 1) {
+    while (i < @as(u32, @intCast(@max(0, @min(len, std.math.maxInt(u32)))))) : (i += 1) {
         const elem = JS_GetPropertyUint32(ctx, this, i);
         defer JS_FreeValue(ctx, elem);
 
@@ -365,7 +365,7 @@ fn nativeEvery(ctx: ?*JSContext, this: JSValue, argc: c_int, argv: [*c]JSValue) 
     _ = JS_ToInt64(ctx, &len, len_val);
 
     var i: u32 = 0;
-    while (i < @as(u32, @intCast(len))) : (i += 1) {
+    while (i < @as(u32, @intCast(@max(0, @min(len, std.math.maxInt(u32)))))) : (i += 1) {
         const atom = JS_NewAtomUInt32(ctx, i);
         defer JS_FreeAtom(ctx, atom);
         const has_prop = JS_HasProperty(ctx, this, atom);
@@ -413,7 +413,7 @@ fn nativeSome(ctx: ?*JSContext, this: JSValue, argc: c_int, argv: [*c]JSValue) c
     _ = JS_ToInt64(ctx, &len, len_val);
 
     var i: u32 = 0;
-    while (i < @as(u32, @intCast(len))) : (i += 1) {
+    while (i < @as(u32, @intCast(@max(0, @min(len, std.math.maxInt(u32)))))) : (i += 1) {
         const atom = JS_NewAtomUInt32(ctx, i);
         defer JS_FreeAtom(ctx, atom);
         const has_prop = JS_HasProperty(ctx, this, atom);
@@ -469,7 +469,7 @@ fn nativeIncludes(ctx: ?*JSContext, this: JSValue, argc: c_int, argv: [*c]JSValu
     }
 
     var i: u32 = @intCast(@max(0, from_idx));
-    while (i < @as(u32, @intCast(len))) : (i += 1) {
+    while (i < @as(u32, @intCast(@max(0, @min(len, std.math.maxInt(u32)))))) : (i += 1) {
         const elem = JS_GetPropertyUint32(ctx, this, i);
         defer JS_FreeValue(ctx, elem);
 
@@ -511,7 +511,7 @@ fn nativeIndexOf(ctx: ?*JSContext, this: JSValue, argc: c_int, argv: [*c]JSValue
     }
 
     var i: u32 = @intCast(@max(0, from_idx));
-    while (i < @as(u32, @intCast(len))) : (i += 1) {
+    while (i < @as(u32, @intCast(@max(0, @min(len, std.math.maxInt(u32)))))) : (i += 1) {
         const atom = JS_NewAtomUInt32(ctx, i);
         defer JS_FreeAtom(ctx, atom);
         const has_prop = JS_HasProperty(ctx, this, atom);
