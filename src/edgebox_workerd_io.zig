@@ -309,6 +309,22 @@ fn handleRequest(request: []const u8) ![]u8 {
         }
         edgebox_register_type(tid, flags_val, 0);
         try result.appendSlice(alloc, "{\"ok\":true}");
+    } else if (std.mem.eql(u8, op, "batchRegisterTypes")) {
+        // Batch register: "data":"id1,flags1,id2,flags2,..."
+        if (std.mem.indexOf(u8, request, "\"data\":\"")) |data_start| {
+            const s = data_start + 8;
+            if (std.mem.indexOfPos(u8, request, s, "\"")) |end| {
+                const data = request[s..end];
+                var it = std.mem.splitScalar(u8, data, ',');
+                while (it.next()) |id_str| {
+                    const flags_str = it.next() orelse break;
+                    const tid = std.fmt.parseInt(u32, id_str, 10) catch continue;
+                    const flags_val = std.fmt.parseInt(u32, flags_str, 10) catch continue;
+                    edgebox_register_type(tid, flags_val, 0);
+                }
+            }
+        }
+        try result.writer(alloc).print("{{\"ok\":true,\"types\":{d}}}", .{type_count});
     } else if (std.mem.eql(u8, op, "typeStats")) {
         var t: u32 = 0;
         var m: u32 = 0;
