@@ -36,32 +36,26 @@ fn execSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
     defer qjs.JS_FreeCString(ctx, cmd_cstr);
 
     // Parse options
-    var encoding: ?[]const u8 = null;
-    var cwd: ?[]const u8 = null;
+    var has_encoding = false;
+    _ = &has_encoding;
+    var cwd: ?[*:0]const u8 = null;
 
     if (argc >= 2 and qjs.JS_IsObject(argv[1])) {
-        // Get encoding option
+        // Get encoding option (only need to know if it's set, not the value)
         const enc_val = qjs.JS_GetPropertyStr(ctx, argv[1], "encoding");
         defer qjs.JS_FreeValue(ctx, enc_val);
         if (qjs.JS_IsString(enc_val)) {
-            const enc_str = qjs.JS_ToCString(ctx, enc_val);
-            if (enc_str != null) {
-                encoding = std.mem.span(enc_str);
-                qjs.JS_FreeCString(ctx, enc_str);
-            }
+            has_encoding = true;
         }
 
         // Get cwd option (not used in this simple implementation)
         const cwd_val = qjs.JS_GetPropertyStr(ctx, argv[1], "cwd");
         defer qjs.JS_FreeValue(ctx, cwd_val);
         if (qjs.JS_IsString(cwd_val)) {
-            const cwd_str = qjs.JS_ToCString(ctx, cwd_val);
-            if (cwd_str != null) {
-                cwd = std.mem.span(cwd_str);
-                qjs.JS_FreeCString(ctx, cwd_str);
-            }
+            cwd = qjs.JS_ToCString(ctx, cwd_val);
         }
     }
+    defer if (cwd) |c2| qjs.JS_FreeCString(ctx, c2);
 
     // Execute command using /bin/sh -c
     const cmd_slice = std.mem.span(cmd_cstr);
@@ -112,7 +106,7 @@ fn execSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
     }
 
     // Return result based on encoding
-    if (encoding != null) {
+    if (has_encoding) {
         // Return as string
         return qjs.JS_NewStringLen(ctx, &stdout_buf, stdout_len);
     } else {
