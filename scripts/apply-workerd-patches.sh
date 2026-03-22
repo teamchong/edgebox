@@ -28,4 +28,15 @@ for patch in "$PATCH_DIR"/*.patch; do
   fi
 done
 
-echo "[workerd] Patches applied successfully"
+# Build Zig IO library with -fPIC (required for workerd PIE binary)
+echo "[workerd] Building Zig IO library (libedgebox_io.a)..."
+mkdir -p zig-out/lib
+zig build-lib src/edgebox_workerd_io.zig \
+  -target x86_64-linux-gnu \
+  -OReleaseFast \
+  --name edgebox_io \
+  -fPIC \
+  -femit-bin=zig-out/lib/libedgebox_io.a
+cp zig-out/lib/libedgebox_io.a "$WORKERD_DIR/libedgebox_io.a"
+
+echo "[workerd] Patches applied + Zig IO library built"
