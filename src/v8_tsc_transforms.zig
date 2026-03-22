@@ -72,10 +72,9 @@ pub const transforms = [_]Transform{
     // T-PARALLEL: Spawn workers AFTER main's createProgram.
     // All workers have full programs — correct diagnostics.
     .{ .needle = "const program = createProgram(programOptions);\n  const exitStatus = emitFilesAndReportErrorsAndGetExitStatus(", .replacement = "const program = createProgram(programOptions);\n  if(typeof __edgebox_spawn_check_workers==='function'&&typeof __edgebox_worker_count!=='undefined'&&__edgebox_worker_count>1){__edgebox_spawn_check_workers();process.exit(typeof __edgebox_parallel_exit!=='undefined'?__edgebox_parallel_exit:0);}\n  const exitStatus = emitFilesAndReportErrorsAndGetExitStatus(" },
-    // T-SHARD-DIAGS: Shard getDiagnosticsHelper to only check assigned files.
-    // Without this, getSemanticDiagnostics(undefined) checks ALL files via flatMap,
-    // defeating the eager check loop sharding.
-    .{ .needle = "return sortAndDeduplicateDiagnostics(flatMap(program.getSourceFiles(), (sourceFile2) => {\n      if (cancellationToken) {\n        cancellationToken.throwIfCancellationRequested();\n      }\n      return getDiagnostics2(sourceFile2, cancellationToken);\n    }));", .replacement = "var __allFiles=program.getSourceFiles();if(typeof __edgebox_worker_count!=='undefined'&&__edgebox_worker_count>1){var __wid=__edgebox_worker_id,__wcnt=__edgebox_worker_count;__allFiles=__allFiles.filter(function(_,i){return i%__wcnt===__wid;});}return sortAndDeduplicateDiagnostics(flatMap(__allFiles, (sourceFile2) => {\n      if (cancellationToken) {\n        cancellationToken.throwIfCancellationRequested();\n      }\n      return getDiagnostics2(sourceFile2, cancellationToken);\n    }));" },
+    // T-SHARD-DIAGS: REMOVED — workers now write to per-worker Zig buffers.
+    // No need to shard getDiagnosticsHelper in JS. Each worker runs TSC normally,
+    // its stdout goes to a separate buffer, main merges after all workers finish.
     // Check loop: shard files across parallel workers.
     // Each worker checks files where fileIndex % workerCount === workerId.
     // When not set (single-threaded), defaults to id=0, count=1 → checks all files.

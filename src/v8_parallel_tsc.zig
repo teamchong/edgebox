@@ -68,6 +68,7 @@ var g_ctxs: [max_check_workers]CheckWorkerCtx = undefined;
 
 fn checkWorkerFn(ctx: *CheckWorkerCtx) void {
     v8_io.is_worker_thread = true;
+    v8_io.worker_id = @intCast(ctx.worker_id);
 
     // Snapshot isolate — TSC pre-compiled (~10ms startup)
     const iso = v8.SnapshotApi.createIsolateFromSnapshot(
@@ -152,10 +153,10 @@ pub fn setupParallelCheck(
     tsc_path: []const u8,
     tsc_fast_js: []const u8,
 ) bool {
-    // Parallel disabled on V8 runner path — workerd parallel is the correct approach.
-    // V8 runner parallel has diagnostic doubling bug (T-SHARD-DIAGS needle mismatch
-    // causes getSemanticDiagnostics to return ALL diagnostics from both workers).
-    // The workerd path (src/workerd-tsc/) handles parallel correctly via service bindings.
+    // V8 runner parallel disabled — workerd parallel is the production path.
+    // Per-worker stdout buffers work but ts.executeCommandLine outputs ALL diagnostics
+    // (not just sharded files), so each worker produces full diagnostic set.
+    // The workerd path uses per-file getSemanticDiagnostics which shards correctly.
     g_worker_count = 1;
 
     if (g_worker_count <= 1 or embedded_snapshot.len == 0) return false;
@@ -185,12 +186,30 @@ pub fn setupParallelCheck(
     return true;
 }
 
-/// Wait for all parallel workers to finish. Call after main TSC eval completes.
+/// Wait for all parallel workers to finish, then merge stdout.
+/// Workers write to per-worker buffers. Main's stdout goes directly.
+/// After join, write worker buffers to real stdout (no doubling).
 pub fn waitForWorkers() void {
     for (&g_threads) |*t| {
         if (t.*) |thread| {
             thread.join();
             t.* = null;
         }
+    }
+
+    // Merge worker stdout buffers to real stdout
+    // Workers wrote to per-worker buffers, main wrote to stdout directly.
+    // Now write all worker output (diagnostics are already sharded by worker).
+    for (1..g_worker_count) |w| {
+        const output = v8_io.getWorkerStdout(@intCast(w));
+        if (output.len > 0) {
+            var written: usize = 0;
+            while (written < output.len) {
+                const n = std.posix.write(1, output[written..]) catch break;
+                if (n == 0) break;
+                written += n;
+            }
+        }
+        v8_io.clearWorkerStdout(@intCast(w));
     }
 }

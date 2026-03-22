@@ -23,6 +23,29 @@ pub var prefetch_complete: bool = false;
 /// Set to true in worker threads to skip PumpMessageLoop
 pub threadlocal var is_worker_thread: bool = false;
 
+/// Per-worker stdout buffer — workers write here instead of real stdout.
+/// Main collects after all workers finish (avoids diagnostic doubling).
+const MAX_WORKERS = 8;
+var worker_stdout_bufs: [MAX_WORKERS]std.ArrayListUnmanaged(u8) = [_]std.ArrayListUnmanaged(u8){.{}} ** MAX_WORKERS;
+var worker_stdout_mutex: std.Thread.Mutex = .{};
+pub threadlocal var worker_id: u32 = 0;
+
+/// Get all worker stdout output, concatenated. Caller frees.
+pub fn getWorkerStdout(w_id: u32) []const u8 {
+    if (w_id >= MAX_WORKERS) return "";
+    worker_stdout_mutex.lock();
+    defer worker_stdout_mutex.unlock();
+    return worker_stdout_bufs[w_id].items;
+}
+
+/// Clear worker stdout buffer.
+pub fn clearWorkerStdout(w_id: u32) void {
+    if (w_id >= MAX_WORKERS) return;
+    worker_stdout_mutex.lock();
+    defer worker_stdout_mutex.unlock();
+    worker_stdout_bufs[w_id].clearRetainingCapacity();
+}
+
 
 /// Pump throttle — only call pumpMessageLoop every N IO callbacks.
 /// During Check phase, TurboFan has already compiled hot functions;
@@ -150,6 +173,21 @@ pub fn writeStdoutFastCallback(info: *const v8.FunctionCallbackInfo) callconv(.c
     const str: *const v8.String = @ptrCast(arg0);
     const len: usize = @intCast(v8.StringApi.utf8Length(str, isolate));
     if (len == 0) return;
+
+    // Workers write to per-worker buffer (avoids diagnostic doubling)
+    if (is_worker_thread) {
+        var stack_buf2: [4096]u8 = undefined;
+        const buf_slice = if (len <= stack_buf2.len) &stack_buf2 else (alloc.alloc(u8, len) catch return);
+        const wc = v8.StringApi.writeUtf8(str, isolate, buf_slice);
+        const wid = worker_id;
+        if (wid < MAX_WORKERS) {
+            worker_stdout_mutex.lock();
+            defer worker_stdout_mutex.unlock();
+            worker_stdout_bufs[wid].appendSlice(alloc, buf_slice[0..wc]) catch {};
+        }
+        if (len > stack_buf2.len) alloc.free(buf_slice);
+        return;
+    }
 
     // Ensure capacity in the buffer
     var stack_buf: [4096]u8 = undefined;
