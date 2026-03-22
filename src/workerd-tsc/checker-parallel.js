@@ -1,11 +1,7 @@
 import './bootstrap.js';
 import ts from './typescript.js';
 
-var cachedProgram = null;
-var cachedDiagsByFile = null;
-var preCheckDone = false;
-var preCheckTime = 0;
-
+// Pre-check at module init — results submitted to Zig shared memory
 (function() {
   try {
     var resp = JSON.parse(__edgebox_io_sync(JSON.stringify({op:'readFile',path:'/tmp/edgebox-project-config.json'})));
@@ -16,25 +12,28 @@ var preCheckTime = 0;
       return r.ok ? r.data : undefined;
     });
     var parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, config.cwd);
-    cachedProgram = ts.createProgram(parsed.fileNames, parsed.options);
+    var program = ts.createProgram(parsed.fileNames, parsed.options);
     
     var t0 = Date.now();
-    cachedDiagsByFile = {};
-    var files = cachedProgram.getSourceFiles();
+    var files = program.getSourceFiles();
+    var diagCount = 0;
+    var diagLines = [];
+    
     for (var i = 0; i < files.length; i++) {
-      var diags = cachedProgram.getSemanticDiagnostics(files[i]);
-      if (diags.length > 0) {
-        cachedDiagsByFile[files[i].fileName] = diags.map(function(d) {
-          return { file: d.file ? d.file.fileName : '', start: d.start || 0, code: d.code,
-            message: ts.flattenDiagnosticMessageText(d.messageText, '\n') };
-        });
+      var diags = program.getSemanticDiagnostics(files[i]);
+      diagCount += diags.length;
+      for (var k = 0; k < diags.length; k++) {
+        var d = diags[k];
+        if (d.file) {
+          var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
+          diagLines.push(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' '));
+        }
       }
     }
-    preCheckTime = Date.now() - t0;
-    preCheckDone = true;
+    var checkTime = Date.now() - t0;
     
-    // Register types + members AFTER check (read-only)
-    var checker = cachedProgram.getTypeChecker();
+    // Register types AFTER check (read-only)
+    var checker = program.getTypeChecker();
     var seenTypes = {};
     for (var fi = 0; fi < files.length; fi++) {
       ts.forEachChild(files[fi], function visit(node) {
@@ -47,41 +46,38 @@ var preCheckTime = 0;
             for (var p = 0; p < props.length && p < 50; p++) {
               var prop = props[p];
               var pt = checker.getTypeOfSymbol(prop);
-              if (prop.escapedName && pt && pt.id) {
+              if (prop.escapedName && pt && pt.id)
                 __edgebox_register_member(type.id, prop.escapedName, pt.id, prop.flags || 0);
-              }
             }
           }
         } catch(e) {}
         ts.forEachChild(node, visit);
       });
     }
-  } catch(e) {}
+    
+    // Submit results to Zig shared memory — NO HTTP
+    __edgebox_io_sync(JSON.stringify({
+      op: 'submitResult',
+      workerId: 0,
+      data: JSON.stringify({
+        diagnostics: diagCount,
+        checkTime: checkTime,
+        files: files.length,
+        lines: diagLines,
+      })
+    }));
+    
+    // Write diagnostics to stderr (visible in terminal)
+    __edgebox_io_sync(JSON.stringify({
+      op: 'writeErr',
+      data: '[checker] ' + diagCount + ' diagnostics, ' + files.length + ' files, ' + checkTime + 'ms\n'
+    }));
+  } catch(e) {
+    __edgebox_io_sync(JSON.stringify({op:'writeErr', data:'[checker] error: ' + e.message + '\n'}));
+  }
 })();
 
+// Dummy fetch handler (workerd requires it but we don't use HTTP)
 export default {
-  async fetch(request) {
-    var body = await request.json().catch(function() { return {}; });
-    var wid = body.workerId || 0;
-    var wcnt = body.workerCount || 1;
-    var stats = JSON.parse(__edgebox_io_sync(JSON.stringify({op:'typeStats'})));
-    var cstats = JSON.parse(__edgebox_io_sync(JSON.stringify({op:'checkStats'})));
-    if (preCheckDone && cachedDiagsByFile) {
-      var diagnostics = 0;
-      var files = cachedProgram.getSourceFiles();
-      for (var i = 0; i < files.length; i++) {
-        if (i % wcnt !== wid) continue;
-        var fd = cachedDiagsByFile[files[i].fileName];
-        if (fd) diagnostics += fd.length;
-      }
-      return new Response(JSON.stringify({
-        workerId: wid, diagnostics: diagnostics,
-        filesChecked: Math.ceil(files.length / wcnt),
-        preCheckTime: preCheckTime, cached: true,
-        zigTypes: stats.types, zigMembers: stats.members,
-        checkTotal: cstats.total, checkFlagHits: cstats.flagHits, checkHitRate: cstats.hitRate,
-      }));
-    }
-    return new Response(JSON.stringify({error: 'not ready'}));
-  }
+  fetch() { return new Response('edgebox-checker'); }
 };
