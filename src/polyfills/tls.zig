@@ -282,9 +282,10 @@ fn tlsConnect(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
     defer qjs.JS_FreeCString(ctx, host_str);
     const hostname = std.mem.span(host_str);
 
-    // Get port
+    // Get port (validated to 1-65535)
     var port: i32 = 443;
     _ = qjs.JS_ToInt32(ctx, &port, argv[1]);
+    if (port < 1 or port > 65535) port = 443;
 
     // Get rejectUnauthorized option (default: true = validate)
     var reject_unauthorized: i32 = 1;

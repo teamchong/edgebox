@@ -262,6 +262,7 @@ fn socketConnect(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
 
     var port: i32 = 0;
     _ = qjs.JS_ToInt32(ctx, &port, argv[1]);
+    if (port < 0 or port > 65535) return qjs.JS_NewInt32(ctx, -1);
 
     // Get host if provided, default to localhost
     var host_buf: [256]u8 = undefined;
@@ -383,6 +384,7 @@ fn socketBind(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
 
     var port: i32 = 0;
     _ = qjs.JS_ToInt32(ctx, &port, argv[1]);
+    if (port < 0 or port > 65535) return qjs.JS_NewInt32(ctx, -1);
 
     const entry = getSocket(socket_id) orelse {
         return qjs.JS_NewInt32(ctx, -1);
@@ -959,6 +961,7 @@ fn udpSocketBind(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
 
     var port: i32 = 0;
     _ = qjs.JS_ToInt32(ctx, &port, argv[1]);
+    if (port < 0 or port > 65535) return qjs.JS_NewInt32(ctx, -1);
 
     const entry = getSocket(socket_id) orelse {
         return qjs.JS_NewInt32(ctx, -1);
@@ -1058,6 +1061,7 @@ fn udpSocketSend(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
 
         var port: i32 = 0;
         _ = qjs.JS_ToInt32(ctx, &port, argv[2]);
+        if (port < 0 or port > 65535) return qjs.JS_NewInt32(ctx, -1);
 
         // Get address
         const addr_str = qjs.JS_ToCString(ctx, argv[3]);
@@ -1103,6 +1107,7 @@ fn udpSocketSend(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
 
         var port: i32 = 0;
         _ = qjs.JS_ToInt32(ctx, &port, argv[2]);
+        if (port < 0 or port > 65535) return qjs.JS_NewInt32(ctx, -1);
 
         const addr_str = qjs.JS_ToCString(ctx, argv[3]);
         if (addr_str == null) {
