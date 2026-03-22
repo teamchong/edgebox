@@ -108,15 +108,11 @@ fn checkWorkerFn(ctx: *CheckWorkerCtx) void {
     ) catch {};
 
     // Workers use per-file getSemanticDiagnostics (not executeCommandLine).
-    // This correctly shards — each worker only outputs its assigned files' errors.
+    // Output format: "DIAG:file:line:col:code:message\n" for main to dedup.
     const worker_check_js =
         \\(function() {
-        \\  if (typeof ts === 'undefined' || !ts.sys) {
-        \\    if(typeof __edgebox_write_stderr==='function') __edgebox_write_stderr('[worker] ts=' + typeof ts + ' sys=' + (typeof ts!=='undefined'?!!ts.sys:'N/A') + '\n');
-        \\    return;
-        \\  }
+        \\  if (typeof ts === 'undefined' || !ts.sys) return;
         \\  var args = process.argv.slice(2).filter(function(a){return a!=='--serve';});
-        \\  // Parse tsconfig from args
         \\  var configPath = null;
         \\  for (var i = 0; i < args.length; i++) {
         \\    if (args[i] === '-p' && i+1 < args.length) { configPath = args[i+1]; break; }
@@ -129,24 +125,20 @@ fn checkWorkerFn(ctx: *CheckWorkerCtx) void {
         \\  var program = ts.createProgram(parsed.fileNames, parsed.options);
         \\  var files = program.getSourceFiles();
         \\  var wid = __edgebox_worker_id, wcnt = __edgebox_worker_count;
-        \\  var host = { getCanonicalFileName: function(f){return f;},
-        \\    getCurrentDirectory: function(){return ts.sys.getCurrentDirectory();},
-        \\    getNewLine: function(){return '\n';} };
-        \\  // Build set of my assigned file names
-        \\  var myFiles = {};
-        \\  for (var j = 0; j < files.length; j++) {
-        \\    if (j % wcnt === wid) myFiles[files[j].fileName] = true;
-        \\  }
+        \\  var seen = {};
         \\  for (var i = 0; i < files.length; i++) {
         \\    if (i % wcnt !== wid) continue;
         \\    var diags = program.getSemanticDiagnostics(files[i]);
-        \\    // Filter: only output diagnostics from MY files
-        \\    var myDiags = [];
         \\    for (var d = 0; d < diags.length; d++) {
-        \\      if (!diags[d].file || myFiles[diags[d].file.fileName]) myDiags.push(diags[d]);
-        \\    }
-        \\    if (myDiags.length > 0) {
-        \\      ts.sys.write(ts.formatDiagnosticsWithColorAndContext(myDiags, host));
+        \\      var dg = diags[d];
+        \\      if (!dg.file) continue;
+        \\      var fn = dg.file.fileName;
+        \\      var pos = dg.file.getLineAndCharacterOfPosition(dg.start || 0);
+        \\      var key = fn + ':' + pos.line + ':' + pos.character + ':' + dg.code;
+        \\      if (seen[key]) continue;
+        \\      seen[key] = true;
+        \\      var msg = ts.flattenDiagnosticMessageText(dg.messageText, ' ');
+        \\      ts.sys.write(fn + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + dg.code + ': ' + msg + '\n');
         \\    }
         \\  }
         \\})();
@@ -206,7 +198,11 @@ pub fn setupParallelCheck(
     // Workers now use per-file getSemanticDiagnostics (not executeCommandLine).
     // Each worker only outputs diagnostics for its assigned files.
     // Per-worker stdout buffers in v8_io.zig prevent diagnostic doubling.
-    g_worker_count = 1; // workerd parallel is production path
+    // TRUE parallel via Zig threads + V8 isolates.
+    // Workers use per-file getSemanticDiagnostics, output to per-worker buffers.
+    // Main deduplicates after all workers finish.
+    const cpu_count = std.Thread.getCpuCount() catch 4;
+    g_worker_count = @min(@max(cpu_count / 2, 2), max_check_workers);
 
     if (g_worker_count <= 1 or embedded_snapshot.len == 0) return false;
 
@@ -246,20 +242,40 @@ pub fn waitForWorkers() void {
         }
     }
 
-    // Merge worker stdout buffers to real stdout
-    // Workers wrote to per-worker buffers, main wrote to stdout directly.
-    // Now write all worker output (diagnostics are already sharded by worker).
-    std.debug.print("[parallel-tsc] merging {d} worker buffers\n", .{g_worker_count});
+    // Merge + dedup worker stdout buffers.
+    // Workers may produce overlapping diagnostics (lazy type resolution).
+    // Dedup by exact line content (file(line,col): error TScode: message).
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+    var total_lines: usize = 0;
+    var deduped_lines: usize = 0;
+
     for (0..g_worker_count) |w| {
         const output = v8_io.getWorkerStdout(@intCast(w));
-        if (output.len > 0) {
-            var written: usize = 0;
-            while (written < output.len) {
-                const n = std.posix.write(1, output[written..]) catch break;
-                if (n == 0) break;
-                written += n;
+        if (output.len == 0) continue;
+
+        // Split output by newlines, dedup each line
+        var start: usize = 0;
+        for (0..output.len) |i| {
+            if (output[i] == '\n' or i == output.len - 1) {
+                const end = if (output[i] == '\n') i else i + 1;
+                const line = output[start..end];
+                if (line.len > 0) {
+                    total_lines += 1;
+                    const gop = seen.getOrPut(alloc, line) catch {
+                        start = end + 1;
+                        continue;
+                    };
+                    if (!gop.found_existing) {
+                        deduped_lines += 1;
+                        _ = std.posix.write(1, line) catch {};
+                        _ = std.posix.write(1, "\n") catch {};
+                    }
+                }
+                start = end + 1;
             }
         }
         v8_io.clearWorkerStdout(@intCast(w));
     }
+    std.debug.print("[parallel-tsc] total={d} deduped={d} unique={d}\n", .{ total_lines, total_lines - deduped_lines, deduped_lines });
 }
