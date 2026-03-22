@@ -21,12 +21,11 @@ fn urlParse(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
 
     var url_args = [1]qjs.JSValue{argv[0]};
     const url_obj = qjs.JS_CallConstructor(ctx, url_ctor, 1, &url_args);
+    defer qjs.JS_FreeValue(ctx, url_obj);
     if (qjs.JS_IsException(url_obj)) {
         // URL parse failed, return empty object
-        qjs.JS_FreeValue(ctx, url_obj);
         return qjs.JS_NewObject(ctx);
     }
-    defer qjs.JS_FreeValue(ctx, url_obj);
 
     // Extract components into legacy format
     const result = qjs.JS_NewObject(ctx);
