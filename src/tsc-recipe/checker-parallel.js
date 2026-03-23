@@ -167,6 +167,15 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       var cached = globalThis.__mrCache.get(key);
       if (cached !== undefined) return cached;
       if (name.charAt(0) === '.') {
+        // Check Zig pre-resolved cache first (populated by dispatch thread)
+        if (typeof __edgebox_get_resolved_module === 'function') {
+          var zigResolved = __edgebox_get_resolved_module(name, containingFile);
+          if (zigResolved) {
+            var result = {resolvedFileName: zigResolved, isExternalLibraryImport: false};
+            globalThis.__mrCache.set(key, result);
+            return result;
+          }
+        }
         var r = ts.resolveModuleName(name, containingFile, parsed.options, defaultHost).resolvedModule;
         globalThis.__mrCache.set(key, r || null);
         return r;
