@@ -119,10 +119,15 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       }
       globalThis.__zigHits = 0;
       globalThis.__zigMisses = 0;
+      // Map relation object to integer for Zig (0=assignable, 1=subtype, 2=identity)
+      var _assignableRel = ts.assignableRelation || null;
+      var _subtypeRel = ts.subtypeRelation || null;
       _checker.isTypeRelatedTo = function(source, target, relation) {
         if (source && target && source.id && target.id) {
           _regType(source);
           _regType(target);
+          // Pass relation type: 0=assignable, 1=subtype, 2=identity
+          var relType = relation === _assignableRel ? 0 : relation === _subtypeRel ? 1 : 2;
           var r = __edgebox_check_structural(source.id, target.id);
           if (r === 1) { globalThis.__zigHits++; return true; }
           globalThis.__zigMisses++;

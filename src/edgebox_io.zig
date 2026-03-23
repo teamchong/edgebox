@@ -583,7 +583,7 @@ export fn edgebox_check_structural(source_id: u32, target_id: u32) u8 {
     const src_flags = col_type_flags[source_id];
     const tgt_flags = col_type_flags[target_id];
     if (tgt_flags & 1 != 0) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; }
-    if (src_flags & 131072 != 0) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; }
+    if (src_flags & 131072 != 0 and tgt_flags & (131072 | 1 | 2) != 0) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; }
     if (tgt_flags & 2 != 0) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; }
     if (src_flags & (128 | 4) != 0 and tgt_flags & 4 != 0) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; }
     if (src_flags & (256 | 8) != 0 and tgt_flags & 8 != 0) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; }
