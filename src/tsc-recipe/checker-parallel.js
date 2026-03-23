@@ -230,34 +230,34 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   try {
   if (!ts || !ts.createProgram) return 'no tsc: ' + typeof ts;
 
-  // Load Zig WASM type registry — shared data model in WASM linear memory.
-  // Type flags stored as flat Uint32Array. Both JS and WASM read same memory. Zero copy.
+  // Load Zig WASM type graph — full data-oriented type representation in linear memory.
+  // Flags, objectFlags, members, unions all stored as flat arrays. Zero copy via Uint32Array.
   if (!globalThis.__zigRegistryDone) {
     globalThis.__zigRegistryDone = true;
     if (typeof __edgebox_read_binary === 'function' && typeof WebAssembly !== 'undefined') {
       var _root = typeof __edgebox_root === 'function' ? __edgebox_root() : '';
-      var _buf = __edgebox_read_binary(_root + '/src/tsc-recipe/type_registry.wasm');
+      var _buf = __edgebox_read_binary(_root + '/src/tsc-recipe/type_graph.wasm');
       if (_buf && _buf instanceof ArrayBuffer && _buf.byteLength >= 8) {
         var _mod = new WebAssembly.Module(_buf);
         var _inst = new WebAssembly.Instance(_mod, {});
         globalThis.__zigRegistry = _inst.exports;
-        globalThis.__zigTypeKernel = _inst.exports; // backward compat for isSimpleTypeRelatedTo injection
-        // Create Uint32Array view for zero-copy JS access to type flags
-        var _flagsPtr = _inst.exports.getFlagsPtr();
-        globalThis.__typeFlags = new Uint32Array(_inst.exports.memory.buffer, _flagsPtr, 65536);
-        globalThis.__wasmMemory = _inst.exports.memory;
-        // Warmup TurboFan (both register + check paths)
+        // Uint32Array views for zero-copy access from JS
+        var _mem = _inst.exports.memory.buffer;
+        globalThis.__typeFlags = new Uint32Array(_mem, _inst.exports.getFlagsPtr(), 65536);
+        globalThis.__typeObjFlags = new Uint32Array(_mem, _inst.exports.getObjectFlagsPtr(), 65536);
+        // Warmup TurboFan
         var _kr = _inst.exports.registerType;
         var _ki = _inst.exports.isTypeRelated;
-        for (var _wi = 0; _wi < 100; _wi++) {
-          _kr(_wi, (_wi & 7) === 0 ? 1 : (_wi & 7) === 1 ? 4 : 524288);
+        var _am = _inst.exports.addMember;
+        for (var _wi = 0; _wi < 50; _wi++) {
+          _kr(_wi, (_wi & 3) === 0 ? 1 : 524288, 0);
+          _am(_wi, _wi * 7, _wi + 1, 0);
         }
         for (var _wi = 0; _wi < 500; _wi++) {
-          _ki(0, 1, 0, 1); _ki(1, 0, 0, 1); _ki(2, 3, 0, 1);
-          _ki(50, 51, 0, 1); _ki(99, 0, 0, 1);
+          _ki(0, 1, 0, 1); _ki(10, 20, 0, 1); _ki(30, 40, 0, 1);
         }
         _inst.exports.reset();
-        __edgebox_write_stderr('[recipe] WASM registry loaded (' + _buf.byteLength + ' bytes, flags@' + _flagsPtr + ')\n');
+        __edgebox_write_stderr('[recipe] WASM graph loaded (' + _buf.byteLength + ' bytes)\n');
       } else {
         __edgebox_write_stderr('[recipe] WASM FAILED: ' + (typeof _buf) + '\n');
       }

@@ -229,10 +229,10 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
 
     // Patch 1: createType — populate WASM flags array when TSC creates a type
     const ct_needle = "function createType(flags) {";
-    // Capture __typeFlags once in closure — not on every createType call.
+    // Register type in WASM graph with flags. objectFlags added later via setObjectFlags injection.
     const ct_inject = "function createType(flags) {" ++
-        "var _tf=globalThis.__typeFlags;" ++
-        "if(_tf){_tf[typeCount+1]=flags;}";
+        "var _zr=globalThis.__zigRegistry;" ++
+        "if(_zr){var _tid=typeCount+1;if(_tid<65536)_zr.registerType(_tid|0,flags|0,0);}";
 
     if (std.mem.indexOf(u8, result, ct_needle)) |ct_idx| {
         _ = std.posix.write(2, "[v8pool] patching createType → WASM flags\n") catch {};
