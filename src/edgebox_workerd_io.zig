@@ -147,7 +147,16 @@ export fn edgebox_cwd(out_len: *c_int) ?[*]const u8 {
 
 // ── process: exit, argv, env ──
 
+// In daemon/pool mode, exit must NOT kill the process.
+// Set to true when running as daemon.
+var daemon_mode: bool = false;
+
+export fn edgebox_set_daemon_mode(enabled: c_int) void {
+    daemon_mode = enabled != 0;
+}
+
 export fn edgebox_exit(code: c_int) void {
+    if (daemon_mode) return; // Don't kill daemon
     std.process.exit(@intCast(@max(0, @min(code, 255))));
 }
 

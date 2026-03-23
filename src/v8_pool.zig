@@ -23,6 +23,7 @@ extern fn edgebox_v8_eval_in_context(?*anyopaque, ?*anyopaque, [*]const u8, c_in
 extern fn edgebox_v8_free(?[*]const u8) void;
 extern fn edgebox_v8_create_snapshot([*]const u8, c_int, [*]const u8, c_int) c_int;
 extern fn edgebox_v8_create_isolate_from_snapshot() ?*anyopaque;
+extern fn edgebox_set_daemon_mode(c_int) void;
 
 // IO functions from edgebox_workerd_io.zig (shared across all workers)
 extern fn edgebox_read_file([*]const u8, c_int, *c_int) ?[*]const u8;
@@ -55,6 +56,9 @@ var work_cond: std.Thread.Condition = .{};
 pub fn init(worker_count: u32) !void {
     const n = @min(worker_count, MAX_WORKERS);
     pool_size = n;
+
+    // Daemon mode: don't let process.exit kill the daemon
+    edgebox_set_daemon_mode(1);
 
     // Initialize V8 platform (once, before any isolate creation)
     edgebox_v8_init();
@@ -350,7 +354,7 @@ fn workerLoop(worker_id: u32) void {
                 \\      }}
                 \\    }}
                 \\  }}
-                \\  return output.join('\\n');
+                \\  return output.join(String.fromCharCode(10));
                 \\}})()
             , .{ cwd, wid, workers[wid].worker_count }) catch {
                 workers[wid].result = null;
