@@ -4,12 +4,15 @@
 // Compiled to WASM. Each error maps to a TSC error code.
 
 const parser = @import("parser.zig");
+const symbols = @import("symbols.zig");
 
 pub const ErrorKind = enum(u16) {
     // TS2322: Type 'X' is not assignable to type 'Y'
     type_not_assignable = 2322,
-    // TS2355: A function whose declared type is not 'void' or 'any' must return a value
-    missing_return = 2355,
+    // TS7006: Parameter 'x' implicitly has an 'any' type
+    implicit_any_param = 7006,
+    // TS7031: Binding element implicitly has an 'any' type
+    implicit_any_binding = 7031,
 };
 
 pub const Diagnostic = struct {
@@ -70,13 +73,23 @@ fn checkLiteralAssignable(init_kind: u8, annotation_kind: u8) u8 {
     };
 }
 
-/// Parse and check a source file in one call.
+// Config flags (set by caller before check)
+var strict_mode: bool = false;
+var no_implicit_any: bool = false;
+
+export fn setConfig(strict: u32, noImplicitAny: u32) void {
+    strict_mode = strict != 0;
+    no_implicit_any = noImplicitAny != 0 or strict_mode;
+}
+
+/// Parse, build symbol table, and check a source file.
 export fn parseAndCheck(src_ptr: [*]const u8, src_len: u32) u32 {
     _ = parser.doParse(src_ptr, src_len);
+    symbols.build(src_ptr[0..src_len]);
     return check();
 }
 
-/// Check all parsed declarations for type errors.
+/// Check all declarations for type errors.
 fn check() u32 {
     diag_count = 0;
     const nc = parser.nodeCount();
@@ -85,17 +98,23 @@ fn check() u32 {
     while (i < nc) : (i += 1) {
         const kind = parser.nodeKind(i);
 
-        // Variable declaration with type annotation AND literal initializer
+        // TS2322: Variable with type annotation AND mismatched literal initializer
         if (kind == 1) { // var_decl
             const type_kind = parser.nodeTypeKind(i);
             const init_kind = parser.nodeInitTypeKind(i);
-
-            // Both annotation and literal initializer present
             if (type_kind > 0 and type_kind <= 10 and init_kind >= 20) {
                 const msg = checkLiteralAssignable(init_kind, type_kind);
                 if (msg > 0) {
                     addDiag(2322, parser.nodeNameStart(i), parser.nodeNameLen(i), msg);
                 }
+            }
+        }
+
+        // TS7006: Parameter without type annotation (noImplicitAny)
+        if (kind == 3 and no_implicit_any) { // param_decl
+            const type_kind = parser.nodeTypeKind(i);
+            if (type_kind == 0) { // no type annotation
+                addDiag(7006, parser.nodeNameStart(i), parser.nodeNameLen(i), 0);
             }
         }
     }
