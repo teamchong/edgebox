@@ -148,19 +148,40 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   var ck = cwd + ':' + parsed.fileNames.length;
   var t1 = Date.now();
 
-  // Module resolution cache — persists across requests per worker.
-  // First request builds cache. Subsequent requests use cached results (saves ~340ms).
+  // Lazy module resolution — game industry on-demand loading.
+  // Only resolve: relative imports + path-mapped modules.
+  // Skip: bare node_module imports that will fail anyway (saves 111K fileExists calls).
+  // Module resolution cache persists across requests (saves ~340ms on 2nd+ request).
   if (!globalThis.__mrCache) globalThis.__mrCache = new Map();
   var defaultHost = ts.createCompilerHost(parsed.options);
+  var pathPrefixes = [];
+  if (parsed.options.paths) {
+    var keys = Object.keys(parsed.options.paths);
+    for (var ki = 0; ki < keys.length; ki++) pathPrefixes.push(keys[ki].replace('/*', ''));
+  }
   var host = Object.create(defaultHost);
   host.resolveModuleNames = function(moduleNames, containingFile) {
     return moduleNames.map(function(name) {
       var key = name + '\0' + containingFile;
       var cached = globalThis.__mrCache.get(key);
       if (cached !== undefined) return cached;
-      var r = ts.resolveModuleName(name, containingFile, parsed.options, defaultHost).resolvedModule;
-      globalThis.__mrCache.set(key, r || null);
-      return r;
+      // Relative imports: always resolve
+      if (name.charAt(0) === '.') {
+        var r = ts.resolveModuleName(name, containingFile, parsed.options, defaultHost).resolvedModule;
+        globalThis.__mrCache.set(key, r || null);
+        return r;
+      }
+      // Non-relative: only resolve if matching a tsconfig path mapping
+      for (var pi = 0; pi < pathPrefixes.length; pi++) {
+        if (name === pathPrefixes[pi] || name.indexOf(pathPrefixes[pi] + '/') === 0) {
+          var r2 = ts.resolveModuleName(name, containingFile, parsed.options, defaultHost).resolvedModule;
+          globalThis.__mrCache.set(key, r2 || null);
+          return r2;
+        }
+      }
+      // Skip — bare module with no path mapping = will fail (TS2307)
+      globalThis.__mrCache.set(key, null);
+      return undefined;
     });
   };
 
