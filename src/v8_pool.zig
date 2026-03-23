@@ -292,8 +292,26 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         }
     }
 
-    // Note: getRelationKey caching is unsafe — identity relation swaps source/target
-    // before key computation, and cache would need to account for all branches.
+    // 3. Wrap ts.createSourceFile to cache .d.ts AST (saves ~128ms for lib files)
+    {
+        const prev = result;
+        result = replaceFirst(result,
+            "function createSourceFile(fileName, sourceText, languageVersionOrOptions,",
+            "var __sfCache__=new Map();function __origCreateSourceFile__(fileName, sourceText, languageVersionOrOptions,",
+        ) catch result;
+        if (result.ptr != prev.ptr) {
+            // Add wrapper function that checks cache first
+            const prev2 = result;
+            result = replaceFirst(result,
+                "var __sfCache__=new Map();function __origCreateSourceFile__(",
+                "var __sfCache__=new Map();\nfunction createSourceFile(fn,st,lv,sp,sk){if(fn.endsWith('.d.ts')){var c=__sfCache__.get(fn);if(c&&c.text===st)return c;}var r=__origCreateSourceFile__(fn,st,lv,sp,sk);if(fn.endsWith('.d.ts'))__sfCache__.set(fn,r);return r;}\nfunction __origCreateSourceFile__(",
+            ) catch result;
+            if (result.ptr != prev2.ptr) {
+                transforms += 1;
+                _ = std.posix.write(2, "[recipe] + .d.ts AST cache\n") catch {};
+            }
+        }
+    }
 
     {
         var msg_buf: [64]u8 = undefined;
