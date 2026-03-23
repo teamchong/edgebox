@@ -244,11 +244,44 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
     // so caching its results externally is unsafe. TSC's own relation cache handles this.
     const zig_check = "/* edgebox: injection point */\n    ";
 
-    const result = try alloc.alloc(u8, src.len + zig_check.len);
-    @memcpy(result[0..inject_pos], src[0..inject_pos]);
-    @memcpy(result[inject_pos .. inject_pos + zig_check.len], zig_check);
-    @memcpy(result[inject_pos + zig_check.len ..], src[inject_pos..]);
-    _ = std.posix.write(2, "[recipe] transform applied\n") catch {};
+    // Second transform: inject WASM fast path into isSimpleTypeRelatedTo.
+    // The Zig kernel handles pure flag comparisons (~80% of calls).
+    // JS fallback handles value/symbol comparisons.
+    const simple_marker = "function isSimpleTypeRelatedTo(source, target, relation, errorReporter) {";
+    const simple_start = std.mem.indexOf(u8, src, simple_marker) orelse {
+        // No isSimpleTypeRelatedTo — just do the first injection
+        const result = try alloc.alloc(u8, src.len + zig_check.len);
+        @memcpy(result[0..inject_pos], src[0..inject_pos]);
+        @memcpy(result[inject_pos .. inject_pos + zig_check.len], zig_check);
+        @memcpy(result[inject_pos + zig_check.len ..], src[inject_pos..]);
+        _ = std.posix.write(2, "[recipe] transform: injection point only\n") catch {};
+        return result;
+    };
+
+    // Inject WASM fast path at the START of isSimpleTypeRelatedTo
+    const simple_body_start = simple_start + simple_marker.len;
+    const wasm_fast_path =
+        "\n    /* edgebox: WASM kernel for flag-based type relation */\n" ++
+        "    var __rel = relation === assignableRelation ? 0 : relation === comparableRelation ? 1 : relation === strictSubtypeRelation ? 2 : 3;\n" ++
+        "    var __r = __edgebox_is_simple_type_related(source.flags, target.flags, __rel, strictNullChecks ? 1 : 0);\n" ++
+        "    if (__r === 1) return true;\n" ++
+        "    /* __r === 0: not determined by flags — fall through to JS for value/symbol checks */\n";
+
+    // isSimpleTypeRelatedTo (line ~69244) comes BEFORE inject_pos (line ~69304)
+    // Order: src[0..simple_body_start] + wasm + src[simple_body_start..inject_pos] + zig_check + src[inject_pos..]
+    const seg1 = src[0..simple_body_start]; // up to isSimpleTypeRelatedTo body
+    const seg2 = src[simple_body_start..inject_pos]; // between the two injection points
+    const seg3 = src[inject_pos..]; // rest (including checkTypeRelatedTo)
+
+    const total = seg1.len + wasm_fast_path.len + seg2.len + zig_check.len + seg3.len;
+    const result = try alloc.alloc(u8, total);
+    var pos: usize = 0;
+    @memcpy(result[pos .. pos + seg1.len], seg1); pos += seg1.len;
+    @memcpy(result[pos .. pos + wasm_fast_path.len], wasm_fast_path); pos += wasm_fast_path.len;
+    @memcpy(result[pos .. pos + seg2.len], seg2); pos += seg2.len;
+    @memcpy(result[pos .. pos + zig_check.len], zig_check); pos += zig_check.len;
+    @memcpy(result[pos .. pos + seg3.len], seg3);
+    _ = std.posix.write(2, "[recipe] transform: WASM isSimpleTypeRelated kernel + injection point\n") catch {};
     return result;
 }
 
@@ -292,7 +325,7 @@ fn prewarmDir(dir_path: []const u8) void {
 pub fn dispatch(cwd: []const u8) void {
     // Reset work counter for work-stealing
     edgebox_reset_work();
-    // Pre-warm file cache — reads all project files into Zig mmap cache
+    // Pre-warm file cache (18ms — reads project files into Zig mmap cache)
     prewarmDir(cwd);
     for (0..pool_size) |i| {
         workers[i].cwd = cwd;
