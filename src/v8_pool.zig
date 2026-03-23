@@ -136,31 +136,24 @@ pub fn dispatch(cwd: []const u8) void {
 /// Collect results from all workers. Blocks until all done.
 /// Returns merged, deduped diagnostics.
 pub fn collect() ![]const u8 {
-    // Wait for all workers to call __edgebox_worker_done
-    // (done flags are in work_slots from edgebox_workerd_io.zig)
-    extern fn edgebox_is_worker_done(c_int) c_int;
+    // Wait for all workers (they set result_ready after eval)
+    work_mutex.lock();
     while (true) {
         var all_done = true;
         for (0..pool_size) |i| {
-            if (edgebox_is_worker_done(@intCast(i)) == 0) {
-                all_done = false;
-                break;
-            }
+            if (!workers[i].result_ready.load(.acquire)) { all_done = false; break; }
         }
         if (all_done) break;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        work_cond.timedWait(&work_mutex, 100 * std.time.ns_per_ms) catch {};
     }
+    work_mutex.unlock();
 
-    // Read results from shared buffer (written by __edgebox_submit_result via C ABI)
+    // Read results from eval returns
     var merged: std.ArrayListUnmanaged(u8) = .{};
     for (0..pool_size) |i| {
-        var result_len: c_int = 0;
-        const result_ptr = edgebox_get_result(@intCast(i), &result_len);
-        if (result_ptr) |ptr| {
-            if (result_len > 0) {
-                try merged.appendSlice(alloc, ptr[0..@intCast(result_len)]);
-                if (ptr[@intCast(result_len - 1)] != '\n') try merged.append(alloc, '\n');
-            }
+        if (workers[i].result) |data| {
+            try merged.appendSlice(alloc, data);
+            if (data.len > 0 and data[data.len - 1] != '\n') try merged.append(alloc, '\n');
         }
     }
     return try merged.toOwnedSlice(alloc);
@@ -248,8 +241,28 @@ fn workerLoop(worker_id: u32) void {
         if (r3) |rr| edgebox_v8_free(rr);
     }
 
+    // Test: does V8 eval return preserve 0x0A?
+    const nl_test = "'A' + String.fromCharCode(10) + 'B'";
+    {
+        var test_len: c_int = 0;
+        const test_r = edgebox_v8_eval_in_context(isolate, context, nl_test.ptr, @intCast(nl_test.len), &test_len);
+        if (test_r) |t| {
+            const data = t[0..@intCast(test_len)];
+            _ = std.posix.write(2, "[v8pool] nl_test: ") catch {};
+            // Write hex of first few bytes
+            for (data) |b| {
+                const hex = "0123456789abcdef";
+                const h = [2]u8{ hex[b >> 4], hex[b & 0xf] };
+                _ = std.posix.write(2, &h) catch {};
+                _ = std.posix.write(2, " ") catch {};
+            }
+            _ = std.posix.write(2, "\n") catch {};
+            edgebox_v8_free(t);
+        }
+    }
+
     // Verify environment
-    const verify = "typeof ts !== 'undefined' ? 'ts:' + typeof ts.createProgram + ' sys:' + typeof ts.sys : 'ts undef, require:' + typeof require + ' process:' + typeof process + ' isNode:' + (typeof process !== 'undefined' && !!process.nextTick && !process.browser && typeof require !== 'undefined')";
+    const verify = "typeof ts !== 'undefined' ? 'ts:' + typeof ts.createProgram + ' sys:' + typeof ts.sys : 'no ts'";
     {
         var vl: c_int = 0;
         const vr = edgebox_v8_eval_in_context(isolate, context, verify.ptr, @intCast(verify.len), &vl);
@@ -355,9 +368,7 @@ fn workerLoop(worker_id: u32) void {
                 \\      }}
                 \\    }}
                 \\  }}
-                \\  for (var oi = 0; oi < output.length; oi++) __edgebox_submit_result(wid, output[oi] + NL);
-                \\  __edgebox_worker_done(wid);
-                \\  return String(output.length);
+                \\  return output.join(NL);
                 \\}})()
             , .{ cwd, wid, workers[wid].worker_count }) catch {
                 workers[wid].result = null;

@@ -53,11 +53,8 @@ fn printUsage() void {
 // ── Daemon ──
 
 fn isDaemonRunning() bool {
-    // Check socket exists AND is connectable
-    const addr = std.net.Address.initUnix(SOCKET_PATH) catch return false;
-    const fd = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch return false;
-    defer std.posix.close(fd);
-    std.posix.connect(fd, &addr.any, addr.getOsSockLen()) catch return false;
+    // Check if socket file exists (don't connect — that consumes the accept)
+    std.fs.cwd().access(SOCKET_PATH, .{}) catch return false;
     return true;
 }
 

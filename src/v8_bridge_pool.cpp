@@ -269,6 +269,17 @@ static void SubmitResultCallback(const v8::FunctionCallbackInfo<v8::Value>& args
   if (args.Length() < 2) return;
   int wid = args[0]->Int32Value(args.GetIsolate()->GetCurrentContext()).FromMaybe(0);
   auto str = GetStringArg(args, 1);
+  // Debug: check for 0x0A vs 0x5C+0x6E
+  if (wid == 0 && str.size() > 0) {
+    int real_nl = 0, lit_nl = 0;
+    for (size_t i = 0; i < str.size(); i++) {
+      if (str[i] == '\n') real_nl++;
+      if (i + 1 < str.size() && str[i] == '\\' && str[i+1] == 'n') lit_nl++;
+    }
+    char dbg[128];
+    snprintf(dbg, sizeof(dbg), "[cpp] submit wid=%d len=%zu real_nl=%d lit_nl=%d\n", wid, str.size(), real_nl, lit_nl);
+    write(2, dbg, strlen(dbg));
+  }
   edgebox_submit_result(wid, str.c_str(), str.size());
 }
 
