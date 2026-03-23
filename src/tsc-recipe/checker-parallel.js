@@ -72,13 +72,16 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     }, function(p) { return __edgebox_realpath(p); });
   };
 
+  var t0 = Date.now();
   var cf = ts.readConfigFile(cwd + '/tsconfig.json', ts.sys.readFile);
   if (cf.error) return 'config error: ' + ts.flattenDiagnosticMessageText(cf.error.messageText, ' ');
   if (!cf.config) return 'config null';
   var parsed = ts.parseJsonConfigFileContent(cf.config, ts.sys, cwd);
   if (!globalThis.__pc) globalThis.__pc = {};
   var ck = cwd + ':' + parsed.fileNames.length;
+  var t1 = Date.now();
   var program = globalThis.__pc[ck] || (globalThis.__pc[ck] = ts.createProgram(parsed.fileNames, parsed.options));
+  var t2 = Date.now();
   var files = program.getSourceFiles();
   var NL = String.fromCharCode(10);
   var output = [];
@@ -114,15 +117,17 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
           }
         } catch(e) {}
       }
+      globalThis.__zigHits = 0;
+      globalThis.__zigMisses = 0;
       _checker.isTypeRelatedTo = function(source, target, relation) {
         if (source && target && source.id && target.id) {
           _regType(source);
           _regType(target);
           var r = __edgebox_check_structural(source.id, target.id);
-          // Single code path: Zig decides. 1=yes, 0=no, 2=no (conservative)
-          return r === 1;
+          if (r === 1) { globalThis.__zigHits++; return true; }
+          globalThis.__zigMisses++;
+          return false;
         }
-        // No type IDs — not related
         return false;
       };
     }
@@ -141,5 +146,11 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     }
   }
 
+  var t3 = Date.now();
+  if (workerId === 0) {
+    var zigHits = 0, zigMisses = 0;
+    if (globalThis.__zigHits !== undefined) { zigHits = globalThis.__zigHits; zigMisses = globalThis.__zigMisses; }
+    __edgebox_write_stderr('[recipe] w' + workerId + ' config:' + (t1-t0) + 'ms parse:' + (t2-t1) + 'ms check:' + (t3-t2) + 'ms total:' + (t3-t0) + 'ms types:' + Object.keys(_regTypes).length + ' zigHits:' + zigHits + ' zigMisses:' + zigMisses + String.fromCharCode(10));
+  }
   return output.join(NL);
 };
