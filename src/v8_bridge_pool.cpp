@@ -107,6 +107,8 @@ static void RegisterUnionCallback(const v8::FunctionCallbackInfo<v8::Value>& arg
 static void CheckStructuralCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void ClaimFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void IOStatsCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void SubmitResultCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void WorkerDoneCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 
 // ── Snapshot: pre-compile TypeScript for instant worker startup ──
 
@@ -142,6 +144,8 @@ static const intptr_t g_external_refs[] = {
   reinterpret_cast<intptr_t>(CheckStructuralCallback),
   reinterpret_cast<intptr_t>(ClaimFileCallback),
   reinterpret_cast<intptr_t>(IOStatsCallback),
+  reinterpret_cast<intptr_t>(SubmitResultCallback),
+  reinterpret_cast<intptr_t>(WorkerDoneCallback),
   0  // sentinel
 };
 
@@ -172,6 +176,8 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
     global->Set(isolate, "__edgebox_check_structural", v8::FunctionTemplate::New(isolate, CheckStructuralCallback));
     global->Set(isolate, "__edgebox_claim_file", v8::FunctionTemplate::New(isolate, ClaimFileCallback));
     global->Set(isolate, "__edgebox_io_stats", v8::FunctionTemplate::New(isolate, IOStatsCallback));
+    global->Set(isolate, "__edgebox_submit_result", v8::FunctionTemplate::New(isolate, SubmitResultCallback));
+    global->Set(isolate, "__edgebox_worker_done", v8::FunctionTemplate::New(isolate, WorkerDoneCallback));
     auto context = v8::Context::New(isolate, nullptr, global);
     v8::Context::Scope context_scope(context);
 
@@ -409,17 +415,6 @@ static void SubmitResultCallback(const v8::FunctionCallbackInfo<v8::Value>& args
   if (args.Length() < 2) return;
   int wid = args[0]->Int32Value(args.GetIsolate()->GetCurrentContext()).FromMaybe(0);
   auto str = GetStringArg(args, 1);
-  // Debug: check for 0x0A vs 0x5C+0x6E
-  if (wid == 0 && str.size() > 0) {
-    int real_nl = 0, lit_nl = 0;
-    for (size_t i = 0; i < str.size(); i++) {
-      if (str[i] == '\n') real_nl++;
-      if (i + 1 < str.size() && str[i] == '\\' && str[i+1] == 'n') lit_nl++;
-    }
-    char dbg[128];
-    snprintf(dbg, sizeof(dbg), "[cpp] submit wid=%d len=%zu real_nl=%d lit_nl=%d\n", wid, str.size(), real_nl, lit_nl);
-    write(2, dbg, strlen(dbg));
-  }
   edgebox_submit_result(wid, str.c_str(), str.size());
 }
 
@@ -458,35 +453,37 @@ void* edgebox_v8_setup_context(void* iso_ptr) {
     context = v8::Context::New(isolate, nullptr, global);
   }
 
-  // Enter context and register IO globals (needed for both snapshot and fresh)
   v8::Context::Scope context_scope(context);
-  auto globalObj = context->Global();
 
-  auto set = [&](const char* name, v8::FunctionCallback cb) {
-    globalObj->Set(context,
-      v8::String::NewFromUtf8(isolate, name).ToLocalChecked(),
-      v8::Function::New(context, cb).ToLocalChecked()).Check();
-  };
-
-  set("__edgebox_read_file", ReadFileCallback);
-  set("__edgebox_file_exists", FileExistsCallback);
-  set("__edgebox_dir_exists", DirExistsCallback);
-  set("__edgebox_stat", StatCallback);
-  set("__edgebox_readdir", ReaddirCallback);
-  set("__edgebox_realpath", RealpathCallback);
-  set("__edgebox_cwd", CwdCallback);
-  set("__edgebox_write_stdout", WriteStdoutCallback);
-  set("__edgebox_write_stderr", WriteStderrCallback);
-  set("__edgebox_hash", HashCallback);
-  set("__edgebox_exit", ExitCallback);
-  set("__edgebox_submit_result", SubmitResultCallback);
-  set("__edgebox_register_type", RegisterTypeCallback);
-  set("__edgebox_register_member", RegisterMemberCallback);
-  set("__edgebox_register_union", RegisterUnionCallback);
-  set("__edgebox_check_structural", CheckStructuralCallback);
-  set("__edgebox_io_stats", IOStatsCallback);
-  set("__edgebox_claim_file", ClaimFileCallback);
-  set("__edgebox_worker_done", WorkerDoneCallback);
+  if (!g_snapshot.data) {
+    // No snapshot — register IO globals on the fresh context
+    auto globalObj = context->Global();
+    auto set = [&](const char* name, v8::FunctionCallback cb) {
+      globalObj->Set(context,
+        v8::String::NewFromUtf8(isolate, name).ToLocalChecked(),
+        v8::Function::New(context, cb).ToLocalChecked()).Check();
+    };
+    set("__edgebox_read_file", ReadFileCallback);
+    set("__edgebox_file_exists", FileExistsCallback);
+    set("__edgebox_dir_exists", DirExistsCallback);
+    set("__edgebox_stat", StatCallback);
+    set("__edgebox_readdir", ReaddirCallback);
+    set("__edgebox_realpath", RealpathCallback);
+    set("__edgebox_cwd", CwdCallback);
+    set("__edgebox_write_stdout", WriteStdoutCallback);
+    set("__edgebox_write_stderr", WriteStderrCallback);
+    set("__edgebox_hash", HashCallback);
+    set("__edgebox_exit", ExitCallback);
+    set("__edgebox_submit_result", SubmitResultCallback);
+    set("__edgebox_register_type", RegisterTypeCallback);
+    set("__edgebox_register_member", RegisterMemberCallback);
+    set("__edgebox_register_union", RegisterUnionCallback);
+    set("__edgebox_check_structural", CheckStructuralCallback);
+    set("__edgebox_io_stats", IOStatsCallback);
+    set("__edgebox_claim_file", ClaimFileCallback);
+    set("__edgebox_worker_done", WorkerDoneCallback);
+  }
+  // Snapshot workers: IO callbacks already baked in via external_references
 
   auto* persistent = new v8::Persistent<v8::Context>(isolate, context);
   return persistent;
