@@ -22,7 +22,6 @@ pub fn start() !void {
     const cpu_count = std.Thread.getCpuCount() catch 4;
     // TSC has high inter-file type sharing: fewer workers = less duplication.
     // Benchmarked on 16-core: 2 workers (2.5s) < 4 (2.7s) < 8 (3.5s).
-    // Formula: max(2, cpu_count / 8) — scales with core count, min 2.
     const worker_count: u32 = @intCast(@max(2, cpu_count / 8));
 
     log("[daemon] starting V8 pool\n");
