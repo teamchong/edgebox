@@ -256,6 +256,17 @@ fn inferLiteralType() TypeRef {
 
 fn parseVarDecl(flags: u8) void {
     advance(); // const/let/var
+
+    // Handle destructuring: const { a, b } = ... or const [a, b] = ...
+    if (peek() == .open_brace or peek() == .open_bracket) {
+        if (peek() == .open_brace) skipBalanced(.open_brace, .close_brace)
+        else skipBalanced(.open_bracket, .close_bracket);
+        // Skip type annotation and initializer
+        _ = parseTypeAnnotation();
+        if (peek() == .equals) { advance(); while (peek() != .semicolon and peek() != .eof) advance(); }
+        return;
+    }
+
     if (peek() != .identifier) return;
     const name_start = tokenStart();
     const name_len = tokenLen();
@@ -267,22 +278,48 @@ fn parseVarDecl(flags: u8) void {
     // Check for = initializer
     if (peek() == .equals) {
         advance(); // =
+
+        // Arrow function: const f = (params) => ... or const f = async (params) => ...
+        if (peek() == .kw_async and (peekAt(1) == .open_paren or peekAt(1) == .identifier)) {
+            advance(); // async
+        }
+        if (peek() == .open_paren) {
+            // Could be arrow function: (params) => body
+            // Save position to backtrack if not arrow
+            const saved = tpos;
+            parseParamList(name_start, name_len, flags);
+            if (peek() == .arrow) {
+                advance(); // =>
+                return; // arrow function with params parsed
+            }
+            // Not arrow — restore and treat as expression
+            tpos = saved;
+        } else if (peek() == .identifier and peekAt(1) == .arrow) {
+            // Single-param arrow: const f = x => ...
+            const pstart = tokenStart();
+            const plen = tokenLen();
+            advance(); // param name
+            advance(); // =>
+            const fidx = addNode(.func_decl, name_start, name_len, NO_TYPE, NO_TYPE, 0, flags);
+            _ = addNode(.param_decl, pstart, plen, NO_TYPE, NO_TYPE, @intCast(fidx), 0);
+            return;
+        } else if (peek() == .kw_function) {
+            // Function expression: const f = function(params) { ... }
+            parseFuncDecl(flags);
+            return;
+        }
+
         init_type = inferLiteralType();
     }
 
     _ = addNode(.var_decl, name_start, name_len, type_ref, init_type, 0, flags);
 }
 
-fn parseFuncDecl(flags: u8) void {
-    advance(); // function
-    if (peek() != .identifier) return;
-    const name_start = tokenStart();
-    const name_len = tokenLen();
-    advance(); // name
-
+/// Parse a function-like parameter list starting at '('.
+/// Works for: function decl, arrow function, method, callback.
+fn parseParamList(parent_name_start: u32, parent_name_len: u16, flags: u8) void {
     if (!expect(.open_paren)) return;
-
-    const func_idx = addNode(.func_decl, name_start, name_len, NO_TYPE, NO_TYPE, 0, flags);
+    const func_idx = addNode(.func_decl, parent_name_start, parent_name_len, NO_TYPE, NO_TYPE, 0, flags);
 
     // Parse parameters
     while (peek() != .close_paren and peek() != .eof) {
@@ -347,6 +384,21 @@ fn parseFuncDecl(flags: u8) void {
             nodes[func_idx].type_ref = ret_type;
         }
     }
+}
+
+fn parseFuncDecl(flags: u8) void {
+    advance(); // function
+    if (peek() != .identifier) {
+        // Anonymous function — still parse params
+        if (peek() == .open_paren) parseParamList(tokenStart(), 0, flags);
+        return;
+    }
+    const name_start = tokenStart();
+    const name_len = tokenLen();
+    advance(); // name
+    // Skip generic params <T>
+    if (peek() == .less_than) skipBalanced(.less_than, .greater_than);
+    parseParamList(name_start, name_len, flags);
 }
 
 fn parseInterfaceDecl(flags: u8) void {
@@ -464,10 +516,52 @@ pub fn doParse(src_ptr: [*]const u8, src_len: u32) u32 {
         }
         switch (peek()) {
             .kw_const, .kw_let, .kw_var => parseVarDecl(flags),
-            .kw_function, .kw_async => { if (peek() == .kw_async) advance(); if (peek() == .kw_function) parseFuncDecl(flags) else advance(); },
+            .kw_function => parseFuncDecl(flags),
+            .kw_async => {
+                advance(); // async
+                if (peek() == .kw_function) parseFuncDecl(flags) else advance();
+            },
             .kw_interface => parseInterfaceDecl(flags),
             .kw_type => parseTypeAlias(flags),
             .kw_import => parseImportDecl(),
+            .kw_class => {
+                advance(); // class
+                if (peek() == .identifier) advance(); // name
+                // Skip extends/implements
+                while (peek() == .kw_extends or peek() == .kw_implements) {
+                    advance();
+                    while (peek() == .identifier or peek() == .dot or peek() == .comma) advance();
+                }
+                if (peek() == .less_than) skipBalanced(.less_than, .greater_than);
+                if (peek() != .open_brace) continue;
+                advance(); // {
+                // Parse class body: methods + properties
+                while (peek() != .close_brace and peek() != .eof) {
+                    const class_prev = tpos;
+                    // Skip modifiers: public, private, protected, static, abstract, override, readonly, async
+                    while (peek() == .kw_readonly or peek() == .kw_async or peek() == .identifier) {
+                        // Check if this identifier is followed by ( or : → it's the member name
+                        if (peek() == .identifier and (peekAt(1) == .open_paren or peekAt(1) == .colon or peekAt(1) == .question or peekAt(1) == .less_than)) break;
+                        advance(); // skip modifier
+                    }
+                    if (peek() == .identifier and (peekAt(1) == .open_paren or (peekAt(1) == .less_than))) {
+                        // Method: name(...) or name<T>(...)
+                        const mstart = tokenStart();
+                        const mlen = tokenLen();
+                        advance();
+                        if (peek() == .less_than) skipBalanced(.less_than, .greater_than);
+                        if (peek() == .open_paren) parseParamList(mstart, mlen, 0);
+                        // Skip method body
+                        if (peek() == .open_brace) skipBalanced(.open_brace, .close_brace);
+                    } else if (peek() == .identifier and (peekAt(1) == .colon or peekAt(1) == .question or peekAt(1) == .equals or peekAt(1) == .semicolon)) {
+                        // Property: name: Type or name = value
+                        advance(); // skip property (handled like var if needed)
+                    }
+                    if (tpos == class_prev) advance(); // safety
+                }
+                if (peek() == .close_brace) advance();
+            },
+            .identifier => advance(), // skip — method detection is inside class parser
             else => advance(),
         }
         if (tpos == prev) advance(); // safety guard
