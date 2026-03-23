@@ -83,17 +83,22 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   var NL = String.fromCharCode(10);
   var output = [];
 
-  // Register types in Zig flat arrays (zero-copy, SIMD-ready)
-  if (!globalThis.__typesRegistered || !globalThis.__typesRegistered[ck]) {
+  // Defer type registration to AFTER diagnostics (don't block cold response)
+  // Types registered on warm runs when program is cached
+  if (globalThis.__pc[ck] && (!globalThis.__typesRegistered || !globalThis.__typesRegistered[ck])) {
+    // Already have cached program — register types in background
     var checker = program.getTypeChecker();
     var seenTypes = {};
+    var typeCount = 0;
     for (var fi = 0; fi < files.length; fi++) {
+      if (fi % workerCount !== workerId) continue; // shard type registration too
       ts.forEachChild(files[fi], function visit(node) {
         try {
           var type = checker.getTypeAtLocation(node);
           if (type && type.id && !seenTypes[type.id]) {
             seenTypes[type.id] = true;
             __edgebox_register_type(type.id, type.flags || 0);
+            typeCount++;
             var props = checker.getPropertiesOfType(type);
             for (var p = 0; p < props.length && p < 50; p++) {
               var prop = props[p];
