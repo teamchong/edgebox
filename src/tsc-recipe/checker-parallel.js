@@ -105,7 +105,15 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
         if (!t || !t.id || _regTypes[t.id]) return;
         _regTypes[t.id] = true;
         __edgebox_register_type(t.id, t.flags || 0);
-        // Register members too (enables Zig structural comparison)
+        // Register union constituent types
+        if (t.types && (t.flags & 1048576)) { // Union flag
+          var ids = [];
+          for (var u = 0; u < t.types.length; u++) {
+            if (t.types[u] && t.types[u].id) ids.push(t.types[u].id);
+          }
+          if (ids.length > 0) __edgebox_register_union(t.id, ids);
+        }
+        // Register members (enables Zig structural comparison)
         try {
           var props = _checker.getPropertiesOfType(t);
           for (var p = 0; p < props.length && p < 50; p++) {

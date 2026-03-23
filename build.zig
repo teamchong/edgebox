@@ -1696,7 +1696,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         // Link V8 bridge (C++) and rusty_v8 library
-        edgebox_cli.addCSourceFile(.{ .file = b.path("src/v8_bridge_pool.cpp"), .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti" } });
+        edgebox_cli.addCSourceFile(.{ .file = b.path("src/v8_bridge_pool.cpp"), .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti", "-Wno-unused-result" } });
         edgebox_cli.addCSourceFile(.{ .file = b.path("src/v8_stubs.c"), .flags = &.{} });
         // Link Zig IO library (edgebox_io.zig exports C ABI functions)
         edgebox_cli.addObjectFile(b.path("zig-out/lib/libedgebox_io.a"));

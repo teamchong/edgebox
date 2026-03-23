@@ -11,6 +11,7 @@
 #include <v8-exception.h>
 #include <v8-persistent-handle.h>
 #include <v8-function.h>
+#include <v8-container.h>
 #include <cstring>
 #include <cstdio>
 #include <string>
@@ -269,6 +270,7 @@ static void ExitCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
 extern void edgebox_register_type(unsigned int type_id, unsigned int flags, unsigned int object_flags);
 extern void edgebox_register_member(unsigned int type_id, const char* name, int name_len, unsigned int member_type_id, unsigned int member_flags);
 extern unsigned char edgebox_check_structural(unsigned int source_id, unsigned int target_id);
+extern void edgebox_register_union(unsigned int type_id, const unsigned int* member_ids, int member_count);
 
 static void RegisterTypeCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
   if (args.Length() < 2) return;
@@ -286,6 +288,23 @@ static void RegisterMemberCallback(const v8::FunctionCallbackInfo<v8::Value>& ar
   unsigned int memberTypeId = args[2]->Uint32Value(ctx).FromMaybe(0);
   unsigned int memberFlags = args[3]->Uint32Value(ctx).FromMaybe(0);
   edgebox_register_member(typeId, name.c_str(), name.size(), memberTypeId, memberFlags);
+}
+
+static void RegisterUnionCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 2) return;
+  auto ctx = args.GetIsolate()->GetCurrentContext();
+  unsigned int typeId = args[0]->Uint32Value(ctx).FromMaybe(0);
+  // args[1] is array of member type IDs
+  if (!args[1]->IsArray()) return;
+  auto arr = args[1].As<v8::Array>();
+  unsigned int len = arr->Length();
+  if (len == 0 || len > 1000) return;
+  unsigned int ids[1000];
+  for (unsigned int i = 0; i < len; i++) {
+    auto val = arr->Get(ctx, i);
+    ids[i] = val.IsEmpty() ? 0 : val.ToLocalChecked()->Uint32Value(ctx).FromMaybe(0);
+  }
+  edgebox_register_union(typeId, ids, len);
 }
 
 static void CheckStructuralCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -376,6 +395,7 @@ void* edgebox_v8_setup_context(void* iso_ptr) {
   set("__edgebox_submit_result", SubmitResultCallback);
   set("__edgebox_register_type", RegisterTypeCallback);
   set("__edgebox_register_member", RegisterMemberCallback);
+  set("__edgebox_register_union", RegisterUnionCallback);
   set("__edgebox_check_structural", CheckStructuralCallback);
   set("__edgebox_worker_done", WorkerDoneCallback);
 

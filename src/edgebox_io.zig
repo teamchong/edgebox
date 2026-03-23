@@ -563,6 +563,28 @@ export fn edgebox_register_member(type_id: u32, name_ptr: [*]const u8, name_len:
     col_type_member_count[type_id] += 1;
 }
 
+// ── Union Type Registry ──
+// Union types: typeId → array of constituent type IDs
+const MAX_UNION_TYPES: u32 = 50_000;
+const MAX_UNION_MEMBERS: u32 = 500_000;
+
+var col_union_offset: [MAX_UNION_TYPES]u32 = [_]u32{0} ** MAX_UNION_TYPES;
+var col_union_count: [MAX_UNION_TYPES]u16 = [_]u16{0} ** MAX_UNION_TYPES;
+var col_union_members: [MAX_UNION_MEMBERS]u32 = [_]u32{0} ** MAX_UNION_MEMBERS;
+var union_member_count: u32 = 0;
+
+/// Register a union type's constituent type IDs
+export fn edgebox_register_union(type_id: u32, member_ids_ptr: [*]const u32, count: c_int) void {
+    if (type_id >= MAX_UNION_TYPES or count <= 0 or union_member_count + @as(u32, @intCast(count)) > MAX_UNION_MEMBERS) return;
+    col_union_offset[type_id] = union_member_count;
+    col_union_count[type_id] = @intCast(@min(count, 65535));
+    const n: u32 = @intCast(count);
+    for (0..n) |i| {
+        col_union_members[union_member_count] = member_ids_ptr[i];
+        union_member_count += 1;
+    }
+}
+
 // ── SIMD Structural Check ──
 
 var check_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
@@ -595,6 +617,29 @@ export fn edgebox_check_structural(source_id: u32, target_id: u32) u8 {
     const tgt_count = col_type_member_count[target_id];
     if (tgt_count == 0) return 1; // empty target = compatible (anything satisfies {})
     if (src_count == 0) return 0; // empty source can't satisfy non-empty target
+    // Union handling: TypeFlags.Union = 1048576
+    const UNION_FLAG: u32 = 1048576;
+    if (tgt_flags & UNION_FLAG != 0 and target_id < MAX_UNION_TYPES and col_union_count[target_id] > 0) {
+        // Target is union: source must be compatible with ANY member
+        const u_offset = col_union_offset[target_id];
+        const u_count = col_union_count[target_id];
+        var ui: u32 = 0;
+        while (ui < u_count) : (ui += 1) {
+            if (edgebox_check_structural(source_id, col_union_members[u_offset + ui]) == 1) return 1;
+        }
+        return 0;
+    }
+    if (src_flags & UNION_FLAG != 0 and source_id < MAX_UNION_TYPES and col_union_count[source_id] > 0) {
+        // Source is union: ALL members must be compatible with target
+        const u_offset = col_union_offset[source_id];
+        const u_count = col_union_count[source_id];
+        var ui: u32 = 0;
+        while (ui < u_count) : (ui += 1) {
+            if (edgebox_check_structural(col_union_members[u_offset + ui], target_id) != 1) return 0;
+        }
+        return 1;
+    }
+
     if (tgt_count > src_count * 2) return 0;
     var ti: u32 = 0;
     while (ti < tgt_count) : (ti += 1) {
