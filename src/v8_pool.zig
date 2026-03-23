@@ -326,6 +326,7 @@ fn workerLoop(worker_id: u32) void {
                 \\      return {{ files: files, directories: dirs }};
                 \\    }}, function(p) {{ return __edgebox_realpath(p); }});
                 \\  }};
+                \\  var NL = String.fromCharCode(10);
                 \\  var wid = {d};
                 \\  var wcount = {d};
                 \\  // Create program (file cache shared via Zig — fast after first worker)
@@ -334,12 +335,13 @@ fn workerLoop(worker_id: u32) void {
                 \\  var parsed = ts.parseJsonConfigFileContent(cf.config, ts.sys, cwd);
                 \\  var program = ts.createProgram(parsed.fileNames, parsed.options);
                 \\  var files = program.getSourceFiles();
-                \\  var output = [];
+                \\  var count = 0;
                 \\  // Worker 0: global diagnostics
                 \\  if (wid === 0) {{
                 \\    var gd = ts.getPreEmitDiagnostics(program).filter(function(d) {{ return !d.file; }});
                 \\    for (var g = 0; g < gd.length; g++) {{
-                \\      output.push('error TS' + gd[g].code + ': ' + ts.flattenDiagnosticMessageText(gd[g].messageText, ' '));
+                \\      __edgebox_write_stdout('error TS' + gd[g].code + ': ' + ts.flattenDiagnosticMessageText(gd[g].messageText, ' ') + NL);
+                \\      count++;
                 \\    }}
                 \\  }}
                 \\  // Check only this worker's shard
@@ -350,13 +352,12 @@ fn workerLoop(worker_id: u32) void {
                 \\      var d = diags[k];
                 \\      if (d.file) {{
                 \\        var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
-                \\        output.push(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' '));
+                \\        __edgebox_write_stdout(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' ') + NL);
+                \\        count++;
                 \\      }}
                 \\    }}
                 \\  }}
-                \\  var result = output.join(String.fromCharCode(10));
-                \\  __edgebox_write_stderr('[worker' + wid + '] ' + output.length + ' diagnostics' + String.fromCharCode(10));
-                \\  return result;
+                \\  return String(count);
                 \\}})()
             , .{ cwd, wid, workers[wid].worker_count }) catch {
                 workers[wid].result = null;
