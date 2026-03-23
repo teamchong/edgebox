@@ -330,17 +330,6 @@ fn workerLoop(worker_id: u32) void {
             };
             defer alloc.free(check_code);
 
-            // Debug: dump first 100 bytes of JS source to stderr
-            if (wid == 0) {
-                _ = std.posix.write(2, "[js-src] ") catch {};
-                const dump_len = @min(check_code.len, 100);
-                for (check_code[0..dump_len]) |b| {
-                    const hex = "0123456789abcdef";
-                    const h = [2]u8{ hex[b >> 4], hex[b & 0xf] };
-                    _ = std.posix.write(2, &h) catch {};
-                }
-                _ = std.posix.write(2, "\n") catch {};
-            }
 
             var out_len: c_int = 0;
             const result = edgebox_v8_eval_in_context(isolate, context, check_code.ptr, @intCast(check_code.len), &out_len);

@@ -615,7 +615,11 @@ export fn edgebox_check_structural(source_id: u32, target_id: u32) u8 {
     const src_count = col_type_member_count[source_id];
     const tgt_offset = col_type_member_offset[target_id];
     const tgt_count = col_type_member_count[target_id];
-    if (tgt_count == 0) return 1; // empty target = compatible (anything satisfies {})
+    // Both no members: compatible only if same flags or flag-compatible
+    if (tgt_count == 0 and src_count == 0) {
+        return if (src_flags == tgt_flags) 1 else 0;
+    }
+    if (tgt_count == 0) return 1; // empty target = anything satisfies {}
     if (src_count == 0) return 0; // empty source can't satisfy non-empty target
     // Union handling: TypeFlags.Union = 1048576
     const UNION_FLAG: u32 = 1048576;
