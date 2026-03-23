@@ -146,24 +146,11 @@ pub fn collect() ![]const u8 {
     }
     work_mutex.unlock();
 
-    // Merge results (dedup by exact line)
-    var merged: std.ArrayListUnmanaged(u8) = .{};
-    var seen = std.StringHashMapUnmanaged(void){};
-    for (0..pool_size) |i| {
-        if (workers[i].result) |data| {
-            var lines = std.mem.splitScalar(u8, data, '\n');
-            while (lines.next()) |line| {
-                if (line.len == 0) continue;
-                if (seen.get(line) != null) continue;
-                const key = try alloc.dupe(u8, line);
-                try seen.put(alloc, key, {});
-                try merged.appendSlice(alloc, line);
-                try merged.append(alloc, '\n');
-            }
-        }
+    // Use worker 0's result
+    if (workers[0].result) |data| {
+        return try alloc.dupe(u8, data);
     }
-
-    return try merged.toOwnedSlice(alloc);
+    return try alloc.dupe(u8, "");
 }
 
 /// Worker thread: creates V8 isolate, loads TSC, loops waiting for work.
