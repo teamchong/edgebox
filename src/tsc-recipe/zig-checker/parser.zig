@@ -561,7 +561,33 @@ pub fn doParse(src_ptr: [*]const u8, src_len: u32) u32 {
                 }
                 if (peek() == .close_brace) advance();
             },
-            .identifier => advance(), // skip — method detection is inside class parser
+            .identifier => {
+                // Single-param arrow anywhere: ident => ...
+                if (peekAt(1) == .arrow) {
+                    const pstart = tokenStart();
+                    const plen = tokenLen();
+                    advance(); advance(); // name =>
+                    const fidx = addNode(.func_decl, pstart, plen, NO_TYPE, NO_TYPE, 0, 0);
+                    _ = addNode(.param_decl, pstart, plen, NO_TYPE, NO_TYPE, @intCast(fidx), 0);
+                }
+                // Check if next tokens form a param list: ident ( → parse as method call
+                // Don't parse — just advance
+                else advance();
+            },
+            // Don't skip ( ) — continue scanning inside for arrow/function patterns
+            .open_paren, .close_paren, .open_bracket, .close_bracket,
+            .open_brace, .close_brace, .comma, .semicolon,
+            .dot, .colon, .question, .exclamation,
+            .equals, .arrow, .pipe, .ampersand,
+            .less_than, .greater_than, .plus, .minus, .star, .slash,
+            .number_literal, .string_literal,
+            .kw_true, .kw_false, .kw_null, .kw_undefined,
+            .kw_new, .kw_this, .kw_typeof, .kw_void,
+            .kw_return, .kw_if, .kw_else, .kw_for, .kw_while,
+            .kw_as, .kw_readonly, .kw_await,
+            .kw_number, .kw_string, .kw_boolean, .kw_any,
+            .kw_unknown, .kw_never, .kw_object,
+            .unknown => advance(),
             else => advance(),
         }
         if (tpos == prev) advance(); // safety guard
