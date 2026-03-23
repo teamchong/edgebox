@@ -95,9 +95,10 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     globalThis.__cc[cwd] = parsed;
   }
   var ck = cwd + ':' + parsed.fileNames.length;
+  var isWarm = !!globalThis.__pc[ck];
   var t1 = Date.now();
   var program;
-  if (globalThis.__pc[ck]) {
+  if (isWarm) {
     program = globalThis.__pc[ck];
   } else {
     program = ts.createProgram(parsed.fileNames, parsed.options);
@@ -117,9 +118,24 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     if (!files[fi].isDeclarationFile) checkFiles.push(files[fi]);
   }
   if (workerId === 0) __edgebox_write_stderr('[recipe] w0 totalFiles:' + files.length + ' checkFiles:' + checkFiles.length + String.fromCharCode(10));
-  // Work-stealing: each worker atomically claims the next file index.
-  // Fast workers process more files — no shard imbalance.
+  // Warm: static sharding (TSC caches diagnostics per file → 0ms check).
+  // Cold: work-stealing (balances load across workers).
   var filesChecked = 0;
+  if (isWarm) {
+    // Static sharding: each worker checks same files as before → TSC cache hits
+    for (var i = workerId; i < checkFiles.length; i += workerCount) {
+      filesChecked++;
+      var diags = program.getSemanticDiagnostics(checkFiles[i]);
+      for (var k = 0; k < diags.length; k++) {
+        var d = diags[k];
+        if (d.file) {
+          var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
+          output.push(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' '));
+        }
+      }
+    }
+  } else {
+  // Work-stealing: atomically claim next file (cold path — balances load)
   while (true) {
     var idx = __edgebox_claim_file();
     if (idx >= checkFiles.length) break;
@@ -133,6 +149,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       }
     }
   }
+  } // end else (cold work-stealing path)
 
   // Worker 0 collects global diagnostics (config errors, missing types)
   // Uses getGlobalDiagnostics + getOptionsDiagnostics instead of getPreEmitDiagnostics
