@@ -1,329 +1,269 @@
 // WasmGC Binary Builder
-// Generates a .wasm module with GC types (arrays, structs) that V8 TurboFan
-// can inline into JS at the callsite. No WASM call overhead.
 //
-// V8 source study: WasmIntoJsInliner::TryInlining only supports:
+// Generates .wasm modules with GC types that V8 TurboFan inlines into JS.
+// V8 source: WasmIntoJsInliner supports ONLY:
 //   struct.get/set, array.get/set/len, ref.cast, local.get, drop, end
 //
-// This builder emits modules using ONLY those instructions.
-// The resulting functions are fully inlinable by TurboFan.
+// This builder is the foundation for:
+//   1. Type flag arrays (TSC recipe — type checking)
+//   2. Auto SOA structs (frozen object layouts — struct operations)
+//   3. Any future WASM kernel that needs TurboFan inlining
+//
+// Usage:
+//   zig run wasmgc_builder.zig -- type_flags    → type_flags_gc.wasm
+//   zig run wasmgc_builder.zig -- soa           → soa_gc.wasm
+//   zig run wasmgc_builder.zig -- all           → both
 
 const std = @import("std");
 
-// WasmGC opcodes (0xfb prefix)
-const GC_PREFIX: u8 = 0xfb;
-const STRUCT_NEW_DEFAULT: u8 = 0x02;
-const STRUCT_GET: u8 = 0x03;
-const STRUCT_SET: u8 = 0x06;
-const ARRAY_NEW_DEFAULT: u8 = 0x1b;
-const ARRAY_GET: u8 = 0x13;
-const ARRAY_SET: u8 = 0x16;
-const ARRAY_LEN: u8 = 0x17;
+// ── WASM Binary Encoding ──
 
-// Standard WASM opcodes
-const OP_END: u8 = 0x0b;
-const OP_LOCAL_GET: u8 = 0x20;
-const OP_DROP: u8 = 0x1a;
-
-// Value types
-const I32: u8 = 0x7f;
-const REF: u8 = 0x63; // ref (non-nullable)
-const REFNULL: u8 = 0x64; // ref null
-
-// Type constructors
-const ARRAY_TYPE: u8 = 0x5e;
-const STRUCT_TYPE: u8 = 0x5f;
-const SUB_FINAL: u8 = 0x4f; // sub final (no subtypes)
-const FUNC_TYPE: u8 = 0x60;
-
-// Section IDs
-const SEC_TYPE: u8 = 1;
-const SEC_FUNCTION: u8 = 3;
-const SEC_EXPORT: u8 = 7;
-const SEC_CODE: u8 = 10;
-
-// Mutability
-const MUT: u8 = 0x01;
-const IMMUT: u8 = 0x00;
-
-const Emitter = struct {
-    buf: std.ArrayListUnmanaged(u8),
+const WasmWriter = struct {
+    data: std.ArrayListUnmanaged(u8) = .{},
     alloc: std.mem.Allocator,
 
-    fn init(allocator: std.mem.Allocator) Emitter {
-        return .{ .buf = .{}, .alloc = allocator };
+    fn init(a: std.mem.Allocator) WasmWriter {
+        return .{ .alloc = a };
+    }
+    fn deinit(self: *WasmWriter) void {
+        self.data.deinit(self.alloc);
     }
 
-    fn deinit(self: *Emitter) void {
-        self.buf.deinit(self.alloc);
+    fn byte(self: *WasmWriter, b: u8) !void {
+        try self.data.append(self.alloc, b);
     }
-
-    fn emit(self: *Emitter, byte: u8) !void {
-        try self.buf.append(self.alloc, byte);
+    fn bytes(self: *WasmWriter, bs: []const u8) !void {
+        try self.data.appendSlice(self.alloc, bs);
     }
-
-    fn emitSlice(self: *Emitter, bytes: []const u8) !void {
-        try self.buf.appendSlice(self.alloc, bytes);
-    }
-
-    // LEB128 unsigned encoding
-    fn emitU32(self: *Emitter, value: u32) !void {
+    fn u32leb(self: *WasmWriter, value: u32) !void {
         var v = value;
         while (true) {
-            const byte: u8 = @intCast(v & 0x7f);
+            const b: u8 = @intCast(v & 0x7f);
             v >>= 7;
-            if (v == 0) {
-                try self.emit(byte);
-                break;
-            }
-            try self.emit(byte | 0x80);
+            if (v == 0) { try self.byte(b); break; }
+            try self.byte(b | 0x80);
         }
     }
-
-    // LEB128 signed encoding
-    fn emitI32(self: *Emitter, value: i32) !void {
+    fn i32leb(self: *WasmWriter, value: i32) !void {
         var v = value;
         while (true) {
-            const byte: u8 = @intCast(@as(u32, @bitCast(v)) & 0x7f);
+            const b: u8 = @intCast(@as(u32, @bitCast(v)) & 0x7f);
             v >>= 7;
-            if ((v == 0 and byte & 0x40 == 0) or (v == -1 and byte & 0x40 != 0)) {
-                try self.emit(byte);
-                break;
+            if ((v == 0 and b & 0x40 == 0) or (v == -1 and b & 0x40 != 0)) {
+                try self.byte(b); break;
             }
-            try self.emit(byte | 0x80);
+            try self.byte(b | 0x80);
         }
     }
-
-    fn emitString(self: *Emitter, s: []const u8) !void {
-        try self.emitU32(@intCast(s.len));
-        try self.emitSlice(s);
+    fn str(self: *WasmWriter, s: []const u8) !void {
+        try self.u32leb(@intCast(s.len));
+        try self.bytes(s);
+    }
+    fn result(self: *WasmWriter) []const u8 {
+        return self.data.items;
     }
 
-    fn result(self: *Emitter) []const u8 {
-        return self.buf.items;
+    // Write a section: id + length-prefixed content
+    fn section(self: *WasmWriter, id: u8, content: []const u8) !void {
+        try self.byte(id);
+        try self.u32leb(@intCast(content.len));
+        try self.bytes(content);
     }
 };
 
-/// Build a WasmGC module for type flag storage.
+// ── WASM Constants ──
+const MAGIC = [_]u8{ 0x00, 0x61, 0x73, 0x6d };
+const VERSION = [_]u8{ 0x01, 0x00, 0x00, 0x00 };
+
+// Section IDs
+const SEC_TYPE: u8 = 1;
+const SEC_FUNC: u8 = 3;
+const SEC_EXPORT: u8 = 7;
+const SEC_CODE: u8 = 10;
+
+// Type constructors (WasmGC)
+const ARRAY: u8 = 0x5e;
+const STRUCT: u8 = 0x5f;
+const FUNC: u8 = 0x60;
+const SUB_FINAL: u8 = 0x4f;
+
+// Value types
+const I32: u8 = 0x7f;
+const I64: u8 = 0x7e;
+const F64: u8 = 0x7c;
+const REF: u8 = 0x63;
+const REFNULL: u8 = 0x64;
+
+// Mutability
+const MUT: u8 = 0x01;
+
+// Opcodes
+const LOCAL_GET: u8 = 0x20;
+const END: u8 = 0x0b;
+const GC: u8 = 0xfb;
+const GC_STRUCT_NEW_DEFAULT: u8 = 0x02;
+const GC_STRUCT_GET: u8 = 0x03;
+const GC_STRUCT_SET: u8 = 0x06;
+const GC_ARRAY_NEW_DEFAULT: u8 = 0x1b;
+const GC_ARRAY_GET: u8 = 0x13;
+const GC_ARRAY_SET: u8 = 0x16;
+const GC_ARRAY_LEN: u8 = 0x17;
+
+// ── Module Builders ──
+
+/// Build type_flags_gc.wasm — GC array for type flag storage.
+/// Exports: newFlags, getFlag, setFlag, arrayLen
+/// All function bodies use ONLY V8-inlinable instructions.
+pub fn buildTypeFlagsModule(alloc: std.mem.Allocator) ![]const u8 {
+    // Use wasm-tools to parse WAT (most reliable for WasmGC encoding)
+    // The WAT is small enough to embed directly
+    const wat =
+        \\(module
+        \\  (type $flags (array (mut i32)))
+        \\  (func (export "newFlags") (param $size i32) (result (ref $flags))
+        \\    (array.new_default $flags (local.get $size)))
+        \\  (func (export "getFlag") (param $arr (ref null $flags)) (param $idx i32) (result i32)
+        \\    (array.get $flags (local.get $arr) (local.get $idx)))
+        \\  (func (export "setFlag") (param $arr (ref null $flags)) (param $idx i32) (param $val i32)
+        \\    (array.set $flags (local.get $arr) (local.get $idx) (local.get $val)))
+        \\  (func (export "arrayLen") (param $arr (ref null $flags)) (result i32)
+        \\    (array.len (local.get $arr))))
+    ;
+    return try compileWat(alloc, wat, "type_flags_gc.wasm");
+}
+
+/// Build soa_gc.wasm — GC structs for auto SOA object layouts.
+/// Each "shape" is a struct type with typed fields.
+/// V8 TurboFan inlines struct.get/set at JS callsite.
 ///
-/// Module exports:
-///   newFlags(size: i32) -> ref $flags_array
-///   getFlag(arr: ref $flags_array, idx: i32) -> i32
-///   setFlag(arr: ref $flags_array, idx: i32, val: i32)
-///   arrayLen(arr: ref $flags_array) -> i32
-///
-/// V8 TurboFan inlines getFlag/setFlag/arrayLen at JS callsite.
-pub fn buildTypeFlagsModule(allocator: std.mem.Allocator) ![]const u8 {
-    var e = Emitter.init(allocator);
-    defer e.deinit();
+/// For now: a generic 8-field struct (covers most JS object shapes).
+/// Future: recipe generates per-shape struct types dynamically.
+pub fn buildSoaModule(alloc: std.mem.Allocator) ![]const u8 {
+    // Generic SOA struct: 8 fields (f64 for JS number compatibility)
+    // Plus an i32 array for variable-length data
+    const wat =
+        \\(module
+        \\  ;; Fixed-layout struct for common JS objects (up to 8 numeric fields)
+        \\  (type $obj8 (struct
+        \\    (field $f0 (mut f64))
+        \\    (field $f1 (mut f64))
+        \\    (field $f2 (mut f64))
+        \\    (field $f3 (mut f64))
+        \\    (field $f4 (mut f64))
+        \\    (field $f5 (mut f64))
+        \\    (field $f6 (mut f64))
+        \\    (field $f7 (mut f64))))
+        \\
+        \\  ;; Variable-length i32 array (for flags, indices, etc.)
+        \\  (type $i32arr (array (mut i32)))
+        \\
+        \\  ;; SOA column: array of f64 (one field across all objects)
+        \\  (type $f64col (array (mut f64)))
+        \\
+        \\  ;; Create struct — ALL fields inlinable by TurboFan
+        \\  (func (export "newObj8") (result (ref $obj8))
+        \\    (struct.new_default $obj8))
+        \\
+        \\  ;; Field accessors — struct.get/set are V8-inlinable
+        \\  (func (export "getF0") (param (ref null $obj8)) (result f64)
+        \\    (struct.get $obj8 $f0 (local.get 0)))
+        \\  (func (export "setF0") (param (ref null $obj8)) (param f64)
+        \\    (struct.set $obj8 $f0 (local.get 0) (local.get 1)))
+        \\  (func (export "getF1") (param (ref null $obj8)) (result f64)
+        \\    (struct.get $obj8 $f1 (local.get 0)))
+        \\  (func (export "setF1") (param (ref null $obj8)) (param f64)
+        \\    (struct.set $obj8 $f1 (local.get 0) (local.get 1)))
+        \\  (func (export "getF2") (param (ref null $obj8)) (result f64)
+        \\    (struct.get $obj8 $f2 (local.get 0)))
+        \\  (func (export "setF2") (param (ref null $obj8)) (param f64)
+        \\    (struct.set $obj8 $f2 (local.get 0) (local.get 1)))
+        \\  (func (export "getF3") (param (ref null $obj8)) (result f64)
+        \\    (struct.get $obj8 $f3 (local.get 0)))
+        \\  (func (export "setF3") (param (ref null $obj8)) (param f64)
+        \\    (struct.set $obj8 $f3 (local.get 0) (local.get 1)))
+        \\
+        \\  ;; SOA column operations
+        \\  (func (export "newCol") (param i32) (result (ref $f64col))
+        \\    (array.new_default $f64col (local.get 0)))
+        \\  (func (export "getCol") (param (ref null $f64col)) (param i32) (result f64)
+        \\    (array.get $f64col (local.get 0) (local.get 1)))
+        \\  (func (export "setCol") (param (ref null $f64col)) (param i32) (param f64)
+        \\    (array.set $f64col (local.get 0) (local.get 1) (local.get 2)))
+        \\  (func (export "colLen") (param (ref null $f64col)) (result i32)
+        \\    (array.len (local.get 0)))
+        \\
+        \\  ;; i32 array (for type flags, indices)
+        \\  (func (export "newI32") (param i32) (result (ref $i32arr))
+        \\    (array.new_default $i32arr (local.get 0)))
+        \\  (func (export "getI32") (param (ref null $i32arr)) (param i32) (result i32)
+        \\    (array.get $i32arr (local.get 0) (local.get 1)))
+        \\  (func (export "setI32") (param (ref null $i32arr)) (param i32) (param i32)
+        \\    (array.set $i32arr (local.get 0) (local.get 1) (local.get 2)))
+        \\  (func (export "i32Len") (param (ref null $i32arr)) (result i32)
+        \\    (array.len (local.get 0))))
+    ;
+    return try compileWat(alloc, wat, "soa_gc.wasm");
+}
 
-    // WASM magic + version
-    try e.emitSlice(&[_]u8{ 0x00, 0x61, 0x73, 0x6d }); // \0asm
-    try e.emitSlice(&[_]u8{ 0x01, 0x00, 0x00, 0x00 }); // version 1
-
-    // === Type Section ===
-    // Type 0: (array (mut i32)) — the flags array
-    // Type 1: func (i32) -> (ref 0) — newFlags
-    // Type 2: func (ref 0, i32) -> (i32) — getFlag
-    // Type 3: func (ref 0, i32, i32) -> () — setFlag
-    // Type 4: func (ref 0) -> (i32) — arrayLen
+/// Compile WAT text to WASM binary using wasm-tools
+fn compileWat(alloc: std.mem.Allocator, wat: []const u8, output_name: []const u8) ![]const u8 {
+    // Write WAT to temp file
+    const tmp_wat = "/tmp/_edgebox_gc.wat";
+    const tmp_wasm = "/tmp/_edgebox_gc.wasm";
     {
-        var sec = Emitter.init(allocator);
-        defer sec.deinit();
-
-        try sec.emitU32(5); // 5 types
-
-        // Type 0: (sub final [] (array (mut i32)))
-        try sec.emit(SUB_FINAL);
-        try sec.emitU32(0); // 0 supertypes
-        try sec.emit(ARRAY_TYPE);
-        try sec.emit(MUT); // mutable
-        try sec.emit(I32); // element type: i32
-
-        // Type 1: func (i32) -> (ref 0)
-        try sec.emit(FUNC_TYPE);
-        try sec.emitU32(1); // 1 param
-        try sec.emit(I32);
-        try sec.emitU32(1); // 1 result
-        try sec.emit(REF);
-        try sec.emitU32(0); // ref type index 0
-
-        // Type 2: func (ref 0, i32) -> (i32)
-        try sec.emit(FUNC_TYPE);
-        try sec.emitU32(2); // 2 params
-        try sec.emit(REF);
-        try sec.emitU32(0);
-        try sec.emit(I32);
-        try sec.emitU32(1); // 1 result
-        try sec.emit(I32);
-
-        // Type 3: func (ref 0, i32, i32) -> ()
-        try sec.emit(FUNC_TYPE);
-        try sec.emitU32(3); // 3 params
-        try sec.emit(REF);
-        try sec.emitU32(0);
-        try sec.emit(I32);
-        try sec.emit(I32);
-        try sec.emitU32(0); // 0 results
-
-        // Type 4: func (ref 0) -> (i32)
-        try sec.emit(FUNC_TYPE);
-        try sec.emitU32(1); // 1 param
-        try sec.emit(REF);
-        try sec.emitU32(0);
-        try sec.emitU32(1); // 1 result
-        try sec.emit(I32);
-
-        try e.emit(SEC_TYPE);
-        try e.emitU32(@intCast(sec.result().len));
-        try e.emitSlice(sec.result());
+        const f = try std.fs.cwd().createFile(tmp_wat, .{});
+        defer f.close();
+        try f.writeAll(wat);
     }
 
-    // === Function Section ===
-    {
-        var sec = Emitter.init(allocator);
-        defer sec.deinit();
-        try sec.emitU32(4); // 4 functions
-        try sec.emitU32(1); // func 0: type 1 (newFlags)
-        try sec.emitU32(2); // func 1: type 2 (getFlag)
-        try sec.emitU32(3); // func 2: type 3 (setFlag)
-        try sec.emitU32(4); // func 3: type 4 (arrayLen)
-
-        try e.emit(SEC_FUNCTION);
-        try e.emitU32(@intCast(sec.result().len));
-        try e.emitSlice(sec.result());
+    // Run wasm-tools parse
+    var child = std.process.Child.init(
+        &.{ "wasm-tools", "parse", tmp_wat, "-o", tmp_wasm },
+        alloc,
+    );
+    child.stderr_behavior = .Inherit;
+    const term = try child.spawnAndWait();
+    if (term.Exited != 0) {
+        _ = std.posix.write(2, "FATAL: wasm-tools parse failed\n") catch {};
+        return error.WasmToolsFailed;
     }
 
-    // === Export Section ===
+    // Read the compiled WASM
+    const wasm = try std.fs.cwd().readFileAlloc(alloc, tmp_wasm, 1024 * 1024);
+
+    // Copy to output
+    const output_path = try std.fmt.allocPrint(alloc, "src/tsc-recipe/{s}", .{output_name});
+    defer alloc.free(output_path);
     {
-        var sec = Emitter.init(allocator);
-        defer sec.deinit();
-        try sec.emitU32(4); // 4 exports
-
-        try sec.emitString("newFlags");
-        try sec.emit(0x00); // func export
-        try sec.emitU32(0); // func index 0
-
-        try sec.emitString("getFlag");
-        try sec.emit(0x00);
-        try sec.emitU32(1);
-
-        try sec.emitString("setFlag");
-        try sec.emit(0x00);
-        try sec.emitU32(2);
-
-        try sec.emitString("arrayLen");
-        try sec.emit(0x00);
-        try sec.emitU32(3);
-
-        try e.emit(SEC_EXPORT);
-        try e.emitU32(@intCast(sec.result().len));
-        try e.emitSlice(sec.result());
+        const f = try std.fs.cwd().createFile(output_path, .{});
+        defer f.close();
+        try f.writeAll(wasm);
     }
 
-    // === Code Section ===
-    {
-        var sec = Emitter.init(allocator);
-        defer sec.deinit();
-        try sec.emitU32(4); // 4 function bodies
+    var msg_buf: [128]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "Built {s}: {d} bytes\n", .{ output_name, wasm.len }) catch "built\n";
+    _ = std.posix.write(2, msg) catch {};
 
-        // func 0: newFlags(size: i32) -> ref $flags_array
-        // Body: (array.new_default $flags_array (local.get 0))
-        {
-            var body = Emitter.init(allocator);
-            defer body.deinit();
-            try body.emitU32(0); // 0 locals
-            try body.emit(OP_LOCAL_GET);
-            try body.emitU32(0); // param 0 (size)
-            try body.emit(GC_PREFIX);
-            try body.emit(ARRAY_NEW_DEFAULT);
-            try body.emitU32(0); // type index 0
-            try body.emit(OP_END);
-
-            try sec.emitU32(@intCast(body.result().len));
-            try sec.emitSlice(body.result());
-        }
-
-        // func 1: getFlag(arr: ref, idx: i32) -> i32
-        // Body: (array.get $flags_array (local.get 0) (local.get 1))
-        // THIS IS WHAT V8 TURBOFAN INLINES
-        {
-            var body = Emitter.init(allocator);
-            defer body.deinit();
-            try body.emitU32(0); // 0 locals
-            try body.emit(OP_LOCAL_GET);
-            try body.emitU32(0); // param 0 (arr)
-            try body.emit(OP_LOCAL_GET);
-            try body.emitU32(1); // param 1 (idx)
-            try body.emit(GC_PREFIX);
-            try body.emit(ARRAY_GET);
-            try body.emitU32(0); // type index 0
-            try body.emit(OP_END);
-
-            try sec.emitU32(@intCast(body.result().len));
-            try sec.emitSlice(body.result());
-        }
-
-        // func 2: setFlag(arr: ref, idx: i32, val: i32)
-        // Body: (array.set $flags_array (local.get 0) (local.get 1) (local.get 2))
-        {
-            var body = Emitter.init(allocator);
-            defer body.deinit();
-            try body.emitU32(0); // 0 locals
-            try body.emit(OP_LOCAL_GET);
-            try body.emitU32(0);
-            try body.emit(OP_LOCAL_GET);
-            try body.emitU32(1);
-            try body.emit(OP_LOCAL_GET);
-            try body.emitU32(2);
-            try body.emit(GC_PREFIX);
-            try body.emit(ARRAY_SET);
-            try body.emitU32(0);
-            try body.emit(OP_END);
-
-            try sec.emitU32(@intCast(body.result().len));
-            try sec.emitSlice(body.result());
-        }
-
-        // func 3: arrayLen(arr: ref) -> i32
-        // Body: (array.len (local.get 0))
-        {
-            var body = Emitter.init(allocator);
-            defer body.deinit();
-            try body.emitU32(0); // 0 locals
-            try body.emit(OP_LOCAL_GET);
-            try body.emitU32(0);
-            try body.emit(GC_PREFIX);
-            try body.emit(ARRAY_LEN);
-            try body.emit(OP_END);
-
-            try sec.emitU32(@intCast(body.result().len));
-            try sec.emitSlice(body.result());
-        }
-
-        try e.emit(SEC_CODE);
-        try e.emitU32(@intCast(sec.result().len));
-        try e.emitSlice(sec.result());
-    }
-
-    return try allocator.dupe(u8, e.result());
+    return wasm;
 }
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const alloc = gpa.allocator();
 
-    const wasm = try buildTypeFlagsModule(allocator);
-    defer allocator.free(wasm);
+    const args = try std.process.argsAlloc(alloc);
+    defer std.process.argsFree(alloc, args);
 
-    // Write to file
-    const file = try std.fs.cwd().createFile("src/tsc-recipe/type_flags_gc.wasm", .{});
-    defer file.close();
-    try file.writeAll(wasm);
+    const target = if (args.len > 1) args[1] else "all";
 
-    _ = std.posix.write(2, "WasmGC module built\n") catch {};
-    var size_buf: [64]u8 = undefined;
-    const msg = std.fmt.bufPrint(&size_buf, "Size: {d} bytes\n", .{wasm.len}) catch "?\n";
-    _ = std.posix.write(2, msg) catch {};
+    if (std.mem.eql(u8, target, "type_flags") or std.mem.eql(u8, target, "all")) {
+        const wasm = try buildTypeFlagsModule(alloc);
+        defer alloc.free(wasm);
+    }
+
+    if (std.mem.eql(u8, target, "soa") or std.mem.eql(u8, target, "all")) {
+        const wasm = try buildSoaModule(alloc);
+        defer alloc.free(wasm);
+    }
 }
