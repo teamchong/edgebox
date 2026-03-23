@@ -61,10 +61,29 @@ fn handleClient(fd: std.posix.fd_t) void {
     };
     defer alloc.free(result);
 
-    // Send results back (raw bytes)
+    // Replace literal \n with actual newlines before sending
+    var fixed = alloc.alloc(u8, result.len) catch {
+        _ = std.posix.write(fd, result) catch {};
+        return;
+    };
+    defer alloc.free(fixed);
+    var fi: usize = 0;
+    var ri: usize = 0;
+    while (ri < result.len) {
+        if (ri + 1 < result.len and result[ri] == '\\' and result[ri + 1] == 'n') {
+            fixed[fi] = '\n';
+            fi += 1;
+            ri += 2;
+        } else {
+            fixed[fi] = result[ri];
+            fi += 1;
+            ri += 1;
+        }
+    }
+
     var written: usize = 0;
-    while (written < result.len) {
-        const w = std.posix.write(fd, result[written..]) catch break;
+    while (written < fi) {
+        const w = std.posix.write(fd, fixed[written..fi]) catch break;
         if (w == 0) break;
         written += w;
     }

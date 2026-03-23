@@ -276,6 +276,7 @@ export fn edgebox_dispatch_work(cwd_ptr: [*]const u8, cwd_len: c_int, worker_cou
     for (0..n) |i| {
         work_slots[i].cwd = cwd;
         work_slots[i].worker_count = n;
+        if (work_slots[i].result) |old| alloc.free(@constCast(old));
         work_slots[i].result = null;
         work_slots[i].done.store(false, .release);
         work_slots[i].ready.store(true, .release);
@@ -316,19 +317,51 @@ export fn edgebox_wait_for_work(worker_id: c_int, out_len: *c_int) ?[*]const u8 
     return null;
 }
 
-/// Worker calls this: submit results to shared buffer.
+/// Worker calls this: APPEND results to shared buffer (can be called multiple times).
 export fn edgebox_submit_result(worker_id: c_int, data_ptr: [*]const u8, data_len: c_int) void {
-    if (worker_id < 0 or worker_id >= MAX_WORKERS or data_len < 0) return;
+    if (worker_id < 0 or worker_id >= MAX_WORKERS or data_len <= 0) return;
     const wid: usize = @intCast(worker_id);
-    if (data_len > 0) {
-        const copy = alloc.alloc(u8, @intCast(data_len)) catch return;
-        @memcpy(copy, data_ptr[0..@intCast(data_len)]);
+    const new_data = data_ptr[0..@intCast(data_len)];
+
+    if (work_slots[wid].result) |existing| {
+        // Append to existing
+        const combined = alloc.alloc(u8, existing.len + new_data.len) catch return;
+        @memcpy(combined[0..existing.len], existing);
+        @memcpy(combined[existing.len..], new_data);
+        alloc.free(@constCast(existing));
+        work_slots[wid].result = combined;
+    } else {
+        const copy = alloc.alloc(u8, new_data.len) catch return;
+        @memcpy(copy, new_data);
         work_slots[wid].result = copy;
     }
-    work_slots[wid].done.store(true, .release);
+}
+
+/// Worker calls this when done — signals main to collect.
+export fn edgebox_worker_done(worker_id: c_int) void {
+    if (worker_id < 0 or worker_id >= MAX_WORKERS) return;
+    work_slots[@intCast(worker_id)].done.store(true, .release);
     work_mutex.lock();
     work_cond.broadcast();
     work_mutex.unlock();
+}
+
+/// Check if worker is done
+export fn edgebox_is_worker_done(worker_id: c_int) c_int {
+    if (worker_id < 0 or worker_id >= MAX_WORKERS) return 1;
+    return if (work_slots[@intCast(worker_id)].done.load(.acquire)) 1 else 0;
+}
+
+/// Read submitted result for a worker (called by v8_pool collect)
+export fn edgebox_get_result(worker_id: c_int, out_len: *c_int) ?[*]const u8 {
+    if (worker_id < 0 or worker_id >= MAX_WORKERS) { out_len.* = 0; return null; }
+    const wid: usize = @intCast(worker_id);
+    if (work_slots[wid].result) |data| {
+        out_len.* = @intCast(data.len);
+        return data.ptr;
+    }
+    out_len.* = 0;
+    return null;
 }
 
 /// Main calls this: blocks until all workers done, returns merged results.

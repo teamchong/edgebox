@@ -24,6 +24,7 @@ extern fn edgebox_v8_free(?[*]const u8) void;
 extern fn edgebox_v8_create_snapshot([*]const u8, c_int, [*]const u8, c_int) c_int;
 extern fn edgebox_v8_create_isolate_from_snapshot() ?*anyopaque;
 extern fn edgebox_set_daemon_mode(c_int) void;
+extern fn edgebox_get_result(c_int, *c_int) ?[*]const u8;
 
 // IO functions from edgebox_workerd_io.zig (shared across all workers)
 extern fn edgebox_read_file([*]const u8, c_int, *c_int) ?[*]const u8;
@@ -135,28 +136,30 @@ pub fn dispatch(cwd: []const u8) void {
 /// Collect results from all workers. Blocks until all done.
 /// Returns merged, deduped diagnostics.
 pub fn collect() ![]const u8 {
-    // Wait for all workers
-    work_mutex.lock();
+    // Wait for all workers to call __edgebox_worker_done
+    // (done flags are in work_slots from edgebox_workerd_io.zig)
+    extern fn edgebox_is_worker_done(c_int) c_int;
     while (true) {
         var all_done = true;
         for (0..pool_size) |i| {
-            if (!workers[i].result_ready.load(.acquire)) {
+            if (edgebox_is_worker_done(@intCast(i)) == 0) {
                 all_done = false;
                 break;
             }
         }
         if (all_done) break;
-        work_cond.timedWait(&work_mutex, 100 * std.time.ns_per_ms) catch {};
+        std.Thread.sleep(10 * std.time.ns_per_ms);
     }
-    work_mutex.unlock();
 
-    // Merge results from all workers (sharded check)
+    // Read results from shared buffer (written by __edgebox_submit_result via C ABI)
     var merged: std.ArrayListUnmanaged(u8) = .{};
     for (0..pool_size) |i| {
-        if (workers[i].result) |data| {
-            try merged.appendSlice(alloc, data);
-            if (data.len > 0 and data[data.len - 1] != '\n') {
-                try merged.append(alloc, '\n');
+        var result_len: c_int = 0;
+        const result_ptr = edgebox_get_result(@intCast(i), &result_len);
+        if (result_ptr) |ptr| {
+            if (result_len > 0) {
+                try merged.appendSlice(alloc, ptr[0..@intCast(result_len)]);
+                if (ptr[@intCast(result_len - 1)] != '\n') try merged.append(alloc, '\n');
             }
         }
     }
@@ -335,16 +338,12 @@ fn workerLoop(worker_id: u32) void {
                 \\  var parsed = ts.parseJsonConfigFileContent(cf.config, ts.sys, cwd);
                 \\  var program = ts.createProgram(parsed.fileNames, parsed.options);
                 \\  var files = program.getSourceFiles();
-                \\  var count = 0;
-                \\  // Worker 0: global diagnostics
+                \\  var output = [];
                 \\  if (wid === 0) {{
                 \\    var gd = ts.getPreEmitDiagnostics(program).filter(function(d) {{ return !d.file; }});
-                \\    for (var g = 0; g < gd.length; g++) {{
-                \\      __edgebox_write_stdout('error TS' + gd[g].code + ': ' + ts.flattenDiagnosticMessageText(gd[g].messageText, ' ') + NL);
-                \\      count++;
-                \\    }}
+                \\    for (var g = 0; g < gd.length; g++)
+                \\      output.push('error TS' + gd[g].code + ': ' + ts.flattenDiagnosticMessageText(gd[g].messageText, ' '));
                 \\  }}
-                \\  // Check only this worker's shard
                 \\  for (var i = 0; i < files.length; i++) {{
                 \\    if (i % wcount !== wid) continue;
                 \\    var diags = program.getSemanticDiagnostics(files[i]);
@@ -352,12 +351,13 @@ fn workerLoop(worker_id: u32) void {
                 \\      var d = diags[k];
                 \\      if (d.file) {{
                 \\        var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
-                \\        __edgebox_write_stdout(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' ') + NL);
-                \\        count++;
+                \\        output.push(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' '));
                 \\      }}
                 \\    }}
                 \\  }}
-                \\  return String(count);
+                \\  for (var oi = 0; oi < output.length; oi++) __edgebox_submit_result(wid, output[oi] + NL);
+                \\  __edgebox_worker_done(wid);
+                \\  return String(output.length);
                 \\}})()
             , .{ cwd, wid, workers[wid].worker_count }) catch {
                 workers[wid].result = null;

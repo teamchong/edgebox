@@ -259,8 +259,23 @@ static void HashCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
 }
 
 static void ExitCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  // Don't actually exit in pool mode — just return
   (void)args;
+}
+
+extern void edgebox_submit_result(int worker_id, const char* data, int data_len);
+extern void edgebox_worker_done(int worker_id);
+
+static void SubmitResultCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 2) return;
+  int wid = args[0]->Int32Value(args.GetIsolate()->GetCurrentContext()).FromMaybe(0);
+  auto str = GetStringArg(args, 1);
+  edgebox_submit_result(wid, str.c_str(), str.size());
+}
+
+static void WorkerDoneCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 1) return;
+  int wid = args[0]->Int32Value(args.GetIsolate()->GetCurrentContext()).FromMaybe(0);
+  edgebox_worker_done(wid);
 }
 
 // Setup context with IO globals. If snapshot exists, uses snapshot context.
@@ -313,6 +328,8 @@ void* edgebox_v8_setup_context(void* iso_ptr) {
   set("__edgebox_write_stderr", WriteStderrCallback);
   set("__edgebox_hash", HashCallback);
   set("__edgebox_exit", ExitCallback);
+  set("__edgebox_submit_result", SubmitResultCallback);
+  set("__edgebox_worker_done", WorkerDoneCallback);
 
   auto* persistent = new v8::Persistent<v8::Context>(isolate, context);
   return persistent;
