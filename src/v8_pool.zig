@@ -260,12 +260,54 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
 
     // Inject WASM fast path at the START of isSimpleTypeRelatedTo
     const simple_body_start = simple_start + simple_marker.len;
-    const wasm_fast_path =
-        "\n    /* edgebox: WASM kernel for flag-based type relation */\n" ++
-        "    var __rel = relation === assignableRelation ? 0 : relation === comparableRelation ? 1 : relation === strictSubtypeRelation ? 2 : 3;\n" ++
-        "    var __r = __edgebox_is_simple_type_related(source.flags, target.flags, __rel, strictNullChecks ? 1 : 0);\n" ++
-        "    if (__r === 1) return true;\n" ++
-        "    /* __r === 0: not determined by flags — fall through to JS for value/symbol checks */\n";
+    // Load WASM kernel bytes and build the injection code.
+    // The WASM is loaded once at snapshot time, instantiated, and the function cached.
+    const wasm_path = std.fmt.allocPrint(alloc, "{s}/src/tsc-recipe/type_kernel.wasm", .{eb_root}) catch null;
+    var wasm_len: c_int = 0;
+    var wasm_bytes: ?[*]const u8 = null;
+    if (wasm_path) |wp| {
+        defer alloc.free(wp);
+        wasm_bytes = edgebox_read_file(wp.ptr, @intCast(wp.len), &wasm_len);
+    }
+
+    var wasm_fast_path: []const u8 = undefined;
+    if (wasm_bytes != null and wasm_len > 0) {
+        // Encode WASM bytes as comma-separated integers for JS
+        const wb = wasm_bytes.?[0..@intCast(wasm_len)];
+        var byte_str: std.ArrayListUnmanaged(u8) = .{};
+        for (wb, 0..) |b, idx| {
+            if (idx > 0) byte_str.append(alloc, ',') catch {};
+            var num_buf: [4]u8 = undefined;
+            const num = std.fmt.bufPrint(&num_buf, "{d}", .{b}) catch "0";
+            byte_str.appendSlice(alloc, num) catch {};
+        }
+        const bytes_js = byte_str.toOwnedSlice(alloc) catch "";
+
+        wasm_fast_path = std.fmt.allocPrint(alloc,
+            "\n    /* edgebox: WASM kernel — TurboFan inlines this */\n" ++
+            "    if (!globalThis.__ebWasmTypeKernel) {{\n" ++
+            "      var __wb = new Uint8Array([{s}]);\n" ++
+            "      var __wm = new WebAssembly.Module(__wb);\n" ++
+            "      var __wi = new WebAssembly.Instance(__wm);\n" ++
+            "      globalThis.__ebWasmTypeKernel = __wi.exports.isSimpleTypeRelated;\n" ++
+            "    }}\n" ++
+            "    var __rel = relation === assignableRelation ? 0 : relation === comparableRelation ? 1 : relation === strictSubtypeRelation ? 2 : 3;\n" ++
+            "    var __r = globalThis.__ebWasmTypeKernel(source.flags, target.flags, __rel, strictNullChecks ? 1 : 0);\n" ++
+            "    if (__r === 1) return true;\n"
+        , .{bytes_js}) catch "";
+        alloc.free(bytes_js);
+
+        var msg_buf: [64]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "[recipe] WASM kernel: {d} bytes\n", .{wasm_len}) catch "";
+        _ = std.posix.write(2, msg) catch {};
+    } else {
+        // Fallback to C ABI callback
+        wasm_fast_path =
+            "\n    /* edgebox: C ABI fallback (no WASM) */\n" ++
+            "    var __rel = relation === assignableRelation ? 0 : relation === comparableRelation ? 1 : relation === strictSubtypeRelation ? 2 : 3;\n" ++
+            "    var __r = __edgebox_is_simple_type_related(source.flags, target.flags, __rel, strictNullChecks ? 1 : 0);\n" ++
+            "    if (__r === 1) return true;\n";
+    }
 
     // isSimpleTypeRelatedTo (line ~69244) comes BEFORE inject_pos (line ~69304)
     // Order: src[0..simple_body_start] + wasm + src[simple_body_start..inject_pos] + zig_check + src[inject_pos..]
