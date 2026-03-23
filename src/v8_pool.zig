@@ -138,7 +138,28 @@ pub fn deinit() void {
 }
 
 /// Dispatch work to all workers. Workers wake from condvar.
+/// Pre-warm file cache by reading all .ts/.d.ts files in project
+fn prewarmDir(dir_path: []const u8) void {
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+    var it = dir.iterate();
+    while (it.next() catch null) |entry| {
+        if (entry.kind == .file and (std.mem.endsWith(u8, entry.name, ".ts") or std.mem.endsWith(u8, entry.name, ".json"))) {
+            const full = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+            defer alloc.free(full);
+            var fl: c_int = 0;
+            _ = edgebox_read_file(full.ptr, @intCast(full.len), &fl);
+        } else if (entry.kind == .directory and !std.mem.eql(u8, entry.name, "node_modules") and !std.mem.eql(u8, entry.name, ".git") and entry.name[0] != '.') {
+            const sub = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+            defer alloc.free(sub);
+            prewarmDir(sub);
+        }
+    }
+}
+
 pub fn dispatch(cwd: []const u8) void {
+    // Pre-warm file cache (Zig reads all files into mmap before V8 touches them)
+    prewarmDir(cwd);
     for (0..pool_size) |i| {
         workers[i].cwd = cwd;
         workers[i].worker_count = pool_size;

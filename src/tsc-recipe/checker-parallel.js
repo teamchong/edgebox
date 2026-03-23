@@ -121,6 +121,24 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       output.push('error TS' + gd[g].code + ': ' + ts.flattenDiagnosticMessageText(gd[g].messageText, ' '));
   }
 
+  // Wire Zig SIMD structural check into TSC's type checker
+  if (typeof __edgebox_check_structural === 'function' && !globalThis.__zigCheckPatched) {
+    // Patch checker's isTypeRelatedTo to try Zig first
+    var _checker = program.getDiagnosticsProducingTypeChecker ? program.getDiagnosticsProducingTypeChecker() : null;
+    if (_checker && _checker.isTypeRelatedTo) {
+      var _origCheck = _checker.isTypeRelatedTo.bind(_checker);
+      _checker.isTypeRelatedTo = function(source, target, relation) {
+        if (source && target && source.id && target.id) {
+          var r = __edgebox_check_structural(source.id, target.id);
+          if (r === 1) return true;
+          if (r === 0) return false;
+        }
+        return _origCheck(source, target, relation);
+      };
+    }
+    globalThis.__zigCheckPatched = true;
+  }
+
   for (var i = 0; i < files.length; i++) {
     if (i % workerCount !== workerId) continue;
     var diags = program.getSemanticDiagnostics(files[i]);
