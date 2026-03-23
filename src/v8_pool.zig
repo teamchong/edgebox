@@ -28,6 +28,7 @@ extern fn edgebox_get_result(c_int, *c_int) ?[*]const u8;
 
 // IO functions from edgebox_io.zig (shared across all workers)
 extern fn edgebox_read_file([*]const u8, c_int, *c_int) ?[*]const u8;
+extern fn edgebox_clear_file_cache() void;
 extern fn edgebox_reset_work() void;
 extern fn edgebox_set_root([*]const u8, c_int) void;
 
@@ -268,6 +269,8 @@ fn prewarmDir(dir_path: []const u8) void {
 pub fn dispatch(cwd: []const u8) void {
     // Reset work counter for work-stealing
     edgebox_reset_work();
+    // Clear stale file cache — ensures fresh content on each request (game-style frame reset)
+    edgebox_clear_file_cache();
     // Pre-warm file cache (18ms — reads project files into Zig mmap cache)
     prewarmDir(cwd);
     for (0..pool_size) |i| {

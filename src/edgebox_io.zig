@@ -12,7 +12,9 @@ const alloc = std.heap.page_allocator;
 var file_cache: std.StringHashMapUnmanaged([]const u8) = .{};
 var cache_mutex: std.Thread.Mutex = .{};
 
-/// Clear file cache between requests — ensures fresh content on each type check.
+/// Clear file content cache between requests — ensures fresh content on each type check.
+/// Existence caches are kept (file/dir existence rarely changes within a daemon session).
+/// Game-style frame reset: discard mutable state, keep structural state.
 export fn edgebox_clear_file_cache() void {
     cache_mutex.lock();
     defer cache_mutex.unlock();

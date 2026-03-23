@@ -197,9 +197,16 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   };
 
   var oldProgram = globalThis.__pc[ck] || undefined;
+  var isWarm = !!oldProgram;
+  // Adaptive worker strategy (game-engine pattern):
+  // Cold: all workers run in parallel (level loading — maximize throughput)
+  // Warm: worker 0 only (game loop — maximize cache reuse, 875ms vs 962ms with 3)
+  if (isWarm && workerId > 0) {
+    __edgebox_write_stderr('[recipe] w' + workerId + ' warm skip (single-worker mode)' + String.fromCharCode(10));
+    return '';
+  }
   var program = ts.createProgram(parsed.fileNames, parsed.options, host, oldProgram);
   globalThis.__pc[ck] = program;
-  var isWarm = !!oldProgram;
   var t2 = Date.now();
   var files = program.getSourceFiles();
   var NL = String.fromCharCode(10);
@@ -207,9 +214,12 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   var filesChecked = 0;
 
   // Filter to project source files (skip .d.ts — skipLibCheck makes them instant)
+  // Sort by size descending — game-engine priority scheduling: expensive files first
+  // so work-stealing distributes them across workers instead of one worker getting stuck.
   var checkFiles = [];
   for (var fi = 0; fi < files.length; fi++)
     if (!files[fi].isDeclarationFile) checkFiles.push(files[fi]);
+  checkFiles.sort(function(a, b) { return b.text.length - a.text.length; });
 
   // Hash each file — check if diagnostics are cached from previous run
   var dc = globalThis.__ebDiagCache;
@@ -253,7 +263,9 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   }
 
   if (isWarm) {
-    for (var i = workerId; i < checkFiles.length; i += workerCount) checkFile(checkFiles[i]);
+    // Warm: single-worker mode — worker 0 checks ALL files with full cache reuse.
+    // Workers 1-N already returned empty results above.
+    for (var i = 0; i < checkFiles.length; i++) checkFile(checkFiles[i]);
   } else {
     while (true) {
       var idx = __edgebox_claim_file();

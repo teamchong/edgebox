@@ -561,33 +561,9 @@ pub fn doParse(src_ptr: [*]const u8, src_len: u32) u32 {
                 }
                 if (peek() == .close_brace) advance();
             },
-            .identifier => {
-                // Single-param arrow anywhere: ident => ...
-                if (peekAt(1) == .arrow) {
-                    const pstart = tokenStart();
-                    const plen = tokenLen();
-                    advance(); advance(); // name =>
-                    const fidx = addNode(.func_decl, pstart, plen, NO_TYPE, NO_TYPE, 0, 0);
-                    _ = addNode(.param_decl, pstart, plen, NO_TYPE, NO_TYPE, @intCast(fidx), 0);
-                }
-                // Check if next tokens form a param list: ident ( → parse as method call
-                // Don't parse — just advance
-                else advance();
-            },
-            // Don't skip ( ) — continue scanning inside for arrow/function patterns
-            .open_paren, .close_paren, .open_bracket, .close_bracket,
-            .open_brace, .close_brace, .comma, .semicolon,
-            .dot, .colon, .question, .exclamation,
-            .equals, .arrow, .pipe, .ampersand,
-            .less_than, .greater_than, .plus, .minus, .star, .slash,
-            .number_literal, .string_literal,
-            .kw_true, .kw_false, .kw_null, .kw_undefined,
-            .kw_new, .kw_this, .kw_typeof, .kw_void,
-            .kw_return, .kw_if, .kw_else, .kw_for, .kw_while,
-            .kw_as, .kw_readonly, .kw_await,
-            .kw_number, .kw_string, .kw_boolean, .kw_any,
-            .kw_unknown, .kw_never, .kw_object,
-            .unknown => advance(),
+            // Skip everything else — only parse declarations, not expressions.
+            // Callback params (arr.map(x => ...)) need contextual typing to check
+            // correctly. Without it, we'd have 884 false positives.
             else => advance(),
         }
         if (tpos == prev) advance(); // safety guard
@@ -598,42 +574,7 @@ pub fn doParse(src_ptr: [*]const u8, src_len: u32) u32 {
 // ── WASM Exports ──
 
 export fn parse(src_ptr: [*]const u8, src_len: u32) u32 {
-    // Tokenize first
-    _ = tokenizer.doTokenize(src_ptr, src_len);
-    tc = tokenizer.getWasmTokenCount();
-    tpos = 0;
-    node_count = 0;
-
-    while (tpos < tc and peek() != .eof) {
-        const prev_pos = tpos; // guard: must advance
-        var flags: u8 = 0;
-        if (peek() == .kw_export) {
-            flags |= 4;
-            advance();
-            if (peek() == .kw_function or peek() == .kw_interface or peek() == .kw_type or
-                peek() == .kw_const or peek() == .kw_let or peek() == .kw_var) {
-                // continue to parse the declaration
-            } else {
-                advance();
-                continue;
-            }
-        }
-
-        switch (peek()) {
-            .kw_const, .kw_let, .kw_var => parseVarDecl(flags),
-            .kw_function, .kw_async => {
-                if (peek() == .kw_async) advance();
-                if (peek() == .kw_function) parseFuncDecl(flags) else advance();
-            },
-            .kw_interface => parseInterfaceDecl(flags),
-            .kw_type => parseTypeAlias(flags),
-            .kw_import => parseImportDecl(),
-            else => advance(),
-        }
-        // Safety: if no progress, force advance to prevent infinite loop
-        if (tpos == prev_pos) advance();
-    }
-    return node_count;
+    return doParse(src_ptr, src_len);
 }
 
 export fn getNodeCount() u32 {

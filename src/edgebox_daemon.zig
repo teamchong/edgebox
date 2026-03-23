@@ -20,8 +20,12 @@ fn log(msg: []const u8) void {
 
 pub fn start() !void {
     const cpu_count = std.Thread.getCpuCount() catch 4;
-    // Benchmarked: 3 workers (2.48s) < 2 (2.57s) < 4 (2.63s) < 8 (3.5s)
-    const worker_count: u32 = @intCast(@min(8, @max(2, (cpu_count + 3) / 6)));
+    // Formula-based: cpu_count / 6, override with EDGEBOX_WORKERS env var.
+    const env_workers = std.posix.getenv("EDGEBOX_WORKERS");
+    const worker_count: u32 = if (env_workers) |ew|
+        std.fmt.parseInt(u32, ew, 10) catch @intCast(@min(8, @max(2, (cpu_count + 3) / 6)))
+    else
+        @intCast(@min(8, @max(2, (cpu_count + 3) / 6)));
 
     log("[daemon] starting V8 pool\n");
     v8_pool.init(worker_count) catch fatal("v8_pool.init failed");
