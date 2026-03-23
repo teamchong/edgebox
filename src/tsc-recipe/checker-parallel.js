@@ -37,6 +37,38 @@ var ts = globalThis.ts || globalThis.module.exports;
   } catch(e) {}
 })();
 
+// 3. JIT warmup — run a small type check during snapshot creation.
+// This triggers V8's TurboFan to compile TSC's hot functions (isTypeRelatedTo,
+// checkTypeRelatedTo, getFlowTypeOfReference, etc.) BEFORE the snapshot.
+// Workers restore with pre-optimized code — no JIT warmup on cold start.
+(function() {
+  if (!ts || !ts.createProgram || !ts.createSourceFile) return;
+  try {
+    var warmupSrc = 'var x: number = 1; var y: string = "a"; interface A { a: number; b: string; } interface B extends A { c: boolean; } var z: A = {} as B; type U = string | number | boolean; var u: U = 1; function f<T>(x: T): T { return x; } f(1); f("a");';
+    var sf = ts.createSourceFile('__warmup.ts', warmupSrc, ts.ScriptTarget.Latest, true);
+    var p = ts.createProgram({
+      rootNames: ['__warmup.ts'],
+      options: { strict: true, noEmit: true },
+      host: {
+        getSourceFile: function(name) { return name === '__warmup.ts' ? sf : undefined; },
+        getDefaultLibFileName: function() { return 'lib.d.ts'; },
+        writeFile: function() {},
+        getCurrentDirectory: function() { return '/'; },
+        getCanonicalFileName: function(f) { return f; },
+        useCaseSensitiveFileNames: function() { return true; },
+        getNewLine: function() { return '\n'; },
+        fileExists: function(f) { return f === '__warmup.ts'; },
+        readFile: function() { return ''; },
+      }
+    });
+    // Run type checker MULTIPLE TIMES — triggers V8 TurboFan optimization.
+    // V8 needs ~3-5 iterations to promote functions from Sparkplug to TurboFan.
+    for (var warmI = 0; warmI < 5; warmI++) {
+      ts.getPreEmitDiagnostics(p);
+    }
+  } catch(e) {}
+})();
+
 globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   try {
   if (!ts || !ts.createProgram) return 'no tsc: ' + typeof ts;
