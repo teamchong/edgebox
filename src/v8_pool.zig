@@ -64,35 +64,6 @@ pub fn init(worker_count: u32) !void {
     // Initialize V8 platform (once, before any isolate creation)
     edgebox_v8_init();
 
-    // Shim: module, process, require, Buffer, setTimeout for TypeScript loading
-    _ = @as([]const u8,
-        "globalThis.module = { exports: {} };" ++
-        "globalThis.__filename = '/edgebox/worker.js';" ++
-        "globalThis.__dirname = '/edgebox';" ++
-        "globalThis.process = { argv:['edgebox'], env:{}, platform:'linux', " ++
-        "cwd:function(){return '/';}, exit:function(){}, " ++
-        "stdout:{write:function(){return true;},isTTY:false,columns:80}, " ++
-        "stderr:{write:function(){return true;},isTTY:false}, " ++
-        "versions:{node:'20.0.0'}, nextTick:function(cb){Promise.resolve().then(cb);}, " ++
-        "on:function(){return process;}, once:function(){return process;}, " ++
-        "removeListener:function(){return process;}, emit:function(){return false;}, " ++
-        "binding:function(){return{};} };" ++
-        "globalThis.setTimeout=function(f){f();return 0;};" ++
-        "globalThis.clearTimeout=function(){};" ++
-        "globalThis.setInterval=function(){return 0;};" ++
-        "globalThis.clearInterval=function(){};" ++
-        "globalThis.queueMicrotask=function(f){Promise.resolve().then(f);};" ++
-        "globalThis.console={log:function(){},warn:function(){},error:function(){},info:function(){},debug:function(){}};" ++
-        "globalThis.Buffer={from:function(s){return s;},isBuffer:function(){return false;},alloc:function(n){return new Uint8Array(n);},byteLength:function(s){return typeof s==='string'?s.length:0;},isEncoding:function(){return true;}};" ++
-        "globalThis.require=function(n){n=String(n).replace(/^node:/,'');" ++
-        "if(n==='fs')return{readFileSync:function(){return null;},writeFileSync:function(){},existsSync:function(){return false;},statSync:function(){throw new Error('ENOENT');},lstatSync:function(){throw new Error('ENOENT');},readdirSync:function(){return[];},realpathSync:Object.assign(function(p){return p;},{native:function(p){return p;}}),openSync:function(){return-1;},closeSync:function(){},watchFile:function(){},unwatchFile:function(){},watch:function(){return{close:function(){}};}};" ++
-        "if(n==='path')return{join:function(){return Array.prototype.slice.call(arguments).join('/').replace(/\\/+/g,'/');},dirname:function(p){var i=String(p).lastIndexOf('/');return i>=0?String(p).slice(0,i):'.';},basename:function(p,e){p=String(p);var b=p.slice(p.lastIndexOf('/')+1);if(e&&b.endsWith(e))b=b.slice(0,-e.length);return b;},resolve:function(){var a=Array.prototype.slice.call(arguments),r='';for(var i=a.length-1;i>=0;i--){r=String(a[i])+(r?'/'+r:'');if(String(a[i]).charAt(0)==='/')break;}if(r.charAt(0)!=='/'){r='/'+r;}return r.replace(/\\/+/g,'/');},normalize:function(p){return String(p).replace(/\\/+/g,'/');},isAbsolute:function(p){return String(p).charAt(0)==='/';},extname:function(p){p=String(p);var i=p.lastIndexOf('.');return i>=0?p.slice(i):'';},sep:'/',delimiter:':'};" ++
-        "if(n==='os')return{EOL:'\\n',platform:function(){return'linux';},tmpdir:function(){return'/tmp';},homedir:function(){return'/tmp';},cpus:function(){return[{model:'edgebox'}];},arch:function(){return'x64';}};" ++
-        "if(n==='crypto')return{};" ++
-        "if(n==='perf_hooks')return{performance:{now:function(){return Date.now();}}};" ++
-        "if(n==='buffer')return{Buffer:Buffer};" ++
-        "return{};};"
-    ;
     // Spawn worker threads (each loads TypeScript independently)
     for (0..n) |i| {
         workers[i].worker_id = @intCast(i);
