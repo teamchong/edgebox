@@ -1684,6 +1684,24 @@ pub fn build(b: *std.Build) void {
     }
 
     // ===================
+    // Recipe WASM kernels — Zig → WASM for V8 TurboFan inlining
+    // ===================
+    {
+        const type_kernel = b.addExecutable(.{
+            .name = "type_kernel",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/tsc-recipe/type_kernel.zig"),
+                .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
+                .optimize = .ReleaseSmall,
+            }),
+        });
+        type_kernel.entry = .disabled;
+        type_kernel.root_module.export_symbol_names = &.{"isSimpleTypeRelated"};
+        const recipe_wasm_step = b.step("recipe-wasm", "Build recipe WASM kernels");
+        recipe_wasm_step.dependOn(&type_kernel.step);
+    }
+
+    // ===================
     // edgebox CLI — daemon-based runtime (V8 + Zig)
     // ===================
     {
