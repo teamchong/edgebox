@@ -171,7 +171,8 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
         if (typeof __edgebox_get_resolved_module === 'function') {
           var zigResolved = __edgebox_get_resolved_module(name, containingFile);
           if (zigResolved) {
-            var result = {resolvedFileName: zigResolved, isExternalLibraryImport: false};
+            var ext = zigResolved.endsWith('.tsx') ? '.tsx' : zigResolved.endsWith('.d.ts') ? '.d.ts' : '.ts';
+            var result = {resolvedFileName: zigResolved, extension: ext, isExternalLibraryImport: false};
             globalThis.__mrCache.set(key, result);
             return result;
           }
