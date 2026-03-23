@@ -213,6 +213,16 @@ fn workerLoop(worker_id: u32) void {
         if (r3) |rr| edgebox_v8_free(rr);
     }
 
+    // Load TSC recipe (sets up globalThis.__edgebox_check)
+    const recipe_path = "src/tsc-recipe/checker-parallel.js";
+    var recipe_len: c_int = 0;
+    const recipe_src = edgebox_read_file(recipe_path.ptr, @intCast(recipe_path.len), &recipe_len);
+    if (recipe_src != null and recipe_len > 0) {
+        var rel: c_int = 0;
+        const rr = edgebox_v8_eval_in_context(isolate, context, recipe_src.?, recipe_len, &rel);
+        if (rr) |r| edgebox_v8_free(r);
+    }
+
     _ = std.posix.write(2, "[v8pool] worker ready\n") catch {};
 
     while (!workers[wid].shutdown.load(.acquire)) {
@@ -229,91 +239,9 @@ fn workerLoop(worker_id: u32) void {
         workers[wid].work_ready.store(false, .release);
 
         if (workers[wid].cwd) |cwd| {
-            // Run TSC via executeCommandLine — identical to Node.js `npx tsc`
+            // Call recipe function: __edgebox_check(cwd, workerId, workerCount)
             const check_code = std.fmt.allocPrint(alloc,
-                \\(function() {{
-                \\  var ts = globalThis.ts || globalThis.module.exports;
-                \\  if (!ts || !ts.executeCommandLine) return 'no tsc';
-                \\  if (!ts.sys) return 'no sys';
-                \\  // Reset cached sys to force re-init with real IO
-                \\  ts.sys.useCaseSensitiveFileNames = true;
-                \\  // Fix: set __filename to typescript.js so isFileSystemCaseSensitive works
-                \\  globalThis.__filename = ebRoot + '/node_modules/typescript/lib/typescript.js';
-                \\  var cwd = '{s}';
-                \\  var ebRoot = __edgebox_cwd();
-                \\  function rp(p) {{ p = String(p); return p.charAt(0) === '/' ? p : cwd + '/' + p; }}
-                \\  ts.sys.readFile = function(p) {{
-                \\    var c = __edgebox_read_file(rp(p));
-                \\    if (!c) {{
-                \\      var base = p.split('/').pop();
-                \\      if (base && base.indexOf('lib.') === 0 && base.endsWith('.d.ts'))
-                \\        c = __edgebox_read_file(ebRoot + '/node_modules/typescript/lib/' + base);
-                \\    }}
-                \\    return c || undefined;
-                \\  }};
-                \\  ts.sys.fileExists = function(p) {{
-                \\    var resolved = rp(p);
-                \\    if (__edgebox_file_exists(resolved) === 1) return true;
-                \\    // Fallback: check EdgeBox root for lib.d.ts files
-                \\    var base = p.split('/').pop();
-                \\    if (base && base.indexOf('lib.') === 0 && base.endsWith('.d.ts'))
-                \\      return __edgebox_file_exists(ebRoot + '/node_modules/typescript/lib/' + base) === 1;
-                \\    return false;
-                \\  }};
-                \\  ts.sys.directoryExists = function(p) {{ return __edgebox_dir_exists(rp(p)) === 1 || (p.charAt(0)==='/'&&__edgebox_dir_exists(p)===1); }};
-                \\  ts.sys.getCurrentDirectory = function() {{ return cwd; }};
-                \\  ts.sys.realpath = function(p) {{ return __edgebox_realpath(rp(p)); }};
-                \\  ts.sys.getExecutingFilePath = function() {{ return ebRoot + '/node_modules/typescript/lib/typescript.js'; }};
-                \\  ts.sys.writeFile = function(p, data) {{ __edgebox_write_file(rp(p), data); }};
-                \\  ts.sys.writeOutputIsTTY = function() {{ return false; }};
-                \\  ts.sys.getDirectories = function(p) {{
-                \\    var rr = rp(p); var entries = JSON.parse(__edgebox_readdir(rr));
-                \\    return entries.filter(function(e) {{ return __edgebox_dir_exists(rr + '/' + e) === 1; }});
-                \\  }};
-                \\  ts.sys.readDirectory = function(rootDir, ext, exc, inc, depth) {{
-                \\    return ts.matchFiles(rootDir, ext, exc, inc, true, cwd, depth, function(p) {{
-                \\      var rr = p || '.'; var json = __edgebox_readdir(rr);
-                \\      if (!json || json === '[]') return {{ files: [], directories: [] }};
-                \\      var entries = JSON.parse(json); var files = [], dirs = [];
-                \\      for (var i = 0; i < entries.length; i++) {{
-                \\        if (entries[i] === '.' || entries[i] === '..') continue;
-                \\        if (__edgebox_dir_exists(rr + '/' + entries[i]) === 1) dirs.push(entries[i]); else files.push(entries[i]);
-                \\      }}
-                \\      return {{ files: files, directories: dirs }};
-                \\    }}, function(p) {{ return __edgebox_realpath(p); }});
-                \\  }};
-                \\  var wid = {d};
-                \\  var wcount = {d};
-                \\  var NL = String.fromCharCode(10);
-                \\  var cf = ts.readConfigFile(cwd + '/tsconfig.json', ts.sys.readFile);
-                \\  if (cf.error) return 'config error';
-                \\  var parsed = ts.parseJsonConfigFileContent(cf.config, ts.sys, cwd);
-                \\  // Cache program across requests
-                \\  if (!globalThis.__pc) globalThis.__pc = {{}};
-                \\  var ck = cwd + ':' + parsed.fileNames.length;
-                \\  var program = globalThis.__pc[ck] || (globalThis.__pc[ck] = ts.createProgram(parsed.fileNames, parsed.options));
-                \\  var files = program.getSourceFiles();
-                \\  var output = [];
-                \\  // Worker 0: global diagnostics
-                \\  if (wid === 0) {{
-                \\    var gd = ts.getPreEmitDiagnostics(program).filter(function(d) {{ return !d.file; }});
-                \\    for (var g = 0; g < gd.length; g++)
-                \\      output.push('error TS' + gd[g].code + ': ' + ts.flattenDiagnosticMessageText(gd[g].messageText, ' '));
-                \\  }}
-                \\  // Sharded check: each worker checks files[i % N]
-                \\  for (var i = 0; i < files.length; i++) {{
-                \\    if (i % wcount !== wid) continue;
-                \\    var diags = program.getSemanticDiagnostics(files[i]);
-                \\    for (var k = 0; k < diags.length; k++) {{
-                \\      var d = diags[k];
-                \\      if (d.file) {{
-                \\        var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
-                \\        output.push(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' '));
-                \\      }}
-                \\    }}
-                \\  }}
-                \\  return output.join(NL);
-                \\}})()
+                "__edgebox_check('{s}', {d}, {d})"
             , .{ cwd, wid, workers[wid].worker_count }) catch {
                 workers[wid].result = null;
                 continue;

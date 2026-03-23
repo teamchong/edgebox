@@ -1,86 +1,84 @@
-import './bootstrap.js';
-import './typescript.js';
+// TSC Recipe — loaded once by V8 pool, called per request via __edgebox_check
 var ts = globalThis.ts || globalThis.module.exports;
 
-var WORKER_ID = parseInt(globalThis.__EDGEBOX_WORKER_ID || '0', 10);
+globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
+  if (!ts || !ts.createProgram) return 'no tsc';
+  if (!ts.sys) return 'no sys';
 
-function patchSys(projectCwd) {
-  function resolvePath(p) { p = String(p); return p.charAt(0) !== '/' ? projectCwd + '/' + p : p; }
-  ts.sys.readFile = function(p) { var c = __edgebox_read_file(resolvePath(p)); return c || undefined; };
-  ts.sys.fileExists = function(p) { return __edgebox_file_exists(resolvePath(p)) === 1; };
-  ts.sys.directoryExists = function(p) { return __edgebox_dir_exists(resolvePath(p)) === 1; };
-  ts.sys.getDirectories = function(p) {
-    var rp = resolvePath(p); var entries = JSON.parse(__edgebox_readdir(rp));
-    return entries.filter(function(e) { return __edgebox_dir_exists(rp + '/' + e) === 1; });
+  var ebRoot = __edgebox_cwd();
+  function rp(p) { p = String(p); return p.charAt(0) === '/' ? p : cwd + '/' + p; }
+
+  ts.sys.readFile = function(p) {
+    var c = __edgebox_read_file(rp(p));
+    if (!c) {
+      var base = p.split('/').pop();
+      if (base && base.indexOf('lib.') === 0 && base.endsWith('.d.ts'))
+        c = __edgebox_read_file(ebRoot + '/node_modules/typescript/lib/' + base);
+    }
+    return c || undefined;
   };
-  ts.sys.readDirectory = function(rootDir, extensions, excludes, includes, depth) {
-    return ts.matchFiles(rootDir, extensions, excludes, includes, true, projectCwd, depth, function(p) {
-      var rp = p || '.'; var json = __edgebox_readdir(rp);
+  ts.sys.fileExists = function(p) {
+    if (__edgebox_file_exists(rp(p)) === 1) return true;
+    var base = p.split('/').pop();
+    if (base && base.indexOf('lib.') === 0 && base.endsWith('.d.ts'))
+      return __edgebox_file_exists(ebRoot + '/node_modules/typescript/lib/' + base) === 1;
+    return false;
+  };
+  ts.sys.directoryExists = function(p) {
+    return __edgebox_dir_exists(rp(p)) === 1 || (p.charAt(0) === '/' && __edgebox_dir_exists(p) === 1);
+  };
+  ts.sys.getCurrentDirectory = function() { return cwd; };
+  ts.sys.realpath = function(p) { return __edgebox_realpath(rp(p)); };
+  ts.sys.getExecutingFilePath = function() { return ebRoot + '/node_modules/typescript/lib/typescript.js'; };
+  ts.sys.writeFile = function(p, data) { __edgebox_write_file(rp(p), data); };
+  ts.sys.writeOutputIsTTY = function() { return false; };
+  ts.sys.exit = function() {};
+  ts.sys.useCaseSensitiveFileNames = true;
+  globalThis.__filename = ebRoot + '/node_modules/typescript/lib/typescript.js';
+  ts.sys.getDirectories = function(p) {
+    var rr = rp(p); var entries = JSON.parse(__edgebox_readdir(rr));
+    return entries.filter(function(e) { return __edgebox_dir_exists(rr + '/' + e) === 1; });
+  };
+  ts.sys.readDirectory = function(rootDir, ext, exc, inc, depth) {
+    return ts.matchFiles(rootDir, ext, exc, inc, true, cwd, depth, function(p) {
+      var rr = p || '.'; var json = __edgebox_readdir(rr);
       if (!json || json === '[]') return { files: [], directories: [] };
       var entries = JSON.parse(json); var files = [], dirs = [];
       for (var i = 0; i < entries.length; i++) {
         if (entries[i] === '.' || entries[i] === '..') continue;
-        if (__edgebox_dir_exists(rp + '/' + entries[i]) === 1) dirs.push(entries[i]); else files.push(entries[i]);
+        if (__edgebox_dir_exists(rr + '/' + entries[i]) === 1) dirs.push(entries[i]); else files.push(entries[i]);
       }
       return { files: files, directories: dirs };
     }, function(p) { return __edgebox_realpath(p); });
   };
-  ts.sys.realpath = function(p) { return __edgebox_realpath(resolvePath(p)); };
-  ts.sys.getCurrentDirectory = function() { return projectCwd; };
-  var tsLibDir = __edgebox_cwd() + '/node_modules/typescript/lib';
-  ts.sys.getExecutingFilePath = function() { return tsLibDir + '/typescript.js'; };
-  ts.sys.writeFile = function(p, data) { __edgebox_write_file(resolvePath(p), data); };
-  ts.sys.writeOutputIsTTY = function() { return false; };
-  ts.sys.exit = function() {};
-}
 
-export default {
-  fetch() {
-    // Block on Zig condvar — wakes when main dispatches work
-    // This is the zero-copy channel: Zig shared memory, no HTTP
-    var workInfo = __edgebox_wait_for_work(WORKER_ID);
-    if (!workInfo) return new Response('no work');
+  var cf = ts.readConfigFile(cwd + '/tsconfig.json', ts.sys.readFile);
+  if (cf.error) return 'config error';
+  var parsed = ts.parseJsonConfigFileContent(cf.config, ts.sys, cwd);
+  if (!globalThis.__pc) globalThis.__pc = {};
+  var ck = cwd + ':' + parsed.fileNames.length;
+  var program = globalThis.__pc[ck] || (globalThis.__pc[ck] = ts.createProgram(parsed.fileNames, parsed.options));
+  var files = program.getSourceFiles();
+  var NL = String.fromCharCode(10);
+  var output = [];
 
-    var parts = workInfo.split('|');
-    var projectCwd = parts[0];
-    var workerId = parseInt(parts[1], 10);
-    var workerCount = parseInt(parts[2], 10);
-
-    if (!ts || !ts.createProgram) {
-      __edgebox_submit_result(workerId, '');
-      return new Response('no tsc');
-    }
-
-    patchSys(projectCwd);
-
-    var configFile = ts.readConfigFile(projectCwd + '/tsconfig.json', ts.sys.readFile);
-    if (configFile.error) { __edgebox_submit_result(workerId, ''); return new Response('config error'); }
-    var parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, projectCwd);
-    var program = ts.createProgram(parsed.fileNames, parsed.options);
-
-    var files = program.getSourceFiles();
-    var output = [];
-
-    if (workerId === 0) {
-      var globalDiags = ts.getPreEmitDiagnostics(program).filter(function(d) { return !d.file; });
-      for (var g = 0; g < globalDiags.length; g++) {
-        output.push(ts.flattenDiagnosticMessageText(globalDiags[g].messageText, '\n'));
-      }
-    }
-
-    for (var i = 0; i < files.length; i++) {
-      if (i % workerCount !== workerId) continue;
-      var diags = program.getSemanticDiagnostics(files[i]);
-      for (var k = 0; k < diags.length; k++) {
-        var d = diags[k];
-        if (d.file) {
-          var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
-          output.push(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' '));
-        }
-      }
-    }
-
-    __edgebox_submit_result(workerId, output.join('\n'));
-    return new Response('done');
+  if (workerId === 0) {
+    var gd = ts.getPreEmitDiagnostics(program).filter(function(d) { return !d.file; });
+    for (var g = 0; g < gd.length; g++)
+      output.push('error TS' + gd[g].code + ': ' + ts.flattenDiagnosticMessageText(gd[g].messageText, ' '));
   }
+
+  for (var i = 0; i < files.length; i++) {
+    if (i % workerCount !== workerId) continue;
+    var diags = program.getSemanticDiagnostics(files[i]);
+    for (var k = 0; k < diags.length; k++) {
+      var d = diags[k];
+      if (d.file) {
+        var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
+        output.push(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' '));
+      }
+    }
+  }
+
+  return output.join(NL);
 };
