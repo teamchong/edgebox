@@ -76,11 +76,40 @@ globalThis.__zigRegistryDone = false;
   }
   MonoType.prototype = Object.create(origProto);
   MonoType.prototype.constructor = MonoType;
+
+  // Monomorphic Node — same approach for AST nodes. Reduces hidden class
+  // transitions during parsing (millions of nodes). Pre-init common properties.
+  var origNodeProto = ts.objectAllocator.getNodeConstructor().prototype;
+  function MonoNode(kind, pos, end) {
+    this.pos = pos;
+    this.end = end;
+    this.kind = kind;
+    this.id = 0;
+    this.flags = 0;
+    this.modifierFlagsCache = 0;
+    this.transformFlags = 0;
+    this.parent = void 0;
+    this.symbol = void 0;
+    this.locals = void 0;
+    this.nextContainer = void 0;
+    this.localSymbol = void 0;
+    this.flowNode = void 0;
+    this.emitNode = void 0;
+    this.contextualType = void 0;
+    this.inferenceContext = void 0;
+    this.original = void 0;
+    this.jsDoc = void 0;
+    this.jsDocCache = void 0;
+  }
+  MonoNode.prototype = Object.create(origNodeProto);
+  MonoNode.prototype.constructor = MonoNode;
+
   ts.setObjectAllocator({
-    getNodeConstructor: ts.objectAllocator.getNodeConstructor,
-    getTokenConstructor: ts.objectAllocator.getTokenConstructor,
-    getIdentifierConstructor: ts.objectAllocator.getIdentifierConstructor,
-    getPrivateIdentifierConstructor: ts.objectAllocator.getPrivateIdentifierConstructor,
+    getNodeConstructor: function() { return MonoNode; },
+    getTokenConstructor: function() { return MonoNode; },
+    getIdentifierConstructor: function() { return MonoNode; },
+    getPrivateIdentifierConstructor: function() { return MonoNode; },
+    // SourceFile needs extra properties — use original to avoid breaking parsing
     getSourceFileConstructor: ts.objectAllocator.getSourceFileConstructor,
     getSymbolConstructor: ts.objectAllocator.getSymbolConstructor,
     getTypeConstructor: function() { return MonoType; },
