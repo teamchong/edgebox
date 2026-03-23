@@ -176,43 +176,39 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   try {
   if (!ts || !ts.createProgram) return 'no tsc: ' + typeof ts;
 
-  // Load Zig WASM type graph — full data-oriented type representation in linear memory.
-  // Flags, objectFlags, members, unions all stored as flat arrays. Zero copy via Uint32Array.
-  if (!globalThis.__zigRegistryDone) {
-    globalThis.__zigRegistryDone = true;
-    if (typeof __edgebox_read_binary === 'function' && typeof WebAssembly !== 'undefined') {
-      var _root = typeof __edgebox_root === 'function' ? __edgebox_root() : '';
-      var _buf = __edgebox_read_binary(_root + '/src/tsc-recipe/type_graph.wasm');
-      if (_buf && _buf instanceof ArrayBuffer && _buf.byteLength >= 8) {
-        var _mod = new WebAssembly.Module(_buf);
-        var _inst = new WebAssembly.Instance(_mod, {});
-        globalThis.__zigRegistry = _inst.exports;
-        // Uint32Array views for zero-copy access from JS
-        var _mem = _inst.exports.memory.buffer;
-        globalThis.__typeFlags = new Uint32Array(_mem, _inst.exports.getFlagsPtr(), 65536);
-        globalThis.__typeObjFlags = new Uint32Array(_mem, _inst.exports.getObjectFlagsPtr(), 65536);
-        // Warmup TurboFan
-        var _kr = _inst.exports.registerType;
-        var _ki = _inst.exports.isTypeRelated;
-        var _am = _inst.exports.addMember;
-        for (var _wi = 0; _wi < 50; _wi++) {
-          _kr(_wi, (_wi & 3) === 0 ? 1 : 524288, 0);
-          _am(_wi, _wi * 7, _wi + 1, 0);
-        }
-        for (var _wi = 0; _wi < 500; _wi++) {
-          _ki(0, 1, 0, 1); _ki(10, 20, 0, 1); _ki(30, 40, 0, 1);
-        }
-        _inst.exports.reset();
-        __edgebox_write_stderr('[recipe] WASM graph loaded (' + _buf.byteLength + ' bytes)\n');
-      } else {
-        throw new Error('[recipe] FATAL: WASM read_binary returned ' + (typeof _buf) + ' for type_graph.wasm');
-      }
-    } else {
-      throw new Error('[recipe] FATAL: __edgebox_read_binary=' + (typeof __edgebox_read_binary) + ' WebAssembly=' + (typeof WebAssembly));
+  // Load WasmGC type flags module — V8 TurboFan inlines array.get/set at callsite.
+  // Uses GC-managed arrays (not linear memory) for zero-overhead JS↔WASM access.
+  if (!globalThis.__gcFlagsDone) {
+    globalThis.__gcFlagsDone = true;
+    if (typeof __edgebox_read_binary !== 'function' || typeof WebAssembly === 'undefined') {
+      throw new Error('[recipe] FATAL: read_binary=' + (typeof __edgebox_read_binary) + ' WebAssembly=' + (typeof WebAssembly));
     }
+    var _root = typeof __edgebox_root === 'function' ? __edgebox_root() : '';
+    // Load WasmGC type flags
+    var _flagsBuf = __edgebox_read_binary(_root + '/src/tsc-recipe/type_flags_gc.wasm');
+    if (!_flagsBuf || !(_flagsBuf instanceof ArrayBuffer) || _flagsBuf.byteLength < 8) {
+      throw new Error('[recipe] FATAL: type_flags_gc.wasm read failed');
+    }
+    var _flagsInst = new WebAssembly.Instance(new WebAssembly.Module(_flagsBuf));
+    globalThis.__gcFlags = _flagsInst.exports;
+    // Create the flags array (65536 slots for type IDs)
+    globalThis.__gcFlagsArr = _flagsInst.exports.newFlags(65536);
+    // Warmup TurboFan — call getFlag/setFlag to trigger Liftoff → TurboFan
+    var _gf = _flagsInst.exports.getFlag;
+    var _sf = _flagsInst.exports.setFlag;
+    var _a = globalThis.__gcFlagsArr;
+    for (var _wi = 0; _wi < 500; _wi++) {
+      _sf(_a, _wi % 100, _wi); _gf(_a, _wi % 100);
+    }
+    // Also load SOA module for future use
+    var _soaBuf = __edgebox_read_binary(_root + '/src/tsc-recipe/soa_gc.wasm');
+    if (_soaBuf && _soaBuf instanceof ArrayBuffer && _soaBuf.byteLength >= 8) {
+      globalThis.__gcSoa = new WebAssembly.Instance(new WebAssembly.Module(_soaBuf)).exports;
+    }
+    __edgebox_write_stderr('[recipe] WasmGC loaded: flags=' + _flagsBuf.byteLength + 'B soa=' + (_soaBuf ? _soaBuf.byteLength : 0) + 'B\n');
   }
-  if (!globalThis.__zigRegistry) {
-    throw new Error('[recipe] FATAL: WASM registry not loaded after init');
+  if (!globalThis.__gcFlags) {
+    throw new Error('[recipe] FATAL: WasmGC flags not loaded');
   }
 
   // Create ts.sys if missing (snapshot restore doesn't init it)
