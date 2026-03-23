@@ -118,26 +118,11 @@ pub fn collect() ![]const u8 {
     }
     work_mutex.unlock();
 
-    // Read results from eval returns, replace literal \n (0x5C 0x6E) with 0x0A
-    _ = std.posix.write(2, "[collect] merging results\n") catch {};
-    var merged: std.ArrayListUnmanaged(u8) = .{};
-    for (0..pool_size) |i| {
-        if (workers[i].result) |data| {
-            // Replace \n (0x5C 0x6E) with actual newline (0x0A)
-            var j: usize = 0;
-            while (j < data.len) {
-                if (j + 1 < data.len and data[j] == 0x5C and data[j + 1] == 0x6E) {
-                    try merged.append(alloc, 0x0A);
-                    j += 2;
-                } else {
-                    try merged.append(alloc, data[j]);
-                    j += 1;
-                }
-            }
-            if (data.len > 0) try merged.append(alloc, '\n');
-        }
+    // Return worker 0's result (all workers run for warm cache, only 0 counts)
+    if (workers[0].result) |data| {
+        return try alloc.dupe(u8, data);
     }
-    return try merged.toOwnedSlice(alloc);
+    return try alloc.dupe(u8, "");
 }
 
 /// Worker thread: creates V8 isolate, loads TSC, loops waiting for work.
@@ -222,38 +207,6 @@ fn workerLoop(worker_id: u32) void {
         if (r3) |rr| edgebox_v8_free(rr);
     }
 
-    // Test: does V8 eval return preserve 0x0A?
-    const nl_test = "'A\\nB'";
-    {
-        var test_len: c_int = 0;
-        const test_r = edgebox_v8_eval_in_context(isolate, context, nl_test.ptr, @intCast(nl_test.len), &test_len);
-        if (test_r) |t| {
-            const data = t[0..@intCast(test_len)];
-            _ = std.posix.write(2, "[v8pool] nl_test: ") catch {};
-            // Write hex of first few bytes
-            for (data) |b| {
-                const hex = "0123456789abcdef";
-                const h = [2]u8{ hex[b >> 4], hex[b & 0xf] };
-                _ = std.posix.write(2, &h) catch {};
-                _ = std.posix.write(2, " ") catch {};
-            }
-            _ = std.posix.write(2, "\n") catch {};
-            edgebox_v8_free(t);
-        }
-    }
-
-    // Verify environment
-    const verify = "typeof ts !== 'undefined' ? 'ts:' + typeof ts.createProgram + ' sys:' + typeof ts.sys : 'no ts'";
-    {
-        var vl: c_int = 0;
-        const vr = edgebox_v8_eval_in_context(isolate, context, verify.ptr, @intCast(verify.len), &vl);
-        if (vr) |v| {
-            _ = std.posix.write(2, "[v8pool] ") catch {};
-            _ = std.posix.write(2, v[0..@intCast(vl)]) catch {};
-            _ = std.posix.write(2, "\n") catch {};
-            edgebox_v8_free(v);
-        }
-    }
     _ = std.posix.write(2, "[v8pool] worker ready\n") catch {};
 
     while (!workers[wid].shutdown.load(.acquire)) {
@@ -323,35 +276,15 @@ fn workerLoop(worker_id: u32) void {
                 \\      return {{ files: files, directories: dirs }};
                 \\    }}, function(p) {{ return __edgebox_realpath(p); }});
                 \\  }};
-                \\  var NL = String.fromCharCode(10);
-                \\  var wid = {d};
-                \\  var wcount = {d};
-                \\  // Create program (file cache shared via Zig — fast after first worker)
-                \\  var cf = ts.readConfigFile(cwd + '/tsconfig.json', ts.sys.readFile);
-                \\  if (cf.error) return 'config error';
-                \\  var parsed = ts.parseJsonConfigFileContent(cf.config, ts.sys, cwd);
-                \\  var program = ts.createProgram(parsed.fileNames, parsed.options);
-                \\  var files = program.getSourceFiles();
+                \\  // Use executeCommandLine — identical to `npx tsc`
                 \\  var output = [];
-                \\  if (wid === 0) {{
-                \\    var gd = ts.getPreEmitDiagnostics(program).filter(function(d) {{ return !d.file; }});
-                \\    for (var g = 0; g < gd.length; g++)
-                \\      output.push('error TS' + gd[g].code + ': ' + ts.flattenDiagnosticMessageText(gd[g].messageText, ' '));
-                \\  }}
-                \\  for (var i = 0; i < files.length; i++) {{
-                \\    if (i % wcount !== wid) continue;
-                \\    var diags = program.getSemanticDiagnostics(files[i]);
-                \\    for (var k = 0; k < diags.length; k++) {{
-                \\      var d = diags[k];
-                \\      if (d.file) {{
-                \\        var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
-                \\        output.push(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' '));
-                \\      }}
-                \\    }}
-                \\  }}
-                \\  return output.join(NL);
+                \\  ts.sys.write = function(s) {{ output.push(String(s)); }};
+                \\  ts.sys.exit = function() {{}};
+                \\  ts.sys.args = ['--noEmit', '-p', cwd + '/tsconfig.json'];
+                \\  try {{ ts.executeCommandLine(ts.sys, ts.noop, ts.sys.args); }} catch(e) {{ output.push('error: ' + e.message); }}
+                \\  return output.join('');
                 \\}})()
-            , .{ cwd, wid, workers[wid].worker_count }) catch {
+            , .{cwd}) catch {
                 workers[wid].result = null;
                 continue;
             };
