@@ -83,37 +83,8 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   var NL = String.fromCharCode(10);
   var output = [];
 
-  // Defer type registration to AFTER diagnostics (don't block cold response)
-  // Types registered on warm runs when program is cached
-  if (globalThis.__pc[ck] && (!globalThis.__typesRegistered || !globalThis.__typesRegistered[ck])) {
-    // Already have cached program — register types in background
-    var checker = program.getTypeChecker();
-    var seenTypes = {};
-    var typeCount = 0;
-    for (var fi = 0; fi < files.length; fi++) {
-      if (fi % workerCount !== workerId) continue; // shard type registration too
-      ts.forEachChild(files[fi], function visit(node) {
-        try {
-          var type = checker.getTypeAtLocation(node);
-          if (type && type.id && !seenTypes[type.id]) {
-            seenTypes[type.id] = true;
-            __edgebox_register_type(type.id, type.flags || 0);
-            typeCount++;
-            var props = checker.getPropertiesOfType(type);
-            for (var p = 0; p < props.length && p < 50; p++) {
-              var prop = props[p];
-              var pt = checker.getTypeOfSymbol(prop);
-              if (prop.escapedName && pt && pt.id)
-                __edgebox_register_member(type.id, prop.escapedName, pt.id, prop.flags || 0);
-            }
-          }
-        } catch(e) {}
-        ts.forEachChild(node, visit);
-      });
-    }
-    if (!globalThis.__typesRegistered) globalThis.__typesRegistered = {};
-    globalThis.__typesRegistered[ck] = true;
-  }
+  // Register types incrementally during checking via SIMD check patch
+  // (types registered on-demand when isTypeRelatedTo is called)
 
   if (workerId === 0) {
     var gd = ts.getPreEmitDiagnostics(program).filter(function(d) { return !d.file; });
@@ -122,13 +93,23 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   }
 
   // Wire Zig SIMD structural check into TSC's type checker
+  // Types registered on-demand (first time each type is checked)
   if (typeof __edgebox_check_structural === 'function' && !globalThis.__zigCheckPatched) {
-    // Patch checker's isTypeRelatedTo to try Zig first
     var _checker = program.getDiagnosticsProducingTypeChecker ? program.getDiagnosticsProducingTypeChecker() : null;
     if (_checker && _checker.isTypeRelatedTo) {
       var _origCheck = _checker.isTypeRelatedTo.bind(_checker);
+      var _regTypes = {};
       _checker.isTypeRelatedTo = function(source, target, relation) {
         if (source && target && source.id && target.id) {
+          // Register types on-demand (zero pre-registration overhead)
+          if (!_regTypes[source.id]) {
+            _regTypes[source.id] = true;
+            __edgebox_register_type(source.id, source.flags || 0);
+          }
+          if (!_regTypes[target.id]) {
+            _regTypes[target.id] = true;
+            __edgebox_register_type(target.id, target.flags || 0);
+          }
           var r = __edgebox_check_structural(source.id, target.id);
           if (r === 1) return true;
           if (r === 0) return false;
