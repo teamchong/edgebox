@@ -97,24 +97,33 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   if (typeof __edgebox_check_structural === 'function' && !globalThis.__zigCheckPatched) {
     var _checker = program.getDiagnosticsProducingTypeChecker ? program.getDiagnosticsProducingTypeChecker() : null;
     if (_checker && _checker.isTypeRelatedTo) {
-      var _origCheck = _checker.isTypeRelatedTo.bind(_checker);
       var _regTypes = {};
+      function _regType(t) {
+        if (!t || !t.id || _regTypes[t.id]) return;
+        _regTypes[t.id] = true;
+        __edgebox_register_type(t.id, t.flags || 0);
+        // Register members too (enables Zig structural comparison)
+        try {
+          var props = _checker.getPropertiesOfType(t);
+          for (var p = 0; p < props.length && p < 50; p++) {
+            var prop = props[p];
+            if (prop.escapedName) {
+              var pt = _checker.getTypeOfSymbol(prop);
+              if (pt && pt.id) __edgebox_register_member(t.id, String(prop.escapedName), pt.id, prop.flags || 0);
+            }
+          }
+        } catch(e) {}
+      }
       _checker.isTypeRelatedTo = function(source, target, relation) {
         if (source && target && source.id && target.id) {
-          // Register types on-demand (zero pre-registration overhead)
-          if (!_regTypes[source.id]) {
-            _regTypes[source.id] = true;
-            __edgebox_register_type(source.id, source.flags || 0);
-          }
-          if (!_regTypes[target.id]) {
-            _regTypes[target.id] = true;
-            __edgebox_register_type(target.id, target.flags || 0);
-          }
+          _regType(source);
+          _regType(target);
           var r = __edgebox_check_structural(source.id, target.id);
-          if (r === 1) return true;
-          if (r === 0) return false;
+          // Single code path: Zig decides. 1=yes, 0=no, 2=no (conservative)
+          return r === 1;
         }
-        return _origCheck(source, target, relation);
+        // No type IDs — not related
+        return false;
       };
     }
     globalThis.__zigCheckPatched = true;

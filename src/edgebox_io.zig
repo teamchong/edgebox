@@ -577,7 +577,7 @@ export fn edgebox_check_stats(out_total: *u64, out_flag: *u64, out_struct: *u64)
 
 export fn edgebox_check_structural(source_id: u32, target_id: u32) u8 {
     _ = check_total.fetchAdd(1, .monotonic);
-    if (source_id >= type_count or target_id >= type_count) return 2;
+    if (source_id >= type_count or target_id >= type_count) return 0; // not registered = not related
     const src_flags = col_type_flags[source_id];
     const tgt_flags = col_type_flags[target_id];
     if (tgt_flags & 1 != 0) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; }
@@ -591,7 +591,8 @@ export fn edgebox_check_structural(source_id: u32, target_id: u32) u8 {
     const src_count = col_type_member_count[source_id];
     const tgt_offset = col_type_member_offset[target_id];
     const tgt_count = col_type_member_count[target_id];
-    if (src_count == 0 or tgt_count == 0) return 2;
+    if (tgt_count == 0) return 1; // empty target = compatible (anything satisfies {})
+    if (src_count == 0) return 0; // empty source can't satisfy non-empty target
     if (tgt_count > src_count * 2) return 0;
     var ti: u32 = 0;
     while (ti < tgt_count) : (ti += 1) {
