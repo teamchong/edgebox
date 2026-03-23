@@ -10,8 +10,11 @@
 #include <v8-function-callback.h>
 #include <v8-exception.h>
 #include <v8-persistent-handle.h>
+#include <v8-function.h>
 #include <cstring>
+#include <cstdio>
 #include <string>
+#include <unistd.h>
 
 // Platform init via rusty_v8's C API (avoids libplatform dependency)
 extern "C" {
@@ -142,7 +145,7 @@ void* edgebox_v8_create_isolate_from_snapshot() {
 }
 
 // Register IO globals on a context — connects V8 to Zig polyfills
-// These are the same C ABI functions from edgebox_workerd_io.zig
+// These are the same C ABI functions from edgebox_io.zig
 extern const char* edgebox_read_file(const char* path, int path_len, int* out_len);
 extern int edgebox_file_exists(const char* path, int path_len);
 extern int edgebox_dir_exists(const char* path, int path_len);

@@ -184,18 +184,18 @@ function downloadProject(project: Project): string | null {
 }
 
 function buildEdgeboxTsc(): string | null {
-  // workerd is now the only runtime — no V8 runner to build.
-  // The workerd binary is built separately via Bazel.
-  // For CI benchmarks, we skip EdgeBox if workerd isn't available.
-  const workerdBin = join(PROJECT_ROOT, "vendor/workerd/bazel-bin/src/workerd/server/workerd");
+  // V8 is now the only runtime — no V8 runner to build.
+  // The V8 binary is built separately via Bazel.
+  // For CI benchmarks, we skip EdgeBox if V8 isn't available.
+  const V8Bin = join(PROJECT_ROOT, "vendor/V8/bazel-bin/src/V8/server/V8");
   const zigLib = join(PROJECT_ROOT, "zig-out/lib/libedgebox_io.a");
 
-  if (existsSync(workerdBin) && existsSync(zigLib)) {
-    return `__workerd__${workerdBin}`;
+  if (existsSync(V8Bin) && existsSync(zigLib)) {
+    return `__V8__${V8Bin}`;
   }
 
-  console.log("EdgeBox workerd binary not found — skipping EdgeBox benchmark");
-  console.log("  Build with: cd vendor/workerd && bazelisk build //src/workerd/server:workerd");
+  console.log("EdgeBox V8 binary not found — skipping EdgeBox benchmark");
+  console.log("  Build with: cd vendor/V8 && bazelisk build //src/V8/server:V8");
   return null;
 }
 
@@ -430,13 +430,13 @@ function benchmarkProject(
   const incrCacheDir = "/tmp/edgebox-incr-cache";
   rmSync(incrCacheDir, { recursive: true, force: true });
 
-  // workerd path — EdgeBox runs TSC via workerd + Zig IO
-  const isWorkerd = edgeboxTsc.startsWith("__workerd__");
-  const workerdBin = isWorkerd ? edgeboxTsc.slice("__workerd__".length) : "";
-  // TODO: implement workerd benchmark runner (start workerd, send check request)
-  // For now, skip EdgeBox benchmark until workerd CI is set up
+  // V8 path — EdgeBox runs TSC via V8 + Zig IO
+  const isV8 = edgeboxTsc.startsWith("__V8__");
+  const V8Bin = isV8 ? edgeboxTsc.slice("__V8__".length) : "";
+  // TODO: implement V8 benchmark runner (start V8, send check request)
+  // For now, skip EdgeBox benchmark until V8 CI is set up
   const edgeboxCmd = "echo";
-  const edgeboxArgs = ["EdgeBox workerd benchmark not yet wired"];
+  const edgeboxArgs = ["EdgeBox V8 benchmark not yet wired"];
 
   for (let i = 0; i < runs; i++) {
     edgeboxResult = runTsc(edgeboxCmd, edgeboxArgs, edgeboxOutDir, debug);

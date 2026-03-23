@@ -26,7 +26,7 @@ extern fn edgebox_v8_create_isolate_from_snapshot() ?*anyopaque;
 extern fn edgebox_set_daemon_mode(c_int) void;
 extern fn edgebox_get_result(c_int, *c_int) ?[*]const u8;
 
-// IO functions from edgebox_workerd_io.zig (shared across all workers)
+// IO functions from edgebox_io.zig (shared across all workers)
 extern fn edgebox_read_file([*]const u8, c_int, *c_int) ?[*]const u8;
 
 const MAX_WORKERS = 16;
@@ -64,9 +64,8 @@ pub fn init(worker_count: u32) !void {
     // Initialize V8 platform (once, before any isolate creation)
     edgebox_v8_init();
 
-    // Skip snapshot for now — load TypeScript fresh per worker.
-    // Correctness first, snapshot optimization later.
-    const shim =
+    // Shim: module, process, require, Buffer, setTimeout for TypeScript loading
+    _ = @as([]const u8,
         "globalThis.module = { exports: {} };" ++
         "globalThis.__filename = '/edgebox/worker.js';" ++
         "globalThis.__dirname = '/edgebox';" ++
@@ -148,12 +147,23 @@ pub fn collect() ![]const u8 {
     }
     work_mutex.unlock();
 
-    // Read results from eval returns
+    // Read results from eval returns, replace literal \n (0x5C 0x6E) with 0x0A
+    _ = std.posix.write(2, "[collect] merging results\n") catch {};
     var merged: std.ArrayListUnmanaged(u8) = .{};
     for (0..pool_size) |i| {
         if (workers[i].result) |data| {
-            try merged.appendSlice(alloc, data);
-            if (data.len > 0 and data[data.len - 1] != '\n') try merged.append(alloc, '\n');
+            // Replace \n (0x5C 0x6E) with actual newline (0x0A)
+            var j: usize = 0;
+            while (j < data.len) {
+                if (j + 1 < data.len and data[j] == 0x5C and data[j + 1] == 0x6E) {
+                    try merged.append(alloc, 0x0A);
+                    j += 2;
+                } else {
+                    try merged.append(alloc, data[j]);
+                    j += 1;
+                }
+            }
+            if (data.len > 0) try merged.append(alloc, '\n');
         }
     }
     return try merged.toOwnedSlice(alloc);
@@ -375,6 +385,18 @@ fn workerLoop(worker_id: u32) void {
                 continue;
             };
             defer alloc.free(check_code);
+
+            // Debug: dump first 100 bytes of JS source to stderr
+            if (wid == 0) {
+                _ = std.posix.write(2, "[js-src] ") catch {};
+                const dump_len = @min(check_code.len, 100);
+                for (check_code[0..dump_len]) |b| {
+                    const hex = "0123456789abcdef";
+                    const h = [2]u8{ hex[b >> 4], hex[b & 0xf] };
+                    _ = std.posix.write(2, &h) catch {};
+                }
+                _ = std.posix.write(2, "\n") catch {};
+            }
 
             var out_len: c_int = 0;
             const result = edgebox_v8_eval_in_context(isolate, context, check_code.ptr, @intCast(check_code.len), &out_len);

@@ -1068,12 +1068,12 @@ fn printUsage() void {
         \\
         \\Usage:
         \\  edgebox <app.js>              Compile (V8 + WASM AOT kernels)
-        \\  edgebox pack <worker-dir>     Pack workerd single binary
+        \\  edgebox pack <worker-dir>     Pack V8 single binary
         \\
         \\Output (in zig-out/bin/<app.js>/):
         \\  <app>-worker.js        Worker module (V8 JIT + WASM AOT)
         \\  <app>-standalone.wasm   WASM numeric kernels
-        \\  <app>-config.capnp      workerd configuration
+        \\  <app>-config.capnp      V8 configuration
         \\
         \\Options:
         \\  -f, --force      Clean previous build outputs first
@@ -1083,8 +1083,8 @@ fn printUsage() void {
         \\
         \\Examples:
         \\  edgebox app.js                                  Compile
-        \\  edgebox pack zig-out/bin/app.js/                Pack workerd binary
-        \\  npx workerd serve zig-out/bin/app.js/app-config.capnp
+        \\  edgebox pack zig-out/bin/app.js/                Pack V8 binary
+        \\  npx V8 serve zig-out/bin/app.js/app-config.capnp
         \\
     , .{});
 }
@@ -1307,7 +1307,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         }
     }
 
-    // Save clean bundle for workerd worker generation (before polyfills/hooks)
+    // Save clean bundle for V8 worker generation (before polyfills/hooks)
     var clean_bundle_path_buf: [4096]u8 = undefined;
     const clean_bundle_path = std.fmt.bufPrint(&clean_bundle_path_buf, "{s}/bundle_clean.js", .{cache_dir}) catch null;
     if (clean_bundle_path) |cbp| {
@@ -1794,7 +1794,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
     const frozen_thin_optimize_arg = "-Dfrozen-thin-optimize=ReleaseSmall";
 
     // Step 6e: Link standalone WASM (pure int32 functions, no QuickJS runtime)
-    // Produces a tiny .wasm file for use in V8/workerd Workers
+    // Produces a tiny .wasm file for use in V8/V8 Workers
     var standalone_wasm_path_buf: [4096]u8 = undefined;
     var has_standalone_wasm = false;
     {
@@ -1849,7 +1849,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         }
     }
 
-    // Step 6f: Generate workerd worker files (worker.mjs + config.capnp)
+    // Step 6f: Generate V8 worker files (worker.mjs + config.capnp)
     // Uses the clean bundle (pre-polyfill) + standalone WASM
     var has_worker_files = false;
     if (has_standalone_wasm) {
@@ -2319,7 +2319,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     // 16 pages (1MB) for scalar-only, 256 pages (16MB) for array args
                     const mem_grow_pages: u32 = if (has_array_funcs) 256 else 16;
 
-                    // Preamble: load WASM module (compatible with Node.js + workerd)
+                    // Preamble: load WASM module (compatible with Node.js + V8)
                     var w_buf: [65536]u8 = undefined;
                     var w_state = wf.writer(&w_buf);
                     const w = &w_state.interface;
@@ -2348,8 +2348,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         // Detects TSC by checking for assignableRelation in source
                         if (clean_content) |detect_cc| {
                             if (std.mem.indexOf(u8, detect_cc, "var assignableRelation") != null) {
-                                // v8_tsc_shim.js removed — workerd path doesn't need relation cache shim
-                                std.debug.print("[soa] TSC detected (workerd handles type checking)\n", .{});
+                                // v8_tsc_shim.js removed — V8 path doesn't need relation cache shim
+                                std.debug.print("[soa] TSC detected (V8 handles type checking)\n", .{});
                             }
                         }
                     }
@@ -5376,9 +5376,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                     const cw = &cf_state.interface;
                     defer cw.flush() catch |err| std.debug.print("[build] config flush: {}\n", .{err});
                     cw.print(
-                        \\using Workerd = import "/workerd/workerd.capnp";
+                        \\using V8 = import "/V8/V8.capnp";
                         \\
-                        \\const config :Workerd.Config = (
+                        \\const config :V8.Config = (
                         \\  services = [
                         \\    (name = "main", worker = .worker),
                         \\  ],
@@ -5387,7 +5387,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         \\  ],
                         \\);
                         \\
-                        \\const worker :Workerd.Worker = (
+                        \\const worker :V8.Worker = (
                         \\  modules = [
                         \\    (name = "entrypoint", esModule = embed "{s}"),
                         \\    (name = "{s}", wasm = embed "{s}"),
@@ -5512,7 +5512,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             const wp_s = std.fmt.bufPrint(&wp_summary, "{s}/{s}-worker.js", .{ output_dir, output_base }) catch "";
             const cp_s = std.fmt.bufPrint(&cp_summary, "{s}/{s}-config.capnp", .{ output_dir, output_base }) catch "";
             std.debug.print("  {s}  (V8 + WASM AOT)\n", .{wp_s});
-            std.debug.print("  {s}  (workerd config)\n", .{cp_s});
+            std.debug.print("  {s}  (V8 config)\n", .{cp_s});
         }
         std.debug.print("\nTo run:\n", .{});
         if (has_worker_files) {
@@ -5521,7 +5521,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             const wp_r = std.fmt.bufPrint(&wp_run, "{s}/{s}-worker.js", .{ output_dir, output_base }) catch "";
             const cp_r = std.fmt.bufPrint(&cp_run, "{s}/{s}-config.capnp", .{ output_dir, output_base }) catch "";
             std.debug.print("  node {s}  # Node.js (V8 JIT + WASM AOT)\n", .{wp_r});
-            std.debug.print("  npx workerd serve {s}  # Cloudflare Workers\n", .{cp_r});
+            std.debug.print("  npx V8 serve {s}  # Cloudflare Workers\n", .{cp_r});
         }
         std.debug.print("\n", .{});
         return;
@@ -5573,7 +5573,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         std.debug.print("  {s}  - AOT native module\n", .{aot_path});
         if (has_standalone_wasm) {
             const sw_path = std.fmt.bufPrint(&standalone_wasm_path_buf, "{s}/{s}-standalone.wasm", .{ output_dir, output_base }) catch "";
-            std.debug.print("  {s}  - Standalone WASM (pure functions, for workerd/V8)\n", .{sw_path});
+            std.debug.print("  {s}  - Standalone WASM (pure functions, for V8/V8)\n", .{sw_path});
         }
         std.debug.print("\n", .{});
         std.debug.print("To run:\n", .{});

@@ -1,4 +1,4 @@
-// EdgeBox Bootstrap — sets up Node.js globals for workerd
+// EdgeBox Bootstrap — sets up Node.js globals for V8
 // ALL polyfills use direct Zig typed methods (zero JSON)
 
 // ── process ──

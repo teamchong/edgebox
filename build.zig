@@ -1672,7 +1672,7 @@ pub fn build(b: *std.Build) void {
         };
 
         if (v8_lib_name) |_| {
-            // V8 runner REMOVED — workerd is the only runtime.
+            // V8 runner REMOVED — V8 is the only runtime.
             const v8_run_step = b.step("v8-run", "REMOVED — use `zig build edgebox-cli`");
             const v8_run_fail = b.addFail("v8-run removed. Use: zig build edgebox-cli");
             v8_run_step.dependOn(&v8_run_fail.step);
@@ -1684,7 +1684,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // ===================
-    // edgebox CLI — daemon-based runtime (workerd + Zig)
+    // edgebox CLI — daemon-based runtime (V8 + Zig)
     // ===================
     {
         const edgebox_cli = b.addExecutable(.{
@@ -1698,7 +1698,7 @@ pub fn build(b: *std.Build) void {
         // Link V8 bridge (C++) and rusty_v8 library
         edgebox_cli.addCSourceFile(.{ .file = b.path("src/v8_bridge_pool.cpp"), .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti" } });
         edgebox_cli.addCSourceFile(.{ .file = b.path("src/v8_stubs.c"), .flags = &.{} });
-        // Link Zig IO library (edgebox_workerd_io.zig exports C ABI functions)
+        // Link Zig IO library (edgebox_io.zig exports C ABI functions)
         edgebox_cli.addObjectFile(b.path("zig-out/lib/libedgebox_io.a"));
         edgebox_cli.addIncludePath(b.path("vendor/v8/include"));
         edgebox_cli.addObjectFile(b.path("vendor/v8/librusty_v8_release_x86_64-unknown-linux-gnu.a"));
@@ -1707,9 +1707,28 @@ pub fn build(b: *std.Build) void {
         const edgebox_cli_step = b.step("edgebox-cli", "Build edgebox CLI (daemon + tsc)");
         edgebox_cli_step.dependOn(&install_cli.step);
 
-        // Also build Zig IO library for workerd
-        const io_lib_step = b.step("workerd-io", "Build Zig IO library for workerd");
-        const io_lib_fail = b.addFail("Use: zig build-lib src/edgebox_workerd_io.zig -target x86_64-linux-gnu -OReleaseFast --name edgebox_io -fPIC");
+        // V8 newline test
+        const nl_test = b.addExecutable(.{
+            .name = "v8-nl-test",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/v8_nl_test.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        nl_test.addCSourceFile(.{ .file = b.path("src/v8_bridge_pool.cpp"), .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti", "-Wno-unused-result" } });
+        nl_test.addCSourceFile(.{ .file = b.path("src/v8_stubs.c"), .flags = &.{} });
+        nl_test.addIncludePath(b.path("vendor/v8/include"));
+        nl_test.addObjectFile(b.path("vendor/v8/librusty_v8_release_x86_64-unknown-linux-gnu.a"));
+        nl_test.addObjectFile(b.path("zig-out/lib/libedgebox_io.a"));
+        nl_test.linkLibCpp();
+        const install_nl = b.addInstallArtifact(nl_test, .{});
+        const nl_step = b.step("v8-nl-test", "Test V8 newline handling");
+        nl_step.dependOn(&install_nl.step);
+
+        // Also build Zig IO library 
+        const io_lib_step = b.step("V8-io", "Build Zig IO library ");
+        const io_lib_fail = b.addFail("Use: zig build-lib src/edgebox_io.zig -target x86_64-linux-gnu -OReleaseFast --name edgebox_io -fPIC");
         io_lib_step.dependOn(&io_lib_fail.step);
     }
 }

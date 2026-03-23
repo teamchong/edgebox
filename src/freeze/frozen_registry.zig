@@ -633,7 +633,7 @@ pub fn generateModuleZigShardedWithBackend(
         }
 
         // Generate standalone WASM for numeric functions (i32 + f64 + array, no QuickJS runtime)
-        // These can run directly in V8/workerd at near-native speed.
+        // These can run directly in V8/V8 at near-native speed.
         // Runs independently of whether there are int32 shard functions.
         if (std.posix.getenv("EDGEBOX_WASM_DEBUG") != null) {
             std.debug.print("[wasm-scan] generated_all has {d} functions:\n", .{generated_all.items.len});

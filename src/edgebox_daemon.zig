@@ -28,12 +28,15 @@ pub fn start() !void {
     try std.posix.bind(server, &addr.any, addr.getOsSockLen());
     try std.posix.listen(server, 16);
 
-    std.debug.print("Daemon listening on {s}\n", .{SOCKET_PATH});
+    _ = std.posix.write(2, "DAEMON_BUILD_V3 listening\n") catch {};
 
     // Accept loop
+    _ = std.posix.write(2, "[daemon] entering accept loop\n") catch {};
     while (true) {
         const client_fd = std.posix.accept(server, null, null, 0) catch continue;
+        _ = std.posix.write(2, "[daemon] accepted client\n") catch {};
         handleClient(client_fd);
+        _ = std.posix.write(2, "[daemon] handled client\n") catch {};
     }
 }
 
@@ -51,6 +54,10 @@ fn handleClient(fd: std.posix.fd_t) void {
     if (n == 0) return;
     const cwd = std.mem.trim(u8, buf[0..n], &[_]u8{ '\n', '\r', ' ' });
 
+    _ = std.posix.write(2, "[daemon] handleClient cwd=") catch {};
+    _ = std.posix.write(2, cwd) catch {};
+    _ = std.posix.write(2, "\n") catch {};
+
     // Dispatch to V8 pool (condvar, zero copy)
     v8_pool.dispatch(cwd);
 
@@ -61,29 +68,10 @@ fn handleClient(fd: std.posix.fd_t) void {
     };
     defer alloc.free(result);
 
-    // Replace literal \n with actual newlines before sending
-    var fixed = alloc.alloc(u8, result.len) catch {
-        _ = std.posix.write(fd, result) catch {};
-        return;
-    };
-    defer alloc.free(fixed);
-    var fi: usize = 0;
-    var ri: usize = 0;
-    while (ri < result.len) {
-        if (ri + 1 < result.len and result[ri] == '\\' and result[ri + 1] == 'n') {
-            fixed[fi] = '\n';
-            fi += 1;
-            ri += 2;
-        } else {
-            fixed[fi] = result[ri];
-            fi += 1;
-            ri += 1;
-        }
-    }
-
+    // Send results (literal \n already replaced in collect)
     var written: usize = 0;
-    while (written < fi) {
-        const w = std.posix.write(fd, fixed[written..fi]) catch break;
+    while (written < result.len) {
+        const w = std.posix.write(fd, result[written..]) catch break;
         if (w == 0) break;
         written += w;
     }

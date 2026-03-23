@@ -105,7 +105,7 @@ runs:
         path: |
           zig-out/
           vendor/binaryen/
-        key: edgebox-v12-${{ runner.os }}-${{ hashFiles('build.zig', 'src/**/*.zig', 'src/freeze/*.zig', 'src/*.js', 'src/workerd-tsc/*.js', 'src/polyfills/*.js') }}
+        key: edgebox-v12-${{ runner.os }}-${{ hashFiles('build.zig', 'src/**/*.zig', 'src/freeze/*.zig', 'src/*.js', 'src/tsc-recipe/*.js', 'src/polyfills/*.js') }}
 
     # === Build Binaryen (if cache miss) ===
     - name: Build Binaryen
@@ -126,7 +126,7 @@ runs:
           sudo ldconfig
         fi
 
-    # === Install TypeScript (needed for workerd TSC benchmark) ===
+    # === Install TypeScript (needed  TSC benchmark) ===
     - name: Install TypeScript
       if: steps.cache-edgebox.outputs.cache-hit != 'true'
       shell: bash
@@ -134,13 +134,13 @@ runs:
         npm install typescript@5.9.3 --no-save 2>/dev/null || npm install typescript --no-save
         ls node_modules/typescript/lib/typescript.js && echo "TypeScript installed"
 
-    # === Build Zig IO library for workerd ===
+    # === Build Zig IO library  ===
     - name: Build Zig IO
       if: steps.cache-edgebox.outputs.cache-hit != 'true'
       shell: bash
       run: |
         mkdir -p zig-out/lib
-        zig build-lib src/edgebox_workerd_io.zig -target x86_64-linux-gnu -OReleaseFast --name edgebox_io -fPIC -femit-bin=zig-out/lib/libedgebox_io.a
+        zig build-lib src/edgebox_io.zig -target x86_64-linux-gnu -OReleaseFast --name edgebox_io -fPIC -femit-bin=zig-out/lib/libedgebox_io.a
         echo "Built libedgebox_io.a ($(du -h zig-out/lib/libedgebox_io.a | cut -f1))"
 
     # === Install binaryen system-wide (on cache hit, since build step is skipped) ===

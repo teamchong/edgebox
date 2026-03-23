@@ -1,13 +1,13 @@
-// edgebox_workerd_io.zig — Zig polyfills for workerd
+// edgebox_io.zig — Zig polyfills for V8 pool
 //
-// ALL Node.js APIs that workerd doesn't have are implemented here in Zig.
-// Direct C ABI exports → workerd jsg methods → JS globals. Zero JSON in hot path.
+// ALL Node.js APIs that V8 pool doesn't have are implemented here in Zig.
+// Direct C ABI exports → V8 pool jsg methods → JS globals. Zero JSON in hot path.
 // File contents cached in mmap for zero-copy reads across workers.
 
 const std = @import("std");
 const alloc = std.heap.page_allocator;
 
-// ── File Cache (shared across all workerd worker threads) ──
+// ── File Cache (shared across all V8 pool worker threads) ──
 
 var file_cache: std.StringHashMapUnmanaged([]const u8) = .{};
 var cache_mutex: std.Thread.Mutex = .{};
@@ -19,7 +19,7 @@ fn cacheReadFile(path: []const u8) ![]const u8 {
         if (file_cache.get(path)) |cached| return cached;
     }
     const raw = std.fs.cwd().readFileAlloc(alloc, path, 50 * 1024 * 1024) catch |err| return err;
-    // Append NUL terminator for kj::StringPtr compatibility (workerd requires it)
+    // Append NUL terminator for kj::StringPtr compatibility (V8 pool requires it)
     const content = try alloc.alloc(u8, raw.len + 1);
     @memcpy(content[0..raw.len], raw);
     content[raw.len] = 0;

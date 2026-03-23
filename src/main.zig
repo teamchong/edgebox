@@ -1,7 +1,7 @@
 /// EdgeBox - QuickJS Runtime with WASI + AOT for Claude Code
 ///
 /// A lightweight JavaScript runtime designed for running Claude Code at the edge.
-/// Combines QuickJS parser + V8 runner + workerd deployment.
+/// Combines QuickJS parser + V8 runner + V8 deployment.
 ///
 /// Usage:
 /// ```zig
@@ -338,7 +338,7 @@ pub fn runCli(allocator: Allocator, args: []const [:0]const u8) !u8 {
     const cmd = args[1];
 
     if (std.mem.eql(u8, cmd, "--version")) {
-        std.debug.print("EdgeBox 0.1.0 (QuickJS + V8 + workerd)\n", .{});
+        std.debug.print("EdgeBox 0.1.0 (QuickJS + V8 + V8)\n", .{});
         return 0;
     }
 
