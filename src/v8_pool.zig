@@ -242,7 +242,7 @@ fn workerLoop(worker_id: u32) void {
     }
 
     // Test: does V8 eval return preserve 0x0A?
-    const nl_test = "'A' + String.fromCharCode(10) + 'B'";
+    const nl_test = "'A\\nB'";
     {
         var test_len: c_int = 0;
         const test_r = edgebox_v8_eval_in_context(isolate, context, nl_test.ptr, @intCast(nl_test.len), &test_len);
