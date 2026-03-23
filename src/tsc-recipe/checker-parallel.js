@@ -20,7 +20,7 @@ globalThis.__zigRegistryDone = false;
 //       Mono Type = 0.80x total (check 47% SLOWER — 45 undefined slots per type
 //       causes GC pressure + CPU cache pollution for 47K types = 17MB waste).
 (function() {
-  if (!ts || !ts.setObjectAllocator || !ts.objectAllocator) return;
+  if (!ts || !ts.setObjectAllocator || !ts.objectAllocator) { throw new Error('[recipe] FATAL: ts.setObjectAllocator not available'); }
   var origNodeProto = ts.objectAllocator.getNodeConstructor().prototype;
   function MonoNode(kind, pos, end) {
     this.pos = pos;
@@ -66,7 +66,7 @@ globalThis.__zigRegistryDone = false;
 var sfCache = new Map();
 globalThis.__sfCache = sfCache;
 (function() {
-  if (!ts || !ts.createSourceFile) return;
+  if (!ts || !ts.createSourceFile) { throw new Error('[recipe] FATAL: ts.createSourceFile not available'); }
   var origCSF = ts.createSourceFile;
   globalThis.__sfCacheHits = 0;
   globalThis.__sfCacheMisses = 0;
@@ -102,7 +102,10 @@ globalThis.__sfCache = sfCache;
         var parsed = JSON.parse(cached);
         if (parsed && parsed.hashes) globalThis.__ebDiagCache = parsed;
       }
-    } catch(e) {}
+    } catch(e) {
+      if (typeof __edgebox_write_stderr === 'function')
+        __edgebox_write_stderr('[recipe] diag cache load failed: ' + String(e) + '\n');
+    }
   }
 })();
 
@@ -200,9 +203,14 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
         _inst.exports.reset();
         __edgebox_write_stderr('[recipe] WASM graph loaded (' + _buf.byteLength + ' bytes)\n');
       } else {
-        __edgebox_write_stderr('[recipe] WASM FAILED: ' + (typeof _buf) + '\n');
+        throw new Error('[recipe] FATAL: WASM read_binary returned ' + (typeof _buf) + ' for type_graph.wasm');
       }
+    } else {
+      throw new Error('[recipe] FATAL: __edgebox_read_binary=' + (typeof __edgebox_read_binary) + ' WebAssembly=' + (typeof WebAssembly));
     }
+  }
+  if (!globalThis.__zigRegistry) {
+    throw new Error('[recipe] FATAL: WASM registry not loaded after init');
   }
 
   // Create ts.sys if missing (snapshot restore doesn't init it)

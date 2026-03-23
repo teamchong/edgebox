@@ -233,8 +233,12 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         "var _zr=globalThis.__zigRegistry;" ++
         "if(_zr){var _tid=typeCount+1;if(_tid<65536)_zr.registerType(_tid|0,flags|0,0);}";
 
-    if (std.mem.indexOf(u8, result, ct_needle)) |ct_idx| {
-        _ = std.posix.write(2, "[v8pool] patching createType → WASM flags\n") catch {};
+    const ct_idx = std.mem.indexOf(u8, result, ct_needle) orelse {
+        _ = std.posix.write(2, "[v8pool] FATAL: createType needle not found in TSC source\n") catch {};
+        return error.NeedleNotFound;
+    };
+    _ = std.posix.write(2, "[v8pool] patching createType → WASM flags\n") catch {};
+    {
         const ct_len = result.len - ct_needle.len + ct_inject.len;
         const ct_result = try alloc.alloc(u8, ct_len);
         @memcpy(ct_result[0..ct_idx], result[0..ct_idx]);
@@ -258,8 +262,12 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         // Non-pre-parsed .d.ts files will be parsed normally (only once per daemon lifetime).
         "";
 
-    if (std.mem.indexOf(u8, result, csf_full_needle)) |csf_idx| {
-        _ = std.posix.write(2, "[v8pool] patching createSourceFile → .d.ts cache\n") catch {};
+    const csf_idx = std.mem.indexOf(u8, result, csf_full_needle) orelse {
+        _ = std.posix.write(2, "[v8pool] FATAL: createSourceFile needle not found\n") catch {};
+        return error.NeedleNotFound;
+    };
+    _ = std.posix.write(2, "[v8pool] patching createSourceFile → .d.ts cache\n") catch {};
+    {
         const csf_len = result.len - csf_full_needle.len + csf_full_inject.len;
         const csf_result = try alloc.alloc(u8, csf_len);
         @memcpy(csf_result[0..csf_idx], result[0..csf_idx]);
@@ -290,8 +298,12 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         "if(_r===1)return true;" ++
         "}}";
 
-    if (std.mem.indexOf(u8, result, itr_needle)) |itr_idx| {
-        _ = std.posix.write(2, "[v8pool] patching isTypeRelatedTo → WASM registry\n") catch {};
+    const itr_idx = std.mem.indexOf(u8, result, itr_needle) orelse {
+        _ = std.posix.write(2, "[v8pool] FATAL: isTypeRelatedTo needle not found\n") catch {};
+        return error.NeedleNotFound;
+    };
+    _ = std.posix.write(2, "[v8pool] patching isTypeRelatedTo → WASM registry\n") catch {};
+    {
         const itr_len = result.len - itr_needle.len + itr_inject.len;
         const itr_result = try alloc.alloc(u8, itr_len);
         @memcpy(itr_result[0..itr_idx], result[0..itr_idx]);
