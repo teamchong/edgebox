@@ -124,35 +124,59 @@ globalThis.__zigRegistryDone = false;
   }
 })();
 
-// 3. JIT warmup — run a small type check during snapshot creation.
-// This triggers V8's TurboFan to compile TSC's hot functions (isTypeRelatedTo,
-// checkTypeRelatedTo, getFlowTypeOfReference, etc.) BEFORE the snapshot.
-// Workers restore with pre-optimized code — no JIT warmup on cold start.
+// 3. Pre-parse lib .d.ts files during snapshot creation.
+// These are the same for ALL projects. Parsing them here (573ms) means
+// workers restore with pre-parsed ASTs — saves 573ms on cold start per worker.
+// The createSourceFile cache (recipe #1) stores the results across requests too.
 (function() {
-  if (!ts || !ts.createProgram || !ts.createSourceFile) return;
+  if (!ts || !ts.createSourceFile) return;
+  if (typeof __edgebox_read_file !== 'function' || typeof __edgebox_root !== 'function') return;
   try {
-    var warmupSrc = 'var x: number = 1; var y: string = "a"; interface A { a: number; b: string; } interface B extends A { c: boolean; } var z: A = {} as B; type U = string | number | boolean; var u: U = 1; function f<T>(x: T): T { return x; } f(1); f("a");';
-    var sf = ts.createSourceFile('__warmup.ts', warmupSrc, ts.ScriptTarget.Latest, true);
-    var p = ts.createProgram({
-      rootNames: ['__warmup.ts'],
-      options: { strict: true, noEmit: true },
-      host: {
-        getSourceFile: function(name) { return name === '__warmup.ts' ? sf : undefined; },
-        getDefaultLibFileName: function() { return 'lib.d.ts'; },
-        writeFile: function() {},
-        getCurrentDirectory: function() { return '/'; },
-        getCanonicalFileName: function(f) { return f; },
-        useCaseSensitiveFileNames: function() { return true; },
-        getNewLine: function() { return '\n'; },
-        fileExists: function(f) { return f === '__warmup.ts'; },
-        readFile: function() { return ''; },
+    var root = __edgebox_root();
+    var libDir = root + '/node_modules/typescript/lib/';
+    // Parse the most commonly used lib files
+    var libFiles = [
+      'lib.es5.d.ts', 'lib.es2015.d.ts', 'lib.es2015.core.d.ts',
+      'lib.es2015.collection.d.ts', 'lib.es2015.iterable.d.ts',
+      'lib.es2015.generator.d.ts', 'lib.es2015.promise.d.ts',
+      'lib.es2015.proxy.d.ts', 'lib.es2015.reflect.d.ts',
+      'lib.es2015.symbol.d.ts', 'lib.es2015.symbol.wellknown.d.ts',
+      'lib.es2016.d.ts', 'lib.es2016.array.include.d.ts',
+      'lib.es2017.d.ts', 'lib.es2017.object.d.ts', 'lib.es2017.string.d.ts',
+      'lib.es2017.intl.d.ts', 'lib.es2017.typedarrays.d.ts',
+      'lib.es2017.sharedmemory.d.ts',
+      'lib.es2018.d.ts', 'lib.es2018.asynciterable.d.ts',
+      'lib.es2018.asyncgenerator.d.ts', 'lib.es2018.promise.d.ts',
+      'lib.es2018.regexp.d.ts', 'lib.es2018.intl.d.ts',
+      'lib.es2019.d.ts', 'lib.es2019.array.d.ts', 'lib.es2019.object.d.ts',
+      'lib.es2019.string.d.ts', 'lib.es2019.symbol.d.ts',
+      'lib.es2019.intl.d.ts',
+      'lib.es2020.d.ts', 'lib.es2020.bigint.d.ts', 'lib.es2020.promise.d.ts',
+      'lib.es2020.sharedmemory.d.ts', 'lib.es2020.string.d.ts',
+      'lib.es2020.symbol.wellknown.d.ts', 'lib.es2020.intl.d.ts',
+      'lib.es2020.date.d.ts', 'lib.es2020.number.d.ts',
+      'lib.es2021.d.ts', 'lib.es2021.promise.d.ts',
+      'lib.es2021.string.d.ts', 'lib.es2021.weakref.d.ts',
+      'lib.es2021.intl.d.ts',
+      'lib.es2022.d.ts', 'lib.es2022.array.d.ts', 'lib.es2022.error.d.ts',
+      'lib.es2022.intl.d.ts', 'lib.es2022.object.d.ts',
+      'lib.es2022.regexp.d.ts', 'lib.es2022.string.d.ts',
+      'lib.es2022.sharedmemory.d.ts',
+      'lib.es2023.d.ts', 'lib.es2023.array.d.ts',
+      'lib.esnext.d.ts', 'lib.esnext.intl.d.ts',
+      'lib.dom.d.ts', 'lib.dom.iterable.d.ts', 'lib.dom.asynciterable.d.ts',
+    ];
+    var count = 0;
+    for (var i = 0; i < libFiles.length; i++) {
+      var content = __edgebox_read_file(libDir + libFiles[i]);
+      if (content) {
+        // Parse and cache via the createSourceFile wrapper (recipe #1)
+        ts.createSourceFile(libDir + libFiles[i], content, 99 /* Latest */, true);
+        count++;
       }
-    });
-    // Run type checker MULTIPLE TIMES — triggers V8 TurboFan optimization.
-    // V8 needs ~3-5 iterations to promote functions from Sparkplug to TurboFan.
-    for (var warmI = 0; warmI < 5; warmI++) {
-      ts.getPreEmitDiagnostics(p);
     }
+    if (typeof __edgebox_write_stderr === 'function')
+      __edgebox_write_stderr('[recipe] pre-parsed ' + count + ' lib .d.ts files in snapshot\n');
   } catch(e) {}
 })();
 
