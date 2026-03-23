@@ -237,10 +237,10 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   var oldProgram = globalThis.__pc[ck] || undefined;
   var isWarm = !!oldProgram;
   // Adaptive worker strategy (game-engine pattern):
-  // Cold: all workers run in parallel (level loading — maximize throughput)
-  // Warm: worker 0 only (game loop — maximize cache reuse, 875ms vs 962ms with 3)
+  // Cold: all workers run in parallel (file I/O is fast via Zig cache)
+  // Warm: worker 0 only (maximize TSC internal cache reuse)
   if (isWarm && workerId > 0) {
-    __edgebox_write_stderr('[recipe] w' + workerId + ' warm skip (single-worker mode)' + String.fromCharCode(10));
+    __edgebox_write_stderr('[recipe] w' + workerId + ' warm skip\n');
     return '';
   }
   var program = ts.createProgram(parsed.fileNames, parsed.options, host, oldProgram);

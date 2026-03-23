@@ -114,6 +114,8 @@ static void ClaimFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void IOStatsCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void SubmitResultCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void WorkerDoneCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void SignalProgramReadyCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void WaitProgramReadyCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 
 // ── Snapshot: pre-compile TypeScript for instant worker startup ──
 
@@ -155,6 +157,8 @@ static const intptr_t g_external_refs[] = {
   reinterpret_cast<intptr_t>(IsSimpleTypeRelatedCallback),
   reinterpret_cast<intptr_t>(SubmitResultCallback),
   reinterpret_cast<intptr_t>(WorkerDoneCallback),
+  reinterpret_cast<intptr_t>(SignalProgramReadyCallback),
+  reinterpret_cast<intptr_t>(WaitProgramReadyCallback),
   0  // sentinel
 };
 
@@ -185,6 +189,8 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
     global->Set(isolate, "__edgebox_register_union", v8::FunctionTemplate::New(isolate, RegisterUnionCallback));
     global->Set(isolate, "__edgebox_check_structural", v8::FunctionTemplate::New(isolate, CheckStructuralCallback));
     global->Set(isolate, "__edgebox_claim_file", v8::FunctionTemplate::New(isolate, ClaimFileCallback));
+    global->Set(isolate, "__edgebox_signal_program_ready", v8::FunctionTemplate::New(isolate, SignalProgramReadyCallback));
+    global->Set(isolate, "__edgebox_wait_program_ready", v8::FunctionTemplate::New(isolate, WaitProgramReadyCallback));
     global->Set(isolate, "__edgebox_io_stats", v8::FunctionTemplate::New(isolate, IOStatsCallback));
     global->Set(isolate, "__edgebox_root", v8::FunctionTemplate::New(isolate, RootCallback));
     global->Set(isolate, "__edgebox_write_file", v8::FunctionTemplate::New(isolate, WriteFileCallback));
@@ -455,6 +461,17 @@ static void ClaimFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
   args.GetReturnValue().Set(v8::Number::New(args.GetIsolate(), edgebox_claim_file()));
 }
 
+extern void edgebox_signal_program_ready();
+extern void edgebox_wait_program_ready();
+
+static void SignalProgramReadyCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  edgebox_signal_program_ready();
+}
+
+static void WaitProgramReadyCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  edgebox_wait_program_ready();
+}
+
 extern void edgebox_io_stats(unsigned long long* fe_calls, unsigned long long* fe_cached, unsigned long long* de_calls, unsigned long long* de_cached);
 
 static void IOStatsCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -545,6 +562,8 @@ void* edgebox_v8_setup_context(void* iso_ptr) {
     set("__edgebox_check_structural", CheckStructuralCallback);
     set("__edgebox_io_stats", IOStatsCallback);
     set("__edgebox_claim_file", ClaimFileCallback);
+    set("__edgebox_signal_program_ready", SignalProgramReadyCallback);
+    set("__edgebox_wait_program_ready", WaitProgramReadyCallback);
     set("__edgebox_worker_done", WorkerDoneCallback);
   }
   // Snapshot workers: IO callbacks already baked in via external_references

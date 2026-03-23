@@ -718,6 +718,33 @@ export fn edgebox_claim_file() u32 {
 
 export fn edgebox_reset_work() void {
     work_file_index.store(0, .release);
+    program_ready.store(0, .release);
+}
+
+// ── Phase Barrier for Coordinated Cold Start ──
+// Worker 0 sets program_ready=1 after createProgram finishes.
+// Workers 1-N spin-wait on this before starting their createProgram.
+// This lets worker 0 populate shared file/existence caches first.
+var program_ready: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
+export fn edgebox_signal_program_ready() void {
+    program_ready.store(1, .release);
+}
+
+export fn edgebox_wait_program_ready() void {
+    // Spin-wait with exponential backoff (max ~1ms per iteration)
+    var spins: u32 = 0;
+    while (program_ready.load(.acquire) == 0) {
+        if (spins < 10) {
+            // Busy spin for first 10 iterations (~100ns each)
+            std.atomic.spinLoopHint();
+        } else {
+            // Yield after 10 spins (~10us)
+            std.Thread.yield() catch {};
+        }
+        spins += 1;
+        if (spins > 100000) break; // Safety: don't wait forever (>1s)
+    }
 }
 
 // ── Relation Cache ──
