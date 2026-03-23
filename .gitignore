@@ -243,3 +243,4 @@ scripts/refactoring/
 .claude/
 !src/tsc_standalone.wasm
 .tsbuildinfo
+.edgebox-diag-cache.json
