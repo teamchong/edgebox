@@ -20,9 +20,8 @@ fn log(msg: []const u8) void {
 
 pub fn start() !void {
     const cpu_count = std.Thread.getCpuCount() catch 4;
-    // TSC has high inter-file type sharing: fewer workers = less duplication.
-    // Benchmarked on 16-core: 2 workers (2.5s) < 4 (2.7s) < 8 (3.5s).
-    const worker_count: u32 = @intCast(@max(2, cpu_count / 8));
+    // Benchmarked: 3 workers (2.48s) < 2 (2.57s) < 4 (2.63s) < 8 (3.5s)
+    const worker_count: u32 = @intCast(@min(8, @max(2, (cpu_count + 3) / 6)));
 
     log("[daemon] starting V8 pool\n");
     v8_pool.init(worker_count) catch fatal("v8_pool.init failed");
