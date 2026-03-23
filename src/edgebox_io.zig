@@ -633,13 +633,7 @@ export fn edgebox_io_free(ptr: ?[*]const u8, len: c_int) void {
     edgebox_free(ptr, len);
 }
 
-// ── LEGACY STUBS — kept for C++ linker compatibility ──
-// Type data model migrated to WasmGC (type_flags_gc.wasm, soa_gc.wasm).
-// These stubs are never called. Remove when C++ external_refs are cleaned up.
-
-export fn edgebox_register_type(_: u32, _: u32, _: u32) void {}
-export fn edgebox_register_member(_: u32, _: [*]const u8, _: c_int, _: u32, _: u32) void {}
-export fn edgebox_register_union(_: u32, _: [*]const u32, _: c_int) void {}
+// Type data model fully migrated to WasmGC (type_flags_gc.wasm, soa_gc.wasm).
 
 // ── Work-Stealing File Counter ──
 // Workers atomically claim the next file index instead of static sharding.
@@ -681,17 +675,6 @@ export fn edgebox_wait_program_ready() void {
     }
 }
 
-// ── LEGACY STUBS — relation cache + structural check migrated to WasmGC ──
-export fn edgebox_cache_relation(_: u32, _: u32, _: u8) void {}
-export fn edgebox_check_stats(out_total: *u64, out_flag: *u64, out_struct: *u64, out_cache: *u64) void {
-    out_total.* = 0; out_flag.* = 0; out_struct.* = 0; out_cache.* = 0;
-}
-export fn edgebox_check_structural(_: u32, _: u32) u8 { return 0; }
-export fn edgebox_is_simple_type_related(_: u32, _: u32, _: u32, _: u32) u8 { return 0; }
-export fn edgebox_type_stats(out_types: *u32, out_members: *u32, out_strings: *u32) void {
-    out_types.* = 0; out_members.* = 0; out_strings.* = 0;
-}
-
-// All type data now lives in WasmGC modules:
+// All type data lives in WasmGC modules:
 //   type_flags_gc.wasm — GC array for type flags (TurboFan-inlinable array.get/set)
 //   soa_gc.wasm — GC structs for auto SOA + columns (TurboFan-inlinable struct.get/set)
