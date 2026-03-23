@@ -59,7 +59,8 @@ pub fn init(worker_count: u32) !void {
     // Initialize V8 platform (once, before any isolate creation)
     edgebox_v8_init();
 
-    // Create snapshot with TypeScript pre-loaded (speeds up worker startup)
+    // Skip snapshot for now — load TypeScript fresh per worker.
+    // Correctness first, snapshot optimization later.
     const shim =
         "globalThis.module = { exports: {} };" ++
         "globalThis.__filename = '/edgebox/worker.js';" ++
@@ -88,17 +89,7 @@ pub fn init(worker_count: u32) !void {
         "if(n==='buffer')return{Buffer:Buffer};" ++
         "return{};};"
     ;
-    const ts_path = "node_modules/typescript/lib/typescript.js";
-    var ts_len: c_int = 0;
-    const ts_src = edgebox_read_file(ts_path.ptr, @intCast(ts_path.len), &ts_len);
-    if (ts_src != null and ts_len > 0) {
-        const snap_size = edgebox_v8_create_snapshot(ts_src.?, ts_len, shim.ptr, @intCast(shim.len));
-        if (snap_size > 0) {
-            _ = std.posix.write(2, "[v8pool] snapshot created\n") catch {};
-        }
-    }
-
-    // Spawn worker threads
+    // Spawn worker threads (each loads TypeScript independently)
     for (0..n) |i| {
         workers[i].worker_id = @intCast(i);
         workers[i].worker_count = n;
@@ -179,8 +170,8 @@ pub fn collect() ![]const u8 {
 fn workerLoop(worker_id: u32) void {
     const wid: usize = @intCast(worker_id);
 
-    // Create V8 isolate from snapshot (TypeScript pre-loaded)
-    const isolate = edgebox_v8_create_isolate_from_snapshot();
+    // Create fresh V8 isolate (each worker loads TypeScript independently)
+    const isolate = edgebox_v8_create_isolate();
     if (isolate == null) return;
     const context = edgebox_v8_setup_context(isolate);
     if (context == null) { edgebox_v8_dispose_isolate(isolate); return; }
@@ -241,8 +232,16 @@ fn workerLoop(worker_id: u32) void {
         if (r) |rr| edgebox_v8_free(rr);
     }
 
-    // TypeScript is already loaded from snapshot — just set ts alias
-    const ts_alias = "globalThis.ts = globalThis.ts || globalThis.module.exports;";
+    // Load TypeScript
+    const ts_path2 = "node_modules/typescript/lib/typescript.js";
+    var ts_len2: c_int = 0;
+    const ts_src2 = edgebox_read_file(ts_path2.ptr, @intCast(ts_path2.len), &ts_len2);
+    if (ts_src2 != null and ts_len2 > 0) {
+        var eval_len2: c_int = 0;
+        const r2 = edgebox_v8_eval_in_context(isolate, context, ts_src2.?, ts_len2, &eval_len2);
+        if (r2) |rr| edgebox_v8_free(rr);
+    }
+    const ts_alias = "globalThis.ts = globalThis.module.exports;";
     {
         var el2: c_int = 0;
         const r3 = edgebox_v8_eval_in_context(isolate, context, ts_alias.ptr, @intCast(ts_alias.len), &el2);
@@ -277,45 +276,43 @@ fn workerLoop(worker_id: u32) void {
         workers[wid].work_ready.store(false, .release);
 
         if (workers[wid].cwd) |cwd| {
-            // Run TSC check on this shard — caches program between requests
+            // Run TSC via executeCommandLine — identical to Node.js `npx tsc`
             const check_code = std.fmt.allocPrint(alloc,
                 \\(function() {{
                 \\  var ts = globalThis.ts || globalThis.module.exports;
-                \\  if (!ts || !ts.createProgram) return 'no tsc';
-                \\  if (!ts.sys) return 'ts.sys is ' + typeof ts.sys;
+                \\  if (!ts || !ts.executeCommandLine) return 'no tsc';
+                \\  if (!ts.sys) return 'no sys';
+                \\  // Reset cached sys to force re-init with real IO
+                \\  ts.sys.useCaseSensitiveFileNames = true;
+                \\  // Fix: set __filename to typescript.js so isFileSystemCaseSensitive works
+                \\  globalThis.__filename = ebRoot + '/node_modules/typescript/lib/typescript.js';
                 \\  var cwd = '{s}';
-                \\  var wid = {d};
-                \\  var wcount = {d};
                 \\  var ebRoot = __edgebox_cwd();
-                \\  function rp(p) {{
-                \\    p = String(p);
-                \\    if (p.charAt(0) === '/') return p;
-                \\    return cwd + '/' + p;
-                \\  }}
+                \\  function rp(p) {{ p = String(p); return p.charAt(0) === '/' ? p : cwd + '/' + p; }}
                 \\  ts.sys.readFile = function(p) {{
-                \\    var resolved = rp(p);
-                \\    var c = __edgebox_read_file(resolved);
-                \\    if (!c && resolved.indexOf('/node_modules/typescript/lib/') === -1 && p.indexOf('lib.') === 0) {{
-                \\      c = __edgebox_read_file(ebRoot + '/node_modules/typescript/lib/' + p);
+                \\    var c = __edgebox_read_file(rp(p));
+                \\    if (!c) {{
+                \\      var base = p.split('/').pop();
+                \\      if (base && base.indexOf('lib.') === 0 && base.endsWith('.d.ts'))
+                \\        c = __edgebox_read_file(ebRoot + '/node_modules/typescript/lib/' + base);
                 \\    }}
                 \\    return c || undefined;
                 \\  }};
                 \\  ts.sys.fileExists = function(p) {{
-                \\    if (__edgebox_file_exists(rp(p)) === 1) return true;
-                \\    if (String(p).indexOf('lib.') === 0) return __edgebox_file_exists(ebRoot + '/node_modules/typescript/lib/' + p) === 1;
+                \\    var resolved = rp(p);
+                \\    if (__edgebox_file_exists(resolved) === 1) return true;
+                \\    // Fallback: check EdgeBox root for lib.d.ts files
+                \\    var base = p.split('/').pop();
+                \\    if (base && base.indexOf('lib.') === 0 && base.endsWith('.d.ts'))
+                \\      return __edgebox_file_exists(ebRoot + '/node_modules/typescript/lib/' + base) === 1;
                 \\    return false;
                 \\  }};
-                \\  ts.sys.directoryExists = function(p) {{
-                \\    if (__edgebox_dir_exists(rp(p)) === 1) return true;
-                \\    if (p.charAt(0) === '/') return __edgebox_dir_exists(p) === 1;
-                \\    return false;
-                \\  }};
+                \\  ts.sys.directoryExists = function(p) {{ return __edgebox_dir_exists(rp(p)) === 1 || (p.charAt(0)==='/'&&__edgebox_dir_exists(p)===1); }};
                 \\  ts.sys.getCurrentDirectory = function() {{ return cwd; }};
                 \\  ts.sys.realpath = function(p) {{ return __edgebox_realpath(rp(p)); }};
-                \\  ts.sys.getExecutingFilePath = function() {{ return __edgebox_cwd() + '/node_modules/typescript/lib/typescript.js'; }};
-                \\  ts.sys.write = function(s) {{ __edgebox_write_stdout(String(s)); }};
-                \\  ts.sys.writeFile = function() {{}};
-                \\  ts.sys.exit = function() {{}};
+                \\  ts.sys.getExecutingFilePath = function() {{ return ebRoot + '/node_modules/typescript/lib/typescript.js'; }};
+                \\  ts.sys.writeFile = function(p, data) {{ __edgebox_write_file(rp(p), data); }};
+                \\  ts.sys.writeOutputIsTTY = function() {{ return false; }};
                 \\  ts.sys.getDirectories = function(p) {{
                 \\    var rr = rp(p); var entries = JSON.parse(__edgebox_readdir(rr));
                 \\    return entries.filter(function(e) {{ return __edgebox_dir_exists(rr + '/' + e) === 1; }});
@@ -332,37 +329,15 @@ fn workerLoop(worker_id: u32) void {
                 \\      return {{ files: files, directories: dirs }};
                 \\    }}, function(p) {{ return __edgebox_realpath(p); }});
                 \\  }};
-                \\  var cf = ts.readConfigFile(cwd + '/tsconfig.json', ts.sys.readFile);
-                \\  if (cf.error) return 'config error';
-                \\  var parsed = ts.parseJsonConfigFileContent(cf.config, ts.sys, cwd);
-                \\  // Cache program across requests — skip createProgram on warm runs
-                \\  var cacheKey = cwd + ':' + parsed.fileNames.length;
-                \\  if (!globalThis.__programCache) globalThis.__programCache = {{}};
-                \\  var program = globalThis.__programCache[cacheKey];
-                \\  if (!program) {{
-                \\    program = ts.createProgram(parsed.fileNames, parsed.options);
-                \\    globalThis.__programCache[cacheKey] = program;
-                \\  }}
-                \\  var files = program.getSourceFiles();
+                \\  // Capture output
                 \\  var output = [];
-                \\  if (wid === 0) {{
-                \\    var gd = ts.getPreEmitDiagnostics(program).filter(function(d) {{ return !d.file; }});
-                \\    for (var g = 0; g < gd.length; g++) output.push(ts.flattenDiagnosticMessageText(gd[g].messageText, '\\n'));
-                \\  }}
-                \\  for (var i = 0; i < files.length; i++) {{
-                \\    if (i % wcount !== wid) continue;
-                \\    var diags = program.getSemanticDiagnostics(files[i]);
-                \\    for (var k = 0; k < diags.length; k++) {{
-                \\      var d = diags[k];
-                \\      if (d.file) {{
-                \\        var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
-                \\        output.push(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' '));
-                \\      }}
-                \\    }}
-                \\  }}
-                \\  return output.join('\\n');
+                \\  ts.sys.write = function(s) {{ output.push(String(s)); }};
+                \\  ts.sys.exit = function() {{}};
+                \\  ts.sys.args = ['--noEmit', '-p', cwd + '/tsconfig.json'];
+                \\  try {{ ts.executeCommandLine(ts.sys, ts.noop, ts.sys.args); }} catch(e) {{ output.push('error: ' + e.message); }}
+                \\  return output.join('');
                 \\}})()
-            , .{ cwd, wid, workers[wid].worker_count }) catch {
+            , .{ cwd }) catch {
                 workers[wid].result = null;
                 continue;
             };
