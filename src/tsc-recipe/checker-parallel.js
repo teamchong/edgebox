@@ -93,15 +93,13 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     globalThis.__cc[cwd] = parsed;
   }
   var ck = cwd + ':' + parsed.fileNames.length;
-  var isWarm = !!globalThis.__pc[ck];
   var t1 = Date.now();
-  var program;
-  if (isWarm) {
-    program = globalThis.__pc[ck];
-  } else {
-    program = ts.createProgram(parsed.fileNames, parsed.options);
-    globalThis.__pc[ck] = program;
-  }
+  // Always create a fresh program — pass oldProgram for incremental reuse.
+  // TSC reuses unchanged source files from oldProgram (compares content).
+  var oldProgram = globalThis.__pc[ck] || undefined;
+  var program = ts.createProgram(parsed.fileNames, parsed.options, undefined, oldProgram);
+  globalThis.__pc[ck] = program;
+  var isWarm = !!oldProgram;
   var t2 = Date.now();
   var files = program.getSourceFiles();
   var NL = String.fromCharCode(10);

@@ -12,6 +12,15 @@ const alloc = std.heap.page_allocator;
 var file_cache: std.StringHashMapUnmanaged([]const u8) = .{};
 var cache_mutex: std.Thread.Mutex = .{};
 
+/// Clear file cache between requests — ensures fresh content on each type check.
+export fn edgebox_clear_file_cache() void {
+    cache_mutex.lock();
+    defer cache_mutex.unlock();
+    // Don't free entries — they may be referenced by V8 strings.
+    // Just clear the map so next reads go to disk.
+    file_cache.clearRetainingCapacity();
+}
+
 fn cacheReadFile(path: []const u8) ![]const u8 {
     {
         cache_mutex.lock();
