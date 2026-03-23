@@ -245,7 +245,28 @@ fn workerLoop(worker_id: u32) void {
         if (r) |rr| edgebox_v8_free(rr);
     }
 
-    // TypeScript already loaded from snapshot — just set ts alias
+    // Re-initialize ts.sys after snapshot restore (snapshot had stub require)
+    // The module_shim above sets up real require with Zig IO
+    const reinit_sys = "if(typeof ts !== 'undefined' && !ts.sys) { try { ts.setSys(ts.createSystem()); } catch(e) { /* createSystem may not exist */ } }";
+    {
+        var rl: c_int = 0;
+        const rr = edgebox_v8_eval_in_context(isolate, context, reinit_sys.ptr, @intCast(reinit_sys.len), &rl);
+        if (rr) |r| edgebox_v8_free(r);
+    }
+
+    // Check if TypeScript survived snapshot restore
+    const ts_check = "typeof ts !== 'undefined' ? 'ts:OK' : (typeof module !== 'undefined' ? 'module:' + typeof module.exports : 'no ts, no module')";
+    {
+        var cl: c_int = 0;
+        const cr = edgebox_v8_eval_in_context(isolate, context, ts_check.ptr, @intCast(ts_check.len), &cl);
+        if (cr) |c| {
+            _ = std.posix.write(2, "[v8pool] ") catch {};
+            _ = std.posix.write(2, c[0..@intCast(cl)]) catch {};
+            _ = std.posix.write(2, "\n") catch {};
+            edgebox_v8_free(c);
+        }
+    }
+    // Set ts alias
     const ts_alias = "globalThis.ts = globalThis.ts || globalThis.module.exports;";
     {
         var el2: c_int = 0;
@@ -281,7 +302,7 @@ fn workerLoop(worker_id: u32) void {
         if (workers[wid].cwd) |cwd| {
             // Call recipe function: __edgebox_check(cwd, workerId, workerCount)
             const check_code = std.fmt.allocPrint(alloc,
-                "__edgebox_check('{s}', {d}, {d})"
+                "typeof __edgebox_check === 'function' ? __edgebox_check('{s}', {d}, {d}) : 'no __edgebox_check: ' + typeof __edgebox_check"
             , .{ cwd, wid, workers[wid].worker_count }) catch {
                 workers[wid].result = null;
                 continue;

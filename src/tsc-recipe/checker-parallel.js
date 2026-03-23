@@ -3,7 +3,27 @@ var ts = globalThis.ts || globalThis.module.exports;
 
 globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   if (!ts || !ts.createProgram) return 'no tsc';
-  if (!ts.sys) return 'no sys';
+  // Create ts.sys if missing (snapshot restore doesn't init it)
+  if (!ts.sys && ts.setSys) {
+    ts.setSys({
+      args: [], newLine: '\n', useCaseSensitiveFileNames: true,
+      write: function(s) { __edgebox_write_stdout(String(s)); },
+      writeOutputIsTTY: function() { return false; },
+      readFile: function() { return undefined; },
+      writeFile: function() {},
+      fileExists: function() { return false; },
+      directoryExists: function() { return false; },
+      createDirectory: function() {},
+      getExecutingFilePath: function() { return '/'; },
+      getCurrentDirectory: function() { return '/'; },
+      getDirectories: function() { return []; },
+      readDirectory: function() { return []; },
+      exit: function() {},
+      realpath: function(p) { return p; },
+      getEnvironmentVariable: function() { return ''; },
+    });
+  }
+  if (!ts.sys) return 'no sys (setSys failed)';
 
   var ebRoot = __edgebox_cwd();
   function rp(p) { p = String(p); return p.charAt(0) === '/' ? p : cwd + '/' + p; }
@@ -53,7 +73,8 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   };
 
   var cf = ts.readConfigFile(cwd + '/tsconfig.json', ts.sys.readFile);
-  if (cf.error) return 'config error';
+  if (cf.error) return 'config error: ' + ts.flattenDiagnosticMessageText(cf.error.messageText, ' ');
+  if (!cf.config) return 'config null';
   var parsed = ts.parseJsonConfigFileContent(cf.config, ts.sys, cwd);
   if (!globalThis.__pc) globalThis.__pc = {};
   var ck = cwd + ':' + parsed.fileNames.length;
