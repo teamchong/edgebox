@@ -229,11 +229,10 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
 
     // Patch 1: createType — populate WASM flags array when TSC creates a type
     const ct_needle = "function createType(flags) {";
+    // Capture __typeFlags once in closure — not on every createType call.
     const ct_inject = "function createType(flags) {" ++
-        // Write flags to WASM memory at type.id position (typeCount+1 after increment).
-        // TSC does: typeCount++; result.id = typeCount; so id = typeCount+1 at this point.
         "var _tf=globalThis.__typeFlags;" ++
-        "if(_tf){var _tid=typeCount+1;if(_tid<65536)_tf[_tid]=flags;}";
+        "if(_tf){_tf[typeCount+1]=flags;}";
 
     if (std.mem.indexOf(u8, result, ct_needle)) |ct_idx| {
         _ = std.posix.write(2, "[v8pool] patching createType → WASM flags\n") catch {};
@@ -250,14 +249,16 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
     // WASM fast path at isTypeRelatedTo level.
     // Handle fresh literals (use regularType), skip identity relation (different logic).
     // Only positive results — no false negatives.
+    // Closure-captured reference — no globalThis lookup on hot path.
+    // V8 optimizes closure variables much better than global property access.
     const itr_inject = "function isTypeRelatedTo(source, target, relation) {" ++
-        "if(globalThis.__zigRegistry&&relation!==identityRelation){" ++
-        // Use regularType for fresh literals (same as TSC's first two lines)
+        "var _zr=globalThis.__zigRegistry;" ++
+        "if(_zr&&relation!==identityRelation){" ++
         "var _s=source.regularType||source,_t=target.regularType||target;" ++
         "if(_s===_t)return true;" ++
-        "if(_s.id<65536&&_t.id<65536){" ++
-        "var _r=globalThis.__zigRegistry.isTypeRelated(" ++
-        "_s.id|0,_t.id|0," ++
+        "var _si=_s.id,_ti=_t.id;" ++
+        "if(_si<65536&&_ti<65536){" ++
+        "var _r=_zr.isTypeRelated(_si|0,_ti|0," ++
         "(relation===assignableRelation?0:relation===comparableRelation?1:2)|0," ++
         "(strictNullChecks?1:0)|0);" ++
         "if(_r===1)return true;" ++

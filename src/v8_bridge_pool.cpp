@@ -32,7 +32,12 @@ extern "C" {
 
 void edgebox_v8_init() {
   if (g_initialized) return;
-  const char* flags = "--max-old-space-size=4096";
+  // V8 flags for cold start performance:
+  // - max-old-space-size: prevent OOM with multiple isolates
+  // - concurrent-sparkplug: compile baseline JIT on background threads
+  // - lazy-feedback-allocation: defer feedback vector allocation (less GC pressure)
+  // - max-semi-space-size: larger young gen for type-heavy workloads
+  const char* flags = "--max-old-space-size=4096 --concurrent-sparkplug --lazy-feedback-allocation --max-semi-space-size=16";
   v8__V8__SetFlagsFromString(flags, strlen(flags));
   // 8 platform threads for background JIT compilation across 8 V8 isolates
   g_platform = v8__Platform__NewDefaultPlatform(8, false);
