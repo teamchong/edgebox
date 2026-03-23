@@ -22,20 +22,9 @@ var ts = globalThis.ts || globalThis.module.exports;
   };
 })();
 
-// 2. Load WASM type kernel (if available)
-(function() {
-  if (typeof __edgebox_read_file !== 'function' || typeof __edgebox_root !== 'function') return;
-  var root = __edgebox_root();
-  var wasmSrc = __edgebox_read_file(root + '/src/tsc-recipe/type_kernel.wasm');
-  if (!wasmSrc) return;
-  try {
-    var bytes = new Uint8Array(wasmSrc.length);
-    for (var i = 0; i < wasmSrc.length; i++) bytes[i] = wasmSrc.charCodeAt(i);
-    var mod = new WebAssembly.Module(bytes);
-    var inst = new WebAssembly.Instance(mod);
-    globalThis.__ebWasmTypeKernel = inst.exports.isSimpleTypeRelated;
-  } catch(e) {}
-})();
+// WASM kernels available as globalThis.__ebWasmTypeKernel (loaded from .wasm files)
+// Currently not wired into TSC's internal checker — would require source patching.
+// Kept for future use in AOT compilation pipeline.
 
 // 3. JIT warmup — run a small type check during snapshot creation.
 // This triggers V8's TurboFan to compile TSC's hot functions (isTypeRelatedTo,
