@@ -227,10 +227,11 @@ pub fn init(worker_count: u32) !void {
 fn applyRecipeTransform(src: []const u8) ![]const u8 {
     var result = src;
 
-    // Patch 1: createType — DISABLED. WASM flag population doesn't help cold
-    // and may interfere with typeCount closure variable.
+    // Patch 1: createType — populate WASM flags array
     const ct_needle = "function createType(flags) {";
-    const ct_inject = ct_needle;
+    const ct_inject = "function createType(flags) {" ++
+        "var _zr=globalThis.__zigRegistry;" ++
+        "if(_zr){var _tid=typeCount+1;if(_tid<65536)_zr.registerType(_tid|0,flags|0,0);}";
 
     if (std.mem.indexOf(u8, result, ct_needle)) |ct_idx| {
         _ = std.posix.write(2, "[v8pool] patching createType → WASM flags\n") catch {};
@@ -267,12 +268,21 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         result = csf_result;
     }
 
-    // Patch 3: isTypeRelatedTo WASM fast path — DISABLED.
-    // A/B test showed WASM injection produces false positives (11508 vs 2058 diags)
-    // when flags array is populated via createType injection. Need investigation
-    // before re-enabling. The WASM kernel loads but isn't called from TSC.
+    // Patch 3: isTypeRelatedTo — WASM fast path for flag-based type relations.
+    // Positive-only: returns true when flags prove types related, else falls through to JS.
     const itr_needle = "function isTypeRelatedTo(source, target, relation) {";
-    const itr_inject = itr_needle;
+    const itr_inject = "function isTypeRelatedTo(source, target, relation) {" ++
+        "var _zr=globalThis.__zigRegistry;" ++
+        "if(_zr&&relation!==identityRelation){" ++
+        "var _s=source.regularType||source,_t=target.regularType||target;" ++
+        "if(_s===_t)return true;" ++
+        "var _si=_s.id,_ti=_t.id;" ++
+        "if(_si<65536&&_ti<65536){" ++
+        "var _r=_zr.isTypeRelated(_si|0,_ti|0," ++
+        "(relation===assignableRelation?0:relation===comparableRelation?1:2)|0," ++
+        "(strictNullChecks?1:0)|0);" ++
+        "if(_r===1)return true;" ++
+        "}}";
 
     if (std.mem.indexOf(u8, result, itr_needle)) |itr_idx| {
         _ = std.posix.write(2, "[v8pool] patching isTypeRelatedTo → WASM registry\n") catch {};
