@@ -169,9 +169,11 @@ static std::string GetStringArg(const v8::FunctionCallbackInfo<v8::Value>& args,
 
 // V8 callback: __edgebox_read_file(path) → string
 static void ReadFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  auto path = GetStringArg(args, 0);
+  if (args.Length() < 1) return;
+  v8::String::Utf8Value utf8(args.GetIsolate(), args[0]);
+  if (!*utf8) { args.GetReturnValue().Set(v8::String::NewFromUtf8(args.GetIsolate(), "").ToLocalChecked()); return; }
   int out_len = 0;
-  auto* data = edgebox_read_file(path.c_str(), path.size(), &out_len);
+  auto* data = edgebox_read_file(*utf8, utf8.length(), &out_len);
   if (!data || out_len <= 0) {
     args.GetReturnValue().Set(v8::String::NewFromUtf8(args.GetIsolate(), "").ToLocalChecked());
     return;
