@@ -146,11 +146,17 @@ pub fn collect() ![]const u8 {
     }
     work_mutex.unlock();
 
-    // Use worker 0's result
-    if (workers[0].result) |data| {
-        return try alloc.dupe(u8, data);
+    // Merge results from all workers (sharded check)
+    var merged: std.ArrayListUnmanaged(u8) = .{};
+    for (0..pool_size) |i| {
+        if (workers[i].result) |data| {
+            try merged.appendSlice(alloc, data);
+            if (data.len > 0 and data[data.len - 1] != '\n') {
+                try merged.append(alloc, '\n');
+            }
+        }
     }
-    return try alloc.dupe(u8, "");
+    return try merged.toOwnedSlice(alloc);
 }
 
 /// Worker thread: creates V8 isolate, loads TSC, loops waiting for work.
@@ -316,15 +322,37 @@ fn workerLoop(worker_id: u32) void {
                 \\      return {{ files: files, directories: dirs }};
                 \\    }}, function(p) {{ return __edgebox_realpath(p); }});
                 \\  }};
-                \\  // Capture output
+                \\  var wid = {d};
+                \\  var wcount = {d};
+                \\  // Create program (file cache shared via Zig — fast after first worker)
+                \\  var cf = ts.readConfigFile(cwd + '/tsconfig.json', ts.sys.readFile);
+                \\  if (cf.error) return 'config error';
+                \\  var parsed = ts.parseJsonConfigFileContent(cf.config, ts.sys, cwd);
+                \\  var program = ts.createProgram(parsed.fileNames, parsed.options);
+                \\  var files = program.getSourceFiles();
                 \\  var output = [];
-                \\  ts.sys.write = function(s) {{ output.push(String(s)); }};
-                \\  ts.sys.exit = function() {{}};
-                \\  ts.sys.args = ['--noEmit', '-p', cwd + '/tsconfig.json'];
-                \\  try {{ ts.executeCommandLine(ts.sys, ts.noop, ts.sys.args); }} catch(e) {{ output.push('error: ' + e.message); }}
-                \\  return output.join('');
+                \\  // Worker 0: global diagnostics
+                \\  if (wid === 0) {{
+                \\    var gd = ts.getPreEmitDiagnostics(program).filter(function(d) {{ return !d.file; }});
+                \\    for (var g = 0; g < gd.length; g++) {{
+                \\      output.push('error TS' + gd[g].code + ': ' + ts.flattenDiagnosticMessageText(gd[g].messageText, ' '));
+                \\    }}
+                \\  }}
+                \\  // Check only this worker's shard
+                \\  for (var i = 0; i < files.length; i++) {{
+                \\    if (i % wcount !== wid) continue;
+                \\    var diags = program.getSemanticDiagnostics(files[i]);
+                \\    for (var k = 0; k < diags.length; k++) {{
+                \\      var d = diags[k];
+                \\      if (d.file) {{
+                \\        var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
+                \\        output.push(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' '));
+                \\      }}
+                \\    }}
+                \\  }}
+                \\  return output.join('\\n');
                 \\}})()
-            , .{ cwd }) catch {
+            , .{ cwd, wid, workers[wid].worker_count }) catch {
                 workers[wid].result = null;
                 continue;
             };

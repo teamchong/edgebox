@@ -131,7 +131,8 @@ fn runTsc() u8 {
         std.debug.print("Starting daemon...\n", .{});
         const rc = daemonStart();
         if (rc != 0) return rc;
-        std.Thread.sleep(3 * std.time.ns_per_s);
+        // Wait for workers to load TypeScript (~10s for 8 workers)
+        std.Thread.sleep(12 * std.time.ns_per_s);
     }
 
     // Get project cwd
