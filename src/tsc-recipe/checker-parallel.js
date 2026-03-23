@@ -149,9 +149,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   var t1 = Date.now();
 
   // Module resolution cache — persists across requests per worker.
-  // First request: resolves modules normally, caches results.
-  // Subsequent requests: returns cached results instantly (saves ~340ms).
-  // Game industry trick: pre-compute in batch, not per-entity.
+  // First request builds cache. Subsequent requests use cached results (saves ~340ms).
   if (!globalThis.__mrCache) globalThis.__mrCache = new Map();
   var defaultHost = ts.createCompilerHost(parsed.options);
   var host = Object.create(defaultHost);
