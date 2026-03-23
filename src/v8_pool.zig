@@ -235,10 +235,17 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         "if(_r===1){globalThis.__zigHits=(globalThis.__zigHits||0)+1;return true;}" ++
         "}";
 
-    // Temporarily disabled to isolate GPE — just load WASM, don't inject
-    _ = needle;
-    _ = injection;
-    return src;
+    const idx = std.mem.indexOf(u8, src, needle) orelse {
+        _ = std.posix.write(2, "[v8pool] WASM injection: needle not found\n") catch {};
+        return src;
+    };
+    _ = std.posix.write(2, "[v8pool] WASM injection: patching isSimpleTypeRelatedTo\n") catch {};
+    const new_len = src.len - needle.len + injection.len;
+    const result = try alloc.alloc(u8, new_len);
+    @memcpy(result[0..idx], src[0..idx]);
+    @memcpy(result[idx .. idx + injection.len], injection);
+    @memcpy(result[idx + injection.len .. new_len], src[idx + needle.len ..]);
+    return result;
 }
 
 /// Shutdown the pool. Signal all workers to exit, join threads.

@@ -81,8 +81,33 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   try {
   if (!ts || !ts.createProgram) return 'no tsc: ' + typeof ts;
 
-  // WASM kernel loading — disabled pending segfault investigation
-  // Will be re-enabled once ReadBinaryCallback is stable.
+  // Load Zig WASM type kernel — NO FALLBACK. Must succeed or fail loud.
+  if (!globalThis.__zigWasmInitDone) {
+    globalThis.__zigWasmInitDone = true;
+    if (typeof __edgebox_read_binary === 'function' && typeof WebAssembly !== 'undefined') {
+      var _root = typeof __edgebox_root === 'function' ? __edgebox_root() : '';
+      var _wasmPath = _root + '/src/tsc-recipe/type_kernel.wasm';
+      var _buf = __edgebox_read_binary(_wasmPath);
+      if (_buf && _buf instanceof ArrayBuffer && _buf.byteLength >= 8) {
+        var _mod = new WebAssembly.Module(_buf);
+        var _inst = new WebAssembly.Instance(_mod, {});
+        globalThis.__zigTypeKernel = _inst.exports;
+        // Warmup: trigger Liftoff → TurboFan promotion (500 calls each)
+        var _k = _inst.exports.isSimpleTypeRelated;
+        for (var _wi = 0; _wi < 500; _wi++) {
+          _k(1, 1, 0, 1); _k(4, 8, 0, 1); _k(524288, 524288, 0, 1);
+          _k(2, 1, 0, 1); _k(16, 16, 1, 1); _k(131072, 1, 0, 1);
+        }
+        __edgebox_write_stderr('[recipe] WASM kernel loaded (' + _buf.byteLength + ' bytes, TurboFan warmed)\n');
+      } else {
+        __edgebox_write_stderr('[recipe] WASM FAILED: read_binary returned ' + typeof _buf +
+          (_buf ? ' len=' + _buf.byteLength : ' null') + ' for ' + _wasmPath + '\n');
+      }
+    } else {
+      __edgebox_write_stderr('[recipe] WASM SKIPPED: read_binary=' + (typeof __edgebox_read_binary) +
+        ' WebAssembly=' + (typeof WebAssembly) + '\n');
+    }
+  }
 
   // Create ts.sys if missing (snapshot restore doesn't init it)
   if (!ts.sys && ts.setSys) {

@@ -261,18 +261,25 @@ static void ReadFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
     v8::String::NewFromUtf8(args.GetIsolate(), data, v8::NewStringType::kNormal, out_len).ToLocalChecked());
 }
 
-// Read binary file → ArrayBuffer (for WASM modules, binary assets)
+// Read binary file → Uint8Array (for WASM modules, binary assets)
+// Uses Uint8Array wrapping an ArrayBuffer so JS sees proper binary data.
 static void ReadBinaryCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
   if (args.Length() < 1) return;
   auto* isolate = args.GetIsolate();
+  v8::HandleScope scope(isolate);
   v8::String::Utf8Value utf8(isolate, args[0]);
   if (!*utf8) return;
   int out_len = 0;
   auto* data = edgebox_read_file(*utf8, utf8.length(), &out_len);
   if (!data || out_len <= 0) return;
-  // Create ArrayBuffer and copy binary data into it
+  // Use Uint8Array approach — JS can pass .buffer to WebAssembly.Module
+  auto context = isolate->GetCurrentContext();
   auto ab = v8::ArrayBuffer::New(isolate, (size_t)out_len);
-  memcpy(ab->GetBackingStore()->Data(), data, out_len);
+  if (ab.IsEmpty()) { fprintf(stderr, "[v8] ReadBinary: ArrayBuffer::New failed\n"); return; }
+  // Get the data pointer and copy
+  void* dest = ab->Data();
+  if (!dest) { fprintf(stderr, "[v8] ReadBinary: ab->Data() null\n"); return; }
+  memcpy(dest, data, out_len);
   args.GetReturnValue().Set(ab);
 }
 
