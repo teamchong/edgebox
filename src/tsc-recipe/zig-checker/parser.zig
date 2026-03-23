@@ -99,9 +99,23 @@ fn parseTypeAnnotation() TypeRef {
     // : Type
     if (peek() != .colon) return NO_TYPE;
     advance(); // skip :
+    return parseTypeExpr();
+}
+
+/// Parse a type expression. Handles:
+/// - Built-in types: number, string, boolean, any, unknown, never, void, object
+/// - Identifiers: Foo, tls.ConnectionOptions
+/// - Generic types: Promise<T>, Map<K, V>
+/// - Array types: T[], Array<T>
+/// - Union types: A | B | C
+/// - Function types: (a: T) => R
+/// - Parenthesized: (Type)
+/// - Literal types: null, undefined
+fn parseTypeExpr() TypeRef {
     const start = tokenStart();
-    const len = tokenLen();
-    const kind: u8 = switch (peek()) {
+
+    // Try to parse a single type
+    var kind: u8 = switch (peek()) {
         .kw_number => 1,
         .kw_string => 2,
         .kw_boolean => 3,
@@ -112,29 +126,93 @@ fn parseTypeAnnotation() TypeRef {
         .kw_object => 8,
         .kw_null => 9,
         .kw_undefined => 10,
-        .identifier => 11, // custom type
+        .identifier => 11,
+        .kw_typeof => 11, // typeof X
+        .open_paren => blk: {
+            // Function type or parenthesized type: (a: T) => R or (Type)
+            skipBalanced(.open_paren, .close_paren);
+            if (peek() == .arrow) {
+                advance(); // =>
+                _ = parseTypeExpr(); // return type
+            }
+            break :blk 11; // complex type
+        },
+        .open_brace => blk: {
+            // Object literal type: { a: T; b: U }
+            skipBalanced(.open_brace, .close_brace);
+            break :blk 11;
+        },
+        .open_bracket => blk: {
+            // Tuple type: [T, U]
+            skipBalanced(.open_bracket, .close_bracket);
+            break :blk 11;
+        },
+        .kw_new => blk: {
+            // Constructor type: new (args) => T
+            advance();
+            if (peek() == .open_paren) skipBalanced(.open_paren, .close_paren);
+            if (peek() == .arrow) { advance(); _ = parseTypeExpr(); }
+            break :blk 11;
+        },
         else => 0,
     };
-    if (kind > 0) {
-        advance();
-        // Check for array: Type[]
-        if (peek() == .open_bracket and peekAt(1) == .close_bracket) {
-            advance();
-            advance();
-            return TypeRef{ .kind = 13, .start = start, .len = @intCast(tokenStart() + tokenLen() - start) };
-        }
-        // Check for union: Type | Type
-        if (peek() == .pipe) {
-            // Skip union members
-            while (peek() == .pipe) {
-                advance(); // |
-                advance(); // type
-            }
-            return TypeRef{ .kind = 12, .start = start, .len = @intCast(tokenStart() - start) };
-        }
-        return TypeRef{ .kind = kind, .start = start, .len = len };
+
+    if (kind == 0) return NO_TYPE;
+
+    // For non-complex types, advance past the token
+    if (kind >= 1 and kind <= 10) advance();
+    if (kind == 11 and peek() == .identifier) advance();
+    if (kind == 11 and peek() == .kw_typeof) { advance(); if (peek() == .identifier) advance(); }
+
+    // Handle dotted types: a.b.c
+    while (peek() == .dot and peekAt(1) == .identifier) {
+        advance(); // .
+        advance(); // identifier
     }
-    return NO_TYPE;
+
+    // Handle generic types: Type<T, U>
+    if (peek() == .less_than) {
+        skipBalanced(.less_than, .greater_than);
+    }
+
+    // Handle array suffix: Type[] or Type[][]
+    while (peek() == .open_bracket and peekAt(1) == .close_bracket) {
+        advance();
+        advance();
+        kind = 13; // array
+    }
+
+    // Handle union: Type | Type | Type
+    if (peek() == .pipe) {
+        while (peek() == .pipe) {
+            advance(); // |
+            _ = parseTypeExpr(); // recursive
+        }
+        kind = 12; // union
+    }
+
+    // Handle intersection: Type & Type
+    if (peek() == .ampersand) {
+        while (peek() == .ampersand) {
+            advance(); // &
+            _ = parseTypeExpr();
+        }
+    }
+
+    const end_pos = tokenStart();
+    return TypeRef{ .kind = kind, .start = start, .len = @intCast(if (end_pos > start) end_pos - start else 1) };
+}
+
+/// Skip balanced pairs: (), {}, [], <>
+fn skipBalanced(open: TK, close: TK) void {
+    if (peek() != open) return;
+    var depth: u32 = 1;
+    advance();
+    while (depth > 0 and peek() != .eof) {
+        if (peek() == open) depth += 1;
+        if (peek() == close) depth -= 1;
+        advance();
+    }
 }
 
 fn inferLiteralType() TypeRef {
@@ -203,6 +281,9 @@ fn parseFuncDecl(flags: u8) void {
 
     // Parse parameters
     while (peek() != .close_paren and peek() != .eof) {
+        // Skip modifiers: readonly, public, private, protected
+        if (peek() == .kw_readonly) advance();
+
         if (peek() == .identifier) {
             const pname_start = tokenStart();
             const pname_len = tokenLen();
@@ -212,11 +293,44 @@ fn parseFuncDecl(flags: u8) void {
                 pflags |= 1; // optional
                 advance();
             }
-            const ptype = parseTypeAnnotation();
-            _ = addNode(.param_decl, pname_start, pname_len, ptype, NO_TYPE, @intCast(func_idx), pflags);
+            var ptype = parseTypeAnnotation();
+
+            // Default value: param = value → infers type from default
+            var init = NO_TYPE;
+            if (peek() == .equals) {
+                advance(); // =
+                init = inferLiteralType();
+                // Default value provides implicit type
+                if (ptype.kind == 0 and init.kind > 0) {
+                    // Infer type from default: number literal → number, etc.
+                    ptype.kind = switch (init.kind) {
+                        20 => 1, // numLit → number
+                        21 => 2, // strLit → string
+                        22, 23 => 3, // true/false → boolean
+                        else => 0,
+                    };
+                    pflags |= 8; // has inferred type from default
+                }
+                // Skip rest of default expression
+                while (peek() != .comma and peek() != .close_paren and peek() != .eof) advance();
+            }
+
+            _ = addNode(.param_decl, pname_start, pname_len, ptype, init, @intCast(func_idx), pflags);
+        } else if (peek() == .dot and peekAt(1) == .dot and peekAt(2) == .dot) {
+            // Rest parameter: ...args
+            advance(); advance(); advance(); // ...
+            if (peek() == .identifier) {
+                const pname_start = tokenStart();
+                const pname_len = tokenLen();
+                advance();
+                const ptype = parseTypeAnnotation();
+                _ = addNode(.param_decl, pname_start, pname_len, ptype, NO_TYPE, @intCast(func_idx), 0);
+            }
         }
         if (peek() == .comma) advance();
-        if (peek() != .close_paren and peek() != .identifier) advance(); // skip unknown
+        // Skip destructuring patterns { a, b } or [ a, b ]
+        if (peek() == .open_brace) skipBalanced(.open_brace, .close_brace);
+        if (peek() == .open_bracket) skipBalanced(.open_bracket, .close_bracket);
     }
     if (expect(.close_paren)) {
         // Return type
