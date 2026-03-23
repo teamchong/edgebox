@@ -4,9 +4,9 @@
 // WASM kernels compiled from Zig, loaded here. V8 TurboFan inlines WASM at callsite.
 var ts = globalThis.ts || globalThis.module.exports;
 
-// 0. WASM type registry — deferred to first worker call (WebAssembly unavailable during snapshot).
-// Shared data model: type flags in WASM linear memory, zero-copy access from JS and WASM.
-globalThis.__zigRegistryDone = false;
+// 0. WasmGC — all WASM uses GC types (array.get/set, struct.get/set).
+// V8 TurboFan inlines these at JS callsite. No linear memory WASM.
+globalThis.__gcFlagsDone = false;
 
 // --- Recipe optimizations (public API wrapping, stable across TSC versions) ---
 

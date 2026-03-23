@@ -633,79 +633,13 @@ export fn edgebox_io_free(ptr: ?[*]const u8, len: c_int) void {
     edgebox_free(ptr, len);
 }
 
-// ── Zero-Copy Type Data Model ──
+// ── LEGACY STUBS — kept for C++ linker compatibility ──
+// Type data model migrated to WasmGC (type_flags_gc.wasm, soa_gc.wasm).
+// These stubs are never called. Remove when C++ external_refs are cleaned up.
 
-const MAX_TYPES: u32 = 200_000;
-const MAX_MEMBERS: u32 = 2_000_000;
-
-var col_type_flags: [MAX_TYPES]u32 = [_]u32{0} ** MAX_TYPES;
-var col_type_member_offset: [MAX_TYPES]u32 = [_]u32{0} ** MAX_TYPES;
-var col_type_member_count: [MAX_TYPES]u16 = [_]u16{0} ** MAX_TYPES;
-var type_count: u32 = 0;
-
-var col_member_name_id: [MAX_MEMBERS]u32 = [_]u32{0} ** MAX_MEMBERS;
-var col_member_type_id: [MAX_MEMBERS]u32 = [_]u32{0} ** MAX_MEMBERS;
-var col_member_flags: [MAX_MEMBERS]u32 = [_]u32{0} ** MAX_MEMBERS;
-var member_count: u32 = 0;
-
-var string_table: std.StringHashMapUnmanaged(u32) = .{};
-var string_count: u32 = 0;
-var type_data_mutex: std.Thread.Mutex = .{};
-// Arena for string interning — avoids mmap per string (page_allocator does mmap per alloc)
-var string_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-
-export fn edgebox_register_type(type_id: u32, flags: u32, _: u32) void {
-    if (type_id >= MAX_TYPES) return;
-    col_type_flags[type_id] = flags;
-    if (type_id >= type_count) type_count = type_id + 1;
-}
-
-export fn edgebox_register_member(type_id: u32, name_ptr: [*]const u8, name_len: c_int, member_type_id: u32, member_flags: u32) void {
-    if (type_id >= MAX_TYPES or member_count >= MAX_MEMBERS or name_len <= 0) return;
-    const name = name_ptr[0..@intCast(name_len)];
-    type_data_mutex.lock();
-    defer type_data_mutex.unlock();
-    const name_id = blk: {
-        if (string_table.get(name)) |id| break :blk id;
-        const id = string_count;
-        string_count += 1;
-        const key = string_arena.allocator().dupe(u8, name) catch return;
-        string_table.put(string_arena.allocator(), key, id) catch return;
-        break :blk id;
-    };
-    if (col_type_member_count[type_id] == 0) col_type_member_offset[type_id] = member_count;
-    const idx = member_count;
-    col_member_name_id[idx] = name_id;
-    col_member_type_id[idx] = member_type_id;
-    col_member_flags[idx] = member_flags;
-    member_count += 1;
-    col_type_member_count[type_id] += 1;
-}
-
-// ── Union Type Registry ──
-// Union types: typeId → array of constituent type IDs
-const MAX_UNION_TYPES: u32 = 50_000;
-const MAX_UNION_MEMBERS: u32 = 500_000;
-
-var col_union_offset: [MAX_UNION_TYPES]u32 = [_]u32{0} ** MAX_UNION_TYPES;
-var col_union_count: [MAX_UNION_TYPES]u16 = [_]u16{0} ** MAX_UNION_TYPES;
-var col_union_members: [MAX_UNION_MEMBERS]u32 = [_]u32{0} ** MAX_UNION_MEMBERS;
-var union_member_count: u32 = 0;
-
-/// Register a union type's constituent type IDs
-export fn edgebox_register_union(type_id: u32, member_ids_ptr: [*]const u32, count: c_int) void {
-    if (type_id >= MAX_UNION_TYPES or count <= 0) return;
-    type_data_mutex.lock();
-    defer type_data_mutex.unlock();
-    if (union_member_count + @as(u32, @intCast(count)) > MAX_UNION_MEMBERS) return;
-    col_union_offset[type_id] = union_member_count;
-    col_union_count[type_id] = @intCast(@min(count, 65535));
-    const n: u32 = @intCast(count);
-    for (0..n) |i| {
-        col_union_members[union_member_count] = member_ids_ptr[i];
-        union_member_count += 1;
-    }
-}
+export fn edgebox_register_type(_: u32, _: u32, _: u32) void {}
+export fn edgebox_register_member(_: u32, _: [*]const u8, _: c_int, _: u32, _: u32) void {}
+export fn edgebox_register_union(_: u32, _: [*]const u32, _: c_int) void {}
 
 // ── Work-Stealing File Counter ──
 // Workers atomically claim the next file index instead of static sharding.
@@ -747,155 +681,17 @@ export fn edgebox_wait_program_ready() void {
     }
 }
 
-// ── Relation Cache ──
-// Caches TSC's type relation results: (source_id, target_id) → 1=compatible, 2=incompatible
-// Populated after TSC resolves a pair, used on subsequent checks for same pair.
-const CACHE_SIZE: u32 = 1 << 20; // 1M entries — power of 2 for fast modulo
-const CACHE_MASK: u32 = CACHE_SIZE - 1;
-var cache_keys: [CACHE_SIZE]u64 = [_]u64{0} ** CACHE_SIZE; // packed (source << 32 | target)
-var cache_vals: [CACHE_SIZE]u8 = [_]u8{0} ** CACHE_SIZE; // 0=empty, 1=true, 2=false
-var cache_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
-
-fn cacheKey(source: u32, target: u32) u64 {
-    return (@as(u64, source) << 32) | @as(u64, target);
-}
-
-fn cacheSlot(key: u64) u32 {
-    // Simple hash: mix bits and mask
-    const h = key ^ (key >> 17) ^ (key >> 34);
-    return @intCast(h & CACHE_MASK);
-}
-
-fn cacheGet(source: u32, target: u32) u8 {
-    const key = cacheKey(source, target);
-    const slot = cacheSlot(key);
-    if (cache_keys[slot] == key) return cache_vals[slot];
-    return 0;
-}
-
-fn cachePut(source: u32, target: u32, val: u8) void {
-    const key = cacheKey(source, target);
-    const slot = cacheSlot(key);
-    cache_keys[slot] = key;
-    cache_vals[slot] = val;
-}
-
-export fn edgebox_cache_relation(source_id: u32, target_id: u32, result: u8) void {
-    cachePut(source_id, target_id, result);
-}
-
-// ── Structural Check ──
-
-var check_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
-var check_flag_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
-var check_structural_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
-
+// ── LEGACY STUBS — relation cache + structural check migrated to WasmGC ──
+export fn edgebox_cache_relation(_: u32, _: u32, _: u8) void {}
 export fn edgebox_check_stats(out_total: *u64, out_flag: *u64, out_struct: *u64, out_cache: *u64) void {
-    out_total.* = check_total.load(.monotonic);
-    out_flag.* = check_flag_hits.load(.monotonic);
-    out_struct.* = check_structural_hits.load(.monotonic);
-    out_cache.* = cache_hits.load(.monotonic);
+    out_total.* = 0; out_flag.* = 0; out_struct.* = 0; out_cache.* = 0;
 }
-
-// Generic structural check — NO package-specific flag semantics.
-// The recipe handles flag-based fast paths (Any, Unknown, literal widening)
-// in JS BEFORE calling this. Zig only knows: IDs, unions, member overlap.
-// Correctness-first check: only returns positive for provably correct cases.
-// 1 = same ID (trivially correct)
-// cached 1 or 2 = TSC already verified this pair
-// 0 = unknown, let TSC handle (NEVER guess)
-export fn edgebox_check_structural(source_id: u32, target_id: u32) u8 {
-    _ = check_total.fetchAdd(1, .monotonic);
-    // Same type = always compatible
-    if (source_id == target_id) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; }
-    // Check relation cache (populated by TSC after resolving pairs)
-    const cached = cacheGet(source_id, target_id);
-    if (cached != 0) { _ = cache_hits.fetchAdd(1, .monotonic); return cached; }
-    // Unknown — let TSC handle. TSC will cache the result for future lookups.
-    return 0;
-}
-
-// ── WASM Kernel: isSimpleTypeRelatedTo (flag-only fast path) ──
-// Pure function of (source_flags, target_flags, relation, strictNullChecks).
-// Returns: 1 = related (true), 0 = not determined (fall through to JS).
-// Handles ~80% of calls that are pure flag comparisons.
-// V8 TurboFan inlines this into TSC's JS — zero call overhead.
-//
-// TSC TypeFlags constants:
-const TF_Any: u32 = 1;
-const TF_Unknown: u32 = 2;
-const TF_String: u32 = 4;
-const TF_Number: u32 = 8;
-const TF_Boolean: u32 = 16;
-const TF_Enum: u32 = 32;
-const TF_BigInt: u32 = 64;
-const TF_StringLiteral: u32 = 128;
-const TF_NumberLiteral: u32 = 256;
-const TF_BooleanLiteral: u32 = 512;
-const TF_EnumLiteral: u32 = 1024;
-const TF_BigIntLiteral: u32 = 2048;
-const TF_ESSymbol: u32 = 4096;
-const TF_ESSymbolLike: u32 = 12288;
-const TF_Void: u32 = 16384;
-const TF_Undefined: u32 = 32768;
-const TF_Null: u32 = 65536;
-const TF_Never: u32 = 131072;
-const TF_Object: u32 = 524288;
-const TF_NonPrimitive: u32 = 67108864;
-const TF_StringLike: u32 = 402653316;
-const TF_NumberLike: u32 = 296;
-const TF_BigIntLike: u32 = 2112;
-const TF_BooleanLike: u32 = 528;
-// Relation types: 0=assignable, 1=comparable, 2=strictSubtype
-const REL_ASSIGNABLE: u32 = 0;
-const REL_COMPARABLE: u32 = 1;
-const REL_STRICT_SUBTYPE: u32 = 2;
-
-export fn edgebox_is_simple_type_related(src_flags: u32, tgt_flags: u32, relation: u32, strict_null: u32) u8 {
-    const s = src_flags;
-    const t = tgt_flags;
-    // target is Any, or source is Never → always related
-    if (t & TF_Any != 0 or s & TF_Never != 0) return 1;
-    // target is Unknown (unless strictSubtype + source is Any)
-    if (t & TF_Unknown != 0 and !(relation == REL_STRICT_SUBTYPE and s & TF_Any != 0)) return 1;
-    // target is Never → never related
-    if (t & TF_Never != 0) return 0;
-    // StringLike → String
-    if (s & TF_StringLike != 0 and t & TF_String != 0) return 1;
-    // NumberLike → Number
-    if (s & TF_NumberLike != 0 and t & TF_Number != 0) return 1;
-    // BigIntLike → BigInt
-    if (s & TF_BigIntLike != 0 and t & TF_BigInt != 0) return 1;
-    // BooleanLike → Boolean
-    if (s & TF_BooleanLike != 0 and t & TF_Boolean != 0) return 1;
-    // ESSymbolLike → ESSymbol
-    if (s & TF_ESSymbolLike != 0 and t & TF_ESSymbol != 0) return 1;
-    // Undefined → Undefined|Void (or anything if not strictNullChecks)
-    if (s & TF_Undefined != 0) {
-        if (strict_null == 0 or t & (TF_Undefined | TF_Void) != 0) return 1;
-    }
-    // Null → Null (or anything if not strictNullChecks)
-    if (s & TF_Null != 0) {
-        if (strict_null == 0 or t & TF_Null != 0) return 1;
-    }
-    // Object → NonPrimitive
-    if (s & TF_Object != 0 and t & TF_NonPrimitive != 0) return 1;
-    // Assignable/Comparable: Any source → true
-    if (relation == REL_ASSIGNABLE or relation == REL_COMPARABLE) {
-        if (s & TF_Any != 0) return 1;
-        // Number → Enum
-        if (s & TF_Number != 0 and t & TF_Enum != 0) return 1;
-    }
-    // 0 = not determined by flags alone, needs JS (value/symbol comparisons)
-    return 0;
-}
-
+export fn edgebox_check_structural(_: u32, _: u32) u8 { return 0; }
+export fn edgebox_is_simple_type_related(_: u32, _: u32, _: u32, _: u32) u8 { return 0; }
 export fn edgebox_type_stats(out_types: *u32, out_members: *u32, out_strings: *u32) void {
-    out_types.* = type_count;
-    out_members.* = member_count;
-    out_strings.* = string_count;
+    out_types.* = 0; out_members.* = 0; out_strings.* = 0;
 }
 
-// Module resolution is handled by the recipe JS via CompilerHost.resolveModuleNames.
-// The Zig checker (src/tsc-recipe/zig-checker/) provides proper tokenizer + type
-// extraction compiled to WASM — no byte-level pattern matching.
+// All type data now lives in WasmGC modules:
+//   type_flags_gc.wasm — GC array for type flags (TurboFan-inlinable array.get/set)
+//   soa_gc.wasm — GC structs for auto SOA + columns (TurboFan-inlinable struct.get/set)
