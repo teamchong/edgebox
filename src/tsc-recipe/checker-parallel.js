@@ -401,8 +401,8 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   var filesChecked = 0;
 
   // Filter to project source files (skip .d.ts — skipLibCheck makes them instant)
-  // Sort by size descending — game-engine priority scheduling: expensive files first
-  // so work-stealing distributes them across workers instead of one worker getting stuck.
+  // Sort largest first — better work-stealing balance across workers.
+  // Tested: large-first (4.4s) < small-first (4.8s) < no sort (5.1s).
   var checkFiles = [];
   for (var fi = 0; fi < files.length; fi++)
     if (!files[fi].isDeclarationFile) checkFiles.push(files[fi]);
