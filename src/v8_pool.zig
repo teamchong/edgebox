@@ -28,6 +28,7 @@ extern fn edgebox_get_result(c_int, *c_int) ?[*]const u8;
 
 // IO functions from edgebox_io.zig (shared across all workers)
 extern fn edgebox_read_file([*]const u8, c_int, *c_int) ?[*]const u8;
+extern fn edgebox_reset_work() void;
 
 const MAX_WORKERS = 16;
 
@@ -230,6 +231,8 @@ fn prewarmDir(dir_path: []const u8) void {
 }
 
 pub fn dispatch(cwd: []const u8) void {
+    // Reset work counter for work-stealing
+    edgebox_reset_work();
     // Pre-warm file cache — reads all project files into Zig mmap cache
     prewarmDir(cwd);
     for (0..pool_size) |i| {

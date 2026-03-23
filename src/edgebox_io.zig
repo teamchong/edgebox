@@ -674,6 +674,19 @@ export fn edgebox_register_union(type_id: u32, member_ids_ptr: [*]const u32, cou
     }
 }
 
+// ── Work-Stealing File Counter ──
+// Workers atomically claim the next file index instead of static sharding.
+// Fast workers process more files; slow workers don't bottleneck.
+var work_file_index: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
+export fn edgebox_claim_file() u32 {
+    return work_file_index.fetchAdd(1, .monotonic);
+}
+
+export fn edgebox_reset_work() void {
+    work_file_index.store(0, .release);
+}
+
 // ── Relation Cache ──
 // Caches TSC's type relation results: (source_id, target_id) → 1=compatible, 2=incompatible
 // Populated after TSC resolves a pair, used on subsequent checks for same pair.

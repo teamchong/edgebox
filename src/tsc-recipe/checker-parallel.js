@@ -117,10 +117,14 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     if (!files[fi].isDeclarationFile) checkFiles.push(files[fi]);
   }
   if (workerId === 0) __edgebox_write_stderr('[recipe] w0 totalFiles:' + files.length + ' checkFiles:' + checkFiles.length + String.fromCharCode(10));
-  // Sharded check: each worker checks checkFiles[i % workerCount === workerId]
-  for (var i = 0; i < checkFiles.length; i++) {
-    if (i % workerCount !== workerId) continue;
-    var diags = program.getSemanticDiagnostics(checkFiles[i]);
+  // Work-stealing: each worker atomically claims the next file index.
+  // Fast workers process more files — no shard imbalance.
+  var filesChecked = 0;
+  while (true) {
+    var idx = __edgebox_claim_file();
+    if (idx >= checkFiles.length) break;
+    filesChecked++;
+    var diags = program.getSemanticDiagnostics(checkFiles[idx]);
     for (var k = 0; k < diags.length; k++) {
       var d = diags[k];
       if (d.file) {
@@ -145,8 +149,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
 
   var t3 = Date.now();
   // All workers report timing + Zig check stats
-  var io = typeof __edgebox_io_stats === 'function' ? __edgebox_io_stats() : {};
-  __edgebox_write_stderr('[recipe] w' + workerId + '/' + workerCount + ' config:' + (t1-t0) + 'ms parse:' + (t2-t1) + 'ms check:' + (t3-t2) + 'ms total:' + (t3-t0) + 'ms files:' + files.length + ' fe:' + (io.fileExistsCalls||0) + '/' + (io.fileExistsCached||0) + ' de:' + (io.dirExistsCalls||0) + '/' + (io.dirExistsCached||0) + String.fromCharCode(10));
+  __edgebox_write_stderr('[recipe] w' + workerId + '/' + workerCount + ' config:' + (t1-t0) + 'ms parse:' + (t2-t1) + 'ms check:' + (t3-t2) + 'ms total:' + (t3-t0) + 'ms checked:' + filesChecked + '/' + checkFiles.length + String.fromCharCode(10));
   return output.join(NL);
   } catch(e) { return '[recipe-error] w' + workerId + ': ' + (e && e.stack ? e.stack : String(e)); }
 };

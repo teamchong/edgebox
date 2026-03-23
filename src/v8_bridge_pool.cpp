@@ -319,6 +319,13 @@ static void CheckStructuralCallback(const v8::FunctionCallbackInfo<v8::Value>& a
   args.GetReturnValue().Set(v8::Number::New(args.GetIsolate(), edgebox_check_structural(src, tgt)));
 }
 
+extern unsigned int edgebox_claim_file();
+extern void edgebox_reset_work();
+
+static void ClaimFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  args.GetReturnValue().Set(v8::Number::New(args.GetIsolate(), edgebox_claim_file()));
+}
+
 extern void edgebox_io_stats(unsigned long long* fe_calls, unsigned long long* fe_cached, unsigned long long* de_calls, unsigned long long* de_cached);
 
 static void IOStatsCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -417,6 +424,7 @@ void* edgebox_v8_setup_context(void* iso_ptr) {
   set("__edgebox_register_union", RegisterUnionCallback);
   set("__edgebox_check_structural", CheckStructuralCallback);
   set("__edgebox_io_stats", IOStatsCallback);
+  set("__edgebox_claim_file", ClaimFileCallback);
   set("__edgebox_worker_done", WorkerDoneCallback);
 
   auto* persistent = new v8::Persistent<v8::Context>(isolate, context);
