@@ -34,7 +34,8 @@ void edgebox_v8_init() {
   if (g_initialized) return;
   const char* flags = "--max-old-space-size=4096";
   v8__V8__SetFlagsFromString(flags, strlen(flags));
-  g_platform = v8__Platform__NewDefaultPlatform(0, false);
+  // 8 platform threads for background JIT compilation across 8 V8 isolates
+  g_platform = v8__Platform__NewDefaultPlatform(8, false);
   v8__V8__InitializePlatform(g_platform);
   v8__V8__Initialize();
   g_initialized = true;
