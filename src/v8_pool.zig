@@ -254,10 +254,30 @@ fn workerLoop(worker_id: u32) void {
                 \\  var cwd = '{s}';
                 \\  var wid = {d};
                 \\  var wcount = {d};
-                \\  function rp(p) {{ p = String(p); return p.charAt(0) !== '/' ? cwd + '/' + p : p; }}
-                \\  ts.sys.readFile = function(p) {{ var c = __edgebox_read_file(rp(p)); return c || undefined; }};
-                \\  ts.sys.fileExists = function(p) {{ return __edgebox_file_exists(rp(p)) === 1; }};
-                \\  ts.sys.directoryExists = function(p) {{ return __edgebox_dir_exists(rp(p)) === 1; }};
+                \\  var ebRoot = __edgebox_cwd();
+                \\  function rp(p) {{
+                \\    p = String(p);
+                \\    if (p.charAt(0) === '/') return p;
+                \\    return cwd + '/' + p;
+                \\  }}
+                \\  ts.sys.readFile = function(p) {{
+                \\    var resolved = rp(p);
+                \\    var c = __edgebox_read_file(resolved);
+                \\    if (!c && resolved.indexOf('/node_modules/typescript/lib/') === -1 && p.indexOf('lib.') === 0) {{
+                \\      c = __edgebox_read_file(ebRoot + '/node_modules/typescript/lib/' + p);
+                \\    }}
+                \\    return c || undefined;
+                \\  }};
+                \\  ts.sys.fileExists = function(p) {{
+                \\    if (__edgebox_file_exists(rp(p)) === 1) return true;
+                \\    if (String(p).indexOf('lib.') === 0) return __edgebox_file_exists(ebRoot + '/node_modules/typescript/lib/' + p) === 1;
+                \\    return false;
+                \\  }};
+                \\  ts.sys.directoryExists = function(p) {{
+                \\    if (__edgebox_dir_exists(rp(p)) === 1) return true;
+                \\    if (p.charAt(0) === '/') return __edgebox_dir_exists(p) === 1;
+                \\    return false;
+                \\  }};
                 \\  ts.sys.getCurrentDirectory = function() {{ return cwd; }};
                 \\  ts.sys.realpath = function(p) {{ return __edgebox_realpath(rp(p)); }};
                 \\  ts.sys.getExecutingFilePath = function() {{ return __edgebox_cwd() + '/node_modules/typescript/lib/typescript.js'; }};
