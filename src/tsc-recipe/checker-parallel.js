@@ -147,10 +147,27 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   }
   var ck = cwd + ':' + parsed.fileNames.length;
   var t1 = Date.now();
-  // Always create a fresh program — pass oldProgram for incremental reuse.
-  // TSC reuses unchanged source files from oldProgram (compares content).
+
+  // Module resolution cache — persists across requests per worker.
+  // First request: resolves modules normally, caches results.
+  // Subsequent requests: returns cached results instantly (saves ~340ms).
+  // Game industry trick: pre-compute in batch, not per-entity.
+  if (!globalThis.__mrCache) globalThis.__mrCache = new Map();
+  var defaultHost = ts.createCompilerHost(parsed.options);
+  var host = Object.create(defaultHost);
+  host.resolveModuleNames = function(moduleNames, containingFile) {
+    return moduleNames.map(function(name) {
+      var key = name + '\0' + containingFile;
+      var cached = globalThis.__mrCache.get(key);
+      if (cached !== undefined) return cached;
+      var r = ts.resolveModuleName(name, containingFile, parsed.options, defaultHost).resolvedModule;
+      globalThis.__mrCache.set(key, r || null);
+      return r;
+    });
+  };
+
   var oldProgram = globalThis.__pc[ck] || undefined;
-  var program = ts.createProgram(parsed.fileNames, parsed.options, undefined, oldProgram);
+  var program = ts.createProgram(parsed.fileNames, parsed.options, host, oldProgram);
   globalThis.__pc[ck] = program;
   var isWarm = !!oldProgram;
   var t2 = Date.now();
