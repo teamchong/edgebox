@@ -577,7 +577,9 @@ export fn edgebox_check_stats(out_total: *u64, out_flag: *u64, out_struct: *u64)
 
 export fn edgebox_check_structural(source_id: u32, target_id: u32) u8 {
     _ = check_total.fetchAdd(1, .monotonic);
-    if (source_id >= type_count or target_id >= type_count) return 0; // not registered = not related
+    // Same type = always compatible
+    if (source_id == target_id) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; }
+    if (source_id >= type_count or target_id >= type_count) return 0;
     const src_flags = col_type_flags[source_id];
     const tgt_flags = col_type_flags[target_id];
     if (tgt_flags & 1 != 0) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; }
@@ -597,10 +599,28 @@ export fn edgebox_check_structural(source_id: u32, target_id: u32) u8 {
     var ti: u32 = 0;
     while (ti < tgt_count) : (ti += 1) {
         const tgt_name = col_member_name_id[tgt_offset + ti];
+        const tgt_type = col_member_type_id[tgt_offset + ti];
         var found = false;
         var si: u32 = 0;
         while (si < src_count) : (si += 1) {
-            if (col_member_name_id[src_offset + si] == tgt_name) { found = true; break; }
+            if (col_member_name_id[src_offset + si] == tgt_name) {
+                // Name matches — check member type compatibility
+                const src_type = col_member_type_id[src_offset + si];
+                if (src_type == tgt_type) {
+                    found = true; // Same type ID = compatible
+                } else if (src_type < type_count and tgt_type < type_count) {
+                    // Check flag compatibility of member types
+                    const sf = col_type_flags[src_type];
+                    const tf = col_type_flags[tgt_type];
+                    if (tf & 1 != 0) { found = true; } // target member is Any
+                    else if (sf == tf) { found = true; } // same flags = likely compatible
+                    else if (sf & (128 | 4) != 0 and tf & 4 != 0) { found = true; } // string
+                    else if (sf & (256 | 8) != 0 and tf & 8 != 0) { found = true; } // number
+                    else if (sf & (512 | 16) != 0 and tf & 16 != 0) { found = true; } // boolean
+                    else { found = true; } // Conservative: assume compatible if name matches
+                }
+                break;
+            }
         }
         if (!found) return 0;
     }
