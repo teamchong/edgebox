@@ -247,15 +247,36 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
     // TypedArray access is monomorphic — V8 optimizes it perfectly.
     const zig_check = "/* edgebox: injection point */\n    ";
 
-    // Third injection: patch createType to materialize flags into flat Uint32Array.
-    // This eliminates megamorphic LoadIC_Megamorphic (15.4% of TSC time).
+    // Third injection: stabilize type object hidden class in createType.
+    // TSC creates types with 60 different shapes → megamorphic IC (15.4% overhead).
+    // Fix: initialize ALL possible properties upfront → 1 shape → monomorphic IC.
     const create_marker = "result.id = typeCount;";
     const create_pos = std.mem.indexOf(u8, src, create_marker) orelse null;
     const create_inject = if (create_pos != null)
-        // After "result.id = typeCount;", add flat array write
         "result.id = typeCount;\n" ++
-        "    if (!globalThis.__ebF) globalThis.__ebF = new Uint32Array(131072);\n" ++
-        "    globalThis.__ebF[typeCount] = flags;\n"
+        "    /* edgebox: stabilize hidden class — force all property slots */\n" ++
+        "    result.symbol = result.symbol;\n" ++
+        "    result.types = result.types;\n" ++
+        "    result.value = result.value;\n" ++
+        "    result.target = result.target;\n" ++
+        "    result.mapper = result.mapper;\n" ++
+        "    result.members = result.members;\n" ++
+        "    result.properties = result.properties;\n" ++
+        "    result.callSignatures = result.callSignatures;\n" ++
+        "    result.constructSignatures = result.constructSignatures;\n" ++
+        "    result.indexInfos = result.indexInfos;\n" ++
+        "    result.objectFlags = result.objectFlags || 0;\n" ++
+        "    result.intrinsicName = result.intrinsicName;\n" ++
+        "    result.debugIntrinsicName = result.debugIntrinsicName;\n" ++
+        "    result.freshType = result.freshType;\n" ++
+        "    result.regularType = result.regularType;\n" ++
+        "    result.aliasSymbol = result.aliasSymbol;\n" ++
+        "    result.aliasTypeArguments = result.aliasTypeArguments;\n" ++
+        "    result.immediateBaseConstraint = result.immediateBaseConstraint;\n" ++
+        "    result.origin = result.origin;\n" ++
+        "    result.typeParameters = result.typeParameters;\n" ++
+        "    result.node = result.node;\n" ++
+        "    result.constraint = result.constraint;\n"
     else
         null;
 
