@@ -64,7 +64,55 @@ pub fn init(worker_count: u32) !void {
     // Initialize V8 platform (once, before any isolate creation)
     edgebox_v8_init();
 
-    // Spawn worker threads (each loads TypeScript independently)
+    // Create V8 snapshot with TypeScript pre-loaded (eliminates 3s per worker)
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const eb_cwd = std.fs.cwd().realpath(".", &cwd_buf) catch "/tmp";
+    const shim = std.fmt.allocPrint(alloc,
+        "globalThis.module = {{ exports: {{}} }};" ++
+        "globalThis.__filename = '{s}/node_modules/typescript/lib/typescript.js';" ++
+        "globalThis.__dirname = '{s}/node_modules/typescript/lib';" ++
+        "globalThis.process = {{ argv:['edgebox'], env:{{}}, platform:'linux', " ++
+        "cwd:function(){{return '/';}}, exit:function(){{}}, " ++
+        "stdout:{{write:function(){{return true;}},isTTY:false,columns:80}}, " ++
+        "stderr:{{write:function(){{return true;}},isTTY:false}}, " ++
+        "versions:{{node:'20.0.0'}}, nextTick:function(cb){{Promise.resolve().then(cb);}}, " ++
+        "on:function(){{return process;}}, once:function(){{return process;}}, " ++
+        "removeListener:function(){{return process;}}, emit:function(){{return false;}}, " ++
+        "binding:function(){{return {{}};}} }};" ++
+        "globalThis.setTimeout=function(f){{f();return 0;}};" ++
+        "globalThis.clearTimeout=function(){{}};" ++
+        "globalThis.setInterval=function(){{return 0;}};" ++
+        "globalThis.clearInterval=function(){{}};" ++
+        "globalThis.queueMicrotask=function(f){{Promise.resolve().then(f);}};" ++
+        "globalThis.console={{log:function(){{}},warn:function(){{}},error:function(){{}},info:function(){{}},debug:function(){{}}}};" ++
+        "globalThis.Buffer={{from:function(s){{return s;}},isBuffer:function(){{return false;}},alloc:function(n){{return new Uint8Array(n);}},byteLength:function(s){{return typeof s==='string'?s.length:0;}},isEncoding:function(){{return true;}}}};" ++
+        "globalThis.require=function(n){{n=String(n).replace(/^node:/,'');" ++
+        "if(n==='fs')return{{readFileSync:function(){{return null;}},writeFileSync:function(){{}},existsSync:function(){{return false;}},statSync:function(){{throw new Error('ENOENT');}},lstatSync:function(){{throw new Error('ENOENT');}},readdirSync:function(){{return[];}},realpathSync:Object.assign(function(p){{return p;}},{{native:function(p){{return p;}}}}),openSync:function(){{return-1;}},closeSync:function(){{}},watchFile:function(){{}},unwatchFile:function(){{}},watch:function(){{return{{close:function(){{}}}};}}}};" ++
+        "if(n==='path')return{{join:function(){{return Array.prototype.slice.call(arguments).join('/').replace(/\\\\/+/g,'/');}},dirname:function(p){{var i=String(p).lastIndexOf('/');return i>=0?String(p).slice(0,i):'.';}},basename:function(p,e){{p=String(p);var b=p.slice(p.lastIndexOf('/')+1);if(e&&b.endsWith(e))b=b.slice(0,-e.length);return b;}},resolve:function(){{var a=Array.prototype.slice.call(arguments),r='';for(var i=a.length-1;i>=0;i--){{r=String(a[i])+(r?'/'+r:'');if(String(a[i]).charAt(0)==='/')break;}}if(r.charAt(0)!=='/');return r.replace(/\\\\/+/g,'/');}},normalize:function(p){{return String(p).replace(/\\\\/+/g,'/');}},isAbsolute:function(p){{return String(p).charAt(0)==='/';}},extname:function(p){{p=String(p);var i=p.lastIndexOf('.');return i>=0?p.slice(i):'';}},sep:'/',delimiter:':'}};" ++
+        "if(n==='os')return{{EOL:'\\n',platform:function(){{return'linux';}},tmpdir:function(){{return'/tmp';}},homedir:function(){{return'/tmp';}},cpus:function(){{return[{{model:'edgebox'}}];}},arch:function(){{return'x64';}}}};" ++
+        "if(n==='crypto')return{{}};" ++
+        "if(n==='perf_hooks')return{{performance:{{now:function(){{return Date.now();}}}}}};" ++
+        "if(n==='buffer')return{{Buffer:Buffer}};" ++
+        "return{{}};}};"
+    , .{ eb_cwd, eb_cwd }) catch null;
+
+    if (shim) |s| {
+        defer alloc.free(s);
+        const ts_path = "node_modules/typescript/lib/typescript.js";
+        var ts_len: c_int = 0;
+        const ts_src = edgebox_read_file(ts_path.ptr, @intCast(ts_path.len), &ts_len);
+        if (ts_src != null and ts_len > 0) {
+            _ = std.posix.write(2, "[v8pool] creating snapshot...\n") catch {};
+            const snap_size = edgebox_v8_create_snapshot(ts_src.?, ts_len, s.ptr, @intCast(s.len));
+            if (snap_size > 0) {
+                var snap_msg: [64]u8 = undefined;
+                const msg = std.fmt.bufPrint(&snap_msg, "[v8pool] snapshot: {d} bytes\n", .{snap_size}) catch "[v8pool] snapshot created\n";
+                _ = std.posix.write(2, msg) catch {};
+            }
+        }
+    }
+
+    // Spawn worker threads (restore from snapshot — instant TypeScript)
     for (0..n) |i| {
         workers[i].worker_id = @intCast(i);
         workers[i].worker_count = n;
@@ -135,8 +183,8 @@ pub fn collect() ![]const u8 {
 fn workerLoop(worker_id: u32) void {
     const wid: usize = @intCast(worker_id);
 
-    // Create fresh V8 isolate (each worker loads TypeScript independently)
-    const isolate = edgebox_v8_create_isolate();
+    // Create V8 isolate from snapshot (TypeScript pre-loaded, instant)
+    const isolate = edgebox_v8_create_isolate_from_snapshot();
     if (isolate == null) return;
     const context = edgebox_v8_setup_context(isolate);
     if (context == null) { edgebox_v8_dispose_isolate(isolate); return; }
@@ -197,16 +245,8 @@ fn workerLoop(worker_id: u32) void {
         if (r) |rr| edgebox_v8_free(rr);
     }
 
-    // Load TypeScript
-    const ts_path2 = "node_modules/typescript/lib/typescript.js";
-    var ts_len2: c_int = 0;
-    const ts_src2 = edgebox_read_file(ts_path2.ptr, @intCast(ts_path2.len), &ts_len2);
-    if (ts_src2 != null and ts_len2 > 0) {
-        var eval_len2: c_int = 0;
-        const r2 = edgebox_v8_eval_in_context(isolate, context, ts_src2.?, ts_len2, &eval_len2);
-        if (r2) |rr| edgebox_v8_free(rr);
-    }
-    const ts_alias = "globalThis.ts = globalThis.module.exports;";
+    // TypeScript already loaded from snapshot — just set ts alias
+    const ts_alias = "globalThis.ts = globalThis.ts || globalThis.module.exports;";
     {
         var el2: c_int = 0;
         const r3 = edgebox_v8_eval_in_context(isolate, context, ts_alias.ptr, @intCast(ts_alias.len), &el2);

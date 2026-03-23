@@ -10,7 +10,7 @@ Injections:
 import sys
 
 input_path = sys.argv[1] if len(sys.argv) > 1 else "node_modules/typescript/lib/typescript.js"
-output_path = sys.argv[2] if len(sys.argv) > 2 else "src/workerd-tsc/typescript.js"
+output_path = sys.argv[2] if len(sys.argv) > 2 else "src/tsc-recipe/typescript.js"
 
 with open(input_path) as f:
     src = f.read()
