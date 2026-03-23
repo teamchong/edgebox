@@ -10,6 +10,85 @@ globalThis.__zigRegistryDone = false;
 
 // --- Recipe optimizations (public API wrapping, stable across TSC versions) ---
 
+// 0.5. Monomorphic Type constructor — eliminates V8 megamorphic IC (17% of runtime).
+// TSC's default Type constructor only sets `this.flags`. Properties like `symbol`,
+// `types`, `members` etc. are added dynamically, creating hundreds of hidden classes.
+// Pre-initializing ALL properties in the constructor forces a single hidden class.
+// Uses ts.setObjectAllocator (public API) — no source patching.
+(function() {
+  if (!ts || !ts.setObjectAllocator || !ts.objectAllocator) return;
+  var origProto = ts.objectAllocator.getTypeConstructor().prototype;
+  function MonoType(checker, flags) {
+    this.flags = flags;
+    this.id = 0;
+    this.symbol = void 0;
+    this.aliasSymbol = void 0;
+    this.aliasTypeArguments = void 0;
+    this.objectFlags = 0;
+    this.members = void 0;
+    this.properties = void 0;
+    this.callSignatures = void 0;
+    this.constructSignatures = void 0;
+    this.indexInfos = void 0;
+    this.target = void 0;
+    this.node = void 0;
+    this.outerTypeParameters = void 0;
+    this.localTypeParameters = void 0;
+    this.thisType = void 0;
+    this.resolvedBaseConstructorType = void 0;
+    this.resolvedBaseTypes = void 0;
+    this.baseTypesResolved = void 0;
+    this.types = void 0;
+    this.propertyCache = void 0;
+    this.resolvedProperties = void 0;
+    this.resolvedIndexType = void 0;
+    this.resolvedStringIndexType = void 0;
+    this.resolvedBaseConstraint = void 0;
+    this.constraint = void 0;
+    this.default = void 0;
+    this.isThisType = void 0;
+    this.root = void 0;
+    this.checkType = void 0;
+    this.extendsType = void 0;
+    this.resolvedTrueType = void 0;
+    this.resolvedFalseType = void 0;
+    this.declaration = void 0;
+    this.typeParameter = void 0;
+    this.constraintType = void 0;
+    this.nameType = void 0;
+    this.templateType = void 0;
+    this.modifiersType = void 0;
+    this.resolvedApparentType = void 0;
+    this.value = void 0;
+    this.regularType = void 0;
+    this.freshType = void 0;
+    this.intrinsicName = void 0;
+    this.type = void 0;
+    this.indexFlags = void 0;
+    this.baseType = void 0;
+    this.writableType = void 0;
+    this.links = void 0;
+    this.permissiveInstantiation = void 0;
+    this.restrictiveInstantiation = void 0;
+    this.uniqueLiteralFilledInstantiation = void 0;
+    this.immediateBaseConstraint = void 0;
+    this.widened = void 0;
+  }
+  MonoType.prototype = Object.create(origProto);
+  MonoType.prototype.constructor = MonoType;
+  ts.setObjectAllocator({
+    getNodeConstructor: ts.objectAllocator.getNodeConstructor,
+    getTokenConstructor: ts.objectAllocator.getTokenConstructor,
+    getIdentifierConstructor: ts.objectAllocator.getIdentifierConstructor,
+    getPrivateIdentifierConstructor: ts.objectAllocator.getPrivateIdentifierConstructor,
+    getSourceFileConstructor: ts.objectAllocator.getSourceFileConstructor,
+    getSymbolConstructor: ts.objectAllocator.getSymbolConstructor,
+    getTypeConstructor: function() { return MonoType; },
+    getSignatureConstructor: ts.objectAllocator.getSignatureConstructor,
+    getSourceMapSourceConstructor: ts.objectAllocator.getSourceMapSourceConstructor,
+  });
+})();
+
 // 1. Cache createSourceFile for .d.ts files (lib files parsed identically every time)
 (function() {
   if (!ts || !ts.createSourceFile) return;
