@@ -85,6 +85,62 @@ void edgebox_v8_free(const char* ptr) {
   delete[] ptr;
 }
 
+// ── Snapshot: pre-compile TypeScript for instant worker startup ──
+
+static v8::StartupData g_snapshot = {nullptr, 0};
+
+// Create a snapshot with TypeScript pre-loaded
+int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim_code, int shim_len) {
+  v8::SnapshotCreator creator;
+  auto* isolate = creator.GetIsolate();
+  {
+    v8::Isolate::Scope isolate_scope(isolate);
+    v8::HandleScope handle_scope(isolate);
+    auto context = v8::Context::New(isolate);
+    v8::Context::Scope context_scope(context);
+
+    // Eval shim (module, process, require, Buffer, setTimeout)
+    if (shim_code && shim_len > 0) {
+      auto source = v8::String::NewFromUtf8(isolate, shim_code, v8::NewStringType::kNormal, shim_len);
+      if (!source.IsEmpty()) {
+        auto script = v8::Script::Compile(context, source.ToLocalChecked());
+        if (!script.IsEmpty()) script.ToLocalChecked()->Run(context);
+      }
+    }
+
+    // Eval TypeScript
+    if (ts_code && ts_len > 0) {
+      auto source = v8::String::NewFromUtf8(isolate, ts_code, v8::NewStringType::kNormal, ts_len);
+      if (!source.IsEmpty()) {
+        auto script = v8::Script::Compile(context, source.ToLocalChecked());
+        if (!script.IsEmpty()) script.ToLocalChecked()->Run(context);
+      }
+    }
+
+    // Set ts = module.exports
+    {
+      auto source = v8::String::NewFromUtf8Literal(isolate, "globalThis.ts = globalThis.module.exports;");
+      auto script = v8::Script::Compile(context, source);
+      if (!script.IsEmpty()) script.ToLocalChecked()->Run(context);
+    }
+
+    creator.SetDefaultContext(context);
+  }
+
+  g_snapshot = creator.CreateBlob(v8::SnapshotCreator::FunctionCodeHandling::kKeep);
+  return g_snapshot.raw_size;
+}
+
+// Create isolate from snapshot (instant TypeScript)
+void* edgebox_v8_create_isolate_from_snapshot() {
+  if (!g_snapshot.data) return edgebox_v8_create_isolate(); // fallback
+
+  v8::Isolate::CreateParams params;
+  params.array_buffer_allocator = v8::ArrayBuffer::Allocator::NewDefaultAllocator();
+  params.snapshot_blob = &g_snapshot;
+  return v8::Isolate::New(params);
+}
+
 // Register IO globals on a context — connects V8 to Zig polyfills
 // These are the same C ABI functions from edgebox_workerd_io.zig
 extern const char* edgebox_read_file(const char* path, int path_len, int* out_len);
@@ -207,30 +263,57 @@ static void ExitCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
   (void)args;
 }
 
-// Setup a context with all IO globals
+// Setup context with IO globals. If snapshot exists, uses snapshot context.
+// Otherwise creates a new context.
 void* edgebox_v8_setup_context(void* iso_ptr) {
   auto* isolate = static_cast<v8::Isolate*>(iso_ptr);
   v8::Isolate::Scope isolate_scope(isolate);
   v8::HandleScope handle_scope(isolate);
 
-  auto global = v8::ObjectTemplate::New(isolate);
+  v8::Local<v8::Context> context;
 
-  // Register all IO functions as globals
-  global->Set(isolate, "__edgebox_read_file", v8::FunctionTemplate::New(isolate, ReadFileCallback));
-  global->Set(isolate, "__edgebox_file_exists", v8::FunctionTemplate::New(isolate, FileExistsCallback));
-  global->Set(isolate, "__edgebox_dir_exists", v8::FunctionTemplate::New(isolate, DirExistsCallback));
-  global->Set(isolate, "__edgebox_stat", v8::FunctionTemplate::New(isolate, StatCallback));
-  global->Set(isolate, "__edgebox_readdir", v8::FunctionTemplate::New(isolate, ReaddirCallback));
-  global->Set(isolate, "__edgebox_realpath", v8::FunctionTemplate::New(isolate, RealpathCallback));
-  global->Set(isolate, "__edgebox_cwd", v8::FunctionTemplate::New(isolate, CwdCallback));
-  global->Set(isolate, "__edgebox_write_stdout", v8::FunctionTemplate::New(isolate, WriteStdoutCallback));
-  global->Set(isolate, "__edgebox_write_stderr", v8::FunctionTemplate::New(isolate, WriteStderrCallback));
-  global->Set(isolate, "__edgebox_hash", v8::FunctionTemplate::New(isolate, HashCallback));
-  global->Set(isolate, "__edgebox_exit", v8::FunctionTemplate::New(isolate, ExitCallback));
+  if (g_snapshot.data) {
+    // Restore snapshot context (TypeScript already loaded)
+    context = v8::Context::New(isolate);
+  } else {
+    // Fresh context with IO globals template
+    auto global = v8::ObjectTemplate::New(isolate);
+    global->Set(isolate, "__edgebox_read_file", v8::FunctionTemplate::New(isolate, ReadFileCallback));
+    global->Set(isolate, "__edgebox_file_exists", v8::FunctionTemplate::New(isolate, FileExistsCallback));
+    global->Set(isolate, "__edgebox_dir_exists", v8::FunctionTemplate::New(isolate, DirExistsCallback));
+    global->Set(isolate, "__edgebox_stat", v8::FunctionTemplate::New(isolate, StatCallback));
+    global->Set(isolate, "__edgebox_readdir", v8::FunctionTemplate::New(isolate, ReaddirCallback));
+    global->Set(isolate, "__edgebox_realpath", v8::FunctionTemplate::New(isolate, RealpathCallback));
+    global->Set(isolate, "__edgebox_cwd", v8::FunctionTemplate::New(isolate, CwdCallback));
+    global->Set(isolate, "__edgebox_write_stdout", v8::FunctionTemplate::New(isolate, WriteStdoutCallback));
+    global->Set(isolate, "__edgebox_write_stderr", v8::FunctionTemplate::New(isolate, WriteStderrCallback));
+    global->Set(isolate, "__edgebox_hash", v8::FunctionTemplate::New(isolate, HashCallback));
+    global->Set(isolate, "__edgebox_exit", v8::FunctionTemplate::New(isolate, ExitCallback));
+    context = v8::Context::New(isolate, nullptr, global);
+  }
 
-  auto context = v8::Context::New(isolate, nullptr, global);
+  // Enter context and register IO globals (needed for both snapshot and fresh)
+  v8::Context::Scope context_scope(context);
+  auto globalObj = context->Global();
 
-  // Return persistent context handle (caller must manage lifetime)
+  auto set = [&](const char* name, v8::FunctionCallback cb) {
+    globalObj->Set(context,
+      v8::String::NewFromUtf8(isolate, name).ToLocalChecked(),
+      v8::Function::New(context, cb).ToLocalChecked()).Check();
+  };
+
+  set("__edgebox_read_file", ReadFileCallback);
+  set("__edgebox_file_exists", FileExistsCallback);
+  set("__edgebox_dir_exists", DirExistsCallback);
+  set("__edgebox_stat", StatCallback);
+  set("__edgebox_readdir", ReaddirCallback);
+  set("__edgebox_realpath", RealpathCallback);
+  set("__edgebox_cwd", CwdCallback);
+  set("__edgebox_write_stdout", WriteStdoutCallback);
+  set("__edgebox_write_stderr", WriteStderrCallback);
+  set("__edgebox_hash", HashCallback);
+  set("__edgebox_exit", ExitCallback);
+
   auto* persistent = new v8::Persistent<v8::Context>(isolate, context);
   return persistent;
 }
