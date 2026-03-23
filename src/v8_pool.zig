@@ -232,7 +232,8 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         "source.flags|0,target.flags|0," ++
         "(relation===assignableRelation?0:relation===comparableRelation?1:2)|0," ++
         "(strictNullChecks?1:0)|0);" ++
-        "if(_r===1){globalThis.__zigHits=(globalThis.__zigHits||0)+1;return true;}" ++
+        "if(_r===1)return true;" ++
+        "if(_r===2)return false;" ++
         "}";
 
     const idx = std.mem.indexOf(u8, src, needle) orelse {
