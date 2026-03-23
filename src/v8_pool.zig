@@ -21,7 +21,7 @@ extern fn edgebox_v8_dispose_isolate(?*anyopaque) void;
 extern fn edgebox_v8_setup_context(?*anyopaque) ?*anyopaque;
 extern fn edgebox_v8_eval_in_context(?*anyopaque, ?*anyopaque, [*]const u8, c_int, *c_int) ?[*]const u8;
 extern fn edgebox_v8_free(?[*]const u8) void;
-extern fn edgebox_v8_create_snapshot([*]const u8, c_int, [*]const u8, c_int) c_int;
+extern fn edgebox_v8_create_snapshot([*]const u8, c_int, [*]const u8, c_int, [*]const u8, c_int, [*]const u8, c_int) c_int;
 extern fn edgebox_v8_create_isolate_from_snapshot() ?*anyopaque;
 extern fn edgebox_set_daemon_mode(c_int) void;
 extern fn edgebox_get_result(c_int, *c_int) ?[*]const u8;
@@ -55,6 +55,47 @@ var work_cond: std.Thread.Condition = .{};
 // Edgebox root directory (resolved at init, used for recipe + TypeScript paths)
 var eb_root: []const u8 = ".";
 var eb_root_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+// Worker init JS — overrides snapshot stubs with real Zig-backed IO.
+// Shared between snapshot creation and worker startup.
+const worker_init_js =
+    "globalThis.ts = globalThis.ts || (globalThis.module && globalThis.module.exports);" ++
+    "globalThis.process = { argv:['edgebox'], env:{}, platform:'linux', " ++
+    "cwd:function(){return __edgebox_cwd();}, " ++
+    "exit:function(){}, " ++
+    "stdout:{write:function(s){__edgebox_write_stdout(String(s));return true;},isTTY:false,columns:80}, " ++
+    "stderr:{write:function(s){__edgebox_write_stderr(String(s));return true;},isTTY:false}, " ++
+    "versions:{node:'20.0.0'}, nextTick:function(cb){Promise.resolve().then(cb);}, " ++
+    "hrtime:Object.assign(function(){var t=Date.now();return[Math.floor(t/1000),(t%1000)*1e6];},{bigint:function(){return BigInt(Date.now())*1000000n;}}), " ++
+    "on:function(){return process;}, once:function(){return process;}, removeListener:function(){return process;}, emit:function(){return false;}, binding:function(){return{};} };" ++
+    "globalThis.require = function(name) {" ++
+    "  name = String(name).replace(/^node:/, '');" ++
+    "  if(name==='fs') return {" ++
+    "    readFileSync:function(p){return __edgebox_read_file(String(p))||null;}," ++
+    "    writeFileSync:function(){}," ++
+    "    existsSync:function(p){return __edgebox_file_exists(String(p))===1||__edgebox_dir_exists(String(p))===1;}," ++
+    "    statSync:function(p){var j=__edgebox_stat(String(p));if(!j){var e=new Error('ENOENT');e.code='ENOENT';throw e;}var s=JSON.parse(j);return{isFile:function(){return s.isFile;},isDirectory:function(){return s.isDirectory;},isSymbolicLink:function(){return false;},size:s.size,mtime:new Date()};}," ++
+    "    lstatSync:function(p){return require('fs').statSync(p);}," ++
+    "    readdirSync:function(p){return JSON.parse(__edgebox_readdir(String(p)));}," ++
+    "    realpathSync:Object.assign(function(p){return __edgebox_realpath(String(p));},{native:function(p){return __edgebox_realpath(String(p));}})," ++
+    "    openSync:function(){return -1;},closeSync:function(){},watchFile:function(){},unwatchFile:function(){},watch:function(){return{close:function(){}};}" ++
+    "  };" ++
+    "  if(name==='path') return {" ++
+    "    join:function(){return Array.prototype.slice.call(arguments).join('/').replace(/\\/+/g,'/');}," ++
+    "    dirname:function(p){var i=String(p).lastIndexOf('/');return i>=0?String(p).slice(0,i):'.';}," ++
+    "    basename:function(p,e){p=String(p);var b=p.slice(p.lastIndexOf('/')+1);if(e&&b.endsWith(e))b=b.slice(0,-e.length);return b;}," ++
+    "    resolve:function(){var a=Array.prototype.slice.call(arguments),r='';for(var i=a.length-1;i>=0;i--){r=String(a[i])+(r?'/'+r:'');if(String(a[i]).charAt(0)==='/')break;}if(r.charAt(0)!=='/'){r='/'+r;}return r.replace(/\\/+/g,'/');}," ++
+    "    normalize:function(p){return String(p).replace(/\\/+/g,'/');}," ++
+    "    isAbsolute:function(p){return String(p).charAt(0)==='/';}," ++
+    "    extname:function(p){p=String(p);var i=p.lastIndexOf('.');return i>=0?p.slice(i):'';}," ++
+    "    sep:'/',delimiter:':'" ++
+    "  };" ++
+    "  if(name==='os') return {EOL:'\\n',platform:function(){return'linux';},tmpdir:function(){return'/tmp';},homedir:function(){return'/tmp';},cpus:function(){return[{model:'edgebox'}];},arch:function(){return'x64';}};" ++
+    "  if(name==='crypto') return {createHash:function(a){var d='';return{update:function(s){d+=String(s);return this;},digest:function(){return __edgebox_hash(a,d);}};},randomBytes:function(n){return{toString:function(){return'';}};}};" ++
+    "  if(name==='perf_hooks') return {performance:{now:function(){return Date.now();},mark:function(){},measure:function(){}}};" ++
+    "  if(name==='buffer') return {Buffer:{from:function(s){return s;},isBuffer:function(){return false;},alloc:function(n){return new Uint8Array(n);}}};" ++
+    "  return {};" ++
+    "};";
 
 /// Initialize the V8 pool with N workers (formula-based).
 /// Each worker creates a V8 isolate, loads TSC, parks on condvar.
@@ -134,8 +175,23 @@ pub fn init(worker_count: u32) !void {
             const patched = applyRecipeTransform(ts_data) catch ts_data;
             const final_src: [*]const u8 = patched.ptr;
             const final_len: c_int = @intCast(patched.len);
-            _ = std.posix.write(2, "[v8pool] creating snapshot...\n") catch {};
-            const snap_size = edgebox_v8_create_snapshot(final_src, final_len, s.ptr, @intCast(s.len));
+
+            // Read recipe file for inclusion in snapshot
+            const recipe_path = std.fmt.allocPrint(alloc, "{s}/src/tsc-recipe/checker-parallel.js", .{eb_root}) catch null;
+            var r_len: c_int = 0;
+            var r_src: ?[*]const u8 = null;
+            if (recipe_path) |rp| {
+                defer alloc.free(rp);
+                r_src = edgebox_read_file(rp.ptr, @intCast(rp.len), &r_len);
+            }
+
+            _ = std.posix.write(2, "[v8pool] creating snapshot (with worker_init + recipe)...\n") catch {};
+            const snap_size = edgebox_v8_create_snapshot(
+                final_src, final_len,
+                s.ptr, @intCast(s.len),
+                worker_init_js.ptr, @intCast(worker_init_js.len),
+                if (r_src) |rs| rs else "".ptr, r_len,
+            );
             if (snap_size > 0) {
                 var snap_msg: [64]u8 = undefined;
                 const msg = std.fmt.bufPrint(&snap_msg, "[v8pool] snapshot: {d} bytes\n", .{snap_size}) catch "[v8pool] snapshot created\n";
@@ -285,72 +341,8 @@ fn workerLoop(worker_id: u32) void {
     const context = edgebox_v8_setup_context(isolate);
     if (context == null) { edgebox_v8_dispose_isolate(isolate); return; }
 
-    // Single consolidated init: override snapshot stubs with real Zig IO,
-    // set ts alias, reinit ts.sys — all in one V8 compile+eval.
-    // NOTE: Do NOT reset module.exports — snapshot already has TypeScript there.
-    const worker_init =
-        "globalThis.ts = globalThis.ts || (globalThis.module && globalThis.module.exports);" ++
-        "globalThis.process = { argv:['edgebox'], env:{}, platform:'linux', " ++
-        "cwd:function(){return __edgebox_cwd();}, " ++
-        "exit:function(){}, " ++
-        "stdout:{write:function(s){__edgebox_write_stdout(String(s));return true;},isTTY:false,columns:80}, " ++
-        "stderr:{write:function(s){__edgebox_write_stderr(String(s));return true;},isTTY:false}, " ++
-        "versions:{node:'20.0.0'}, nextTick:function(cb){Promise.resolve().then(cb);}, " ++
-        "hrtime:Object.assign(function(){var t=Date.now();return[Math.floor(t/1000),(t%1000)*1e6];},{bigint:function(){return BigInt(Date.now())*1000000n;}}), " ++
-        "on:function(){return process;}, once:function(){return process;}, removeListener:function(){return process;}, emit:function(){return false;}, binding:function(){return{};} };" ++
-        "globalThis.require = function(name) {" ++
-        "  name = String(name).replace(/^node:/, '');" ++
-        "  if(name==='fs') return {" ++
-        "    readFileSync:function(p){return __edgebox_read_file(String(p))||null;}," ++
-        "    writeFileSync:function(){}," ++
-        "    existsSync:function(p){return __edgebox_file_exists(String(p))===1||__edgebox_dir_exists(String(p))===1;}," ++
-        "    statSync:function(p){var j=__edgebox_stat(String(p));if(!j){var e=new Error('ENOENT');e.code='ENOENT';throw e;}var s=JSON.parse(j);return{isFile:function(){return s.isFile;},isDirectory:function(){return s.isDirectory;},isSymbolicLink:function(){return false;},size:s.size,mtime:new Date()};}," ++
-        "    lstatSync:function(p){return require('fs').statSync(p);}," ++
-        "    readdirSync:function(p){return JSON.parse(__edgebox_readdir(String(p)));}," ++
-        "    realpathSync:Object.assign(function(p){return __edgebox_realpath(String(p));},{native:function(p){return __edgebox_realpath(String(p));}})," ++
-        "    openSync:function(){return -1;},closeSync:function(){},watchFile:function(){},unwatchFile:function(){},watch:function(){return{close:function(){}};}" ++
-        "  };" ++
-        "  if(name==='path') return {" ++
-        "    join:function(){return Array.prototype.slice.call(arguments).join('/').replace(/\\/+/g,'/');}," ++
-        "    dirname:function(p){var i=String(p).lastIndexOf('/');return i>=0?String(p).slice(0,i):'.';}," ++
-        "    basename:function(p,e){p=String(p);var b=p.slice(p.lastIndexOf('/')+1);if(e&&b.endsWith(e))b=b.slice(0,-e.length);return b;}," ++
-        "    resolve:function(){var a=Array.prototype.slice.call(arguments),r='';for(var i=a.length-1;i>=0;i--){r=String(a[i])+(r?'/'+r:'');if(String(a[i]).charAt(0)==='/')break;}if(r.charAt(0)!=='/'){r='/'+r;}return r.replace(/\\/+/g,'/');}," ++
-        "    normalize:function(p){return String(p).replace(/\\/+/g,'/');}," ++
-        "    isAbsolute:function(p){return String(p).charAt(0)==='/';}," ++
-        "    extname:function(p){p=String(p);var i=p.lastIndexOf('.');return i>=0?p.slice(i):'';}," ++
-        "    sep:'/',delimiter:':'" ++
-        "  };" ++
-        "  if(name==='os') return {EOL:'\\n',platform:function(){return'linux';},tmpdir:function(){return'/tmp';},homedir:function(){return'/tmp';},cpus:function(){return[{model:'edgebox'}];},arch:function(){return'x64';}};" ++
-        "  if(name==='crypto') return {createHash:function(a){var d='';return{update:function(s){d+=String(s);return this;},digest:function(){return __edgebox_hash(a,d);}};},randomBytes:function(n){return{toString:function(){return'';}};}};" ++
-        "  if(name==='perf_hooks') return {performance:{now:function(){return Date.now();},mark:function(){},measure:function(){}}};" ++
-        "  if(name==='buffer') return {Buffer:{from:function(s){return s;},isBuffer:function(){return false;},alloc:function(n){return new Uint8Array(n);}}};" ++
-        "  return {};" ++
-        "};" ++
-        // ts.sys initialization is handled by the recipe (checker-parallel.js)
-        // which creates a minimal sys object backed by Zig IO
-        ""
-    ;
-    {
-        var el: c_int = 0;
-        const r = edgebox_v8_eval_in_context(isolate, context, worker_init.ptr, @intCast(worker_init.len), &el);
-        if (r) |rr| edgebox_v8_free(rr);
-    }
-
-    // Load TSC recipe (sets up globalThis.__edgebox_check)
-    const recipe_path = std.fmt.allocPrint(alloc, "{s}/src/tsc-recipe/checker-parallel.js", .{eb_root}) catch null;
-    if (recipe_path == null) return;
-    defer alloc.free(recipe_path.?);
-    var recipe_len: c_int = 0;
-    const recipe_src = edgebox_read_file(recipe_path.?.ptr, @intCast(recipe_path.?.len), &recipe_len);
-    if (recipe_src != null and recipe_len > 0) {
-        var rel: c_int = 0;
-        const rr = edgebox_v8_eval_in_context(isolate, context, recipe_src.?, recipe_len, &rel);
-        if (rr) |r| edgebox_v8_free(r);
-        _ = std.posix.write(2, "[v8pool] recipe loaded\n") catch {};
-    } else {
-        _ = std.posix.write(2, "[v8pool] FAILED to load recipe\n") catch {};
-    }
-
+    // Snapshot includes worker_init + recipe — no post-restore eval needed.
+    // IO callbacks are registered by setup_context (same functions as snapshot).
     _ = std.posix.write(2, "[v8pool] worker ready\n") catch {};
 
     while (!workers[wid].shutdown.load(.acquire)) {

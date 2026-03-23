@@ -89,44 +89,102 @@ void edgebox_v8_free(const char* ptr) {
   delete[] ptr;
 }
 
+// Forward declarations for callbacks (used in snapshot creation)
+static void ReadFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void FileExistsCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void DirExistsCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void StatCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void ReaddirCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void RealpathCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void CwdCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void WriteStdoutCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void WriteStderrCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void HashCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void ExitCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void RegisterTypeCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void RegisterMemberCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void RegisterUnionCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void CheckStructuralCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void ClaimFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void IOStatsCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+
 // ── Snapshot: pre-compile TypeScript for instant worker startup ──
 
 static v8::StartupData g_snapshot = {nullptr, 0};
 
-// Create a snapshot with TypeScript pre-loaded
-int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim_code, int shim_len) {
-  v8::SnapshotCreator creator;
+// Helper: eval JS in a context (used during snapshot creation)
+static void EvalInContext(v8::Isolate* isolate, v8::Local<v8::Context> context, const char* code, int len) {
+  if (!code || len <= 0) return;
+  auto source = v8::String::NewFromUtf8(isolate, code, v8::NewStringType::kNormal, len);
+  if (source.IsEmpty()) return;
+  auto script = v8::Script::Compile(context, source.ToLocalChecked());
+  if (!script.IsEmpty()) script.ToLocalChecked()->Run(context);
+}
+
+// Create a snapshot with TypeScript + worker init + recipe pre-loaded.
+// IO callbacks are registered on the snapshot context so worker_init can use real require('fs').
+// External references — V8 needs these to serialize/deserialize native function pointers in snapshots
+static const intptr_t g_external_refs[] = {
+  reinterpret_cast<intptr_t>(ReadFileCallback),
+  reinterpret_cast<intptr_t>(FileExistsCallback),
+  reinterpret_cast<intptr_t>(DirExistsCallback),
+  reinterpret_cast<intptr_t>(StatCallback),
+  reinterpret_cast<intptr_t>(ReaddirCallback),
+  reinterpret_cast<intptr_t>(RealpathCallback),
+  reinterpret_cast<intptr_t>(CwdCallback),
+  reinterpret_cast<intptr_t>(WriteStdoutCallback),
+  reinterpret_cast<intptr_t>(WriteStderrCallback),
+  reinterpret_cast<intptr_t>(HashCallback),
+  reinterpret_cast<intptr_t>(ExitCallback),
+  reinterpret_cast<intptr_t>(RegisterTypeCallback),
+  reinterpret_cast<intptr_t>(RegisterMemberCallback),
+  reinterpret_cast<intptr_t>(RegisterUnionCallback),
+  reinterpret_cast<intptr_t>(CheckStructuralCallback),
+  reinterpret_cast<intptr_t>(ClaimFileCallback),
+  reinterpret_cast<intptr_t>(IOStatsCallback),
+  0  // sentinel
+};
+
+int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim_code, int shim_len,
+                                const char* init_code, int init_len, const char* recipe_code, int recipe_len) {
+  v8::SnapshotCreator creator(g_external_refs);
   auto* isolate = creator.GetIsolate();
   {
     v8::Isolate::Scope isolate_scope(isolate);
     v8::HandleScope handle_scope(isolate);
-    auto context = v8::Context::New(isolate);
+
+    // Create context WITH IO callbacks (so worker_init's require('fs') works)
+    auto global = v8::ObjectTemplate::New(isolate);
+    global->Set(isolate, "__edgebox_read_file", v8::FunctionTemplate::New(isolate, ReadFileCallback));
+    global->Set(isolate, "__edgebox_file_exists", v8::FunctionTemplate::New(isolate, FileExistsCallback));
+    global->Set(isolate, "__edgebox_dir_exists", v8::FunctionTemplate::New(isolate, DirExistsCallback));
+    global->Set(isolate, "__edgebox_stat", v8::FunctionTemplate::New(isolate, StatCallback));
+    global->Set(isolate, "__edgebox_readdir", v8::FunctionTemplate::New(isolate, ReaddirCallback));
+    global->Set(isolate, "__edgebox_realpath", v8::FunctionTemplate::New(isolate, RealpathCallback));
+    global->Set(isolate, "__edgebox_cwd", v8::FunctionTemplate::New(isolate, CwdCallback));
+    global->Set(isolate, "__edgebox_write_stdout", v8::FunctionTemplate::New(isolate, WriteStdoutCallback));
+    global->Set(isolate, "__edgebox_write_stderr", v8::FunctionTemplate::New(isolate, WriteStderrCallback));
+    global->Set(isolate, "__edgebox_hash", v8::FunctionTemplate::New(isolate, HashCallback));
+    global->Set(isolate, "__edgebox_exit", v8::FunctionTemplate::New(isolate, ExitCallback));
+    global->Set(isolate, "__edgebox_register_type", v8::FunctionTemplate::New(isolate, RegisterTypeCallback));
+    global->Set(isolate, "__edgebox_register_member", v8::FunctionTemplate::New(isolate, RegisterMemberCallback));
+    global->Set(isolate, "__edgebox_register_union", v8::FunctionTemplate::New(isolate, RegisterUnionCallback));
+    global->Set(isolate, "__edgebox_check_structural", v8::FunctionTemplate::New(isolate, CheckStructuralCallback));
+    global->Set(isolate, "__edgebox_claim_file", v8::FunctionTemplate::New(isolate, ClaimFileCallback));
+    global->Set(isolate, "__edgebox_io_stats", v8::FunctionTemplate::New(isolate, IOStatsCallback));
+    auto context = v8::Context::New(isolate, nullptr, global);
     v8::Context::Scope context_scope(context);
 
-    // Eval shim (module, process, require, Buffer, setTimeout)
-    if (shim_code && shim_len > 0) {
-      auto source = v8::String::NewFromUtf8(isolate, shim_code, v8::NewStringType::kNormal, shim_len);
-      if (!source.IsEmpty()) {
-        auto script = v8::Script::Compile(context, source.ToLocalChecked());
-        if (!script.IsEmpty()) script.ToLocalChecked()->Run(context);
-      }
-    }
-
-    // Eval TypeScript
-    if (ts_code && ts_len > 0) {
-      auto source = v8::String::NewFromUtf8(isolate, ts_code, v8::NewStringType::kNormal, ts_len);
-      if (!source.IsEmpty()) {
-        auto script = v8::Script::Compile(context, source.ToLocalChecked());
-        if (!script.IsEmpty()) script.ToLocalChecked()->Run(context);
-      }
-    }
-
-    // Set ts = module.exports
-    {
-      auto source = v8::String::NewFromUtf8Literal(isolate, "globalThis.ts = globalThis.module.exports;");
-      auto script = v8::Script::Compile(context, source);
-      if (!script.IsEmpty()) script.ToLocalChecked()->Run(context);
-    }
+    // 1. Eval shim (module, process stubs, require stubs)
+    EvalInContext(isolate, context, shim_code, shim_len);
+    // 2. Eval TypeScript (compiled + executed)
+    EvalInContext(isolate, context, ts_code, ts_len);
+    // 3. Set ts alias
+    EvalInContext(isolate, context, "globalThis.ts = globalThis.module.exports;", 42);
+    // 4. Eval worker_init (process, require with real IO)
+    EvalInContext(isolate, context, init_code, init_len);
+    // 5. Eval recipe (__edgebox_check defined)
+    EvalInContext(isolate, context, recipe_code, recipe_len);
 
     creator.SetDefaultContext(context);
   }
@@ -142,6 +200,7 @@ void* edgebox_v8_create_isolate_from_snapshot() {
   v8::Isolate::CreateParams params;
   params.array_buffer_allocator = v8::ArrayBuffer::Allocator::NewDefaultAllocator();
   params.snapshot_blob = &g_snapshot;
+  params.external_references = g_external_refs;
   return v8::Isolate::New(params);
 }
 
