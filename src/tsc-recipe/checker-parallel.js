@@ -22,9 +22,24 @@ var ts = globalThis.ts || globalThis.module.exports;
   };
 })();
 
-// WASM kernels available as globalThis.__ebWasmTypeKernel (loaded from .wasm files)
-// Currently not wired into TSC's internal checker — would require source patching.
-// Kept for future use in AOT compilation pipeline.
+// 3. Diagnostic cache — persist per-file diagnostics by content hash.
+// Skip checking files that haven't changed since last check.
+// Cache stored on disk as JSON — survives daemon restarts.
+(function() {
+  if (!ts) return;
+  globalThis.__ebDiagCache = { hashes: {}, diags: {}, dirty: false };
+  // Load from disk if available
+  if (typeof __edgebox_read_file === 'function' && typeof __edgebox_root === 'function') {
+    var root = __edgebox_root();
+    try {
+      var cached = __edgebox_read_file(root + '/.edgebox-diag-cache.json');
+      if (cached) {
+        var parsed = JSON.parse(cached);
+        if (parsed && parsed.hashes) globalThis.__ebDiagCache = parsed;
+      }
+    } catch(e) {}
+  }
+})();
 
 // 3. JIT warmup — run a small type check during snapshot creation.
 // This triggers V8's TurboFan to compile TSC's hot functions (isTypeRelatedTo,
@@ -208,33 +223,54 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   for (var fi = 0; fi < files.length; fi++)
     if (!files[fi].isDeclarationFile) checkFiles.push(files[fi]);
 
-  if (isWarm) {
-    // Hot: static sharding — TSC caches diagnostics per file in-memory
-    for (var i = workerId; i < checkFiles.length; i += workerCount) {
-      filesChecked++;
-      var diags = program.getSemanticDiagnostics(checkFiles[i]);
-      for (var k = 0; k < diags.length; k++) {
-        var d = diags[k];
-        if (d.file) {
-          var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
-          output.push(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' '));
-        }
+  // Hash each file — check if diagnostics are cached from previous run
+  var dc = globalThis.__ebDiagCache;
+  var cacheHits = 0, cacheMisses = 0;
+
+  function hashContent(text) {
+    if (typeof __edgebox_hash === 'function') return __edgebox_hash('sha256', text);
+    // Fallback: simple hash
+    var h = 0;
+    for (var i = 0; i < text.length; i++) h = ((h << 5) - h + text.charCodeAt(i)) | 0;
+    return '' + h;
+  }
+
+  function checkFile(file) {
+    var hash = hashContent(file.text);
+    var fn = file.fileName;
+    // Cache hit: file unchanged since last check → return cached diagnostics
+    if (dc.hashes[fn] === hash && dc.diags[fn] !== undefined) {
+      cacheHits++;
+      var cached = dc.diags[fn];
+      for (var ci = 0; ci < cached.length; ci++) output.push(cached[ci]);
+      return;
+    }
+    // Cache miss: check with TSC, store result
+    cacheMisses++;
+    filesChecked++;
+    var diags = program.getSemanticDiagnostics(file);
+    var fileDiags = [];
+    for (var k = 0; k < diags.length; k++) {
+      var d = diags[k];
+      if (d.file) {
+        var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
+        var msg = d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' ');
+        fileDiags.push(msg);
+        output.push(msg);
       }
     }
+    dc.hashes[fn] = hash;
+    dc.diags[fn] = fileDiags;
+    dc.dirty = true;
+  }
+
+  if (isWarm) {
+    for (var i = workerId; i < checkFiles.length; i += workerCount) checkFile(checkFiles[i]);
   } else {
-    // Cold: work-stealing — atomic counter balances load across workers
     while (true) {
       var idx = __edgebox_claim_file();
       if (idx >= checkFiles.length) break;
-      filesChecked++;
-      var diags = program.getSemanticDiagnostics(checkFiles[idx]);
-      for (var k = 0; k < diags.length; k++) {
-        var d = diags[k];
-        if (d.file) {
-          var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
-          output.push(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' '));
-        }
-      }
+      checkFile(checkFiles[idx]);
     }
   }
 
@@ -249,8 +285,17 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     }
   }
 
+  // Persist diagnostic cache to disk (all workers — each has partial results)
+  if (dc.dirty && typeof __edgebox_write_file === 'function') {
+    try {
+      var ebRoot = typeof __edgebox_root === 'function' ? __edgebox_root() : __edgebox_cwd();
+      __edgebox_write_file(ebRoot + '/.edgebox-diag-cache.json', JSON.stringify({hashes: dc.hashes, diags: dc.diags}));
+      dc.dirty = false;
+    } catch(e) {}
+  }
+
   var t3 = Date.now();
-  __edgebox_write_stderr('[recipe] w' + workerId + '/' + workerCount + ' config:' + (t1-t0) + 'ms parse:' + (t2-t1) + 'ms check:' + (t3-t2) + 'ms total:' + (t3-t0) + 'ms checked:' + filesChecked + '/' + checkFiles.length + String.fromCharCode(10));
+  __edgebox_write_stderr('[recipe] w' + workerId + '/' + workerCount + ' config:' + (t1-t0) + 'ms parse:' + (t2-t1) + 'ms check:' + (t3-t2) + 'ms total:' + (t3-t0) + 'ms checked:' + filesChecked + ' cached:' + cacheHits + '/' + checkFiles.length + String.fromCharCode(10));
   return output.join(NL);
   } catch(e) { return '[recipe-error] w' + workerId + ': ' + (e && e.stack ? e.stack : String(e)); }
 };
