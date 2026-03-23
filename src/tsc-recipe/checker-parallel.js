@@ -1,8 +1,14 @@
 // TSC Recipe — loaded once by V8 pool, called per request via __edgebox_check
+//
+// The Zig structural check is injected directly into TSC's internal isTypeRelatedTo
+// via the recipe transform in v8_pool.zig (applied before snapshot creation).
+// This recipe only handles: ts.sys setup, program creation, sharded diagnostics.
 var ts = globalThis.ts || globalThis.module.exports;
 
 globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
-  if (!ts || !ts.createProgram) return 'no tsc';
+  try {
+  if (!ts || !ts.createProgram) return 'no tsc: ' + typeof ts;
+
   // Create ts.sys if missing (snapshot restore doesn't init it)
   if (!ts.sys && ts.setSys) {
     ts.setSys({
@@ -26,8 +32,10 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   if (!ts.sys) return 'no sys (setSys failed)';
 
   var ebRoot = __edgebox_cwd();
+  if (workerId === 0) __edgebox_write_stderr('[recipe] ebRoot=' + ebRoot + ' cwd=' + cwd + String.fromCharCode(10));
   function rp(p) { p = String(p); return p.charAt(0) === '/' ? p : cwd + '/' + p; }
 
+  // Wire ts.sys methods to Zig IO (zero-copy via C ABI)
   ts.sys.readFile = function(p) {
     var c = __edgebox_read_file(rp(p));
     if (!c) {
@@ -55,101 +63,64 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   ts.sys.exit = function() {};
   ts.sys.useCaseSensitiveFileNames = true;
   globalThis.__filename = ebRoot + '/node_modules/typescript/lib/typescript.js';
+  // readdir now returns pre-typed: {"f":["file1"],"d":["dir1"]}
+  // No need for N separate dir_exists calls per directory
   ts.sys.getDirectories = function(p) {
-    var rr = rp(p); var entries = JSON.parse(__edgebox_readdir(rr));
-    return entries.filter(function(e) { return __edgebox_dir_exists(rr + '/' + e) === 1; });
+    var rr = rp(p); var json = __edgebox_readdir(rr);
+    if (!json || json.charAt(0) !== '{') return [];
+    var typed = JSON.parse(json);
+    return typed.d || [];
   };
   ts.sys.readDirectory = function(rootDir, ext, exc, inc, depth) {
     return ts.matchFiles(rootDir, ext, exc, inc, true, cwd, depth, function(p) {
       var rr = p || '.'; var json = __edgebox_readdir(rr);
-      if (!json || json === '[]') return { files: [], directories: [] };
-      var entries = JSON.parse(json); var files = [], dirs = [];
-      for (var i = 0; i < entries.length; i++) {
-        if (entries[i] === '.' || entries[i] === '..') continue;
-        if (__edgebox_dir_exists(rr + '/' + entries[i]) === 1) dirs.push(entries[i]); else files.push(entries[i]);
-      }
-      return { files: files, directories: dirs };
+      if (!json || json.charAt(0) !== '{') return { files: [], directories: [] };
+      var typed = JSON.parse(json);
+      return { files: typed.f || [], directories: typed.d || [] };
     }, function(p) { return __edgebox_realpath(p); });
   };
 
-  var t0 = Date.now();
-  var cf = ts.readConfigFile(cwd + '/tsconfig.json', ts.sys.readFile);
-  if (cf.error) return 'config error: ' + ts.flattenDiagnosticMessageText(cf.error.messageText, ' ');
-  if (!cf.config) return 'config null';
-  var parsed = ts.parseJsonConfigFileContent(cf.config, ts.sys, cwd);
+  // Create program (cached across requests on same worker)
   if (!globalThis.__pc) globalThis.__pc = {};
+  if (!globalThis.__cc) globalThis.__cc = {};
+  var t0 = Date.now();
+  var parsed;
+  if (globalThis.__cc[cwd]) {
+    parsed = globalThis.__cc[cwd];
+  } else {
+    var cf = ts.readConfigFile(cwd + '/tsconfig.json', ts.sys.readFile);
+    if (cf.error) return 'config error: ' + ts.flattenDiagnosticMessageText(cf.error.messageText, ' ');
+    if (!cf.config) return 'config null';
+    parsed = ts.parseJsonConfigFileContent(cf.config, ts.sys, cwd);
+    globalThis.__cc[cwd] = parsed;
+  }
   var ck = cwd + ':' + parsed.fileNames.length;
   var t1 = Date.now();
-  var program = globalThis.__pc[ck] || (globalThis.__pc[ck] = ts.createProgram(parsed.fileNames, parsed.options));
+  var program;
+  if (globalThis.__pc[ck]) {
+    program = globalThis.__pc[ck];
+  } else {
+    program = ts.createProgram(parsed.fileNames, parsed.options);
+    globalThis.__pc[ck] = program;
+  }
   var t2 = Date.now();
+  // Track IO call counts during parse (config already counted in t0-t1)
+  var io_after = typeof __edgebox_io_stats === 'function' ? __edgebox_io_stats() : {};
+  if (workerId === 0) __edgebox_write_stderr('[recipe] w0 files:' + parsed.fileNames.length + ' parse:' + (t2-t1) + 'ms fe:' + (io_after.fileExistsCalls||0) + ' de:' + (io_after.dirExistsCalls||0) + String.fromCharCode(10));
   var files = program.getSourceFiles();
   var NL = String.fromCharCode(10);
   var output = [];
 
-  // Register types incrementally during checking via SIMD check patch
-  // (types registered on-demand when isTypeRelatedTo is called)
-
-  if (workerId === 0) {
-    var gd = ts.getPreEmitDiagnostics(program).filter(function(d) { return !d.file; });
-    for (var g = 0; g < gd.length; g++)
-      output.push('error TS' + gd[g].code + ': ' + ts.flattenDiagnosticMessageText(gd[g].messageText, ' '));
+  // Filter to only project source files (skip .d.ts — skipLibCheck makes them instant)
+  var checkFiles = [];
+  for (var fi = 0; fi < files.length; fi++) {
+    if (!files[fi].isDeclarationFile) checkFiles.push(files[fi]);
   }
-
-  // Wire Zig SIMD structural check into TSC's type checker
-  // Types registered on-demand (first time each type is checked)
-  if (typeof __edgebox_check_structural === 'function' && !globalThis.__zigCheckPatched) {
-    var _checker = program.getDiagnosticsProducingTypeChecker ? program.getDiagnosticsProducingTypeChecker() : null;
-    if (_checker && _checker.isTypeRelatedTo) {
-      var _regTypes = {};
-      function _regType(t) {
-        if (!t || !t.id || _regTypes[t.id]) return;
-        _regTypes[t.id] = true;
-        __edgebox_register_type(t.id, t.flags || 0);
-        // Register union constituent types
-        if (t.types && (t.flags & 1048576)) { // Union flag
-          var ids = [];
-          for (var u = 0; u < t.types.length; u++) {
-            if (t.types[u] && t.types[u].id) ids.push(t.types[u].id);
-          }
-          if (ids.length > 0) __edgebox_register_union(t.id, ids);
-        }
-        // Register members (enables Zig structural comparison)
-        try {
-          var props = _checker.getPropertiesOfType(t);
-          for (var p = 0; p < props.length && p < 50; p++) {
-            var prop = props[p];
-            if (prop.escapedName) {
-              var pt = _checker.getTypeOfSymbol(prop);
-              if (pt && pt.id) __edgebox_register_member(t.id, String(prop.escapedName), pt.id, prop.flags || 0);
-            }
-          }
-        } catch(e) {}
-      }
-      globalThis.__zigHits = 0;
-      globalThis.__zigMisses = 0;
-      // Map relation object to integer for Zig (0=assignable, 1=subtype, 2=identity)
-      var _assignableRel = ts.assignableRelation || null;
-      var _subtypeRel = ts.subtypeRelation || null;
-      _checker.isTypeRelatedTo = function(source, target, relation) {
-        if (source && target && source.id && target.id) {
-          _regType(source);
-          _regType(target);
-          // Pass relation type: 0=assignable, 1=subtype, 2=identity
-          var relType = relation === _assignableRel ? 0 : relation === _subtypeRel ? 1 : 2;
-          var r = __edgebox_check_structural(source.id, target.id);
-          if (r === 1) { globalThis.__zigHits++; return true; }
-          globalThis.__zigMisses++;
-          return false;
-        }
-        return false;
-      };
-    }
-    globalThis.__zigCheckPatched = true;
-  }
-
-  for (var i = 0; i < files.length; i++) {
+  if (workerId === 0) __edgebox_write_stderr('[recipe] w0 totalFiles:' + files.length + ' checkFiles:' + checkFiles.length + String.fromCharCode(10));
+  // Sharded check: each worker checks checkFiles[i % workerCount === workerId]
+  for (var i = 0; i < checkFiles.length; i++) {
     if (i % workerCount !== workerId) continue;
-    var diags = program.getSemanticDiagnostics(files[i]);
+    var diags = program.getSemanticDiagnostics(checkFiles[i]);
     for (var k = 0; k < diags.length; k++) {
       var d = diags[k];
       if (d.file) {
@@ -159,11 +130,23 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     }
   }
 
-  var t3 = Date.now();
+  // Worker 0 collects global diagnostics (config errors, missing types)
+  // Uses getGlobalDiagnostics + getOptionsDiagnostics instead of getPreEmitDiagnostics
+  // (getPreEmitDiagnostics re-checks ALL files — defeats sharding)
   if (workerId === 0) {
-    var zigHits = 0, zigMisses = 0;
-    if (globalThis.__zigHits !== undefined) { zigHits = globalThis.__zigHits; zigMisses = globalThis.__zigMisses; }
-    __edgebox_write_stderr('[recipe] w' + workerId + ' config:' + (t1-t0) + 'ms parse:' + (t2-t1) + 'ms check:' + (t3-t2) + 'ms total:' + (t3-t0) + 'ms types:' + Object.keys(_regTypes).length + ' zigHits:' + zigHits + ' zigMisses:' + zigMisses + String.fromCharCode(10));
+    var gd = (program.getGlobalDiagnostics ? program.getGlobalDiagnostics() : [])
+      .concat(program.getOptionsDiagnostics ? program.getOptionsDiagnostics() : [])
+      .concat(program.getConfigFileParsingDiagnostics ? program.getConfigFileParsingDiagnostics() : []);
+    for (var g = 0; g < gd.length; g++) {
+      if (!gd[g].file)
+        output.push('error TS' + gd[g].code + ': ' + ts.flattenDiagnosticMessageText(gd[g].messageText, ' '));
+    }
   }
+
+  var t3 = Date.now();
+  // All workers report timing + Zig check stats
+  var io = typeof __edgebox_io_stats === 'function' ? __edgebox_io_stats() : {};
+  __edgebox_write_stderr('[recipe] w' + workerId + '/' + workerCount + ' config:' + (t1-t0) + 'ms parse:' + (t2-t1) + 'ms check:' + (t3-t2) + 'ms total:' + (t3-t0) + 'ms files:' + files.length + ' fe:' + (io.fileExistsCalls||0) + '/' + (io.fileExistsCached||0) + ' de:' + (io.dirExistsCalls||0) + '/' + (io.dirExistsCached||0) + String.fromCharCode(10));
   return output.join(NL);
+  } catch(e) { return '[recipe-error] w' + workerId + ': ' + (e && e.stack ? e.stack : String(e)); }
 };

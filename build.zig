@@ -1698,8 +1698,16 @@ pub fn build(b: *std.Build) void {
         // Link V8 bridge (C++) and rusty_v8 library
         edgebox_cli.addCSourceFile(.{ .file = b.path("src/v8_bridge_pool.cpp"), .flags = &.{ "-std=c++20", "-fno-exceptions", "-fno-rtti", "-Wno-unused-result" } });
         edgebox_cli.addCSourceFile(.{ .file = b.path("src/v8_stubs.c"), .flags = &.{} });
-        // Link Zig IO library (edgebox_io.zig exports C ABI functions)
-        edgebox_cli.addObjectFile(b.path("zig-out/lib/libedgebox_io.a"));
+        // Build and link Zig IO library (edgebox_io.zig exports C ABI functions)
+        const io_lib = b.addLibrary(.{
+            .name = "edgebox_io",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/edgebox_io.zig"),
+                .target = target,
+                .optimize = .ReleaseFast,
+            }),
+        });
+        edgebox_cli.addObjectFile(io_lib.getEmittedBin());
         edgebox_cli.addIncludePath(b.path("vendor/v8/include"));
         edgebox_cli.addObjectFile(b.path("vendor/v8/librusty_v8_release_x86_64-unknown-linux-gnu.a"));
         edgebox_cli.linkLibCpp();
@@ -1720,7 +1728,7 @@ pub fn build(b: *std.Build) void {
         nl_test.addCSourceFile(.{ .file = b.path("src/v8_stubs.c"), .flags = &.{} });
         nl_test.addIncludePath(b.path("vendor/v8/include"));
         nl_test.addObjectFile(b.path("vendor/v8/librusty_v8_release_x86_64-unknown-linux-gnu.a"));
-        nl_test.addObjectFile(b.path("zig-out/lib/libedgebox_io.a"));
+        nl_test.addObjectFile(io_lib.getEmittedBin());
         nl_test.linkLibCpp();
         const install_nl = b.addInstallArtifact(nl_test, .{});
         const nl_step = b.step("v8-nl-test", "Test V8 newline handling");

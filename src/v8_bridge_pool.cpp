@@ -181,13 +181,17 @@ static void ReadFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
 }
 
 static void FileExistsCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  auto path = GetStringArg(args, 0);
-  args.GetReturnValue().Set(v8::Number::New(args.GetIsolate(), edgebox_file_exists(path.c_str(), path.size())));
+  if (args.Length() < 1) return;
+  v8::String::Utf8Value utf8(args.GetIsolate(), args[0]);
+  if (!*utf8) { args.GetReturnValue().Set(v8::Number::New(args.GetIsolate(), 0)); return; }
+  args.GetReturnValue().Set(v8::Number::New(args.GetIsolate(), edgebox_file_exists(*utf8, utf8.length())));
 }
 
 static void DirExistsCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  auto path = GetStringArg(args, 0);
-  args.GetReturnValue().Set(v8::Number::New(args.GetIsolate(), edgebox_dir_exists(path.c_str(), path.size())));
+  if (args.Length() < 1) return;
+  v8::String::Utf8Value utf8(args.GetIsolate(), args[0]);
+  if (!*utf8) { args.GetReturnValue().Set(v8::Number::New(args.GetIsolate(), 0)); return; }
+  args.GetReturnValue().Set(v8::Number::New(args.GetIsolate(), edgebox_dir_exists(*utf8, utf8.length())));
 }
 
 static void StatCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -199,8 +203,8 @@ static void StatCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
     args.GetReturnValue().Set(v8::String::NewFromUtf8(iso, "").ToLocalChecked());
     return;
   }
+  // stat uses thread-local buffer — do NOT free
   auto result = v8::String::NewFromUtf8(iso, data, v8::NewStringType::kNormal, out_len).ToLocalChecked();
-  edgebox_free(data, out_len);
   args.GetReturnValue().Set(result);
 }
 
@@ -315,6 +319,21 @@ static void CheckStructuralCallback(const v8::FunctionCallbackInfo<v8::Value>& a
   args.GetReturnValue().Set(v8::Number::New(args.GetIsolate(), edgebox_check_structural(src, tgt)));
 }
 
+extern void edgebox_io_stats(unsigned long long* fe_calls, unsigned long long* fe_cached, unsigned long long* de_calls, unsigned long long* de_cached);
+
+static void IOStatsCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  unsigned long long fe_calls = 0, fe_cached = 0, de_calls = 0, de_cached = 0;
+  edgebox_io_stats(&fe_calls, &fe_cached, &de_calls, &de_cached);
+  auto* iso = args.GetIsolate();
+  auto ctx = iso->GetCurrentContext();
+  auto obj = v8::Object::New(iso);
+  obj->Set(ctx, v8::String::NewFromUtf8Literal(iso, "fileExistsCalls"), v8::Number::New(iso, (double)fe_calls)).Check();
+  obj->Set(ctx, v8::String::NewFromUtf8Literal(iso, "fileExistsCached"), v8::Number::New(iso, (double)fe_cached)).Check();
+  obj->Set(ctx, v8::String::NewFromUtf8Literal(iso, "dirExistsCalls"), v8::Number::New(iso, (double)de_calls)).Check();
+  obj->Set(ctx, v8::String::NewFromUtf8Literal(iso, "dirExistsCached"), v8::Number::New(iso, (double)de_cached)).Check();
+  args.GetReturnValue().Set(obj);
+}
+
 extern void edgebox_submit_result(int worker_id, const char* data, int data_len);
 extern void edgebox_worker_done(int worker_id);
 
@@ -397,6 +416,7 @@ void* edgebox_v8_setup_context(void* iso_ptr) {
   set("__edgebox_register_member", RegisterMemberCallback);
   set("__edgebox_register_union", RegisterUnionCallback);
   set("__edgebox_check_structural", CheckStructuralCallback);
+  set("__edgebox_io_stats", IOStatsCallback);
   set("__edgebox_worker_done", WorkerDoneCallback);
 
   auto* persistent = new v8::Persistent<v8::Context>(isolate, context);

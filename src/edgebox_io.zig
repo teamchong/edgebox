@@ -56,29 +56,97 @@ export fn edgebox_write_file(path_ptr: [*]const u8, path_len: c_int, data_ptr: [
 }
 
 /// Check if file exists. Returns 1=yes, 0=no.
+// Existence cache — HashMap for correctness (no hash collisions).
+// Shared across workers. Populated on first access, reused by all.
+// Key: path string, Value: true=exists, false=not exists
+// Separate caches for files and directories.
+var file_exist_cache: std.StringHashMapUnmanaged(bool) = .{};
+var dir_exist_cache: std.StringHashMapUnmanaged(bool) = .{};
+var exist_rwlock: std.Thread.RwLock = .{};
+
+var io_file_exists_calls: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var io_file_exists_cached: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var io_dir_exists_calls: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var io_dir_exists_cached: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+export fn edgebox_io_stats(fe_calls: *u64, fe_cached: *u64, de_calls: *u64, de_cached: *u64) void {
+    fe_calls.* = io_file_exists_calls.load(.monotonic);
+    fe_cached.* = io_file_exists_cached.load(.monotonic);
+    de_calls.* = io_dir_exists_calls.load(.monotonic);
+    de_cached.* = io_dir_exists_cached.load(.monotonic);
+}
+
 export fn edgebox_file_exists(path_ptr: [*]const u8, path_len: c_int) c_int {
     if (path_len <= 0) return 0;
     const path = path_ptr[0..@intCast(path_len)];
-    std.fs.cwd().access(path, .{}) catch return 0;
-    return 1;
+    _ = io_file_exists_calls.fetchAdd(1, .monotonic);
+    // Check existence cache (HashMap — no collisions)
+    {
+        exist_rwlock.lockShared();
+        defer exist_rwlock.unlockShared();
+        if (file_exist_cache.get(path)) |exists| {
+            _ = io_file_exists_cached.fetchAdd(1, .monotonic);
+            return if (exists) @as(c_int, 1) else @as(c_int, 0);
+        }
+    }
+    // Also check file content cache — if file was read, it exists
+    {
+        cache_mutex.lock();
+        defer cache_mutex.unlock();
+        if (file_cache.get(path) != null) {
+            _ = io_file_exists_cached.fetchAdd(1, .monotonic);
+            return 1;
+        }
+    }
+    const exists = blk: {
+        std.fs.cwd().access(path, .{}) catch break :blk false;
+        break :blk true;
+    };
+    {
+        exist_rwlock.lock();
+        defer exist_rwlock.unlock();
+        const key = alloc.dupe(u8, path) catch return if (exists) @as(c_int, 1) else @as(c_int, 0);
+        file_exist_cache.put(alloc, key, exists) catch {};
+    }
+    return if (exists) @as(c_int, 1) else @as(c_int, 0);
 }
 
-/// Check if directory exists. Returns 1=yes, 0=no.
+/// Check if directory exists. Returns 1=yes, 0=no. Cached via HashMap.
 export fn edgebox_dir_exists(path_ptr: [*]const u8, path_len: c_int) c_int {
     if (path_len <= 0) return 0;
     const path = path_ptr[0..@intCast(path_len)];
-    var dir = std.fs.cwd().openDir(path, .{}) catch return 0;
-    dir.close();
-    return 1;
+    _ = io_dir_exists_calls.fetchAdd(1, .monotonic);
+    {
+        exist_rwlock.lockShared();
+        defer exist_rwlock.unlockShared();
+        if (dir_exist_cache.get(path)) |exists| {
+            _ = io_dir_exists_cached.fetchAdd(1, .monotonic);
+            return if (exists) @as(c_int, 1) else @as(c_int, 0);
+        }
+    }
+    const exists = blk: {
+        var dir = std.fs.cwd().openDir(path, .{}) catch break :blk false;
+        dir.close();
+        break :blk true;
+    };
+    {
+        exist_rwlock.lock();
+        defer exist_rwlock.unlock();
+        const key = alloc.dupe(u8, path) catch return if (exists) @as(c_int, 1) else @as(c_int, 0);
+        dir_exist_cache.put(alloc, key, exists) catch {};
+    }
+    return if (exists) @as(c_int, 1) else @as(c_int, 0);
 }
 
 /// Stat file. Returns JSON: {"isFile":true,"isDirectory":false,"size":N}
-/// Uses JSON for this one because stat has multiple return values.
+/// Uses thread-local buffer to avoid mmap per call.
+threadlocal var stat_buf: [128]u8 = undefined;
+
 export fn edgebox_stat(path_ptr: [*]const u8, path_len: c_int, out_len: *c_int) ?[*]const u8 {
     if (path_len <= 0) { out_len.* = 0; return null; }
     const path = path_ptr[0..@intCast(path_len)];
     const stat = std.fs.cwd().statFile(path) catch { out_len.* = 0; return null; };
-    const result = std.fmt.allocPrint(alloc,
+    const result = std.fmt.bufPrint(&stat_buf,
         "{{\"isFile\":{s},\"isDirectory\":{s},\"size\":{d}}}",
         .{
             if (stat.kind == .file) "true" else "false",
@@ -90,24 +158,40 @@ export fn edgebox_stat(path_ptr: [*]const u8, path_len: c_int, out_len: *c_int) 
     return result.ptr;
 }
 
-/// Read directory entries. Returns JSON array: ["file1","file2",...]
+/// Read directory entries. Returns JSON: {"f":["file1"],"d":["dir1"]}
+/// Pre-classifies entries as file or directory — avoids N separate dir_exists calls.
 export fn edgebox_readdir(path_ptr: [*]const u8, path_len: c_int, out_len: *c_int) ?[*]const u8 {
     if (path_len <= 0) { out_len.* = 0; return null; }
     const path = path_ptr[0..@intCast(path_len)];
     var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch { out_len.* = 0; return null; };
     defer dir.close();
     var result: std.ArrayListUnmanaged(u8) = .{};
-    result.appendSlice(alloc, "[") catch { out_len.* = 0; return null; };
-    var first = true;
+    result.appendSlice(alloc, "{\"f\":[") catch { out_len.* = 0; return null; };
+    var first_f = true;
+    var dirs_buf: std.ArrayListUnmanaged(u8) = .{};
+    var first_d = true;
     var it = dir.iterate();
     while (it.next() catch null) |entry| {
-        if (!first) result.append(alloc, ',') catch {};
-        first = false;
-        result.append(alloc, '"') catch {};
-        result.appendSlice(alloc, entry.name) catch {};
-        result.append(alloc, '"') catch {};
+        if (entry.kind == .directory) {
+            if (!first_d) dirs_buf.append(alloc, ',') catch {};
+            first_d = false;
+            dirs_buf.append(alloc, '"') catch {};
+            dirs_buf.appendSlice(alloc, entry.name) catch {};
+            dirs_buf.append(alloc, '"') catch {};
+        } else {
+            if (!first_f) result.append(alloc, ',') catch {};
+            first_f = false;
+            result.append(alloc, '"') catch {};
+            result.appendSlice(alloc, entry.name) catch {};
+            result.append(alloc, '"') catch {};
+        }
     }
-    result.appendSlice(alloc, "]") catch {};
+    result.appendSlice(alloc, "],\"d\":[") catch {};
+    if (dirs_buf.items.len > 0) {
+        result.appendSlice(alloc, dirs_buf.items) catch {};
+    }
+    dirs_buf.deinit(alloc);
+    result.appendSlice(alloc, "]}") catch {};
     const slice = result.toOwnedSlice(alloc) catch { out_len.* = 0; return null; };
     out_len.* = @intCast(slice.len);
     return slice.ptr;
@@ -534,6 +618,8 @@ var member_count: u32 = 0;
 var string_table: std.StringHashMapUnmanaged(u32) = .{};
 var string_count: u32 = 0;
 var type_data_mutex: std.Thread.Mutex = .{};
+// Arena for string interning — avoids mmap per string (page_allocator does mmap per alloc)
+var string_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 export fn edgebox_register_type(type_id: u32, flags: u32, _: u32) void {
     if (type_id >= MAX_TYPES) return;
@@ -550,8 +636,8 @@ export fn edgebox_register_member(type_id: u32, name_ptr: [*]const u8, name_len:
         if (string_table.get(name)) |id| break :blk id;
         const id = string_count;
         string_count += 1;
-        const key = alloc.dupe(u8, name) catch return;
-        string_table.put(alloc, key, id) catch return;
+        const key = string_arena.allocator().dupe(u8, name) catch return;
+        string_table.put(string_arena.allocator(), key, id) catch return;
         break :blk id;
     };
     if (col_type_member_count[type_id] == 0) col_type_member_offset[type_id] = member_count;
@@ -575,7 +661,10 @@ var union_member_count: u32 = 0;
 
 /// Register a union type's constituent type IDs
 export fn edgebox_register_union(type_id: u32, member_ids_ptr: [*]const u32, count: c_int) void {
-    if (type_id >= MAX_UNION_TYPES or count <= 0 or union_member_count + @as(u32, @intCast(count)) > MAX_UNION_MEMBERS) return;
+    if (type_id >= MAX_UNION_TYPES or count <= 0) return;
+    type_data_mutex.lock();
+    defer type_data_mutex.unlock();
+    if (union_member_count + @as(u32, @intCast(count)) > MAX_UNION_MEMBERS) return;
     col_union_offset[type_id] = union_member_count;
     col_union_count[type_id] = @intCast(@min(count, 65535));
     const n: u32 = @intCast(count);
@@ -585,96 +674,72 @@ export fn edgebox_register_union(type_id: u32, member_ids_ptr: [*]const u32, cou
     }
 }
 
-// ── SIMD Structural Check ──
+// ── Relation Cache ──
+// Caches TSC's type relation results: (source_id, target_id) → 1=compatible, 2=incompatible
+// Populated after TSC resolves a pair, used on subsequent checks for same pair.
+const CACHE_SIZE: u32 = 1 << 20; // 1M entries — power of 2 for fast modulo
+const CACHE_MASK: u32 = CACHE_SIZE - 1;
+var cache_keys: [CACHE_SIZE]u64 = [_]u64{0} ** CACHE_SIZE; // packed (source << 32 | target)
+var cache_vals: [CACHE_SIZE]u8 = [_]u8{0} ** CACHE_SIZE; // 0=empty, 1=true, 2=false
+var cache_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+fn cacheKey(source: u32, target: u32) u64 {
+    return (@as(u64, source) << 32) | @as(u64, target);
+}
+
+fn cacheSlot(key: u64) u32 {
+    // Simple hash: mix bits and mask
+    const h = key ^ (key >> 17) ^ (key >> 34);
+    return @intCast(h & CACHE_MASK);
+}
+
+fn cacheGet(source: u32, target: u32) u8 {
+    const key = cacheKey(source, target);
+    const slot = cacheSlot(key);
+    if (cache_keys[slot] == key) return cache_vals[slot];
+    return 0;
+}
+
+fn cachePut(source: u32, target: u32, val: u8) void {
+    const key = cacheKey(source, target);
+    const slot = cacheSlot(key);
+    cache_keys[slot] = key;
+    cache_vals[slot] = val;
+}
+
+export fn edgebox_cache_relation(source_id: u32, target_id: u32, result: u8) void {
+    cachePut(source_id, target_id, result);
+}
+
+// ── Structural Check ──
 
 var check_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 var check_flag_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 var check_structural_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
-export fn edgebox_check_stats(out_total: *u64, out_flag: *u64, out_struct: *u64) void {
+export fn edgebox_check_stats(out_total: *u64, out_flag: *u64, out_struct: *u64, out_cache: *u64) void {
     out_total.* = check_total.load(.monotonic);
     out_flag.* = check_flag_hits.load(.monotonic);
     out_struct.* = check_structural_hits.load(.monotonic);
+    out_cache.* = cache_hits.load(.monotonic);
 }
 
+// Generic structural check — NO package-specific flag semantics.
+// The recipe handles flag-based fast paths (Any, Unknown, literal widening)
+// in JS BEFORE calling this. Zig only knows: IDs, unions, member overlap.
+// Correctness-first check: only returns positive for provably correct cases.
+// 1 = same ID (trivially correct)
+// cached 1 or 2 = TSC already verified this pair
+// 0 = unknown, let TSC handle (NEVER guess)
 export fn edgebox_check_structural(source_id: u32, target_id: u32) u8 {
     _ = check_total.fetchAdd(1, .monotonic);
     // Same type = always compatible
     if (source_id == target_id) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; }
-    if (source_id >= type_count or target_id >= type_count) return 0;
-    const src_flags = col_type_flags[source_id];
-    const tgt_flags = col_type_flags[target_id];
-    if (tgt_flags & 1 != 0) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; }
-    if (src_flags & 131072 != 0 and tgt_flags & (131072 | 1 | 2) != 0) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; }
-    if (tgt_flags & 2 != 0) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; }
-    if (src_flags & (128 | 4) != 0 and tgt_flags & 4 != 0) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; }
-    if (src_flags & (256 | 8) != 0 and tgt_flags & 8 != 0) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; }
-    if (src_flags & (512 | 16) != 0 and tgt_flags & 16 != 0) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; }
-    if (src_flags & (2048 | 64) != 0 and tgt_flags & 64 != 0) { _ = check_flag_hits.fetchAdd(1, .monotonic); return 1; }
-    const src_offset = col_type_member_offset[source_id];
-    const src_count = col_type_member_count[source_id];
-    const tgt_offset = col_type_member_offset[target_id];
-    const tgt_count = col_type_member_count[target_id];
-    // Both no members: compatible only if same flags or flag-compatible
-    if (tgt_count == 0 and src_count == 0) {
-        return if (src_flags == tgt_flags) 1 else 0;
-    }
-    if (tgt_count == 0) return 1; // empty target = anything satisfies {}
-    if (src_count == 0) return 0; // empty source can't satisfy non-empty target
-    // Union handling: TypeFlags.Union = 1048576
-    const UNION_FLAG: u32 = 1048576;
-    if (tgt_flags & UNION_FLAG != 0 and target_id < MAX_UNION_TYPES and col_union_count[target_id] > 0) {
-        // Target is union: source must be compatible with ANY member
-        const u_offset = col_union_offset[target_id];
-        const u_count = col_union_count[target_id];
-        var ui: u32 = 0;
-        while (ui < u_count) : (ui += 1) {
-            if (edgebox_check_structural(source_id, col_union_members[u_offset + ui]) == 1) return 1;
-        }
-        return 0;
-    }
-    if (src_flags & UNION_FLAG != 0 and source_id < MAX_UNION_TYPES and col_union_count[source_id] > 0) {
-        // Source is union: ALL members must be compatible with target
-        const u_offset = col_union_offset[source_id];
-        const u_count = col_union_count[source_id];
-        var ui: u32 = 0;
-        while (ui < u_count) : (ui += 1) {
-            if (edgebox_check_structural(col_union_members[u_offset + ui], target_id) != 1) return 0;
-        }
-        return 1;
-    }
-
-    if (tgt_count > src_count * 2) return 0;
-    var ti: u32 = 0;
-    while (ti < tgt_count) : (ti += 1) {
-        const tgt_name = col_member_name_id[tgt_offset + ti];
-        const tgt_type = col_member_type_id[tgt_offset + ti];
-        var found = false;
-        var si: u32 = 0;
-        while (si < src_count) : (si += 1) {
-            if (col_member_name_id[src_offset + si] == tgt_name) {
-                // Name matches — check member type compatibility
-                const src_type = col_member_type_id[src_offset + si];
-                if (src_type == tgt_type) {
-                    found = true; // Same type ID = compatible
-                } else if (src_type < type_count and tgt_type < type_count) {
-                    // Check flag compatibility of member types
-                    const sf = col_type_flags[src_type];
-                    const tf = col_type_flags[tgt_type];
-                    if (tf & 1 != 0) { found = true; } // target member is Any
-                    else if (sf == tf) { found = true; } // same flags = likely compatible
-                    else if (sf & (128 | 4) != 0 and tf & 4 != 0) { found = true; } // string
-                    else if (sf & (256 | 8) != 0 and tf & 8 != 0) { found = true; } // number
-                    else if (sf & (512 | 16) != 0 and tf & 16 != 0) { found = true; } // boolean
-                    // else: member types don't match = NOT compatible
-                }
-                break;
-            }
-        }
-        if (!found) return 0;
-    }
-    _ = check_structural_hits.fetchAdd(1, .monotonic);
-    return 1;
+    // Check relation cache (populated by TSC after resolving pairs)
+    const cached = cacheGet(source_id, target_id);
+    if (cached != 0) { _ = cache_hits.fetchAdd(1, .monotonic); return cached; }
+    // Unknown — let TSC handle. TSC will cache the result for future lookups.
+    return 0;
 }
 
 export fn edgebox_type_stats(out_types: *u32, out_members: *u32, out_strings: *u32) void {
