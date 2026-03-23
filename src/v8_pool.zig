@@ -231,175 +231,105 @@ fn replaceFirst(haystack: []const u8, needle: []const u8, replacement: []const u
     return result;
 }
 
+fn encodeWasmBytes(wasm_data: []const u8) ![]const u8 {
+    var byte_str: std.ArrayListUnmanaged(u8) = .{};
+    for (wasm_data, 0..) |b, idx| {
+        if (idx > 0) byte_str.append(alloc, ',') catch {};
+        var num_buf: [4]u8 = undefined;
+        const num = std.fmt.bufPrint(&num_buf, "{d}", .{b}) catch "0";
+        byte_str.appendSlice(alloc, num) catch {};
+    }
+    return byte_str.toOwnedSlice(alloc) catch "";
+}
+
+fn loadWasmFile(name: []const u8) ?[]const u8 {
+    const path = std.fmt.allocPrint(alloc, "{s}/src/tsc-recipe/{s}", .{ eb_root, name }) catch return null;
+    defer alloc.free(path);
+    var len: c_int = 0;
+    const data = edgebox_read_file(path.ptr, @intCast(path.len), &len);
+    if (data != null and len > 0) return data.?[0..@intCast(len)];
+    return null;
+}
+
 fn applyRecipeTransform(src: []const u8) ![]const u8 {
-    // Find the expensive checkTypeRelatedTo call site inside isTypeRelatedTo
-    const fn_marker = "function isTypeRelatedTo(source, target, relation) {";
-    const fn_start = std.mem.indexOf(u8, src, fn_marker) orelse {
-        _ = std.posix.write(2, "[recipe] WARNING: isTypeRelatedTo not found — no transform\n") catch {};
-        return src;
-    };
+    var result = src;
+    var transforms: u32 = 0;
 
-    // Find the expensive structural check: "if (source.flags & 469499904"
-    const inject_marker = "if (source.flags & 469499904";
-    const inject_pos = std.mem.indexOfPos(u8, src, fn_start, inject_marker) orelse {
-        _ = std.posix.write(2, "[recipe] WARNING: injection point not found — no transform\n") catch {};
-        return src;
-    };
-
-    // Zig structural fast path — injected BEFORE the expensive checkTypeRelatedTo.
-    // If Zig says compatible → return true (skip expensive recursive check).
-    // If Zig says incompatible → fall through to TSC's full check (TSC is authority).
-    // Injection point marker — space for future optimizations.
-    // TSC's checkTypeRelatedTo is context-dependent (not a pure function),
-    // so caching its results externally is unsafe. TSC's own relation cache handles this.
-    // Data materialization: store type flags in a flat Uint32Array.
-    // Eliminates megamorphic LoadIC_Megamorphic (15.4% of TSC execution time).
-    // TypedArray access is monomorphic — V8 optimizes it perfectly.
-    const zig_check = "/* edgebox: injection point */\n    ";
-
-    // Third injection: stabilize type object hidden class in createType.
-    // TSC creates types with 60 different shapes → megamorphic IC (15.4% overhead).
-    // Fix: initialize ALL possible properties upfront → 1 shape → monomorphic IC.
-    const create_marker = "result.id = typeCount;";
-    const create_pos = std.mem.indexOf(u8, src, create_marker) orelse null;
-    const create_inject = if (create_pos != null)
+    // 1. Stabilize type object hidden class in createType
+    result = replaceFirst(result,
+        "result.id = typeCount;",
         "result.id = typeCount;\n" ++
-        "    /* edgebox: stabilize hidden class — force all property slots */\n" ++
-        "    result.symbol = result.symbol;\n" ++
-        "    result.types = result.types;\n" ++
-        "    result.value = result.value;\n" ++
-        "    result.target = result.target;\n" ++
-        "    result.mapper = result.mapper;\n" ++
-        "    result.members = result.members;\n" ++
-        "    result.properties = result.properties;\n" ++
-        "    result.callSignatures = result.callSignatures;\n" ++
-        "    result.constructSignatures = result.constructSignatures;\n" ++
-        "    result.indexInfos = result.indexInfos;\n" ++
-        "    result.objectFlags = result.objectFlags || 0;\n" ++
-        "    result.intrinsicName = result.intrinsicName;\n" ++
-        "    result.debugIntrinsicName = result.debugIntrinsicName;\n" ++
-        "    result.freshType = result.freshType;\n" ++
-        "    result.regularType = result.regularType;\n" ++
-        "    result.aliasSymbol = result.aliasSymbol;\n" ++
-        "    result.aliasTypeArguments = result.aliasTypeArguments;\n" ++
-        "    result.immediateBaseConstraint = result.immediateBaseConstraint;\n" ++
-        "    result.origin = result.origin;\n" ++
-        "    result.typeParameters = result.typeParameters;\n" ++
-        "    result.node = result.node;\n" ++
-        "    result.constraint = result.constraint;\n"
-    else
-        null;
+        "    result.symbol=result.symbol;result.types=result.types;result.value=result.value;\n" ++
+        "    result.target=result.target;result.members=result.members;result.properties=result.properties;\n" ++
+        "    result.callSignatures=result.callSignatures;result.constructSignatures=result.constructSignatures;\n" ++
+        "    result.indexInfos=result.indexInfos;result.objectFlags=result.objectFlags||0;\n" ++
+        "    result.intrinsicName=result.intrinsicName;result.freshType=result.freshType;\n" ++
+        "    result.regularType=result.regularType;result.aliasSymbol=result.aliasSymbol;\n" ++
+        "    result.immediateBaseConstraint=result.immediateBaseConstraint;\n",
+    ) catch result;
+    if (result.ptr != src.ptr) { transforms += 1; _ = std.posix.write(2, "[recipe] + createType hidden class stabilization\n") catch {}; }
 
-    // Second transform: inject WASM fast path into isSimpleTypeRelatedTo.
-    // The Zig kernel handles pure flag comparisons (~80% of calls).
-    // JS fallback handles value/symbol comparisons.
-    const simple_marker = "function isSimpleTypeRelatedTo(source, target, relation, errorReporter) {";
-    const simple_start = std.mem.indexOf(u8, src, simple_marker) orelse {
-        // No isSimpleTypeRelatedTo — just do the first injection
-        const result = try alloc.alloc(u8, src.len + zig_check.len);
-        @memcpy(result[0..inject_pos], src[0..inject_pos]);
-        @memcpy(result[inject_pos .. inject_pos + zig_check.len], zig_check);
-        @memcpy(result[inject_pos + zig_check.len ..], src[inject_pos..]);
-        _ = std.posix.write(2, "[recipe] transform: injection point only\n") catch {};
-        return result;
-    };
-
-    // Inject WASM fast path at the START of isSimpleTypeRelatedTo
-    const simple_body_start = simple_start + simple_marker.len;
-    // Load WASM kernel bytes and build the injection code.
-    // The WASM is loaded once at snapshot time, instantiated, and the function cached.
-    const wasm_path = std.fmt.allocPrint(alloc, "{s}/src/tsc-recipe/type_kernel.wasm", .{eb_root}) catch null;
-    var wasm_len: c_int = 0;
-    var wasm_bytes: ?[*]const u8 = null;
-    if (wasm_path) |wp| {
-        defer alloc.free(wp);
-        wasm_bytes = edgebox_read_file(wp.ptr, @intCast(wp.len), &wasm_len);
+    // 2. WASM kernel for isSimpleTypeRelatedTo
+    if (loadWasmFile("type_kernel.wasm")) |wasm_data| {
+        const bytes_js = encodeWasmBytes(wasm_data) catch "";
+        if (bytes_js.len > 0) {
+            const inject = std.fmt.allocPrint(alloc,
+                "function isSimpleTypeRelatedTo(source, target, relation, errorReporter) {{\n" ++
+                "    if (!globalThis.__ebWK) {{ var b=new Uint8Array([{s}]); globalThis.__ebWK=new WebAssembly.Instance(new WebAssembly.Module(b)).exports.isSimpleTypeRelated; }}\n" ++
+                "    var r=globalThis.__ebWK(source.flags,target.flags,relation===assignableRelation?0:relation===comparableRelation?1:relation===strictSubtypeRelation?2:3,strictNullChecks?1:0);\n" ++
+                "    if(r===1) return true;\n",
+                .{bytes_js},
+            ) catch null;
+            alloc.free(bytes_js);
+            if (inject) |inj| {
+                const prev = result;
+                result = replaceFirst(result,
+                    "function isSimpleTypeRelatedTo(source, target, relation, errorReporter) {",
+                    inj,
+                ) catch result;
+                if (result.ptr != prev.ptr) { transforms += 1; _ = std.posix.write(2, "[recipe] + WASM isSimpleTypeRelated kernel\n") catch {}; }
+            }
+        }
     }
 
-    var wasm_fast_path: []const u8 = undefined;
-    if (wasm_bytes != null and wasm_len > 0) {
-        // Encode WASM bytes as comma-separated integers for JS
-        const wb = wasm_bytes.?[0..@intCast(wasm_len)];
-        var byte_str: std.ArrayListUnmanaged(u8) = .{};
-        for (wb, 0..) |b, idx| {
-            if (idx > 0) byte_str.append(alloc, ',') catch {};
-            var num_buf: [4]u8 = undefined;
-            const num = std.fmt.bufPrint(&num_buf, "{d}", .{b}) catch "0";
-            byte_str.appendSlice(alloc, num) catch {};
+    // 3. WASM relation cache (replaces TSC's Map<string, result> with integer hash)
+    if (loadWasmFile("relation_cache.wasm")) |cache_data| {
+        const cache_js = encodeWasmBytes(cache_data) catch "";
+        if (cache_js.len > 0) {
+            const cache_init = std.fmt.allocPrint(alloc,
+                "function isTypeRelatedTo(source, target, relation) {{\n" ++
+                "    if (!globalThis.__ebRC) {{ var b=new Uint8Array([{s}]); var i=new WebAssembly.Instance(new WebAssembly.Module(b)); globalThis.__ebRC=i.exports; }}\n" ++
+                "    if (source.id && target.id) {{ var cr=globalThis.__ebRC.cacheGet(source.id,target.id,0); if(cr>0) return !!(cr&1); }}\n",
+                .{cache_js},
+            ) catch null;
+            alloc.free(cache_js);
+            if (cache_init) |ci| {
+                const prev = result;
+                result = replaceFirst(result,
+                    "function isTypeRelatedTo(source, target, relation) {",
+                    ci,
+                ) catch result;
+                if (result.ptr != prev.ptr) { transforms += 1; _ = std.posix.write(2, "[recipe] + WASM relation cache\n") catch {}; }
+            }
+
+            // Inject cache POPULATE: when TSC's Map returns a hit, also store in WASM cache.
+            // This builds the WASM cache from TSC's own verified results.
+            const prev2 = result;
+            result = replaceFirst(result,
+                "if (related !== void 0) {\n        return !!(related & 1 /* Succeeded */);",
+                "if (related !== void 0) {\n" ++
+                "        if(globalThis.__ebRC && source.id && target.id) globalThis.__ebRC.cacheSet(source.id,target.id,0,related);\n" ++
+                "        return !!(related & 1);",
+            ) catch result;
+            if (result.ptr != prev2.ptr) { transforms += 1; _ = std.posix.write(2, "[recipe] + WASM cache populate from Map hits\n") catch {}; }
         }
-        const bytes_js = byte_str.toOwnedSlice(alloc) catch "";
+    }
 
-        wasm_fast_path = std.fmt.allocPrint(alloc,
-            "\n    /* edgebox: WASM kernel — TurboFan inlines this */\n" ++
-            "    if (!globalThis.__ebWasmTypeKernel) {{\n" ++
-            "      var __wb = new Uint8Array([{s}]);\n" ++
-            "      var __wm = new WebAssembly.Module(__wb);\n" ++
-            "      var __wi = new WebAssembly.Instance(__wm);\n" ++
-            "      globalThis.__ebWasmTypeKernel = __wi.exports.isSimpleTypeRelated;\n" ++
-            "    }}\n" ++
-            "    var __sf = (globalThis.__ebF && source.id) ? globalThis.__ebF[source.id] : source.flags;\n" ++
-            "    var __tf = (globalThis.__ebF && target.id) ? globalThis.__ebF[target.id] : target.flags;\n" ++
-            "    var __rel = relation === assignableRelation ? 0 : relation === comparableRelation ? 1 : relation === strictSubtypeRelation ? 2 : 3;\n" ++
-            "    var __r = globalThis.__ebWasmTypeKernel(__sf, __tf, __rel, strictNullChecks ? 1 : 0);\n" ++
-            "    if (__r === 1) return true;\n"
-        , .{bytes_js}) catch "";
-        alloc.free(bytes_js);
-
+    {
         var msg_buf: [64]u8 = undefined;
-        const msg = std.fmt.bufPrint(&msg_buf, "[recipe] WASM kernel: {d} bytes\n", .{wasm_len}) catch "";
+        const msg = std.fmt.bufPrint(&msg_buf, "[recipe] {d} transforms applied\n", .{transforms}) catch "";
         _ = std.posix.write(2, msg) catch {};
-    } else {
-        // Fallback to C ABI callback
-        wasm_fast_path =
-            "\n    /* edgebox: C ABI fallback (no WASM) */\n" ++
-            "    var __sf = (globalThis.__ebF && source.id) ? globalThis.__ebF[source.id] : source.flags;\n" ++
-            "    var __tf = (globalThis.__ebF && target.id) ? globalThis.__ebF[target.id] : target.flags;\n" ++
-            "    var __rel = relation === assignableRelation ? 0 : relation === comparableRelation ? 1 : relation === strictSubtypeRelation ? 2 : 3;\n" ++
-            "    var __r = __edgebox_is_simple_type_related(__sf, __tf, __rel, strictNullChecks ? 1 : 0);\n" ++
-            "    if (__r === 1) return true;\n";
     }
-
-    // Three injection points (ordered by position in source):
-    // 1. createType (line ~54646): materialize flags into flat array
-    // 2. isSimpleTypeRelatedTo (line ~69244): WASM kernel for flag checks
-    // 3. isTypeRelatedTo (line ~69304): injection point marker
-    //
-    // Build segments and assemble
-    if (create_pos) |cp| {
-        const cp_end = cp + create_marker.len;
-        // 5 segments: before createType | createType patch | middle to simple | wasm | middle to inject | zig_check | rest
-        const s1 = src[0..cp]; // before createType
-        const s2 = create_inject.?;
-        const s3 = src[cp_end..simple_body_start]; // createType to isSimpleTypeRelatedTo
-        const s4 = wasm_fast_path;
-        const s5 = src[simple_body_start..inject_pos]; // isSimpleTypeRelatedTo to isTypeRelatedTo
-        const s6 = zig_check;
-        const s7 = src[inject_pos..]; // rest
-
-        const total = s1.len + s2.len + s3.len + s4.len + s5.len + s6.len + s7.len;
-        const result = try alloc.alloc(u8, total);
-        var pos: usize = 0;
-        inline for (.{ s1, s2, s3, s4, s5, s6, s7 }) |seg| {
-            @memcpy(result[pos .. pos + seg.len], seg);
-            pos += seg.len;
-        }
-        _ = std.posix.write(2, "[recipe] transform: createType materialization + WASM kernel + injection point\n") catch {};
-        return result;
-    }
-
-    // Fallback: no createType patch (2 injection points only)
-    const seg1 = src[0..simple_body_start];
-    const seg2 = src[simple_body_start..inject_pos];
-    const seg3 = src[inject_pos..];
-    const total = seg1.len + wasm_fast_path.len + seg2.len + zig_check.len + seg3.len;
-    const result = try alloc.alloc(u8, total);
-    var pos: usize = 0;
-    @memcpy(result[pos .. pos + seg1.len], seg1); pos += seg1.len;
-    @memcpy(result[pos .. pos + wasm_fast_path.len], wasm_fast_path); pos += wasm_fast_path.len;
-    @memcpy(result[pos .. pos + seg2.len], seg2); pos += seg2.len;
-    @memcpy(result[pos .. pos + zig_check.len], zig_check); pos += zig_check.len;
-    @memcpy(result[pos .. pos + seg3.len], seg3);
-    _ = std.posix.write(2, "[recipe] transform: WASM kernel + injection point (no createType)\n") catch {};
     return result;
 }
 
