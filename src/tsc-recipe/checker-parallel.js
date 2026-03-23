@@ -62,8 +62,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   ts.sys.exit = function() {};
   ts.sys.useCaseSensitiveFileNames = true;
   globalThis.__filename = ebRoot + '/node_modules/typescript/lib/typescript.js';
-  // readdir now returns pre-typed: {"f":["file1"],"d":["dir1"]}
-  // No need for N separate dir_exists calls per directory
+  // readdir returns pre-typed: {"f":["file1"],"d":["dir1"]}
   ts.sys.getDirectories = function(p) {
     var rr = rp(p); var json = __edgebox_readdir(rr);
     if (!json || json.charAt(0) !== '{') return [];
@@ -104,24 +103,18 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     globalThis.__pc[ck] = program;
   }
   var t2 = Date.now();
-  // Track IO call counts during parse (config already counted in t0-t1)
-  var io_after = typeof __edgebox_io_stats === 'function' ? __edgebox_io_stats() : {};
-  if (workerId === 0) __edgebox_write_stderr('[recipe] w0 files:' + parsed.fileNames.length + ' parse:' + (t2-t1) + 'ms fe:' + (io_after.fileExistsCalls||0) + ' de:' + (io_after.dirExistsCalls||0) + String.fromCharCode(10));
   var files = program.getSourceFiles();
   var NL = String.fromCharCode(10);
   var output = [];
-
-  // Filter to only project source files (skip .d.ts — skipLibCheck makes them instant)
-  var checkFiles = [];
-  for (var fi = 0; fi < files.length; fi++) {
-    if (!files[fi].isDeclarationFile) checkFiles.push(files[fi]);
-  }
-  if (workerId === 0) __edgebox_write_stderr('[recipe] w0 totalFiles:' + files.length + ' checkFiles:' + checkFiles.length + String.fromCharCode(10));
-  // Warm: static sharding (TSC caches diagnostics per file → 0ms check).
-  // Cold: work-stealing (balances load across workers).
   var filesChecked = 0;
+
+  // Filter to project source files (skip .d.ts — skipLibCheck makes them instant)
+  var checkFiles = [];
+  for (var fi = 0; fi < files.length; fi++)
+    if (!files[fi].isDeclarationFile) checkFiles.push(files[fi]);
+
   if (isWarm) {
-    // Static sharding: each worker checks same files as before → TSC cache hits
+    // Hot: static sharding — TSC caches diagnostics per file in-memory
     for (var i = workerId; i < checkFiles.length; i += workerCount) {
       filesChecked++;
       var diags = program.getSemanticDiagnostics(checkFiles[i]);
@@ -134,25 +127,23 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       }
     }
   } else {
-  // Work-stealing: atomically claim next file (cold path — balances load)
-  while (true) {
-    var idx = __edgebox_claim_file();
-    if (idx >= checkFiles.length) break;
-    filesChecked++;
-    var diags = program.getSemanticDiagnostics(checkFiles[idx]);
-    for (var k = 0; k < diags.length; k++) {
-      var d = diags[k];
-      if (d.file) {
-        var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
-        output.push(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' '));
+    // Cold: work-stealing — atomic counter balances load across workers
+    while (true) {
+      var idx = __edgebox_claim_file();
+      if (idx >= checkFiles.length) break;
+      filesChecked++;
+      var diags = program.getSemanticDiagnostics(checkFiles[idx]);
+      for (var k = 0; k < diags.length; k++) {
+        var d = diags[k];
+        if (d.file) {
+          var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
+          output.push(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' '));
+        }
       }
     }
   }
-  } // end else (cold work-stealing path)
 
-  // Worker 0 collects global diagnostics (config errors, missing types)
-  // Uses getGlobalDiagnostics + getOptionsDiagnostics instead of getPreEmitDiagnostics
-  // (getPreEmitDiagnostics re-checks ALL files — defeats sharding)
+  // Worker 0 collects global diagnostics
   if (workerId === 0) {
     var gd = (program.getGlobalDiagnostics ? program.getGlobalDiagnostics() : [])
       .concat(program.getOptionsDiagnostics ? program.getOptionsDiagnostics() : [])
@@ -164,7 +155,6 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   }
 
   var t3 = Date.now();
-  // All workers report timing + Zig check stats
   __edgebox_write_stderr('[recipe] w' + workerId + '/' + workerCount + ' config:' + (t1-t0) + 'ms parse:' + (t2-t1) + 'ms check:' + (t3-t2) + 'ms total:' + (t3-t0) + 'ms checked:' + filesChecked + '/' + checkFiles.length + String.fromCharCode(10));
   return output.join(NL);
   } catch(e) { return '[recipe-error] w' + workerId + ': ' + (e && e.stack ? e.stack : String(e)); }

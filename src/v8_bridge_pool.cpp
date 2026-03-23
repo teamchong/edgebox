@@ -107,6 +107,7 @@ static void RegisterMemberCallback(const v8::FunctionCallbackInfo<v8::Value>& ar
 static void RegisterUnionCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void CheckStructuralCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void RootCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void WriteFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void ClaimFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void IOStatsCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void SubmitResultCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
@@ -147,6 +148,7 @@ static const intptr_t g_external_refs[] = {
   reinterpret_cast<intptr_t>(ClaimFileCallback),
   reinterpret_cast<intptr_t>(IOStatsCallback),
   reinterpret_cast<intptr_t>(RootCallback),
+  reinterpret_cast<intptr_t>(WriteFileCallback),
   reinterpret_cast<intptr_t>(SubmitResultCallback),
   reinterpret_cast<intptr_t>(WorkerDoneCallback),
   0  // sentinel
@@ -180,6 +182,7 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
     global->Set(isolate, "__edgebox_claim_file", v8::FunctionTemplate::New(isolate, ClaimFileCallback));
     global->Set(isolate, "__edgebox_io_stats", v8::FunctionTemplate::New(isolate, IOStatsCallback));
     global->Set(isolate, "__edgebox_root", v8::FunctionTemplate::New(isolate, RootCallback));
+    global->Set(isolate, "__edgebox_write_file", v8::FunctionTemplate::New(isolate, WriteFileCallback));
     global->Set(isolate, "__edgebox_submit_result", v8::FunctionTemplate::New(isolate, SubmitResultCallback));
     global->Set(isolate, "__edgebox_worker_done", v8::FunctionTemplate::New(isolate, WorkerDoneCallback));
     auto context = v8::Context::New(isolate, nullptr, global);
@@ -221,6 +224,7 @@ extern int edgebox_file_exists(const char* path, int path_len);
 extern int edgebox_dir_exists(const char* path, int path_len);
 extern const char* edgebox_stat(const char* path, int path_len, int* out_len);
 extern const char* edgebox_readdir(const char* path, int path_len, int* out_len);
+extern int edgebox_write_file(const char* path, int path_len, const char* data, int data_len);
 extern const char* edgebox_realpath(const char* path, int path_len, int* out_len);
 extern const char* edgebox_cwd(int* out_len);
 extern void edgebox_write_stdout(const char* data, int len);
@@ -393,6 +397,13 @@ static void CheckStructuralCallback(const v8::FunctionCallbackInfo<v8::Value>& a
 extern const char* edgebox_root(int* out_len);
 extern unsigned int edgebox_claim_file();
 extern void edgebox_reset_work();
+
+static void WriteFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 2) return;
+  auto path = GetStringArg(args, 0);
+  auto data = GetStringArg(args, 1);
+  edgebox_write_file(path.c_str(), path.size(), data.c_str(), data.size());
+}
 
 static void RootCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
   int out_len = 0;

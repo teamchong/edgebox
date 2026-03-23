@@ -140,18 +140,21 @@ export fn edgebox_dir_exists(path_ptr: [*]const u8, path_len: c_int) c_int {
 
 /// Stat file. Returns JSON: {"isFile":true,"isDirectory":false,"size":N}
 /// Uses thread-local buffer to avoid mmap per call.
-threadlocal var stat_buf: [128]u8 = undefined;
+threadlocal var stat_buf: [192]u8 = undefined;
 
 export fn edgebox_stat(path_ptr: [*]const u8, path_len: c_int, out_len: *c_int) ?[*]const u8 {
     if (path_len <= 0) { out_len.* = 0; return null; }
     const path = path_ptr[0..@intCast(path_len)];
     const stat = std.fs.cwd().statFile(path) catch { out_len.* = 0; return null; };
+    const mtime_ns: i128 = stat.mtime;
+    const mtime_ms: i64 = if (mtime_ns != 0) @intCast(@divFloor(mtime_ns, std.time.ns_per_ms)) else 0;
     const result = std.fmt.bufPrint(&stat_buf,
-        "{{\"isFile\":{s},\"isDirectory\":{s},\"size\":{d}}}",
+        "{{\"isFile\":{s},\"isDirectory\":{s},\"size\":{d},\"mtimeMs\":{d}}}",
         .{
             if (stat.kind == .file) "true" else "false",
             if (stat.kind == .directory) "true" else "false",
             stat.size,
+            mtime_ms,
         },
     ) catch { out_len.* = 0; return null; };
     out_len.* = @intCast(result.len);
@@ -159,7 +162,7 @@ export fn edgebox_stat(path_ptr: [*]const u8, path_len: c_int, out_len: *c_int) 
 }
 
 /// Read directory entries. Returns JSON: {"f":["file1"],"d":["dir1"]}
-/// Pre-classifies entries as file or directory — avoids N separate dir_exists calls.
+/// Pre-classifies entries as file or directory.
 export fn edgebox_readdir(path_ptr: [*]const u8, path_len: c_int, out_len: *c_int) ?[*]const u8 {
     if (path_len <= 0) { out_len.* = 0; return null; }
     const path = path_ptr[0..@intCast(path_len)];
@@ -203,7 +206,6 @@ export fn edgebox_realpath(path_ptr: [*]const u8, path_len: c_int, out_len: *c_i
     const path = path_ptr[0..@intCast(path_len)];
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const resolved = std.fs.cwd().realpath(path, &buf) catch {
-        // Return original path on failure
         const copy = alloc.alloc(u8, path.len) catch { out_len.* = 0; return null; };
         @memcpy(copy, path);
         out_len.* = @intCast(copy.len);
