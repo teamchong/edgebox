@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// EdgeBox CLI — compiles JS to V8+WASM and packs workerd single binaries
+// EdgeBox CLI — compiles JS to V8+WASM and packs V8 pool single binaries
 // Usage: npx edgebox <app.js>       — compile
-//        npx edgebox pack <dir>     — pack workerd binary
+//        npx edgebox pack <dir>     — pack V8 pool binary
 
 import { execFileSync, execSync } from "node:child_process";
 import {
@@ -23,14 +23,14 @@ function findBinary() {
   return candidates.find((p) => existsSync(p));
 }
 
-function findWorkerd() {
+function findV8Pool() {
   try {
-    execSync("workerd --version", { stdio: "pipe" });
-    return "workerd";
+    execSync("V8 pool --version", { stdio: "pipe" });
+    return "V8 pool";
   } catch {}
   try {
-    execSync("npx workerd --version", { stdio: "pipe" });
-    return "npx workerd";
+    execSync("npx V8 pool --version", { stdio: "pipe" });
+    return "npx V8 pool";
   } catch {}
   return null;
 }
@@ -62,9 +62,9 @@ function findWorkerFiles(workerDir) {
 
 function pack(workerDir) {
   const w = findWorkerFiles(workerDir);
-  const workerd = findWorkerd();
-  if (!workerd) {
-    console.error("edgebox pack: workerd not found.\n  Install: npm install workerd");
+  const V8 pool = findV8Pool();
+  if (!V8 pool) {
+    console.error("edgebox pack: V8 pool not found.\n  Install: npm install V8 pool");
     process.exit(1);
   }
 
@@ -72,10 +72,10 @@ function pack(workerDir) {
   console.log(`  Worker: ${w.workerMjs}`);
   console.log(`  WASM:   ${w.standaloneWasm || "none"}`);
 
-  // Strip Node.js ESM imports, inject require shim for workerd
+  // Strip Node.js ESM imports, inject require shim for V8 pool
   const content = readFileSync(w.workerMjs, "utf-8");
 
-  // Provide require() via workerd's nodejs_compat built-in modules
+  // Provide require() via V8 pool's nodejs_compat built-in modules
   const requireShim = `
 import nodefs from 'node:fs';
 import nodepath from 'node:path';
@@ -85,28 +85,28 @@ const __modules = { fs: nodefs, path: nodepath, os: nodeos, crypto: nodecrypto, 
 function require(id) { return __modules[id] || __modules[id.replace('node:','')] || {}; }
 `;
 
-  let workerdContent = requireShim + content
+  let V8 poolContent = requireShim + content
     .replace(/^import \{[^}]+\} from '[^']+';$/gm, "")
     .replace(/^const require = createRequire\([^)]+\);$/gm, "");
 
-  // Keep only the workerd (else) branch
-  workerdContent = workerdContent.replace(
+  // Keep only the V8 pool (else) branch
+  V8 poolContent = V8 poolContent.replace(
     /if \(typeof process !== ['"]undefined['"] && process\.versions\?\.node\) \{[^}]+\} else \{/,
     "{"
   );
 
-  const workerdMjs = join(w.dir, `${w.name}-workerd-worker.mjs`);
-  const workerdConfig = join(w.dir, `${w.name}-workerd-config.capnp`);
-  writeFileSync(workerdMjs, workerdContent);
+  const V8 poolMjs = join(w.dir, `${w.name}-V8 pool-worker.mjs`);
+  const V8 poolConfig = join(w.dir, `${w.name}-V8 pool-config.capnp`);
+  writeFileSync(V8 poolMjs, V8 poolContent);
 
   const wasmLine = w.standaloneWasm
     ? `    (name = "${basename(w.standaloneWasm)}", wasm = embed "${basename(w.standaloneWasm)}"),`
     : "";
   writeFileSync(
-    workerdConfig,
-    `using Workerd = import "/workerd/workerd.capnp";
+    V8 poolConfig,
+    `using V8Pool = import "/V8 pool/V8 pool.capnp";
 
-const config :Workerd.Config = (
+const config :V8Pool.Config = (
   services = [
     (name = "main", worker = .worker),
   ],
@@ -115,9 +115,9 @@ const config :Workerd.Config = (
   ],
 );
 
-const worker :Workerd.Worker = (
+const worker :V8Pool.Worker = (
   modules = [
-    (name = "entrypoint", esModule = embed "${basename(workerdMjs)}"),
+    (name = "entrypoint", esModule = embed "${basename(V8 poolMjs)}"),
 ${wasmLine}
   ],
   compatibilityDate = "2024-09-23",
@@ -126,20 +126,20 @@ ${wasmLine}
 `
   );
 
-  const output = join(w.dir, `${w.name}-workerd`);
+  const output = join(w.dir, `${w.name}-V8 pool`);
   console.log(`  Output: ${output}`);
   try {
-    execSync(`${workerd} compile "${workerdConfig}" > "${output}"`, {
+    execSync(`${V8 pool} compile "${V8 poolConfig}" > "${output}"`, {
       stdio: ["pipe", "pipe", "inherit"],
     });
     chmodSync(output, 0o755);
   } catch (e) {
-    console.error("workerd compile failed:", e.message);
+    console.error("V8 pool compile failed:", e.message);
     process.exit(1);
   }
 
-  rmSync(workerdMjs, { force: true });
-  rmSync(workerdConfig, { force: true });
+  rmSync(V8 poolMjs, { force: true });
+  rmSync(V8 poolConfig, { force: true });
 
   console.log(`\n=== Done ===`);
   console.log(`  Binary: ${output}`);
@@ -155,14 +155,14 @@ const args = process.argv.slice(2);
 if (args[0] === "pack") {
   const dir = args.slice(1).find((a) => !a.startsWith("-"));
   if (args.includes("--help") || args.includes("-h") || !dir) {
-    console.log(`edgebox pack — Create standalone workerd binary
+    console.log(`edgebox pack — Create standalone V8 pool binary
 
 Usage:
   edgebox pack <worker-dir>
 
 Examples:
   edgebox app.js                        # Compile
-  edgebox pack zig-out/bin/app.js/      # Pack workerd binary
+  edgebox pack zig-out/bin/app.js/      # Pack V8 pool binary
 `);
     process.exit(args.includes("--help") || args.includes("-h") ? 0 : 1);
   }

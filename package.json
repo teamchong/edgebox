@@ -24,7 +24,7 @@
     "numeric",
     "optimization",
     "node",
-    "workerd",
+    "V8 pool",
     "cloudflare-workers"
   ],
   "author": "",

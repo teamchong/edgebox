@@ -1,6 +1,6 @@
 # EdgeBox
 
-**AOT optimizer for V8 JavaScript** — compiles numeric JS kernels to WebAssembly for 2-9x speedups. Ships as a workerd single binary.
+**AOT optimizer for V8 JavaScript** — compiles numeric JS kernels to WebAssembly for 2-9x speedups. Ships as a V8 pool single binary.
 
 ![EdgeBox Architecture](diagram.svg)
 
@@ -28,7 +28,7 @@ This means a JS function that calls `__wasm.exports.fib(n)` compiles to nearly t
 
 EdgeBox exploits this: it compiles numeric JS functions to WASM exports, then rewrites the JS source with thin trampolines that V8 inlines away. The result is LLVM-optimized numeric code running at full speed inside V8's pipeline.
 
-**Runtime:** workerd (Cloudflare Workers runtime, V8-based). Single binary deployment — no Node.js required.
+**Runtime:** V8 pool (Cloudflare Workers runtime, V8-based). Single binary deployment — no Node.js required.
 
 ## The Solution: AOT+JIT Compilation
 
@@ -42,7 +42,7 @@ Automatic numeric tier detection (i32 / f64 / array)
 Pure numeric kernels compiled to WASM exports
     ↓  Source-to-source transform
 JS with function bodies replaced by WASM call trampolines
-    ↓  V8 TurboFan (Node.js / Deno / workerd / Chrome)
+    ↓  V8 TurboFan (Node.js / Deno / V8 pool / Chrome)
 V8 inlines WASM calls into JS — zero boundary overhead
 ```
 
@@ -124,7 +124,7 @@ for (var j = 0; j < nodes.length; j++) {
 ```bash
 # Install
 zig build cli        # Build native compiler
-npm install workerd  # For single binary packing
+npm install V8 pool  # For single binary packing
 
 # Compile
 npx edgebox my-app.js
@@ -132,13 +132,13 @@ npx edgebox my-app.js
 # Output:
 #   zig-out/bin/my-app.js/my-app-worker.mjs        — Worker module (V8 JIT + WASM AOT)
 #   zig-out/bin/my-app.js/my-app-standalone.wasm    — WASM numeric kernels
-#   zig-out/bin/my-app.js/my-app-config.capnp       — workerd configuration
+#   zig-out/bin/my-app.js/my-app-config.capnp       — V8 pool configuration
 
 # Run (pick one)
-npx workerd serve zig-out/bin/my-app.js/my-app-config.capnp   # workerd
-./zig-out/bin/my-app.js/my-app-workerd                         # single binary
+npx V8 pool serve zig-out/bin/my-app.js/my-app-config.capnp   # V8 pool
+./zig-out/bin/my-app.js/my-app-V8 pool                         # single binary
 
-# Pack into single binary (workerd + V8 embedded)
+# Pack into single binary (V8 pool + V8 embedded)
 npx edgebox pack zig-out/bin/my-app.js/
 
 # Run benchmarks
