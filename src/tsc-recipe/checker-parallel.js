@@ -114,8 +114,10 @@ globalThis.__sfCache = sfCache;
 // workers restore with pre-parsed ASTs — saves 573ms on cold start per worker.
 // The createSourceFile cache (recipe #1) stores the results across requests too.
 (function() {
-  if (!ts || !ts.createSourceFile) return;
-  if (typeof __edgebox_read_file !== 'function' || typeof __edgebox_root !== 'function') return;
+  // REMOVED: pre-parse inflates snapshot 14MB→33MB (19MB of serialized ASTs).
+  // The snapshot restore cost (loading+deserializing 19MB × 3 workers) exceeds
+  // the parsing savings. Net effect: 300ms SLOWER.
+  return;
   try {
     var root = __edgebox_root();
     var libDir = root + '/node_modules/typescript/lib/';
