@@ -184,18 +184,21 @@ function downloadProject(project: Project): string | null {
 }
 
 function buildEdgeboxTsc(): string | null {
-  // V8 is now the only runtime — no V8 runner to build.
-  // The V8 binary is built separately via Bazel.
-  // For CI benchmarks, we skip EdgeBox if V8 isn't available.
+  // EdgeBox daemon binary (Zig + rusty_v8)
+  const edgeboxBin = join(PROJECT_ROOT, "zig-out/bin/edgebox");
+  if (existsSync(edgeboxBin)) {
+    return `__V8__${edgeboxBin}`;
+  }
+
+  // Legacy: workerd binary
   const V8Bin = join(PROJECT_ROOT, "vendor/V8/bazel-bin/src/V8/server/V8");
   const zigLib = join(PROJECT_ROOT, "zig-out/lib/libedgebox_io.a");
-
   if (existsSync(V8Bin) && existsSync(zigLib)) {
     return `__V8__${V8Bin}`;
   }
 
-  console.log("EdgeBox V8 binary not found — skipping EdgeBox benchmark");
-  console.log("  Build with: cd vendor/V8 && bazelisk build //src/V8/server:V8");
+  console.log("EdgeBox binary not found — skipping EdgeBox benchmark");
+  console.log("  Build with: zig build edgebox-cli -p zig-out -Doptimize=ReleaseFast");
   return null;
 }
 
@@ -270,7 +273,7 @@ interface RunResult {
   error?: string;
 }
 
-function runTsc(cmd: string, args: string[], outDir: string, debug: boolean = false): RunResult {
+function runTsc(cmd: string, args: string[], outDir: string, debug: boolean = false, cwd?: string): RunResult {
   // Clean output directory
   if (existsSync(outDir)) {
     rmSync(outDir, { recursive: true, force: true });
@@ -282,6 +285,7 @@ function runTsc(cmd: string, args: string[], outDir: string, debug: boolean = fa
     stdio: "pipe",
     timeout: 300000,
     env: { ...process.env, NO_COLOR: "1" },
+    cwd: cwd,
   });
   const elapsed = performance.now() - start;
 
@@ -430,16 +434,17 @@ function benchmarkProject(
   const incrCacheDir = "/tmp/edgebox-incr-cache";
   rmSync(incrCacheDir, { recursive: true, force: true });
 
-  // V8 path — EdgeBox runs TSC via V8 + Zig IO
+  // EdgeBox daemon — runs TSC via V8 pool + Zig IO
   const isV8 = edgeboxTsc.startsWith("__V8__");
   const V8Bin = isV8 ? edgeboxTsc.slice("__V8__".length) : "";
-  // TODO: implement V8 benchmark runner (start V8, send check request)
-  // For now, skip EdgeBox benchmark until V8 CI is set up
-  const edgeboxCmd = "echo";
-  const edgeboxArgs = ["EdgeBox V8 benchmark not yet wired"];
+  const edgeboxCmd = V8Bin;
+  const edgeboxArgs = ["tsc"];
+  // EdgeBox tsc uses CWD to find tsconfig.json
+  const edgeboxCwd = tsconfigPath ? join(projectDir, project.tsconfig ? join("..") : ".") : projectDir;
+  const tscDir = tsconfigPath ? tsconfigPath.replace(/\/[^/]+$/, '') : projectDir;
 
   for (let i = 0; i < runs; i++) {
-    edgeboxResult = runTsc(edgeboxCmd, edgeboxArgs, edgeboxOutDir, debug);
+    edgeboxResult = runTsc(edgeboxCmd, edgeboxArgs, edgeboxOutDir, debug, tscDir);
     if (!edgeboxResult.success) {
       console.log(`    EdgeBox: Failed - ${edgeboxResult.error}`);
       return null;
@@ -452,7 +457,7 @@ function benchmarkProject(
   if (edgeboxResult.diagnostics !== nodeResult.diagnostics) {
     console.log(`    EdgeBox DEBUG: ${edgeboxResult.diagnostics} diagnostics (Node has ${nodeResult.diagnostics})`);
     // Re-run once with debug to see stdout vs stderr split
-    const debugResult = runTsc(edgeboxCmd, edgeboxArgs, edgeboxOutDir, true);
+    const debugResult = runTsc(edgeboxCmd, edgeboxArgs, edgeboxOutDir, true, tscDir);
     console.log(`    EdgeBox DEBUG: re-run got ${debugResult.diagnostics} diagnostics, status=${debugResult.success}`);
     if (edgeboxResult.diagnostics === 0 && debugResult.diagnostics > 0) {
       edgeboxResult = debugResult; // Use the debug run's result
