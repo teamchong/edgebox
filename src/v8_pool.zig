@@ -292,8 +292,8 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         }
     }
 
-    // Note: getRelationKey returns a string that TSC also uses for .startsWith() parsing.
-    // Cannot replace with integer keys — TSC depends on string format.
+    // Note: getRelationKey caching is unsafe — identity relation swaps source/target
+    // before key computation, and cache would need to account for all branches.
 
     {
         var msg_buf: [64]u8 = undefined;
