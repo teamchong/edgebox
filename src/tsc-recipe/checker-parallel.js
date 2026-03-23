@@ -163,35 +163,22 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   var ck = cwd + ':' + parsed.fileNames.length;
   var t1 = Date.now();
 
-  // Lazy module resolution with cache.
-  // - Relative imports: resolve normally, cache result
-  // - Path-mapped imports: resolve normally, cache result
-  // - Bare node modules: skip (will fail with TS2307 — saves 111K fileExists calls)
-  // Cache persists across requests — 2nd+ request uses cached results.
+  // Module resolution cache (public API: CompilerHost.resolveModuleNames).
+  // Caches results per worker. Lazy: skips bare modules without path mapping.
   if (!globalThis.__mrCache) globalThis.__mrCache = new Map();
   var defaultHost = ts.createCompilerHost(parsed.options);
-  var pathPrefixes = [];
-  if (parsed.options.paths) {
-    var keys = Object.keys(parsed.options.paths);
-    for (var ki = 0; ki < keys.length; ki++) pathPrefixes.push(keys[ki].replace('/*', ''));
-  }
+  var pathPrefixes = parsed.options.paths
+    ? Object.keys(parsed.options.paths).map(function(k) { return k.replace('/*', ''); })
+    : [];
+
   var host = Object.create(defaultHost);
   host.resolveModuleNames = function(moduleNames, containingFile) {
     return moduleNames.map(function(name) {
       var key = name + '\0' + containingFile;
       var cached = globalThis.__mrCache.get(key);
       if (cached !== undefined) return cached;
+      // Relative or path-mapped: resolve via TSC
       if (name.charAt(0) === '.') {
-        // Check Zig pre-resolved cache first (populated by dispatch thread)
-        if (typeof __edgebox_get_resolved_module === 'function') {
-          var zigResolved = __edgebox_get_resolved_module(name, containingFile);
-          if (zigResolved) {
-            var ext = zigResolved.endsWith('.tsx') ? '.tsx' : zigResolved.endsWith('.d.ts') ? '.d.ts' : '.ts';
-            var result = {resolvedFileName: zigResolved, extension: ext, isExternalLibraryImport: false};
-            globalThis.__mrCache.set(key, result);
-            return result;
-          }
-        }
         var r = ts.resolveModuleName(name, containingFile, parsed.options, defaultHost).resolvedModule;
         globalThis.__mrCache.set(key, r || null);
         return r;
@@ -203,6 +190,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
           return r2;
         }
       }
+      // Bare module without path mapping: skip (will fail with TS2307)
       globalThis.__mrCache.set(key, null);
       return undefined;
     });
@@ -295,7 +283,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   }
 
   var t3 = Date.now();
-  __edgebox_write_stderr('[recipe] w' + workerId + '/' + workerCount + ' config:' + (t1-t0) + 'ms parse:' + (t2-t1) + 'ms check:' + (t3-t2) + 'ms total:' + (t3-t0) + 'ms checked:' + filesChecked + ' cached:' + cacheHits + '/' + checkFiles.length + String.fromCharCode(10));
+  __edgebox_write_stderr('[recipe] w' + workerId + '/' + workerCount + ' config:' + (t1-t0) + 'ms parse:' + (t2-t1) + 'ms check:' + (t3-t2) + 'ms total:' + (t3-t0) + 'ms checked:' + filesChecked + ' cached:' + cacheHits + '/' + checkFiles.length + ' zigRes:' + (globalThis.__zigHits||0) + String.fromCharCode(10));
   return output.join(NL);
   } catch(e) { return '[recipe-error] w' + workerId + ': ' + (e && e.stack ? e.stack : String(e)); }
 };

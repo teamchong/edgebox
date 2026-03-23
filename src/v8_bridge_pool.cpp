@@ -109,7 +109,6 @@ static void CheckStructuralCallback(const v8::FunctionCallbackInfo<v8::Value>& a
 static void RootCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void WriteFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void IsSimpleTypeRelatedCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
-static void GetResolvedModuleCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void ClaimFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void IOStatsCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void SubmitResultCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
@@ -152,7 +151,6 @@ static const intptr_t g_external_refs[] = {
   reinterpret_cast<intptr_t>(RootCallback),
   reinterpret_cast<intptr_t>(WriteFileCallback),
   reinterpret_cast<intptr_t>(IsSimpleTypeRelatedCallback),
-  reinterpret_cast<intptr_t>(GetResolvedModuleCallback),
   reinterpret_cast<intptr_t>(SubmitResultCallback),
   reinterpret_cast<intptr_t>(WorkerDoneCallback),
   0  // sentinel
@@ -188,7 +186,6 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
     global->Set(isolate, "__edgebox_root", v8::FunctionTemplate::New(isolate, RootCallback));
     global->Set(isolate, "__edgebox_write_file", v8::FunctionTemplate::New(isolate, WriteFileCallback));
     global->Set(isolate, "__edgebox_is_simple_type_related", v8::FunctionTemplate::New(isolate, IsSimpleTypeRelatedCallback));
-    global->Set(isolate, "__edgebox_get_resolved_module", v8::FunctionTemplate::New(isolate, GetResolvedModuleCallback));
     global->Set(isolate, "__edgebox_submit_result", v8::FunctionTemplate::New(isolate, SubmitResultCallback));
     global->Set(isolate, "__edgebox_worker_done", v8::FunctionTemplate::New(isolate, WorkerDoneCallback));
     auto context = v8::Context::New(isolate, nullptr, global);
@@ -402,8 +399,6 @@ static void CheckStructuralCallback(const v8::FunctionCallbackInfo<v8::Value>& a
 
 extern const char* edgebox_root(int* out_len);
 extern unsigned char edgebox_is_simple_type_related(unsigned int src_flags, unsigned int tgt_flags, unsigned int relation, unsigned int strict_null);
-extern const char* edgebox_get_resolved_module(const char* module, int module_len, const char* file, int file_len, int* out_len);
-extern unsigned int edgebox_scan_stats();
 extern unsigned int edgebox_claim_file();
 extern void edgebox_reset_work();
 
@@ -415,17 +410,6 @@ static void IsSimpleTypeRelatedCallback(const v8::FunctionCallbackInfo<v8::Value
   unsigned int rel = args[2]->Uint32Value(ctx).FromMaybe(0);
   unsigned int sn = args[3]->Uint32Value(ctx).FromMaybe(0);
   args.GetReturnValue().Set(v8::Number::New(args.GetIsolate(), edgebox_is_simple_type_related(sf, tf, rel, sn)));
-}
-
-static void GetResolvedModuleCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  if (args.Length() < 2) return;
-  v8::String::Utf8Value mod(args.GetIsolate(), args[0]);
-  v8::String::Utf8Value file(args.GetIsolate(), args[1]);
-  if (!*mod || !*file) { args.GetReturnValue().SetUndefined(); return; }
-  int out_len = 0;
-  auto* data = edgebox_get_resolved_module(*mod, mod.length(), *file, file.length(), &out_len);
-  if (!data || out_len <= 0) { args.GetReturnValue().SetUndefined(); return; }
-  args.GetReturnValue().Set(v8::String::NewFromUtf8(args.GetIsolate(), data, v8::NewStringType::kNormal, out_len).ToLocalChecked());
 }
 
 static void WriteFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {

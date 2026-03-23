@@ -30,7 +30,6 @@ extern fn edgebox_get_result(c_int, *c_int) ?[*]const u8;
 extern fn edgebox_read_file([*]const u8, c_int, *c_int) ?[*]const u8;
 extern fn edgebox_reset_work() void;
 extern fn edgebox_set_root([*]const u8, c_int) void;
-extern fn edgebox_scan_and_resolve([*]const u8, c_int) void;
 
 const MAX_WORKERS = 16;
 
@@ -271,9 +270,6 @@ pub fn dispatch(cwd: []const u8) void {
     edgebox_reset_work();
     // Pre-warm file cache (18ms — reads project files into Zig mmap cache)
     prewarmDir(cwd);
-    // Scan imports + resolve relative paths in Zig (native speed, ~5ms)
-    // Results available to workers via edgebox_get_resolved_module
-    edgebox_scan_and_resolve(cwd.ptr, @intCast(cwd.len));
     for (0..pool_size) |i| {
         workers[i].cwd = cwd;
         workers[i].worker_count = pool_size;
