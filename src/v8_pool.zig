@@ -221,6 +221,16 @@ pub fn init(worker_count: u32) !void {
 /// Recipe transform: inject Zig structural check into TSC's internal isTypeRelatedTo.
 /// Finds the injection point in typescript.js and inserts the Zig fast path.
 /// This is baked into the V8 snapshot — zero runtime overhead.
+/// Replace first occurrence of `needle` with `replacement` in `haystack`.
+fn replaceFirst(haystack: []const u8, needle: []const u8, replacement: []const u8) ![]const u8 {
+    const pos = std.mem.indexOf(u8, haystack, needle) orelse return error.NotFound;
+    const result = try alloc.alloc(u8, haystack.len - needle.len + replacement.len);
+    @memcpy(result[0..pos], haystack[0..pos]);
+    @memcpy(result[pos .. pos + replacement.len], replacement);
+    @memcpy(result[pos + replacement.len ..], haystack[pos + needle.len ..]);
+    return result;
+}
+
 fn applyRecipeTransform(src: []const u8) ![]const u8 {
     // Find the expensive checkTypeRelatedTo call site inside isTypeRelatedTo
     const fn_marker = "function isTypeRelatedTo(source, target, relation) {";
