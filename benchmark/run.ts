@@ -654,10 +654,10 @@ async function main() {
   console.log("=== Setup ===\n");
   const edgeboxTsc = buildEdgeboxTsc();
   if (!edgeboxTsc) {
-    console.error("Failed to build EdgeBox tsc");
-    process.exit(1);
+    console.warn("EdgeBox binary not available — running Node.js-only benchmark");
+  } else {
+    console.log(`EdgeBox tsc: ${edgeboxTsc}`);
   }
-  console.log(`EdgeBox tsc: ${edgeboxTsc}`);
 
   // Find Bun if requested
   let bunPath: string | undefined;

@@ -47,6 +47,16 @@ jobs:
           cd benchmark
           npm install
 
+      - name: Build EdgeBox CLI (if rusty_v8 available)
+        continue-on-error: true
+        run: |
+          if [ -f vendor/v8/librusty_v8_release_x86_64-unknown-linux-gnu.a ]; then
+            zig build edgebox-cli -p zig-out -Doptimize=ReleaseFast
+            echo "EdgeBox CLI built: $(ls -lh zig-out/bin/edgebox)"
+          else
+            echo "rusty_v8 not available — EdgeBox benchmark will be skipped"
+          fi
+
       - name: Install VS Code dependencies (for proper tsconfig benchmark)
         continue-on-error: true
         run: |
