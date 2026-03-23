@@ -29,6 +29,7 @@ extern fn edgebox_get_result(c_int, *c_int) ?[*]const u8;
 // IO functions from edgebox_io.zig (shared across all workers)
 extern fn edgebox_read_file([*]const u8, c_int, *c_int) ?[*]const u8;
 extern fn edgebox_reset_work() void;
+extern fn edgebox_set_root([*]const u8, c_int) void;
 
 const MAX_WORKERS = 16;
 
@@ -127,6 +128,8 @@ pub fn init(worker_count: u32) !void {
         const cwd_r = std.fs.cwd().realpath(".", &eb_root_buf) catch "/tmp";
         eb_root = eb_root_buf[0..cwd_r.len];
     }
+    // Store root in edgebox_io.zig for __edgebox_root() export
+    edgebox_set_root(eb_root.ptr, @intCast(eb_root.len));
     _ = std.posix.write(2, "[v8pool] root: ") catch {};
     _ = std.posix.write(2, eb_root) catch {};
     _ = std.posix.write(2, "\n") catch {};

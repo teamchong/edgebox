@@ -31,8 +31,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   }
   if (!ts.sys) return 'no sys (setSys failed)';
 
-  var ebRoot = __edgebox_cwd();
-  if (workerId === 0) __edgebox_write_stderr('[recipe] ebRoot=' + ebRoot + ' cwd=' + cwd + String.fromCharCode(10));
+  var ebRoot = typeof __edgebox_root === 'function' ? __edgebox_root() : __edgebox_cwd();
   function rp(p) { p = String(p); return p.charAt(0) === '/' ? p : cwd + '/' + p; }
 
   // Wire ts.sys methods to Zig IO (zero-copy via C ABI)

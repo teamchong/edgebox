@@ -105,6 +105,7 @@ static void RegisterTypeCallback(const v8::FunctionCallbackInfo<v8::Value>& args
 static void RegisterMemberCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void RegisterUnionCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void CheckStructuralCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void RootCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void ClaimFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void IOStatsCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void SubmitResultCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
@@ -144,6 +145,7 @@ static const intptr_t g_external_refs[] = {
   reinterpret_cast<intptr_t>(CheckStructuralCallback),
   reinterpret_cast<intptr_t>(ClaimFileCallback),
   reinterpret_cast<intptr_t>(IOStatsCallback),
+  reinterpret_cast<intptr_t>(RootCallback),
   reinterpret_cast<intptr_t>(SubmitResultCallback),
   reinterpret_cast<intptr_t>(WorkerDoneCallback),
   0  // sentinel
@@ -176,6 +178,7 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
     global->Set(isolate, "__edgebox_check_structural", v8::FunctionTemplate::New(isolate, CheckStructuralCallback));
     global->Set(isolate, "__edgebox_claim_file", v8::FunctionTemplate::New(isolate, ClaimFileCallback));
     global->Set(isolate, "__edgebox_io_stats", v8::FunctionTemplate::New(isolate, IOStatsCallback));
+    global->Set(isolate, "__edgebox_root", v8::FunctionTemplate::New(isolate, RootCallback));
     global->Set(isolate, "__edgebox_submit_result", v8::FunctionTemplate::New(isolate, SubmitResultCallback));
     global->Set(isolate, "__edgebox_worker_done", v8::FunctionTemplate::New(isolate, WorkerDoneCallback));
     auto context = v8::Context::New(isolate, nullptr, global);
@@ -386,8 +389,16 @@ static void CheckStructuralCallback(const v8::FunctionCallbackInfo<v8::Value>& a
   args.GetReturnValue().Set(v8::Number::New(args.GetIsolate(), edgebox_check_structural(src, tgt)));
 }
 
+extern const char* edgebox_root(int* out_len);
 extern unsigned int edgebox_claim_file();
 extern void edgebox_reset_work();
+
+static void RootCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  int out_len = 0;
+  auto* data = edgebox_root(&out_len);
+  if (!data || out_len <= 0) { args.GetReturnValue().Set(v8::String::NewFromUtf8(args.GetIsolate(), "/").ToLocalChecked()); return; }
+  args.GetReturnValue().Set(v8::String::NewFromUtf8(args.GetIsolate(), data, v8::NewStringType::kNormal, out_len).ToLocalChecked());
+}
 
 static void ClaimFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
   args.GetReturnValue().Set(v8::Number::New(args.GetIsolate(), edgebox_claim_file()));

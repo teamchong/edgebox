@@ -216,6 +216,26 @@ export fn edgebox_realpath(path_ptr: [*]const u8, path_len: c_int, out_len: *c_i
 }
 
 /// Get current working directory.
+// Edgebox root directory (set by v8_pool.zig at init, resolved from executable path)
+var eb_root_ptr: ?[*]const u8 = null;
+var eb_root_len: c_int = 0;
+
+export fn edgebox_set_root(ptr: [*]const u8, len: c_int) void {
+    const copy = alloc.alloc(u8, @intCast(len)) catch return;
+    @memcpy(copy, ptr[0..@intCast(len)]);
+    eb_root_ptr = copy.ptr;
+    eb_root_len = @intCast(copy.len);
+}
+
+export fn edgebox_root(out_len: *c_int) ?[*]const u8 {
+    if (eb_root_ptr) |p| {
+        out_len.* = eb_root_len;
+        return p;
+    }
+    // Fallback to CWD
+    return edgebox_cwd(out_len);
+}
+
 export fn edgebox_cwd(out_len: *c_int) ?[*]const u8 {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd = std.fs.cwd().realpath(".", &buf) catch {
