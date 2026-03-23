@@ -4,9 +4,9 @@
 // WASM kernels compiled from Zig, loaded here. V8 TurboFan inlines WASM at callsite.
 var ts = globalThis.ts || globalThis.module.exports;
 
-// 0. WASM kernel init — deferred to first worker call (WebAssembly not available during snapshot).
-// Loaded once per worker, TurboFan compiles after warmup calls.
-globalThis.__zigWasmInitDone = false;
+// 0. WASM type registry — deferred to first worker call (WebAssembly unavailable during snapshot).
+// Shared data model: type flags in WASM linear memory, zero-copy access from JS and WASM.
+globalThis.__zigRegistryDone = false;
 
 // --- Recipe optimizations (public API wrapping, stable across TSC versions) ---
 
@@ -81,31 +81,37 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   try {
   if (!ts || !ts.createProgram) return 'no tsc: ' + typeof ts;
 
-  // Load Zig WASM type kernel — NO FALLBACK. Must succeed or fail loud.
-  if (!globalThis.__zigWasmInitDone) {
-    globalThis.__zigWasmInitDone = true;
+  // Load Zig WASM type registry — shared data model in WASM linear memory.
+  // Type flags stored as flat Uint32Array. Both JS and WASM read same memory. Zero copy.
+  if (!globalThis.__zigRegistryDone) {
+    globalThis.__zigRegistryDone = true;
     if (typeof __edgebox_read_binary === 'function' && typeof WebAssembly !== 'undefined') {
       var _root = typeof __edgebox_root === 'function' ? __edgebox_root() : '';
-      var _wasmPath = _root + '/src/tsc-recipe/type_kernel.wasm';
-      var _buf = __edgebox_read_binary(_wasmPath);
+      var _buf = __edgebox_read_binary(_root + '/src/tsc-recipe/type_registry.wasm');
       if (_buf && _buf instanceof ArrayBuffer && _buf.byteLength >= 8) {
         var _mod = new WebAssembly.Module(_buf);
         var _inst = new WebAssembly.Instance(_mod, {});
-        globalThis.__zigTypeKernel = _inst.exports;
-        // Warmup: trigger Liftoff → TurboFan promotion (500 calls each)
-        var _k = _inst.exports.isSimpleTypeRelated;
-        for (var _wi = 0; _wi < 500; _wi++) {
-          _k(1, 1, 0, 1); _k(4, 8, 0, 1); _k(524288, 524288, 0, 1);
-          _k(2, 1, 0, 1); _k(16, 16, 1, 1); _k(131072, 1, 0, 1);
+        globalThis.__zigRegistry = _inst.exports;
+        globalThis.__zigTypeKernel = _inst.exports; // backward compat for isSimpleTypeRelatedTo injection
+        // Create Uint32Array view for zero-copy JS access to type flags
+        var _flagsPtr = _inst.exports.getFlagsPtr();
+        globalThis.__typeFlags = new Uint32Array(_inst.exports.memory.buffer, _flagsPtr, 65536);
+        globalThis.__wasmMemory = _inst.exports.memory;
+        // Warmup TurboFan (both register + check paths)
+        var _kr = _inst.exports.registerType;
+        var _ki = _inst.exports.isTypeRelated;
+        for (var _wi = 0; _wi < 100; _wi++) {
+          _kr(_wi, (_wi & 7) === 0 ? 1 : (_wi & 7) === 1 ? 4 : 524288);
         }
-        __edgebox_write_stderr('[recipe] WASM kernel loaded (' + _buf.byteLength + ' bytes, TurboFan warmed)\n');
+        for (var _wi = 0; _wi < 500; _wi++) {
+          _ki(0, 1, 0, 1); _ki(1, 0, 0, 1); _ki(2, 3, 0, 1);
+          _ki(50, 51, 0, 1); _ki(99, 0, 0, 1);
+        }
+        _inst.exports.reset();
+        __edgebox_write_stderr('[recipe] WASM registry loaded (' + _buf.byteLength + ' bytes, flags@' + _flagsPtr + ')\n');
       } else {
-        __edgebox_write_stderr('[recipe] WASM FAILED: read_binary returned ' + typeof _buf +
-          (_buf ? ' len=' + _buf.byteLength : ' null') + ' for ' + _wasmPath + '\n');
+        __edgebox_write_stderr('[recipe] WASM FAILED: ' + (typeof _buf) + '\n');
       }
-    } else {
-      __edgebox_write_stderr('[recipe] WASM SKIPPED: read_binary=' + (typeof __edgebox_read_binary) +
-        ' WebAssembly=' + (typeof WebAssembly) + '\n');
     }
   }
 

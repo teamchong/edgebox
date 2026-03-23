@@ -219,33 +219,60 @@ pub fn init(worker_count: u32) !void {
     }
 }
 
-/// Recipe transform: inject Zig WASM fast path into TSC's isSimpleTypeRelatedTo.
-/// Finds the exact function declaration and prepends WASM call.
+/// Recipe transform: inject Zig WASM type registry into TSC.
+/// Two patches:
+///   1. createType — writes flags to WASM linear memory (zero-copy shared data model)
+///   2. isTypeRelatedTo — uses WASM kernel with type IDs (avoids megamorphic IC)
 /// Baked into V8 snapshot → TurboFan inlines WASM at callsite.
 fn applyRecipeTransform(src: []const u8) ![]const u8 {
-    // Find isSimpleTypeRelatedTo function and inject WASM fast path before its body.
-    const needle = "function isSimpleTypeRelatedTo(source, target, relation, errorReporter) {";
-    const injection =
-        "function isSimpleTypeRelatedTo(source, target, relation, errorReporter) {" ++
-        "if(globalThis.__zigTypeKernel){" ++
-        "var _r=globalThis.__zigTypeKernel.isSimpleTypeRelated(" ++
-        "source.flags|0,target.flags|0," ++
+    var result = src;
+
+    // Patch 1: createType — populate WASM flags array when TSC creates a type
+    const ct_needle = "function createType(flags) {";
+    const ct_inject = "function createType(flags) {" ++
+        // Write flags to WASM memory at type.id position (typeCount+1 after increment).
+        // TSC does: typeCount++; result.id = typeCount; so id = typeCount+1 at this point.
+        "var _tf=globalThis.__typeFlags;" ++
+        "if(_tf){var _tid=typeCount+1;if(_tid<65536)_tf[_tid]=flags;}";
+
+    if (std.mem.indexOf(u8, result, ct_needle)) |ct_idx| {
+        _ = std.posix.write(2, "[v8pool] patching createType → WASM flags\n") catch {};
+        const ct_len = result.len - ct_needle.len + ct_inject.len;
+        const ct_result = try alloc.alloc(u8, ct_len);
+        @memcpy(ct_result[0..ct_idx], result[0..ct_idx]);
+        @memcpy(ct_result[ct_idx .. ct_idx + ct_inject.len], ct_inject);
+        @memcpy(ct_result[ct_idx + ct_inject.len .. ct_len], result[ct_idx + ct_needle.len ..]);
+        result = ct_result;
+    }
+
+    // Patch 2: isTypeRelatedTo — WASM fast path using type IDs
+    const itr_needle = "function isTypeRelatedTo(source, target, relation) {";
+    // WASM fast path at isTypeRelatedTo level.
+    // Handle fresh literals (use regularType), skip identity relation (different logic).
+    // Only positive results — no false negatives.
+    const itr_inject = "function isTypeRelatedTo(source, target, relation) {" ++
+        "if(globalThis.__zigRegistry&&relation!==identityRelation){" ++
+        // Use regularType for fresh literals (same as TSC's first two lines)
+        "var _s=source.regularType||source,_t=target.regularType||target;" ++
+        "if(_s===_t)return true;" ++
+        "if(_s.id<65536&&_t.id<65536){" ++
+        "var _r=globalThis.__zigRegistry.isTypeRelated(" ++
+        "_s.id|0,_t.id|0," ++
         "(relation===assignableRelation?0:relation===comparableRelation?1:2)|0," ++
         "(strictNullChecks?1:0)|0);" ++
         "if(_r===1)return true;" ++
-        "if(_r===2)return false;" ++
-        "}";
+        "}}";
 
-    const idx = std.mem.indexOf(u8, src, needle) orelse {
-        _ = std.posix.write(2, "[v8pool] WASM injection: needle not found\n") catch {};
-        return src;
-    };
-    _ = std.posix.write(2, "[v8pool] WASM injection: patching isSimpleTypeRelatedTo\n") catch {};
-    const new_len = src.len - needle.len + injection.len;
-    const result = try alloc.alloc(u8, new_len);
-    @memcpy(result[0..idx], src[0..idx]);
-    @memcpy(result[idx .. idx + injection.len], injection);
-    @memcpy(result[idx + injection.len .. new_len], src[idx + needle.len ..]);
+    if (std.mem.indexOf(u8, result, itr_needle)) |itr_idx| {
+        _ = std.posix.write(2, "[v8pool] patching isTypeRelatedTo → WASM registry\n") catch {};
+        const itr_len = result.len - itr_needle.len + itr_inject.len;
+        const itr_result = try alloc.alloc(u8, itr_len);
+        @memcpy(itr_result[0..itr_idx], result[0..itr_idx]);
+        @memcpy(itr_result[itr_idx .. itr_idx + itr_inject.len], itr_inject);
+        @memcpy(itr_result[itr_idx + itr_inject.len .. itr_len], result[itr_idx + itr_needle.len ..]);
+        result = itr_result;
+    }
+
     return result;
 }
 
