@@ -1,9 +1,41 @@
 // TSC Recipe — loaded once by V8 pool, called per request via __edgebox_check
 //
-// The Zig structural check is injected directly into TSC's internal isTypeRelatedTo
-// via the recipe transform in v8_pool.zig (applied before snapshot creation).
-// This recipe only handles: ts.sys setup, program creation, sharded diagnostics.
+// Optimizations use PUBLIC API wrapping — no fragile string matching on TSC source.
+// WASM kernels loaded here, AST cache set up here.
 var ts = globalThis.ts || globalThis.module.exports;
+
+// --- Recipe optimizations (public API wrapping, stable across TSC versions) ---
+
+// 1. Cache createSourceFile for .d.ts files (lib files parsed identically every time)
+(function() {
+  if (!ts || !ts.createSourceFile) return;
+  var origCSF = ts.createSourceFile;
+  var sfCache = new Map();
+  ts.createSourceFile = function(fileName, sourceText, langVer, setParent, scriptKind) {
+    if (fileName.endsWith('.d.ts')) {
+      var cached = sfCache.get(fileName);
+      if (cached && cached.text === sourceText) return cached;
+    }
+    var result = origCSF.apply(this, arguments);
+    if (fileName.endsWith('.d.ts')) sfCache.set(fileName, result);
+    return result;
+  };
+})();
+
+// 2. Load WASM type kernel (if available)
+(function() {
+  if (typeof __edgebox_read_file !== 'function' || typeof __edgebox_root !== 'function') return;
+  var root = __edgebox_root();
+  var wasmSrc = __edgebox_read_file(root + '/src/tsc-recipe/type_kernel.wasm');
+  if (!wasmSrc) return;
+  try {
+    var bytes = new Uint8Array(wasmSrc.length);
+    for (var i = 0; i < wasmSrc.length; i++) bytes[i] = wasmSrc.charCodeAt(i);
+    var mod = new WebAssembly.Module(bytes);
+    var inst = new WebAssembly.Instance(mod);
+    globalThis.__ebWasmTypeKernel = inst.exports.isSimpleTypeRelated;
+  } catch(e) {}
+})();
 
 globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   try {

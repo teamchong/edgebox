@@ -222,103 +222,10 @@ pub fn init(worker_count: u32) !void {
 /// Finds the injection point in typescript.js and inserts the Zig fast path.
 /// This is baked into the V8 snapshot — zero runtime overhead.
 /// Replace first occurrence of `needle` with `replacement` in `haystack`.
-fn replaceFirst(haystack: []const u8, needle: []const u8, replacement: []const u8) ![]const u8 {
-    const pos = std.mem.indexOf(u8, haystack, needle) orelse return error.NotFound;
-    const result = try alloc.alloc(u8, haystack.len - needle.len + replacement.len);
-    @memcpy(result[0..pos], haystack[0..pos]);
-    @memcpy(result[pos .. pos + replacement.len], replacement);
-    @memcpy(result[pos + replacement.len ..], haystack[pos + needle.len ..]);
-    return result;
-}
-
-fn encodeWasmBytes(wasm_data: []const u8) ![]const u8 {
-    var byte_str: std.ArrayListUnmanaged(u8) = .{};
-    for (wasm_data, 0..) |b, idx| {
-        if (idx > 0) byte_str.append(alloc, ',') catch {};
-        var num_buf: [4]u8 = undefined;
-        const num = std.fmt.bufPrint(&num_buf, "{d}", .{b}) catch "0";
-        byte_str.appendSlice(alloc, num) catch {};
-    }
-    return byte_str.toOwnedSlice(alloc) catch "";
-}
-
-fn loadWasmFile(name: []const u8) ?[]const u8 {
-    const path = std.fmt.allocPrint(alloc, "{s}/src/tsc-recipe/{s}", .{ eb_root, name }) catch return null;
-    defer alloc.free(path);
-    var len: c_int = 0;
-    const data = edgebox_read_file(path.ptr, @intCast(path.len), &len);
-    if (data != null and len > 0) return data.?[0..@intCast(len)];
-    return null;
-}
-
+/// Recipe transform — passthrough. All optimizations are in the recipe JS
+/// (checker-parallel.js) using public API wrapping. No fragile string matching.
 fn applyRecipeTransform(src: []const u8) ![]const u8 {
-    var result = src;
-    var transforms: u32 = 0;
-
-    // 1. Stabilize type object hidden class in createType
-    result = replaceFirst(result,
-        "result.id = typeCount;",
-        "result.id = typeCount;\n" ++
-        "    result.symbol=result.symbol;result.types=result.types;result.value=result.value;\n" ++
-        "    result.target=result.target;result.members=result.members;result.properties=result.properties;\n" ++
-        "    result.callSignatures=result.callSignatures;result.constructSignatures=result.constructSignatures;\n" ++
-        "    result.indexInfos=result.indexInfos;result.objectFlags=result.objectFlags||0;\n" ++
-        "    result.intrinsicName=result.intrinsicName;result.freshType=result.freshType;\n" ++
-        "    result.regularType=result.regularType;result.aliasSymbol=result.aliasSymbol;\n" ++
-        "    result.immediateBaseConstraint=result.immediateBaseConstraint;\n",
-    ) catch result;
-    if (result.ptr != src.ptr) { transforms += 1; _ = std.posix.write(2, "[recipe] + createType hidden class stabilization\n") catch {}; }
-
-    // 2. WASM kernel for isSimpleTypeRelatedTo
-    if (loadWasmFile("type_kernel.wasm")) |wasm_data| {
-        const bytes_js = encodeWasmBytes(wasm_data) catch "";
-        if (bytes_js.len > 0) {
-            const inject = std.fmt.allocPrint(alloc,
-                "function isSimpleTypeRelatedTo(source, target, relation, errorReporter) {{\n" ++
-                "    if (!globalThis.__ebWK) {{ var b=new Uint8Array([{s}]); globalThis.__ebWK=new WebAssembly.Instance(new WebAssembly.Module(b)).exports.isSimpleTypeRelated; }}\n" ++
-                "    var r=globalThis.__ebWK(source.flags,target.flags,relation===assignableRelation?0:relation===comparableRelation?1:relation===strictSubtypeRelation?2:3,strictNullChecks?1:0);\n" ++
-                "    if(r===1) return true;\n",
-                .{bytes_js},
-            ) catch null;
-            alloc.free(bytes_js);
-            if (inject) |inj| {
-                const prev = result;
-                result = replaceFirst(result,
-                    "function isSimpleTypeRelatedTo(source, target, relation, errorReporter) {",
-                    inj,
-                ) catch result;
-                if (result.ptr != prev.ptr) { transforms += 1; _ = std.posix.write(2, "[recipe] + WASM isSimpleTypeRelated kernel\n") catch {}; }
-            }
-        }
-    }
-
-    // 3. Wrap ts.createSourceFile to cache .d.ts AST (saves ~128ms for lib files)
-    {
-        const prev = result;
-        result = replaceFirst(result,
-            "function createSourceFile(fileName, sourceText, languageVersionOrOptions,",
-            "var __sfCache__=new Map();function __origCreateSourceFile__(fileName, sourceText, languageVersionOrOptions,",
-        ) catch result;
-        if (result.ptr != prev.ptr) {
-            // Add wrapper function that checks cache first
-            const prev2 = result;
-            result = replaceFirst(result,
-                "var __sfCache__=new Map();function __origCreateSourceFile__(",
-                "var __sfCache__=new Map();\nfunction createSourceFile(fn,st,lv,sp,sk){if(fn.endsWith('.d.ts')){var c=__sfCache__.get(fn);if(c&&c.text===st)return c;}var r=__origCreateSourceFile__(fn,st,lv,sp,sk);if(fn.endsWith('.d.ts'))__sfCache__.set(fn,r);return r;}\nfunction __origCreateSourceFile__(",
-            ) catch result;
-            if (result.ptr != prev2.ptr) {
-                transforms += 1;
-                _ = std.posix.write(2, "[recipe] + .d.ts AST cache\n") catch {};
-            }
-        }
-    }
-
-    {
-        var msg_buf: [64]u8 = undefined;
-        const msg = std.fmt.bufPrint(&msg_buf, "[recipe] {d} transforms applied\n", .{transforms}) catch "";
-        _ = std.posix.write(2, msg) catch {};
-    }
-    return result;
+    return src;
 }
 
 /// Shutdown the pool. Signal all workers to exit, join threads.
