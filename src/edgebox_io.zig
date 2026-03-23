@@ -617,7 +617,7 @@ export fn edgebox_check_structural(source_id: u32, target_id: u32) u8 {
                     else if (sf & (128 | 4) != 0 and tf & 4 != 0) { found = true; } // string
                     else if (sf & (256 | 8) != 0 and tf & 8 != 0) { found = true; } // number
                     else if (sf & (512 | 16) != 0 and tf & 16 != 0) { found = true; } // boolean
-                    else { found = true; } // Conservative: assume compatible if name matches
+                    // else: member types don't match = NOT compatible
                 }
                 break;
             }
