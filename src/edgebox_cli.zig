@@ -152,12 +152,22 @@ fn runTsc() u8 {
     _ = std.posix.write(fd, cwd) catch return 1;
     std.posix.shutdown(fd, .send) catch {};
 
-    // Read diagnostics (raw bytes)
+    // Read diagnostics and replace literal \n with actual newlines
     var buf: [8192]u8 = undefined;
     while (true) {
         const n = std.posix.read(fd, &buf) catch break;
         if (n == 0) break;
-        _ = std.posix.write(1, buf[0..n]) catch {};
+        // Replace \n (0x5C 0x6E) with actual newline (0x0A)
+        var i: usize = 0;
+        while (i < n) {
+            if (i + 1 < n and buf[i] == '\\' and buf[i + 1] == 'n') {
+                _ = std.posix.write(1, "\n") catch {};
+                i += 2;
+            } else {
+                _ = std.posix.write(1, buf[i .. i + 1]) catch {};
+                i += 1;
+            }
+        }
     }
 
     return 0;

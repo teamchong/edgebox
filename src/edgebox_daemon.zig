@@ -61,10 +61,6 @@ fn handleClient(fd: std.posix.fd_t) void {
     };
     defer alloc.free(result);
 
-    // Marker to verify this code path runs
-    _ = std.posix.write(2, "[daemon] handleClient: got result, replacing \\n\n") catch {};
-    _ = std.posix.write(fd, "MARKER\n") catch {};
-
     // Replace literal \n with actual newlines before sending
     var fixed = alloc.alloc(u8, result.len) catch {
         _ = std.posix.write(fd, result) catch {};
