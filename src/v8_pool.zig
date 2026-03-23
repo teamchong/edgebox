@@ -271,10 +271,16 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
     // Patch 3: isTypeRelatedTo — WASM fast path for flag-based type relations.
     // Positive-only: returns true when flags prove types related, else falls through to JS.
     const itr_needle = "function isTypeRelatedTo(source, target, relation) {";
+    // CRITICAL: only access regularType on Freshable types (flags & 2976).
+    // Unconditional regularType access causes V8 Maglev deoptimizations
+    // ("wrong map") because most types don't have regularType property.
+    // Each deopt wastes ~1ms recompilation × 4 deopts = 4ms + cold IC rebuild.
     const itr_inject = "function isTypeRelatedTo(source, target, relation) {" ++
         "var _zr=globalThis.__zigRegistry;" ++
         "if(_zr&&relation!==identityRelation){" ++
-        "var _s=source.regularType||source,_t=target.regularType||target;" ++
+        // Match TSC's isFreshLiteralType pattern exactly
+        "var _s=(source.flags&2976)&&source.freshType===source?source.regularType:source;" ++
+        "var _t=(target.flags&2976)&&target.freshType===target?target.regularType:target;" ++
         "if(_s===_t)return true;" ++
         "var _si=_s.id,_ti=_t.id;" ++
         "if(_si<65536&&_ti<65536){" ++
