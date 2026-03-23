@@ -92,6 +92,7 @@ void edgebox_v8_free(const char* ptr) {
 
 // Forward declarations for callbacks (used in snapshot creation)
 static void ReadFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void ReadBinaryCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void FileExistsCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void DirExistsCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void StatCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
@@ -132,6 +133,7 @@ static void EvalInContext(v8::Isolate* isolate, v8::Local<v8::Context> context, 
 // External references — V8 needs these to serialize/deserialize native function pointers in snapshots
 static const intptr_t g_external_refs[] = {
   reinterpret_cast<intptr_t>(ReadFileCallback),
+  reinterpret_cast<intptr_t>(ReadBinaryCallback),
   reinterpret_cast<intptr_t>(FileExistsCallback),
   reinterpret_cast<intptr_t>(DirExistsCallback),
   reinterpret_cast<intptr_t>(StatCallback),
@@ -167,6 +169,7 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
     // Create context WITH IO callbacks (so worker_init's require('fs') works)
     auto global = v8::ObjectTemplate::New(isolate);
     global->Set(isolate, "__edgebox_read_file", v8::FunctionTemplate::New(isolate, ReadFileCallback));
+    global->Set(isolate, "__edgebox_read_binary", v8::FunctionTemplate::New(isolate, ReadBinaryCallback));
     global->Set(isolate, "__edgebox_file_exists", v8::FunctionTemplate::New(isolate, FileExistsCallback));
     global->Set(isolate, "__edgebox_dir_exists", v8::FunctionTemplate::New(isolate, DirExistsCallback));
     global->Set(isolate, "__edgebox_stat", v8::FunctionTemplate::New(isolate, StatCallback));
@@ -256,6 +259,21 @@ static void ReadFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
   }
   args.GetReturnValue().Set(
     v8::String::NewFromUtf8(args.GetIsolate(), data, v8::NewStringType::kNormal, out_len).ToLocalChecked());
+}
+
+// Read binary file → ArrayBuffer (for WASM modules, binary assets)
+static void ReadBinaryCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 1) return;
+  auto* isolate = args.GetIsolate();
+  v8::String::Utf8Value utf8(isolate, args[0]);
+  if (!*utf8) return;
+  int out_len = 0;
+  auto* data = edgebox_read_file(*utf8, utf8.length(), &out_len);
+  if (!data || out_len <= 0) return;
+  // Create ArrayBuffer and copy binary data into it
+  auto ab = v8::ArrayBuffer::New(isolate, (size_t)out_len);
+  memcpy(ab->GetBackingStore()->Data(), data, out_len);
+  args.GetReturnValue().Set(ab);
 }
 
 static void FileExistsCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
@@ -477,6 +495,7 @@ void* edgebox_v8_setup_context(void* iso_ptr) {
     // Fresh context with IO globals template
     auto global = v8::ObjectTemplate::New(isolate);
     global->Set(isolate, "__edgebox_read_file", v8::FunctionTemplate::New(isolate, ReadFileCallback));
+    global->Set(isolate, "__edgebox_read_binary", v8::FunctionTemplate::New(isolate, ReadBinaryCallback));
     global->Set(isolate, "__edgebox_file_exists", v8::FunctionTemplate::New(isolate, FileExistsCallback));
     global->Set(isolate, "__edgebox_dir_exists", v8::FunctionTemplate::New(isolate, DirExistsCallback));
     global->Set(isolate, "__edgebox_stat", v8::FunctionTemplate::New(isolate, StatCallback));
@@ -501,6 +520,7 @@ void* edgebox_v8_setup_context(void* iso_ptr) {
         v8::Function::New(context, cb).ToLocalChecked()).Check();
     };
     set("__edgebox_read_file", ReadFileCallback);
+    set("__edgebox_read_binary", ReadBinaryCallback);
     set("__edgebox_file_exists", FileExistsCallback);
     set("__edgebox_dir_exists", DirExistsCallback);
     set("__edgebox_stat", StatCallback);

@@ -68,11 +68,10 @@ fn handleClient(fd: std.posix.fd_t) void {
     }
     const cwd = std.mem.trim(u8, buf[0..n], &[_]u8{ '\n', '\r', ' ' });
 
-    log("[daemon] dispatch: ");
-    _ = std.posix.write(2, cwd) catch {};
-    log("\n");
+    var timer = std.time.Timer.start() catch null;
 
     v8_pool.dispatch(cwd);
+    const t_dispatch = if (timer) |*t| t.read() else 0;
 
     const result = v8_pool.collect() catch {
         log("[daemon] collect error\n");
@@ -80,6 +79,7 @@ fn handleClient(fd: std.posix.fd_t) void {
         return;
     };
     defer alloc.free(result);
+    const t_collect = if (timer) |*t| t.read() else 0;
 
     var written: usize = 0;
     while (written < result.len) {
@@ -90,6 +90,16 @@ fn handleClient(fd: std.posix.fd_t) void {
         if (w == 0) break;
         written += w;
     }
+    const t_write = if (timer) |*t| t.read() else 0;
 
-    log("[daemon] done\n");
+    // Timing breakdown (nanoseconds → milliseconds)
+    var tbuf: [256]u8 = undefined;
+    const tmsg = std.fmt.bufPrint(&tbuf, "[daemon] dispatch:{d}ms collect:{d}ms write:{d}ms total:{d}ms bytes:{d}\n", .{
+        t_dispatch / std.time.ns_per_ms,
+        (t_collect - t_dispatch) / std.time.ns_per_ms,
+        (t_write - t_collect) / std.time.ns_per_ms,
+        t_write / std.time.ns_per_ms,
+        result.len,
+    }) catch "[daemon] timing error\n";
+    log(tmsg);
 }

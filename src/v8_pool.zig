@@ -219,13 +219,25 @@ pub fn init(worker_count: u32) !void {
     }
 }
 
-/// Recipe transform: inject Zig structural check into TSC's internal isTypeRelatedTo.
-/// Finds the injection point in typescript.js and inserts the Zig fast path.
-/// This is baked into the V8 snapshot — zero runtime overhead.
-/// Replace first occurrence of `needle` with `replacement` in `haystack`.
-/// Recipe transform — passthrough. All optimizations are in the recipe JS
-/// (checker-parallel.js) using public API wrapping. No fragile string matching.
+/// Recipe transform: inject Zig WASM fast path into TSC's isSimpleTypeRelatedTo.
+/// Finds the exact function declaration and prepends WASM call.
+/// Baked into V8 snapshot → TurboFan inlines WASM at callsite.
 fn applyRecipeTransform(src: []const u8) ![]const u8 {
+    // Find isSimpleTypeRelatedTo function and inject WASM fast path before its body.
+    const needle = "function isSimpleTypeRelatedTo(source, target, relation, errorReporter) {";
+    const injection =
+        "function isSimpleTypeRelatedTo(source, target, relation, errorReporter) {" ++
+        "if(globalThis.__zigTypeKernel){" ++
+        "var _r=globalThis.__zigTypeKernel.isSimpleTypeRelated(" ++
+        "source.flags|0,target.flags|0," ++
+        "(relation===assignableRelation?0:relation===comparableRelation?1:2)|0," ++
+        "(strictNullChecks?1:0)|0);" ++
+        "if(_r===1){globalThis.__zigHits=(globalThis.__zigHits||0)+1;return true;}" ++
+        "}";
+
+    // Temporarily disabled to isolate GPE — just load WASM, don't inject
+    _ = needle;
+    _ = injection;
     return src;
 }
 

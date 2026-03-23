@@ -1,8 +1,12 @@
 // TSC Recipe — loaded once by V8 pool, called per request via __edgebox_check
 //
 // Optimizations use PUBLIC API wrapping — no fragile string matching on TSC source.
-// WASM kernels loaded here, AST cache set up here.
+// WASM kernels compiled from Zig, loaded here. V8 TurboFan inlines WASM at callsite.
 var ts = globalThis.ts || globalThis.module.exports;
+
+// 0. WASM kernel init — deferred to first worker call (WebAssembly not available during snapshot).
+// Loaded once per worker, TurboFan compiles after warmup calls.
+globalThis.__zigWasmInitDone = false;
 
 // --- Recipe optimizations (public API wrapping, stable across TSC versions) ---
 
@@ -76,6 +80,9 @@ var ts = globalThis.ts || globalThis.module.exports;
 globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   try {
   if (!ts || !ts.createProgram) return 'no tsc: ' + typeof ts;
+
+  // WASM kernel loading — disabled pending segfault investigation
+  // Will be re-enabled once ReadBinaryCallback is stable.
 
   // Create ts.sys if missing (snapshot restore doesn't init it)
   if (!ts.sys && ts.setSys) {
