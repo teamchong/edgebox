@@ -113,91 +113,80 @@ fn parseTypeAnnotation() TypeRef {
 /// - Literal types: null, undefined
 fn parseTypeExpr() TypeRef {
     const start = tokenStart();
+    const start_pos = tpos; // track position to detect non-advancing
 
-    // Try to parse a single type
-    var kind: u8 = switch (peek()) {
-        .kw_number => 1,
-        .kw_string => 2,
-        .kw_boolean => 3,
-        .kw_any => 4,
-        .kw_unknown => 5,
-        .kw_never => 6,
-        .kw_void => 7,
-        .kw_object => 8,
-        .kw_null => 9,
-        .kw_undefined => 10,
-        .identifier => 11,
-        .kw_typeof => 11, // typeof X
-        .open_paren => blk: {
-            // Function type or parenthesized type: (a: T) => R or (Type)
+    // Parse primary type
+    var kind: u8 = 0;
+    switch (peek()) {
+        .kw_number => { kind = 1; advance(); },
+        .kw_string => { kind = 2; advance(); },
+        .kw_boolean => { kind = 3; advance(); },
+        .kw_any => { kind = 4; advance(); },
+        .kw_unknown => { kind = 5; advance(); },
+        .kw_never => { kind = 6; advance(); },
+        .kw_void => { kind = 7; advance(); },
+        .kw_object => { kind = 8; advance(); },
+        .kw_null => { kind = 9; advance(); },
+        .kw_undefined => { kind = 10; advance(); },
+        .identifier => { kind = 11; advance(); },
+        .kw_typeof => {
+            kind = 11;
+            advance(); // typeof
+            if (peek() == .identifier) advance(); // name
+            while (peek() == .dot and peekAt(1) == .identifier) { advance(); advance(); }
+        },
+        .open_paren => {
+            kind = 11;
             skipBalanced(.open_paren, .close_paren);
-            if (peek() == .arrow) {
-                advance(); // =>
-                _ = parseTypeExpr(); // return type
-            }
-            break :blk 11; // complex type
+            if (peek() == .arrow) { advance(); _ = parseTypeExpr(); }
         },
-        .open_brace => blk: {
-            // Object literal type: { a: T; b: U }
-            skipBalanced(.open_brace, .close_brace);
-            break :blk 11;
-        },
-        .open_bracket => blk: {
-            // Tuple type: [T, U]
-            skipBalanced(.open_bracket, .close_bracket);
-            break :blk 11;
-        },
-        .kw_new => blk: {
-            // Constructor type: new (args) => T
+        .open_brace => { kind = 11; skipBalanced(.open_brace, .close_brace); },
+        .open_bracket => { kind = 11; skipBalanced(.open_bracket, .close_bracket); },
+        .kw_new => {
+            kind = 11;
             advance();
             if (peek() == .open_paren) skipBalanced(.open_paren, .close_paren);
             if (peek() == .arrow) { advance(); _ = parseTypeExpr(); }
-            break :blk 11;
         },
-        else => 0,
-    };
+        .string_literal => { kind = 21; advance(); }, // string literal type
+        .number_literal => { kind = 20; advance(); }, // number literal type
+        .kw_true => { kind = 22; advance(); },
+        .kw_false => { kind = 23; advance(); },
+        else => {},
+    }
 
     if (kind == 0) return NO_TYPE;
 
-    // For non-complex types, advance past the token
-    if (kind >= 1 and kind <= 10) advance();
-    if (kind == 11 and peek() == .identifier) advance();
-    if (kind == 11 and peek() == .kw_typeof) { advance(); if (peek() == .identifier) advance(); }
-
     // Handle dotted types: a.b.c
-    while (peek() == .dot and peekAt(1) == .identifier) {
-        advance(); // .
-        advance(); // identifier
-    }
+    while (peek() == .dot and peekAt(1) == .identifier) { advance(); advance(); }
 
     // Handle generic types: Type<T, U>
-    if (peek() == .less_than) {
-        skipBalanced(.less_than, .greater_than);
-    }
+    if (peek() == .less_than) skipBalanced(.less_than, .greater_than);
 
     // Handle array suffix: Type[] or Type[][]
-    while (peek() == .open_bracket and peekAt(1) == .close_bracket) {
-        advance();
-        advance();
-        kind = 13; // array
-    }
+    while (peek() == .open_bracket and peekAt(1) == .close_bracket) { advance(); advance(); kind = 13; }
 
-    // Handle union: Type | Type | Type
+    // Handle union: Type | Type
     if (peek() == .pipe) {
         while (peek() == .pipe) {
             advance(); // |
-            _ = parseTypeExpr(); // recursive
+            const inner = parseTypeExpr();
+            if (inner.kind == 0) break; // prevent infinite loop
         }
-        kind = 12; // union
+        kind = 12;
     }
 
     // Handle intersection: Type & Type
     if (peek() == .ampersand) {
         while (peek() == .ampersand) {
             advance(); // &
-            _ = parseTypeExpr();
+            const inner = parseTypeExpr();
+            if (inner.kind == 0) break;
         }
     }
+
+    // Safety: if we didn't advance at all, force advance to prevent infinite loop
+    if (tpos == start_pos) advance();
 
     const end_pos = tokenStart();
     return TypeRef{ .kind = kind, .start = start, .len = @intCast(if (end_pos > start) end_pos - start else 1) };
@@ -281,6 +270,7 @@ fn parseFuncDecl(flags: u8) void {
 
     // Parse parameters
     while (peek() != .close_paren and peek() != .eof) {
+        const param_prev = tpos;
         // Skip modifiers: readonly, public, private, protected
         if (peek() == .kw_readonly) advance();
 
@@ -331,6 +321,8 @@ fn parseFuncDecl(flags: u8) void {
         // Skip destructuring patterns { a, b } or [ a, b ]
         if (peek() == .open_brace) skipBalanced(.open_brace, .close_brace);
         if (peek() == .open_bracket) skipBalanced(.open_bracket, .close_bracket);
+        // Safety: must advance to prevent infinite loop
+        if (tpos == param_prev) advance();
     }
     if (expect(.close_paren)) {
         // Return type
@@ -446,6 +438,7 @@ pub fn doParse(src_ptr: [*]const u8, src_len: u32) u32 {
     tpos = 0;
     node_count = 0;
     while (tpos < tc and peek() != .eof) {
+        const prev = tpos;
         var flags: u8 = 0;
         if (peek() == .kw_export) {
             flags |= 4;
@@ -461,6 +454,7 @@ pub fn doParse(src_ptr: [*]const u8, src_len: u32) u32 {
             .kw_import => parseImportDecl(),
             else => advance(),
         }
+        if (tpos == prev) advance(); // safety guard
     }
     return node_count;
 }
@@ -475,6 +469,7 @@ export fn parse(src_ptr: [*]const u8, src_len: u32) u32 {
     node_count = 0;
 
     while (tpos < tc and peek() != .eof) {
+        const prev_pos = tpos; // guard: must advance
         var flags: u8 = 0;
         if (peek() == .kw_export) {
             flags |= 4;
@@ -483,7 +478,7 @@ export fn parse(src_ptr: [*]const u8, src_len: u32) u32 {
                 peek() == .kw_const or peek() == .kw_let or peek() == .kw_var) {
                 // continue to parse the declaration
             } else {
-                advance(); // skip export default / export { }
+                advance();
                 continue;
             }
         }
@@ -499,6 +494,8 @@ export fn parse(src_ptr: [*]const u8, src_len: u32) u32 {
             .kw_import => parseImportDecl(),
             else => advance(),
         }
+        // Safety: if no progress, force advance to prevent infinite loop
+        if (tpos == prev_pos) advance();
     }
     return node_count;
 }
