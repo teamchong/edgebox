@@ -113,19 +113,15 @@ static void WriteStdoutCallback(const v8::FunctionCallbackInfo<v8::Value>& args)
 static void WriteStderrCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void HashCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void ExitCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
-static void RegisterTypeCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
-static void RegisterMemberCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
-static void RegisterUnionCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
-static void CheckStructuralCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void RootCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void WriteFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
-static void IsSimpleTypeRelatedCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void ClaimFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
-static void IOStatsCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void SubmitResultCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void WorkerDoneCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void SignalProgramReadyCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void WaitProgramReadyCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+// Dead stubs — type system migrated to WasmGC. Kept for external_refs compatibility.
+static void NoopCallback(const v8::FunctionCallbackInfo<v8::Value>&) {}
 
 // ── Snapshot: pre-compile TypeScript for instant worker startup ──
 
@@ -156,15 +152,15 @@ static const intptr_t g_external_refs[] = {
   reinterpret_cast<intptr_t>(WriteStderrCallback),
   reinterpret_cast<intptr_t>(HashCallback),
   reinterpret_cast<intptr_t>(ExitCallback),
-  reinterpret_cast<intptr_t>(RegisterTypeCallback),
-  reinterpret_cast<intptr_t>(RegisterMemberCallback),
-  reinterpret_cast<intptr_t>(RegisterUnionCallback),
-  reinterpret_cast<intptr_t>(CheckStructuralCallback),
+  reinterpret_cast<intptr_t>(NoopCallback), // was RegisterType — migrated to WasmGC
+  reinterpret_cast<intptr_t>(NoopCallback), // was RegisterMember
+  reinterpret_cast<intptr_t>(NoopCallback), // was RegisterUnion
+  reinterpret_cast<intptr_t>(NoopCallback), // was CheckStructural
   reinterpret_cast<intptr_t>(ClaimFileCallback),
-  reinterpret_cast<intptr_t>(IOStatsCallback),
+  reinterpret_cast<intptr_t>(NoopCallback), // was IOStats
   reinterpret_cast<intptr_t>(RootCallback),
   reinterpret_cast<intptr_t>(WriteFileCallback),
-  reinterpret_cast<intptr_t>(IsSimpleTypeRelatedCallback),
+  reinterpret_cast<intptr_t>(NoopCallback), // was IsSimpleTypeRelated
   reinterpret_cast<intptr_t>(SubmitResultCallback),
   reinterpret_cast<intptr_t>(WorkerDoneCallback),
   reinterpret_cast<intptr_t>(SignalProgramReadyCallback),
@@ -194,17 +190,14 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
     global->Set(isolate, "__edgebox_write_stderr", v8::FunctionTemplate::New(isolate, WriteStderrCallback));
     global->Set(isolate, "__edgebox_hash", v8::FunctionTemplate::New(isolate, HashCallback));
     global->Set(isolate, "__edgebox_exit", v8::FunctionTemplate::New(isolate, ExitCallback));
-    global->Set(isolate, "__edgebox_register_type", v8::FunctionTemplate::New(isolate, RegisterTypeCallback));
-    global->Set(isolate, "__edgebox_register_member", v8::FunctionTemplate::New(isolate, RegisterMemberCallback));
-    global->Set(isolate, "__edgebox_register_union", v8::FunctionTemplate::New(isolate, RegisterUnionCallback));
-    global->Set(isolate, "__edgebox_check_structural", v8::FunctionTemplate::New(isolate, CheckStructuralCallback));
+    // Type system callbacks removed — migrated to WasmGC (type_flags_gc.wasm, soa_gc.wasm)
     global->Set(isolate, "__edgebox_claim_file", v8::FunctionTemplate::New(isolate, ClaimFileCallback));
     global->Set(isolate, "__edgebox_signal_program_ready", v8::FunctionTemplate::New(isolate, SignalProgramReadyCallback));
     global->Set(isolate, "__edgebox_wait_program_ready", v8::FunctionTemplate::New(isolate, WaitProgramReadyCallback));
-    global->Set(isolate, "__edgebox_io_stats", v8::FunctionTemplate::New(isolate, IOStatsCallback));
+    // IOStats removed — migrated to WasmGC
     global->Set(isolate, "__edgebox_root", v8::FunctionTemplate::New(isolate, RootCallback));
     global->Set(isolate, "__edgebox_write_file", v8::FunctionTemplate::New(isolate, WriteFileCallback));
-    global->Set(isolate, "__edgebox_is_simple_type_related", v8::FunctionTemplate::New(isolate, IsSimpleTypeRelatedCallback));
+    // IsSimpleTypeRelated removed — migrated to WasmGC
     global->Set(isolate, "__edgebox_submit_result", v8::FunctionTemplate::New(isolate, SubmitResultCallback));
     global->Set(isolate, "__edgebox_worker_done", v8::FunctionTemplate::New(isolate, WorkerDoneCallback));
     auto context = v8::Context::New(isolate, nullptr, global);
@@ -390,68 +383,10 @@ static void ExitCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
 }
 
 // Type system: register types/members in Zig flat arrays for SIMD check
-extern void edgebox_register_type(unsigned int type_id, unsigned int flags, unsigned int object_flags);
-extern void edgebox_register_member(unsigned int type_id, const char* name, int name_len, unsigned int member_type_id, unsigned int member_flags);
-extern unsigned char edgebox_check_structural(unsigned int source_id, unsigned int target_id);
-extern void edgebox_register_union(unsigned int type_id, const unsigned int* member_ids, int member_count);
-
-static void RegisterTypeCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  if (args.Length() < 2) return;
-  auto ctx = args.GetIsolate()->GetCurrentContext();
-  unsigned int id = args[0]->Uint32Value(ctx).FromMaybe(0);
-  unsigned int flags = args[1]->Uint32Value(ctx).FromMaybe(0);
-  edgebox_register_type(id, flags, 0);
-}
-
-static void RegisterMemberCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  if (args.Length() < 4) return;
-  auto ctx = args.GetIsolate()->GetCurrentContext();
-  unsigned int typeId = args[0]->Uint32Value(ctx).FromMaybe(0);
-  auto name = GetStringArg(args, 1);
-  unsigned int memberTypeId = args[2]->Uint32Value(ctx).FromMaybe(0);
-  unsigned int memberFlags = args[3]->Uint32Value(ctx).FromMaybe(0);
-  edgebox_register_member(typeId, name.c_str(), name.size(), memberTypeId, memberFlags);
-}
-
-static void RegisterUnionCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  if (args.Length() < 2) return;
-  auto ctx = args.GetIsolate()->GetCurrentContext();
-  unsigned int typeId = args[0]->Uint32Value(ctx).FromMaybe(0);
-  // args[1] is array of member type IDs
-  if (!args[1]->IsArray()) return;
-  auto arr = args[1].As<v8::Array>();
-  unsigned int len = arr->Length();
-  if (len == 0 || len > 1000) return;
-  unsigned int ids[1000];
-  for (unsigned int i = 0; i < len; i++) {
-    auto val = arr->Get(ctx, i);
-    ids[i] = val.IsEmpty() ? 0 : val.ToLocalChecked()->Uint32Value(ctx).FromMaybe(0);
-  }
-  edgebox_register_union(typeId, ids, len);
-}
-
-static void CheckStructuralCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  if (args.Length() < 2) return;
-  auto ctx = args.GetIsolate()->GetCurrentContext();
-  unsigned int src = args[0]->Uint32Value(ctx).FromMaybe(0);
-  unsigned int tgt = args[1]->Uint32Value(ctx).FromMaybe(0);
-  args.GetReturnValue().Set(v8::Number::New(args.GetIsolate(), edgebox_check_structural(src, tgt)));
-}
-
+// Type system externs removed — migrated to WasmGC
 extern const char* edgebox_root(int* out_len);
-extern unsigned char edgebox_is_simple_type_related(unsigned int src_flags, unsigned int tgt_flags, unsigned int relation, unsigned int strict_null);
 extern unsigned int edgebox_claim_file();
 extern void edgebox_reset_work();
-
-static void IsSimpleTypeRelatedCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  if (args.Length() < 4) return;
-  auto ctx = args.GetIsolate()->GetCurrentContext();
-  unsigned int sf = args[0]->Uint32Value(ctx).FromMaybe(0);
-  unsigned int tf = args[1]->Uint32Value(ctx).FromMaybe(0);
-  unsigned int rel = args[2]->Uint32Value(ctx).FromMaybe(0);
-  unsigned int sn = args[3]->Uint32Value(ctx).FromMaybe(0);
-  args.GetReturnValue().Set(v8::Number::New(args.GetIsolate(), edgebox_is_simple_type_related(sf, tf, rel, sn)));
-}
 
 static void WriteFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
   if (args.Length() < 2) return;
@@ -482,20 +417,6 @@ static void WaitProgramReadyCallback(const v8::FunctionCallbackInfo<v8::Value>& 
   edgebox_wait_program_ready();
 }
 
-extern void edgebox_io_stats(unsigned long long* fe_calls, unsigned long long* fe_cached, unsigned long long* de_calls, unsigned long long* de_cached);
-
-static void IOStatsCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  unsigned long long fe_calls = 0, fe_cached = 0, de_calls = 0, de_cached = 0;
-  edgebox_io_stats(&fe_calls, &fe_cached, &de_calls, &de_cached);
-  auto* iso = args.GetIsolate();
-  auto ctx = iso->GetCurrentContext();
-  auto obj = v8::Object::New(iso);
-  obj->Set(ctx, v8::String::NewFromUtf8Literal(iso, "fileExistsCalls"), v8::Number::New(iso, (double)fe_calls)).Check();
-  obj->Set(ctx, v8::String::NewFromUtf8Literal(iso, "fileExistsCached"), v8::Number::New(iso, (double)fe_cached)).Check();
-  obj->Set(ctx, v8::String::NewFromUtf8Literal(iso, "dirExistsCalls"), v8::Number::New(iso, (double)de_calls)).Check();
-  obj->Set(ctx, v8::String::NewFromUtf8Literal(iso, "dirExistsCached"), v8::Number::New(iso, (double)de_cached)).Check();
-  args.GetReturnValue().Set(obj);
-}
 
 extern void edgebox_submit_result(int worker_id, const char* data, int data_len);
 extern void edgebox_worker_done(int worker_id);
@@ -566,11 +487,7 @@ void* edgebox_v8_setup_context(void* iso_ptr) {
     set("__edgebox_hash", HashCallback);
     set("__edgebox_exit", ExitCallback);
     set("__edgebox_submit_result", SubmitResultCallback);
-    set("__edgebox_register_type", RegisterTypeCallback);
-    set("__edgebox_register_member", RegisterMemberCallback);
-    set("__edgebox_register_union", RegisterUnionCallback);
-    set("__edgebox_check_structural", CheckStructuralCallback);
-    set("__edgebox_io_stats", IOStatsCallback);
+    // Type system callbacks removed — all in WasmGC now
     set("__edgebox_claim_file", ClaimFileCallback);
     set("__edgebox_signal_program_ready", SignalProgramReadyCallback);
     set("__edgebox_wait_program_ready", WaitProgramReadyCallback);
