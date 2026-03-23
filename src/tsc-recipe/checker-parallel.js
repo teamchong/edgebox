@@ -83,6 +83,33 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   var NL = String.fromCharCode(10);
   var output = [];
 
+  // Register types in Zig flat arrays (zero-copy, SIMD-ready)
+  if (!globalThis.__typesRegistered || !globalThis.__typesRegistered[ck]) {
+    var checker = program.getTypeChecker();
+    var seenTypes = {};
+    for (var fi = 0; fi < files.length; fi++) {
+      ts.forEachChild(files[fi], function visit(node) {
+        try {
+          var type = checker.getTypeAtLocation(node);
+          if (type && type.id && !seenTypes[type.id]) {
+            seenTypes[type.id] = true;
+            __edgebox_register_type(type.id, type.flags || 0);
+            var props = checker.getPropertiesOfType(type);
+            for (var p = 0; p < props.length && p < 50; p++) {
+              var prop = props[p];
+              var pt = checker.getTypeOfSymbol(prop);
+              if (prop.escapedName && pt && pt.id)
+                __edgebox_register_member(type.id, prop.escapedName, pt.id, prop.flags || 0);
+            }
+          }
+        } catch(e) {}
+        ts.forEachChild(node, visit);
+      });
+    }
+    if (!globalThis.__typesRegistered) globalThis.__typesRegistered = {};
+    globalThis.__typesRegistered[ck] = true;
+  }
+
   if (workerId === 0) {
     var gd = ts.getPreEmitDiagnostics(program).filter(function(d) { return !d.file; });
     for (var g = 0; g < gd.length; g++)

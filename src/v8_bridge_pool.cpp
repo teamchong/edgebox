@@ -265,6 +265,37 @@ static void ExitCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
   (void)args;
 }
 
+// Type system: register types/members in Zig flat arrays for SIMD check
+extern void edgebox_register_type(unsigned int type_id, unsigned int flags, unsigned int object_flags);
+extern void edgebox_register_member(unsigned int type_id, const char* name, int name_len, unsigned int member_type_id, unsigned int member_flags);
+extern unsigned char edgebox_check_structural(unsigned int source_id, unsigned int target_id);
+
+static void RegisterTypeCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 2) return;
+  auto ctx = args.GetIsolate()->GetCurrentContext();
+  unsigned int id = args[0]->Uint32Value(ctx).FromMaybe(0);
+  unsigned int flags = args[1]->Uint32Value(ctx).FromMaybe(0);
+  edgebox_register_type(id, flags, 0);
+}
+
+static void RegisterMemberCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 4) return;
+  auto ctx = args.GetIsolate()->GetCurrentContext();
+  unsigned int typeId = args[0]->Uint32Value(ctx).FromMaybe(0);
+  auto name = GetStringArg(args, 1);
+  unsigned int memberTypeId = args[2]->Uint32Value(ctx).FromMaybe(0);
+  unsigned int memberFlags = args[3]->Uint32Value(ctx).FromMaybe(0);
+  edgebox_register_member(typeId, name.c_str(), name.size(), memberTypeId, memberFlags);
+}
+
+static void CheckStructuralCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 2) return;
+  auto ctx = args.GetIsolate()->GetCurrentContext();
+  unsigned int src = args[0]->Uint32Value(ctx).FromMaybe(0);
+  unsigned int tgt = args[1]->Uint32Value(ctx).FromMaybe(0);
+  args.GetReturnValue().Set(v8::Number::New(args.GetIsolate(), edgebox_check_structural(src, tgt)));
+}
+
 extern void edgebox_submit_result(int worker_id, const char* data, int data_len);
 extern void edgebox_worker_done(int worker_id);
 
@@ -343,6 +374,9 @@ void* edgebox_v8_setup_context(void* iso_ptr) {
   set("__edgebox_hash", HashCallback);
   set("__edgebox_exit", ExitCallback);
   set("__edgebox_submit_result", SubmitResultCallback);
+  set("__edgebox_register_type", RegisterTypeCallback);
+  set("__edgebox_register_member", RegisterMemberCallback);
+  set("__edgebox_check_structural", CheckStructuralCallback);
   set("__edgebox_worker_done", WorkerDoneCallback);
 
   auto* persistent = new v8::Persistent<v8::Context>(isolate, context);
