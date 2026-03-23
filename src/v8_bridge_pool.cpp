@@ -40,7 +40,9 @@ void edgebox_v8_init() {
   // V8 flags optimized for cold start type checking:
   // --concurrent-sparkplug: baseline JIT on background threads
   // --max-semi-space-size=16: larger young gen reduces GC during type creation (47K types)
-  const char* flags = "--max-old-space-size=4096 --concurrent-sparkplug --max-semi-space-size=16";
+  // --turbo-inline-js-wasm-calls: enable TurboFan inlining of WasmGC functions into JS
+  // V8 source: requires kInlineJSToWasmCalls flag + supported GC instructions only
+  const char* flags = "--max-old-space-size=4096 --concurrent-sparkplug --max-semi-space-size=16 --turbo-inline-js-wasm-calls";
   v8__V8__SetFlagsFromString(flags, strlen(flags));
   // 8 platform threads for background JIT compilation across 8 V8 isolates
   g_platform = v8__Platform__NewDefaultPlatform(8, false);

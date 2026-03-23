@@ -276,27 +276,36 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         result = csf_result;
     }
 
-    // Patch 3: isTypeRelatedTo — WASM fast path for flag-based type relations.
-    // Positive-only: returns true when flags prove types related, else falls through to JS.
+    // Patch 3: isTypeRelatedTo — TypedArray flag check (NOT WASM call).
+    // V8 study showed: WASM body inlining only supports GC instructions (struct/array),
+    // NOT i32 arithmetic. Our kernel's bitwise ops CAN'T be inlined by TurboFan.
+    // Instead: read flags from TypedArray (globalThis.__typeFlags) directly in JS.
+    // V8 TurboFan compiles TypedArray[idx] to a single x86 MOV instruction.
+    // No WASM call boundary, no argument marshaling. Pure TurboFan-optimizable JS.
     const itr_needle = "function isTypeRelatedTo(source, target, relation) {";
-    // CRITICAL: only access regularType on Freshable types (flags & 2976).
-    // Unconditional regularType access causes V8 Maglev deoptimizations
-    // ("wrong map") because most types don't have regularType property.
-    // Each deopt wastes ~1ms recompilation × 4 deopts = 4ms + cold IC rebuild.
     const itr_inject = "function isTypeRelatedTo(source, target, relation) {" ++
-        "var _zr=globalThis.__zigRegistry;" ++
-        "if(_zr&&relation!==identityRelation){" ++
-        // Match TSC's isFreshLiteralType pattern exactly
+        "var _tf=globalThis.__typeFlags;" ++
+        "if(_tf&&relation!==identityRelation){" ++
         "var _s=(source.flags&2976)&&source.freshType===source?source.regularType:source;" ++
         "var _t=(target.flags&2976)&&target.freshType===target?target.regularType:target;" ++
         "if(_s===_t)return true;" ++
         "var _si=_s.id,_ti=_t.id;" ++
         "if(_si<65536&&_ti<65536){" ++
-        "var _r=_zr.isTypeRelated(_si|0,_ti|0," ++
-        "(relation===assignableRelation?0:relation===comparableRelation?1:2)|0," ++
-        "(strictNullChecks?1:0)|0);" ++
-        "if(_r===1)return true;" ++
-        "}}";
+        // Read flags from TypedArray — TurboFan compiles to direct memory load
+        "var s=_tf[_si],t=_tf[_ti];" ++
+        "if(s&&t){" ++
+        // Flag-based positive checks (same logic as WASM kernel, but in JS for TurboFan)
+        "if(t&1||s&131072)return true;" ++ // target Any or source Never
+        "if(t&2)return true;" ++ // target Unknown
+        "if(s&402653316&&t&4)return true;" ++ // StringLike→String
+        "if(s&296&&t&8)return true;" ++ // NumberLike→Number
+        "if(s&2112&&t&64)return true;" ++ // BigIntLike→BigInt
+        "if(s&528&&t&16)return true;" ++ // BooleanLike→Boolean
+        "if(s&12288&&t&4096)return true;" ++ // ESSymbolLike→ESSymbol
+        "if(s&32768&&(t&49152))return true;" ++ // Undefined→Undefined|Void
+        "if(s&65536&&t&65536)return true;" ++ // Null→Null
+        "if(s&524288&&t&67108864)return true;" ++ // Object→NonPrimitive
+        "}}}";
 
     const itr_idx = std.mem.indexOf(u8, result, itr_needle) orelse {
         _ = std.posix.write(2, "[v8pool] FATAL: isTypeRelatedTo needle not found\n") catch {};
