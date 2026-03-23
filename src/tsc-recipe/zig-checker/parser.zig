@@ -99,7 +99,23 @@ fn parseTypeAnnotation() TypeRef {
     // : Type
     if (peek() != .colon) return NO_TYPE;
     advance(); // skip :
-    return parseTypeExpr();
+    const start = tokenStart();
+    const result = parseTypeExpr();
+    if (result.kind > 0) return result;
+    // Complex type we can't parse — skip to next delimiter but mark as "has type"
+    var depth: u32 = 0;
+    while (peek() != .eof) {
+        // Stop at: , ) ; { = (at top level)
+        if (depth == 0) {
+            if (peek() == .comma or peek() == .close_paren or peek() == .semicolon or peek() == .open_brace or peek() == .equals) break;
+        }
+        if (peek() == .open_paren or peek() == .open_bracket or peek() == .less_than) depth += 1;
+        if (peek() == .close_paren or peek() == .close_bracket or peek() == .greater_than) {
+            if (depth > 0) depth -= 1 else break;
+        }
+        advance();
+    }
+    return TypeRef{ .kind = 11, .start = start, .len = @intCast(if (tokenStart() > start) tokenStart() - start else 1) };
 }
 
 /// Parse a type expression. Handles:
