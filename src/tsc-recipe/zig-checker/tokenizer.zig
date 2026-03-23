@@ -263,6 +263,38 @@ fn scanToken() void {
     }
 }
 
+// ── Public API (for use by other Zig modules) ──
+
+pub fn getWasmTokenKind(idx: u32) u8 {
+    if (idx >= token_count) return 0;
+    return @intFromEnum(tokens[idx].kind);
+}
+
+pub fn getWasmTokenStart(idx: u32) u32 {
+    if (idx >= token_count) return 0;
+    return tokens[idx].start;
+}
+
+pub fn getWasmTokenLen(idx: u32) u16 {
+    if (idx >= token_count) return 0;
+    return tokens[idx].len;
+}
+
+pub fn getWasmTokenCount() u32 {
+    return token_count;
+}
+
+pub fn doTokenize(src_ptr: [*]const u8, src_len: u32) u32 {
+    src = src_ptr[0..src_len];
+    pos = 0;
+    token_count = 0;
+    while (pos < src.len and token_count < MAX_TOKENS - 1) {
+        scanToken();
+        if (tokens[token_count - 1].kind == .eof) break;
+    }
+    return token_count;
+}
+
 // ── WASM Exports ──
 
 export fn tokenize(src_ptr: [*]const u8, src_len: u32) u32 {
