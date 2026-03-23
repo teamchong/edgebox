@@ -242,7 +242,22 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
     // Injection point marker — space for future optimizations.
     // TSC's checkTypeRelatedTo is context-dependent (not a pure function),
     // so caching its results externally is unsafe. TSC's own relation cache handles this.
+    // Data materialization: store type flags in a flat Uint32Array.
+    // Eliminates megamorphic LoadIC_Megamorphic (15.4% of TSC execution time).
+    // TypedArray access is monomorphic — V8 optimizes it perfectly.
     const zig_check = "/* edgebox: injection point */\n    ";
+
+    // Third injection: patch createType to materialize flags into flat Uint32Array.
+    // This eliminates megamorphic LoadIC_Megamorphic (15.4% of TSC time).
+    const create_marker = "result.id = typeCount;";
+    const create_pos = std.mem.indexOf(u8, src, create_marker) orelse null;
+    const create_inject = if (create_pos != null)
+        // After "result.id = typeCount;", add flat array write
+        "result.id = typeCount;\n" ++
+        "    if (!globalThis.__ebF) globalThis.__ebF = new Uint32Array(131072);\n" ++
+        "    globalThis.__ebF[typeCount] = flags;\n"
+    else
+        null;
 
     // Second transform: inject WASM fast path into isSimpleTypeRelatedTo.
     // The Zig kernel handles pure flag comparisons (~80% of calls).
@@ -291,8 +306,10 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
             "      var __wi = new WebAssembly.Instance(__wm);\n" ++
             "      globalThis.__ebWasmTypeKernel = __wi.exports.isSimpleTypeRelated;\n" ++
             "    }}\n" ++
+            "    var __sf = (globalThis.__ebF && source.id) ? globalThis.__ebF[source.id] : source.flags;\n" ++
+            "    var __tf = (globalThis.__ebF && target.id) ? globalThis.__ebF[target.id] : target.flags;\n" ++
             "    var __rel = relation === assignableRelation ? 0 : relation === comparableRelation ? 1 : relation === strictSubtypeRelation ? 2 : 3;\n" ++
-            "    var __r = globalThis.__ebWasmTypeKernel(source.flags, target.flags, __rel, strictNullChecks ? 1 : 0);\n" ++
+            "    var __r = globalThis.__ebWasmTypeKernel(__sf, __tf, __rel, strictNullChecks ? 1 : 0);\n" ++
             "    if (__r === 1) return true;\n"
         , .{bytes_js}) catch "";
         alloc.free(bytes_js);
@@ -304,17 +321,45 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         // Fallback to C ABI callback
         wasm_fast_path =
             "\n    /* edgebox: C ABI fallback (no WASM) */\n" ++
+            "    var __sf = (globalThis.__ebF && source.id) ? globalThis.__ebF[source.id] : source.flags;\n" ++
+            "    var __tf = (globalThis.__ebF && target.id) ? globalThis.__ebF[target.id] : target.flags;\n" ++
             "    var __rel = relation === assignableRelation ? 0 : relation === comparableRelation ? 1 : relation === strictSubtypeRelation ? 2 : 3;\n" ++
-            "    var __r = __edgebox_is_simple_type_related(source.flags, target.flags, __rel, strictNullChecks ? 1 : 0);\n" ++
+            "    var __r = __edgebox_is_simple_type_related(__sf, __tf, __rel, strictNullChecks ? 1 : 0);\n" ++
             "    if (__r === 1) return true;\n";
     }
 
-    // isSimpleTypeRelatedTo (line ~69244) comes BEFORE inject_pos (line ~69304)
-    // Order: src[0..simple_body_start] + wasm + src[simple_body_start..inject_pos] + zig_check + src[inject_pos..]
-    const seg1 = src[0..simple_body_start]; // up to isSimpleTypeRelatedTo body
-    const seg2 = src[simple_body_start..inject_pos]; // between the two injection points
-    const seg3 = src[inject_pos..]; // rest (including checkTypeRelatedTo)
+    // Three injection points (ordered by position in source):
+    // 1. createType (line ~54646): materialize flags into flat array
+    // 2. isSimpleTypeRelatedTo (line ~69244): WASM kernel for flag checks
+    // 3. isTypeRelatedTo (line ~69304): injection point marker
+    //
+    // Build segments and assemble
+    if (create_pos) |cp| {
+        const cp_end = cp + create_marker.len;
+        // 5 segments: before createType | createType patch | middle to simple | wasm | middle to inject | zig_check | rest
+        const s1 = src[0..cp]; // before createType
+        const s2 = create_inject.?;
+        const s3 = src[cp_end..simple_body_start]; // createType to isSimpleTypeRelatedTo
+        const s4 = wasm_fast_path;
+        const s5 = src[simple_body_start..inject_pos]; // isSimpleTypeRelatedTo to isTypeRelatedTo
+        const s6 = zig_check;
+        const s7 = src[inject_pos..]; // rest
 
+        const total = s1.len + s2.len + s3.len + s4.len + s5.len + s6.len + s7.len;
+        const result = try alloc.alloc(u8, total);
+        var pos: usize = 0;
+        inline for (.{ s1, s2, s3, s4, s5, s6, s7 }) |seg| {
+            @memcpy(result[pos .. pos + seg.len], seg);
+            pos += seg.len;
+        }
+        _ = std.posix.write(2, "[recipe] transform: createType materialization + WASM kernel + injection point\n") catch {};
+        return result;
+    }
+
+    // Fallback: no createType patch (2 injection points only)
+    const seg1 = src[0..simple_body_start];
+    const seg2 = src[simple_body_start..inject_pos];
+    const seg3 = src[inject_pos..];
     const total = seg1.len + wasm_fast_path.len + seg2.len + zig_check.len + seg3.len;
     const result = try alloc.alloc(u8, total);
     var pos: usize = 0;
@@ -323,7 +368,7 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
     @memcpy(result[pos .. pos + seg2.len], seg2); pos += seg2.len;
     @memcpy(result[pos .. pos + zig_check.len], zig_check); pos += zig_check.len;
     @memcpy(result[pos .. pos + seg3.len], seg3);
-    _ = std.posix.write(2, "[recipe] transform: WASM isSimpleTypeRelated kernel + injection point\n") catch {};
+    _ = std.posix.write(2, "[recipe] transform: WASM kernel + injection point (no createType)\n") catch {};
     return result;
 }
 
