@@ -292,38 +292,8 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         }
     }
 
-    // 3. WASM relation cache (replaces TSC's Map<string, result> with integer hash)
-    if (loadWasmFile("relation_cache.wasm")) |cache_data| {
-        const cache_js = encodeWasmBytes(cache_data) catch "";
-        if (cache_js.len > 0) {
-            const cache_init = std.fmt.allocPrint(alloc,
-                "function isTypeRelatedTo(source, target, relation) {{\n" ++
-                "    if (!globalThis.__ebRC) {{ var b=new Uint8Array([{s}]); var i=new WebAssembly.Instance(new WebAssembly.Module(b)); globalThis.__ebRC=i.exports; }}\n" ++
-                "    if (source.id && target.id) {{ var cr=globalThis.__ebRC.cacheGet(source.id,target.id,0); if(cr>0) return !!(cr&1); }}\n",
-                .{cache_js},
-            ) catch null;
-            alloc.free(cache_js);
-            if (cache_init) |ci| {
-                const prev = result;
-                result = replaceFirst(result,
-                    "function isTypeRelatedTo(source, target, relation) {",
-                    ci,
-                ) catch result;
-                if (result.ptr != prev.ptr) { transforms += 1; _ = std.posix.write(2, "[recipe] + WASM relation cache\n") catch {}; }
-            }
-
-            // Inject cache POPULATE: when TSC's Map returns a hit, also store in WASM cache.
-            // This builds the WASM cache from TSC's own verified results.
-            const prev2 = result;
-            result = replaceFirst(result,
-                "if (related !== void 0) {\n        return !!(related & 1 /* Succeeded */);",
-                "if (related !== void 0) {\n" ++
-                "        if(globalThis.__ebRC && source.id && target.id) globalThis.__ebRC.cacheSet(source.id,target.id,0,related);\n" ++
-                "        return !!(related & 1);",
-            ) catch result;
-            if (result.ptr != prev2.ptr) { transforms += 1; _ = std.posix.write(2, "[recipe] + WASM cache populate from Map hits\n") catch {}; }
-        }
-    }
+    // Note: getRelationKey returns a string that TSC also uses for .startsWith() parsing.
+    // Cannot replace with integer keys — TSC depends on string format.
 
     {
         var msg_buf: [64]u8 = undefined;
