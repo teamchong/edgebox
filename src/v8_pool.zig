@@ -354,7 +354,9 @@ fn workerLoop(worker_id: u32) void {
                 \\      }}
                 \\    }}
                 \\  }}
-                \\  return output.join(String.fromCharCode(10));
+                \\  var result = output.join(String.fromCharCode(10));
+                \\  __edgebox_write_stderr('[worker' + wid + '] ' + output.length + ' diagnostics' + String.fromCharCode(10));
+                \\  return result;
                 \\}})()
             , .{ cwd, wid, workers[wid].worker_count }) catch {
                 workers[wid].result = null;
