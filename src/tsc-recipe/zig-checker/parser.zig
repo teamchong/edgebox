@@ -315,6 +315,42 @@ fn parseImportDecl() void {
     _ = start;
 }
 
+// ── Public API (for use by checker.zig) ──
+
+pub fn nodeCount() u32 { return node_count; }
+pub fn nodeKind(idx: u32) u8 { if (idx >= node_count) return 0; return @intFromEnum(nodes[idx].kind); }
+pub fn nodeNameStart(idx: u32) u32 { if (idx >= node_count) return 0; return nodes[idx].name_start; }
+pub fn nodeNameLen(idx: u32) u16 { if (idx >= node_count) return 0; return nodes[idx].name_len; }
+pub fn nodeTypeKind(idx: u32) u8 { if (idx >= node_count) return 0; return nodes[idx].type_ref.kind; }
+pub fn nodeInitTypeKind(idx: u32) u8 { if (idx >= node_count) return 0; return nodes[idx].init_type.kind; }
+pub fn nodeFlags(idx: u32) u8 { if (idx >= node_count) return 0; return nodes[idx].flags; }
+pub fn nodeParent(idx: u32) u16 { if (idx >= node_count) return 0; return nodes[idx].parent; }
+
+pub fn doParse(src_ptr: [*]const u8, src_len: u32) u32 {
+    _ = tokenizer.doTokenize(src_ptr, src_len);
+    tc = tokenizer.getWasmTokenCount();
+    tpos = 0;
+    node_count = 0;
+    while (tpos < tc and peek() != .eof) {
+        var flags: u8 = 0;
+        if (peek() == .kw_export) {
+            flags |= 4;
+            advance();
+            if (peek() == .kw_function or peek() == .kw_interface or peek() == .kw_type or
+                peek() == .kw_const or peek() == .kw_let or peek() == .kw_var) {} else { advance(); continue; }
+        }
+        switch (peek()) {
+            .kw_const, .kw_let, .kw_var => parseVarDecl(flags),
+            .kw_function, .kw_async => { if (peek() == .kw_async) advance(); if (peek() == .kw_function) parseFuncDecl(flags) else advance(); },
+            .kw_interface => parseInterfaceDecl(flags),
+            .kw_type => parseTypeAlias(flags),
+            .kw_import => parseImportDecl(),
+            else => advance(),
+        }
+    }
+    return node_count;
+}
+
 // ── WASM Exports ──
 
 export fn parse(src_ptr: [*]const u8, src_len: u32) u32 {
