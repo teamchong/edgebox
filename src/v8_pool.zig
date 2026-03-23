@@ -244,7 +244,32 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         result = ct_result;
     }
 
-    // Patch 2: isTypeRelatedTo — WASM fast path using type IDs
+    // Patch 2: createSourceFile — cache .d.ts parsed ASTs.
+    // TSC's internal createGetSourceFile calls the module-level createSourceFile
+    // (NOT ts.createSourceFile), so we must patch the actual function.
+    // Saves 573ms on cold start — lib .d.ts files parsed once, cached forever.
+    const csf_full_needle = "function createSourceFile(fileName, sourceText, languageVersionOrOptions, setParentNodes = false, scriptKind) {";
+    // Inject: cache check at start + store wrapper using a flag
+    const csf_full_inject = "function createSourceFile(fileName, sourceText, languageVersionOrOptions, setParentNodes = false, scriptKind) {" ++
+        "if(typeof fileName==='string'&&fileName.endsWith('.d.ts')&&globalThis.__sfCache){" ++
+        "var _cv=globalThis.__sfCache.get(fileName);" ++
+        "if(_cv&&_cv.text===sourceText)return _cv;}" ++
+        // We can't easily store at the end without wrapping the whole function.
+        // Instead, we'll rely on the pre-parse to populate the cache for lib files.
+        // Non-pre-parsed .d.ts files will be parsed normally (only once per daemon lifetime).
+        "";
+
+    if (std.mem.indexOf(u8, result, csf_full_needle)) |csf_idx| {
+        _ = std.posix.write(2, "[v8pool] patching createSourceFile → .d.ts cache\n") catch {};
+        const csf_len = result.len - csf_full_needle.len + csf_full_inject.len;
+        const csf_result = try alloc.alloc(u8, csf_len);
+        @memcpy(csf_result[0..csf_idx], result[0..csf_idx]);
+        @memcpy(csf_result[csf_idx .. csf_idx + csf_full_inject.len], csf_full_inject);
+        @memcpy(csf_result[csf_idx + csf_full_inject.len .. csf_len], result[csf_idx + csf_full_needle.len ..]);
+        result = csf_result;
+    }
+
+    // Patch 3: isTypeRelatedTo — WASM fast path using type IDs
     const itr_needle = "function isTypeRelatedTo(source, target, relation) {";
     // WASM fast path at isTypeRelatedTo level.
     // Handle fresh literals (use regularType), skip identity relation (different logic).

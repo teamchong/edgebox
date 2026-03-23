@@ -119,14 +119,26 @@ globalThis.__zigRegistryDone = false;
 })();
 
 // 1. Cache createSourceFile for .d.ts files (lib files parsed identically every time)
+// .d.ts source file cache — shared between recipe wrapper and source injection.
+// Source injection in createSourceFile reads globalThis.__sfCache.
+// Pre-parse populates it. Both paths use the same Map.
+var sfCache = new Map();
+globalThis.__sfCache = sfCache;
 (function() {
   if (!ts || !ts.createSourceFile) return;
   var origCSF = ts.createSourceFile;
-  var sfCache = new Map();
+  globalThis.__sfCacheHits = 0;
+  globalThis.__sfCacheMisses = 0;
+  globalThis.__sfCacheSize = 0;
   ts.createSourceFile = function(fileName, sourceText, langVer, setParent, scriptKind) {
     if (fileName.endsWith('.d.ts')) {
       var cached = sfCache.get(fileName);
-      if (cached && cached.text === sourceText) return cached;
+      if (cached) {
+        if (cached.text === sourceText) { globalThis.__sfCacheHits++; return cached; }
+        globalThis.__sfCacheMisses++;
+      } else {
+        globalThis.__sfCacheMisses++;
+      }
     }
     var result = origCSF.apply(this, arguments);
     if (fileName.endsWith('.d.ts')) sfCache.set(fileName, result);
@@ -200,13 +212,18 @@ globalThis.__zigRegistryDone = false;
       var content = __edgebox_read_file(libDir + libFiles[i]);
       if (content) {
         // Parse and cache via the createSourceFile wrapper (recipe #1)
-        ts.createSourceFile(libDir + libFiles[i], content, 99 /* Latest */, true);
+        var fullPath = libDir + libFiles[i];
+        var sf = ts.createSourceFile(fullPath, content, 99 /* Latest */, true);
+        sfCache.set(fullPath, sf);
         count++;
       }
     }
     if (typeof __edgebox_write_stderr === 'function')
-      __edgebox_write_stderr('[recipe] pre-parsed ' + count + ' lib .d.ts files in snapshot\n');
-  } catch(e) {}
+      __edgebox_write_stderr('[recipe] pre-parsed ' + count + ' lib .d.ts, sfCache size=' + sfCache.size + ', lastSet=' + (globalThis.__lastSfCacheSet||'none') + '\n');
+  } catch(e) {
+    if (typeof __edgebox_write_stderr === 'function')
+      __edgebox_write_stderr('[recipe] pre-parse error: ' + (e && e.stack ? e.stack : String(e)) + '\n');
+  }
 })();
 
 globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
@@ -465,7 +482,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   }
 
   var t3 = Date.now();
-  __edgebox_write_stderr('[recipe] w' + workerId + '/' + workerCount + ' config:' + (t1-t0) + 'ms parse:' + (t2-t1) + 'ms check:' + (t3-t2) + 'ms total:' + (t3-t0) + 'ms files:' + filesChecked + '/' + checkFiles.length + ' wasm:' + (globalThis.__zigTypeKernel ? 'on' : 'off') + String.fromCharCode(10));
+  __edgebox_write_stderr('[recipe] w' + workerId + '/' + workerCount + ' parse:' + (t2-t1) + 'ms check:' + (t3-t2) + 'ms total:' + (t3-t0) + 'ms files:' + filesChecked + '/' + checkFiles.length + ' sfCache:' + (globalThis.__sfCacheHits||0) + 'h/' + (globalThis.__sfCacheMisses||0) + 'm' + String.fromCharCode(10));
   return output.join(NL);
   } catch(e) { return '[recipe-error] w' + workerId + ': ' + (e && e.stack ? e.stack : String(e)); }
 };
