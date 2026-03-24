@@ -276,7 +276,42 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         result = csf_result;
     }
 
-    // Patch 3a: isTypeRelatedTo — call globalThis.__gcCheck (force-compiled by TurboFan).
+    // Patch 3a: setStructuredTypeMembers — compute bloom filter of member names.
+    // When a type's members are resolved, hash all member names into an i32 bloom filter.
+    // Stored in WasmGC array. Used by __gcCheck for Object→Object fast-reject.
+    const ssm_needle = "function setStructuredTypeMembers(type, members, callSignatures, constructSignatures, indexInfos) {";
+    const ssm_inject = "function setStructuredTypeMembers(type, members, callSignatures, constructSignatures, indexInfos) {" ++
+        "var _bid=type.id;" ++
+        "if(_bid>0&&_bid<65536&&members&&members!==emptySymbols&&globalThis.__gcBloomArr&&globalThis.__gcSoa){" ++
+        "var _bloom=0;" ++
+        "members.forEach(function(_v,_k){" ++
+        // Skip optional members — only REQUIRED members matter for structural reject.
+        // If target has optional member 'a', source can omit it and still be compatible.
+        "if(_v.flags&16777216)return;" ++ // SymbolFlags.Optional = 16777216
+        // Each member name hashed INDEPENDENTLY — no carry-over
+        "var _h=0;" ++
+        "for(var _i=0;_i<_k.length;_i++){_h=((_h<<5)|(_h>>>27))^_k.charCodeAt(_i);}" ++
+        // Set 3 bloom bits from this member's hash
+        "_bloom|=(1<<(_h&31))|(1<<((_h>>>5)&31))|(1<<((_h>>>10)&31));" ++
+        "});" ++
+        "if(_bloom)globalThis.__gcSoa.setI32(globalThis.__gcBloomArr,_bid|0,_bloom|0);" ++
+        "}";
+
+    const ssm_idx = std.mem.indexOf(u8, result, ssm_needle) orelse {
+        _ = std.posix.write(2, "[v8pool] FATAL: setStructuredTypeMembers needle not found\n") catch {};
+        return error.NeedleNotFound;
+    };
+    _ = std.posix.write(2, "[v8pool] patching setStructuredTypeMembers → bloom filter\n") catch {};
+    {
+        const ssm_len = result.len - ssm_needle.len + ssm_inject.len;
+        const ssm_result = try alloc.alloc(u8, ssm_len);
+        @memcpy(ssm_result[0..ssm_idx], result[0..ssm_idx]);
+        @memcpy(ssm_result[ssm_idx .. ssm_idx + ssm_inject.len], ssm_inject);
+        @memcpy(ssm_result[ssm_idx + ssm_inject.len .. ssm_len], result[ssm_idx + ssm_needle.len ..]);
+        result = ssm_result;
+    }
+
+    // Patch 3b: isTypeRelatedTo — call globalThis.__gcCheck (force-compiled by TurboFan).
     // __gcCheck is defined in recipe JS and force-compiled via %OptimizeFunctionOnNextCall.
     // This means WasmGC getFlag is TurboFan-inlined from the FIRST call, not after 3000.
     const helper_needle = "function isTypeRelatedTo(source, target, relation) {";

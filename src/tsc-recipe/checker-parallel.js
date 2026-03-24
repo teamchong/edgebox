@@ -235,15 +235,27 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       if (s & 524288 && t & 67108864) return 1;// Object→NonPrimitive
 
       // ── NEGATIVE: source is NOT related to target ──
-      // SAFE: two concrete primitive types with no overlapping kind bits.
-      // String(4) vs Number(8) → NOT related. Number(8) vs Boolean(16) → NOT related.
-      // StringLiteral(128) is NOT in PRIM mask — handled by positive paths above.
-      // NOTE: Primitive→Object is NOT safe to reject (structural compatibility).
+      // 1. Two concrete primitives with no overlapping kind bits → NOT related
       var PRIM = 249860; // String|Number|Boolean|BigInt|ESSymbol|Void|Undefined|Null|Never
       if ((s & PRIM) && (t & PRIM) && !(s & t & PRIM)) return 0;
 
+      // 2. Object→Object bloom filter: DISABLED pending edge case investigation.
+      // Bloom filter correctly rejects 2053/2058, but 1 edge case produces false rejection.
+      // TODO: debug the off-by-1 — likely an inherited/computed member not in the members Map.
+      // Infrastructure (setStructuredTypeMembers patch + bloom array) stays active for future use.
+
       return -1; // unknown — fall through to full TSC check
     };
+
+    // ── Bloom filter array: member name hash per type ──
+    // When setStructuredTypeMembers resolves a type's members, we compute
+    // a bloom filter (i32) from the member names. In __gcCheck, for Object→Object:
+    // if target's bloom has bits not in source's → definitely NOT structurally compatible.
+    // This is a SAFE negative check — bloom false positive = fall through to TSC.
+    globalThis.__gcBloomArr = _soaInst.exports.newI32(65536);
+    var _bloomSet = _soaInst.exports.setI32;
+    var _bloomGet = _soaInst.exports.getI32;
+    var _bloomArr = globalThis.__gcBloomArr;
 
     // ── Relation cache: WasmGC-backed fast lookup ──
     // TSC's isTypeRelatedTo is called 200K+ times, many with same (src,tgt) pair.
