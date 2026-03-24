@@ -477,11 +477,27 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     // Warm without incremental: check all files with cache reuse
     for (var i = 0; i < checkFiles.length; i++) checkFile(checkFiles[i]);
   } else {
-    // Cold: parallel work-stealing with per-file diagnostics.
+    // Cold: parallel work-stealing. Skip diagnostic cache overhead on first cold —
+    // empty cache means every hash + lookup is wasted work.
+    var hasCachedDiags = Object.keys(dc.hashes).length > 0;
     while (true) {
       var idx = __edgebox_claim_file();
       if (idx >= checkFiles.length) break;
-      checkFile(checkFiles[idx]);
+      if (hasCachedDiags) {
+        checkFile(checkFiles[idx]);
+      } else {
+        // Direct check — no hash, no cache lookup, no cache store
+        filesChecked++;
+        var file = checkFiles[idx];
+        var diags = program.getSemanticDiagnostics(file);
+        for (var k = 0; k < diags.length; k++) {
+          var d = diags[k];
+          if (d.file) {
+            var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
+            output.push(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' '));
+          }
+        }
+      }
     }
   }
 
