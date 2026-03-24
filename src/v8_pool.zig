@@ -341,6 +341,28 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         "_bloom|=(1<<(_h&31))|(1<<((_h>>>5)&31))|(1<<((_h>>>10)&31));" ++
         "});" ++
         "if(_bloom)globalThis.__gcFlags.setFlag(globalThis.__gcBloomArr,_bid|0,_bloom|0);" ++
+        "}" ++
+        // Also populate property hash/type arrays for structural checking
+        "if(_bid>0&&_bid<16384&&globalThis.__gcPropHashArr){" ++
+        "var _pSf=globalThis.__gcFlags.setFlag;" ++
+        "var _pHA=globalThis.__gcPropHashArr;" ++
+        "var _pTA=globalThis.__gcPropTypeArr;" ++
+        "var _pCA=globalThis.__gcPropCountArr;" ++
+        "var _pi=0,_pBase=_bid*32;" ++
+        "members.forEach(function(_v,_k){" ++
+        "if(_pi>=32)return;" ++
+        "if(_k.charCodeAt(0)===95&&_k.charCodeAt(1)===95)return;" ++
+        // FNV-1a hash of property name
+        "var _h=2166136261;" ++
+        "for(var _ci=0;_ci<_k.length;_ci++){_h=Math.imul(_h^_k.charCodeAt(_ci),16777619);}" ++
+        "_pSf(_pHA,(_pBase+_pi)|0,_h|0);" ++
+        // Property type ID (if available)
+        "var _pTid=0;" ++
+        "if(_v.links&&_v.links.type&&_v.links.type.id>0)_pTid=_v.links.type.id;" ++
+        "_pSf(_pTA,(_pBase+_pi)|0,_pTid|0);" ++
+        "_pi=_pi+1;" ++
+        "});" ++
+        "_pSf(_pCA,_bid|0,_pi|0);" ++
         "}";
 
     const ssm_idx = std.mem.indexOf(u8, result, ssm_needle) orelse {

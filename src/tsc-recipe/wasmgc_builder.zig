@@ -411,6 +411,88 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\    ;; No member matched via flags → unknown
         \\    (i32.const -1))
         \\
+        \\  ;; checkStructural: property-by-property structural comparison
+        \\  ;; For each target property, finds matching source property by hash.
+        \\  ;; If found, checks property type compatibility via flag check.
+        \\  ;; propHashArr: [typeId*32+i] = name hash, propTypeArr: [typeId*32+i] = prop type id
+        \\  ;; propCountArr: [typeId] = property count
+        \\  ;; Returns: 1=all props match, 0=missing/incompatible, -1=unknown
+        \\  (func $checkStructural (export "checkStructural")
+        \\    (param $flagsArr (ref null $flags))
+        \\    (param $propHashArr (ref null $flags))
+        \\    (param $propTypeArr (ref null $flags))
+        \\    (param $propCountArr (ref null $flags))
+        \\    (param $src i32) (param $tgt i32)
+        \\    (result i32)
+        \\    (local $tgtCount i32) (local $srcCount i32)
+        \\    (local $tgtBase i32) (local $srcBase i32)
+        \\    (local $i i32) (local $j i32)
+        \\    (local $tgtHash i32) (local $found i32)
+        \\    (local $srcPropType i32) (local $tgtPropType i32)
+        \\    (local $sf i32) (local $tf i32)
+        \\    ;; Get property counts
+        \\    (local.set $tgtCount (array.get $flags (local.get $propCountArr) (local.get $tgt)))
+        \\    (local.set $srcCount (array.get $flags (local.get $propCountArr) (local.get $src)))
+        \\    ;; No data → can't decide
+        \\    (if (i32.eqz (local.get $tgtCount)) (then (return (i32.const -1))))
+        \\    (if (i32.eqz (local.get $srcCount)) (then (return (i32.const -1))))
+        \\    ;; Compute base offsets
+        \\    (local.set $tgtBase (i32.mul (local.get $tgt) (i32.const 32)))
+        \\    (local.set $srcBase (i32.mul (local.get $src) (i32.const 32)))
+        \\    ;; For each target property
+        \\    (local.set $i (i32.const 0))
+        \\    (block $done
+        \\      (loop $outer
+        \\        (br_if $done (i32.ge_u (local.get $i) (local.get $tgtCount)))
+        \\        (local.set $tgtHash (array.get $flags (local.get $propHashArr)
+        \\          (i32.add (local.get $tgtBase) (local.get $i))))
+        \\        (local.set $found (i32.const 0))
+        \\        ;; Search source properties for matching hash
+        \\        (local.set $j (i32.const 0))
+        \\        (block $innerDone
+        \\          (loop $inner
+        \\            (br_if $innerDone (i32.ge_u (local.get $j) (local.get $srcCount)))
+        \\            (if (i32.eq
+        \\              (array.get $flags (local.get $propHashArr)
+        \\                (i32.add (local.get $srcBase) (local.get $j)))
+        \\              (local.get $tgtHash))
+        \\              (then
+        \\                (local.set $found (i32.const 1))
+        \\                ;; Check property type compatibility
+        \\                (local.set $srcPropType (array.get $flags (local.get $propTypeArr)
+        \\                  (i32.add (local.get $srcBase) (local.get $j))))
+        \\                (local.set $tgtPropType (array.get $flags (local.get $propTypeArr)
+        \\                  (i32.add (local.get $tgtBase) (local.get $i))))
+        \\                (if (i32.and
+        \\                  (i32.and (i32.gt_u (local.get $srcPropType) (i32.const 0))
+        \\                           (i32.gt_u (local.get $tgtPropType) (i32.const 0)))
+        \\                  (i32.ne (local.get $srcPropType) (local.get $tgtPropType)))
+        \\                  (then
+        \\                    ;; Different prop types — check flag compatibility
+        \\                    (local.set $sf (array.get $flags (local.get $flagsArr) (local.get $srcPropType)))
+        \\                    (local.set $tf (array.get $flags (local.get $flagsArr) (local.get $tgtPropType)))
+        \\                    ;; Quick flag check: StringLike→String, NumberLike→Number, etc.
+        \\                    (if (i32.eqz (i32.or
+        \\                      (i32.or
+        \\                        (i32.and (i32.ne (i32.and (local.get $sf) (i32.const 402653316)) (i32.const 0))
+        \\                                 (i32.ne (i32.and (local.get $tf) (i32.const 4)) (i32.const 0)))
+        \\                        (i32.and (i32.ne (i32.and (local.get $sf) (i32.const 296)) (i32.const 0))
+        \\                                 (i32.ne (i32.and (local.get $tf) (i32.const 8)) (i32.const 0))))
+        \\                      (i32.or
+        \\                        (i32.and (i32.ne (i32.and (local.get $sf) (i32.const 528)) (i32.const 0))
+        \\                                 (i32.ne (i32.and (local.get $tf) (i32.const 16)) (i32.const 0)))
+        \\                        (i32.or (i32.and (local.get $tf) (i32.const 1))
+        \\                                (i32.and (local.get $sf) (i32.const 131072))))))
+        \\                      (then (return (i32.const -1))))))
+        \\                (br $innerDone)))
+        \\            (local.set $j (i32.add (local.get $j) (i32.const 1)))
+        \\            (br $inner)))
+        \\        ;; If not found → incompatible
+        \\        (if (i32.eqz (local.get $found)) (then (return (i32.const 0))))
+        \\        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        \\        (br $outer)))
+        \\    (i32.const 1))
+        \\
         \\  ;; getFlag/setFlag/newFlags — same as type_flags_gc.wasm but in same module
         \\  (func (export "newFlags") (param $size i32) (result (ref $flags))
         \\    (array.new_default $flags (local.get $size)))

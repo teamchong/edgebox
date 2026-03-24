@@ -184,11 +184,22 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     // [typeId*4] = count, [typeId*4+1..3] = member IDs (up to 3 members)
     // 16384 types * 4 = 65536 slots
     globalThis.__gcUnionArr = _checkerInst.exports.newFlags(65536);
+    // Property arrays for structural checking (WasmGC — TurboFan inlined)
+    // [typeId*32+i] = property name hash / property type id
+    // Max 32 properties per type, 16384 types = 524288 slots
+    globalThis.__gcPropHashArr = _checkerInst.exports.newFlags(524288);
+    globalThis.__gcPropTypeArr = _checkerInst.exports.newFlags(524288);
+    globalThis.__gcPropCountArr = _checkerInst.exports.newFlags(16384);
+    globalThis.__gcCheckStructural = _checkerInst.exports.checkStructural;
     // 3. __gcCheck: thin wrapper → native WASM checkRelation + checkSrcToUnion
     var _checker = _checkerInst.exports.checkRelation;
     var _unionChecker = _checkerInst.exports.checkSrcToUnion;
     var _fA = globalThis.__gcFlagsArr, _bA = globalThis.__gcBloomArr;
     var _uA = globalThis.__gcUnionArr;
+    var _structChecker = _checkerInst.exports.checkStructural;
+    var _pHA = globalThis.__gcPropHashArr;
+    var _pTA = globalThis.__gcPropTypeArr;
+    var _pCA = globalThis.__gcPropCountArr;
     globalThis.__gcCheck = function(_si, _ti) {
       var r = _checker(_fA, _bA, _si, _ti);
       if (r !== -1) return r;
@@ -199,6 +210,11 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
         if ((tf & 1048576) && !(sf & 3145728)) {
           var ur = _unionChecker(_fA, _bA, _uA, _si, _ti);
           if (ur !== -1) return ur;
+        }
+        // Structural: Object → Object property comparison
+        if ((sf & 524288) && (tf & 524288) && _si < 16384 && _ti < 16384) {
+          var sr = _structChecker(_fA, _pHA, _pTA, _pCA, _si, _ti);
+          if (sr !== -1) return sr;
         }
       }
       return -1;
