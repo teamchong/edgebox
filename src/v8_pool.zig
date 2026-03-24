@@ -272,7 +272,9 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
     // Patch 1: createType — write type.id→flags to WasmGC array.
     const ct_needle = "function createType(flags) {";
     const ct_inject = "function createType(flags) {" ++
-        "if(typeCount<65535&&globalThis.__gcFlagsArr)" ++
+        // typeCount++ happens AFTER this patch code. type.id = typeCount (after ++).
+        // So type.id = typeCount + 1 at this point. Store at typeCount+1.
+        "if(typeCount<65534&&globalThis.__gcFlagsArr)" ++
         "globalThis.__gcFlags.setFlag(globalThis.__gcFlagsArr,(typeCount+1)|0,flags|0);";
 
     const ct_idx = std.mem.indexOf(u8, result, ct_needle) orelse {
@@ -292,7 +294,27 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
     // Skip expensive patches — only createType + isSimpleTypeRelatedTo for minimal overhead
     const skip_expensive = std.posix.getenv("EDGEBOX_LEAN") != null;
     if (skip_expensive) {
-        _ = std.posix.write(2, "[v8pool] lean mode: createType only (no isSimpleTypeRelatedTo patch)\n") catch {};
+        _ = std.posix.write(2, "[v8pool] lean mode: createType + isSimpleTypeRelatedTo (strictNull-aware)\n") catch {};
+        // Patch isSimpleTypeRelatedTo with strictNullChecks-aware WASM
+        const lean_needle = "function isSimpleTypeRelatedTo(source, target, relation, errorReporter) {";
+        const lean_inject = "function isSimpleTypeRelatedTo(source, target, relation, errorReporter) {" ++
+            "var _si=source.id,_ti=target.id;" ++
+            "if(_si>0&&_si<65536&&_ti>0&&_ti<65536&&globalThis.__gcCheckRel){" ++
+            "var _rel=relation===assignableRelation?0:relation===comparableRelation?1:" ++
+            "relation===strictSubtypeRelation?3:relation===identityRelation?4:2;" ++
+            "var _r=globalThis.__gcCheckRel(_si,_ti,_rel,strictNullChecks?1:0);" ++
+            "if(_r===1)return true;" ++
+            "if(_r===0)return false;" ++
+            "}";
+        if (std.mem.indexOf(u8, result, lean_needle)) |idx2| {
+            _ = std.posix.write(2, "[v8pool] patching isSimpleTypeRelatedTo → frozen WASM\n") catch {};
+            const len2 = result.len - lean_needle.len + lean_inject.len;
+            const r2 = try alloc.alloc(u8, len2);
+            @memcpy(r2[0..idx2], result[0..idx2]);
+            @memcpy(r2[idx2 .. idx2 + lean_inject.len], lean_inject);
+            @memcpy(r2[idx2 + lean_inject.len .. len2], result[idx2 + lean_needle.len ..]);
+            result = r2;
+        }
         return result;
     }
 

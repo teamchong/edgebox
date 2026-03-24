@@ -266,6 +266,7 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\    (param $flagsArr (ref null $flags))
         \\    (param $bloomArr (ref null $flags))
         \\    (param $src i32) (param $tgt i32)
+        \\    (param $strictNull i32)
         \\    (result i32)
         \\    (local $s i32) (local $t i32)
         \\
@@ -285,8 +286,10 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\      (i32.and (local.get $s) (i32.const 131072)))
         \\      (then (return (i32.const 1))))
         \\
-        \\    ;; target Unknown(2)
-        \\    (if (i32.and (local.get $t) (i32.const 2))
+        \\    ;; target Unknown(2) — TSC adds !(strictSubtype && source & Any)
+        \\    ;; Can't check relation here. Only safe when NOT (source & Any).
+        \\    (if (i32.and (i32.and (local.get $t) (i32.const 2))
+        \\               (i32.eqz (i32.and (local.get $s) (i32.const 1))))
         \\      (then (return (i32.const 1))))
         \\
         \\    ;; StringLike(402653316) → String(4)
@@ -319,27 +322,28 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\      (i32.ne (i32.and (local.get $t) (i32.const 4096)) (i32.const 0)))
         \\      (then (return (i32.const 1))))
         \\
-        \\    ;; Undefined(32768) — strictNullChecks aware
-        \\    ;; TSC: s & 32768 && (!strictNullChecks && !(t & 3145728) || t & 49152)
-        \\    ;; We can't check strictNullChecks in this function (no param).
-        \\    ;; Conservative: only return 1 when target HAS Undefined|Void bits.
-        \\    ;; Skip the !strictNullChecks case (fall through to JS).
-        \\    (if (i32.and
-        \\      (i32.ne (i32.and (local.get $s) (i32.const 32768)) (i32.const 0))
-        \\      (i32.ne (i32.and (local.get $t) (i32.const 49152)) (i32.const 0)))
-        \\      (then (return (i32.const 1))))
+        \\    ;; Undefined(32768) — strictNullChecks aware (param $strictNull)
+        \\    ;; TSC: s & 32768 && (!strictNullChecks && !(t & UnionOrIntersection) || t & (Undefined|Void))
+        \\    (if (i32.ne (i32.and (local.get $s) (i32.const 32768)) (i32.const 0)) (then
+        \\      (if (i32.and (i32.eqz (local.get $strictNull))
+        \\                   (i32.eqz (i32.and (local.get $t) (i32.const 3145728))))
+        \\        (then (return (i32.const 1))))
+        \\      (if (i32.ne (i32.and (local.get $t) (i32.const 49152)) (i32.const 0))
+        \\        (then (return (i32.const 1))))))
         \\
-        \\    ;; Null(65536) — conservative: only when target has Null
-        \\    (if (i32.and
-        \\      (i32.ne (i32.and (local.get $s) (i32.const 65536)) (i32.const 0))
-        \\      (i32.ne (i32.and (local.get $t) (i32.const 65536)) (i32.const 0)))
-        \\      (then (return (i32.const 1))))
+        \\    ;; Null(65536) — strictNullChecks aware
+        \\    ;; TSC: s & 65536 && (!strictNullChecks && !(t & UnionOrIntersection) || t & Null)
+        \\    (if (i32.ne (i32.and (local.get $s) (i32.const 65536)) (i32.const 0)) (then
+        \\      (if (i32.and (i32.eqz (local.get $strictNull))
+        \\                   (i32.eqz (i32.and (local.get $t) (i32.const 3145728))))
+        \\        (then (return (i32.const 1))))
+        \\      (if (i32.ne (i32.and (local.get $t) (i32.const 65536)) (i32.const 0))
+        \\        (then (return (i32.const 1))))))
         \\
         \\    ;; Object(524288) → NonPrimitive(67108864)
-        \\    (if (i32.and
-        \\      (i32.ne (i32.and (local.get $s) (i32.const 524288)) (i32.const 0))
-        \\      (i32.ne (i32.and (local.get $t) (i32.const 67108864)) (i32.const 0)))
-        \\      (then (return (i32.const 1))))
+        \\    ;; TSC adds condition: !(strictSubtype && isEmpty && !fresh) — can't check here
+        \\    ;; Conservative: only return 1 when NOT strictSubtype relation
+        \\    ;; Fall through for strictSubtype (rel=3) — JS handles the full check
         \\
         \\    ;; ── NEGATIVE: source is NOT related to target ──
         \\
@@ -377,7 +381,7 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\    (param $flagsArr (ref null $flags))
         \\    (param $bloomArr (ref null $flags))
         \\    (param $unionArr (ref null $flags))
-        \\    (param $src i32) (param $tgt i32)
+        \\    (param $src i32) (param $tgt i32) (param $strictNull i32)
         \\    (result i32)
         \\    (local $base i32) (local $cnt i32) (local $mid i32) (local $r i32)
         \\    ;; Compute base offset: tgt * 4
@@ -392,7 +396,7 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\    (if (i32.and (i32.gt_u (local.get $mid) (i32.const 0))
         \\                 (i32.lt_u (local.get $mid) (i32.const 65536))) (then
         \\      (local.set $r (call $checkRel (local.get $flagsArr) (local.get $bloomArr)
-        \\        (local.get $src) (local.get $mid)))
+        \\        (local.get $src) (local.get $mid) (local.get $strictNull)))
         \\      (if (i32.eq (local.get $r) (i32.const 1)) (then (return (i32.const 1))))))
         \\    ;; Check member 1 (if exists + bounds check)
         \\    (if (i32.ge_u (local.get $cnt) (i32.const 2)) (then
@@ -401,7 +405,7 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\      (if (i32.and (i32.gt_u (local.get $mid) (i32.const 0))
         \\                   (i32.lt_u (local.get $mid) (i32.const 65536))) (then
         \\        (local.set $r (call $checkRel (local.get $flagsArr) (local.get $bloomArr)
-        \\          (local.get $src) (local.get $mid)))
+        \\          (local.get $src) (local.get $mid) (local.get $strictNull)))
         \\        (if (i32.eq (local.get $r) (i32.const 1)) (then (return (i32.const 1))))))))
         \\    ;; Check member 2 (if exists + bounds check)
         \\    (if (i32.ge_u (local.get $cnt) (i32.const 3)) (then
@@ -410,7 +414,7 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\      (if (i32.and (i32.gt_u (local.get $mid) (i32.const 0))
         \\                   (i32.lt_u (local.get $mid) (i32.const 65536))) (then
         \\        (local.set $r (call $checkRel (local.get $flagsArr) (local.get $bloomArr)
-        \\          (local.get $src) (local.get $mid)))
+        \\          (local.get $src) (local.get $mid) (local.get $strictNull)))
         \\        (if (i32.eq (local.get $r) (i32.const 1)) (then (return (i32.const 1))))))))
         \\    ;; No member matched via flags → unknown
         \\    (i32.const -1))
@@ -422,7 +426,7 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\    (param $flagsArr (ref null $flags))
         \\    (param $bloomArr (ref null $flags))
         \\    (param $unionArr (ref null $flags))
-        \\    (param $src i32) (param $tgt i32) (param $rel i32)
+        \\    (param $src i32) (param $tgt i32) (param $rel i32) (param $strictNull i32)
         \\    (result i32)
         \\    (local $s i32) (local $t i32) (local $r i32)
         \\    ;; Identity
@@ -441,40 +445,24 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\      (return (i32.const -1))))
         \\    ;; Flag checks (isSimpleTypeRelatedTo core)
         \\    (local.set $r (call $checkRel (local.get $flagsArr) (local.get $bloomArr)
-        \\      (local.get $src) (local.get $tgt)))
+        \\      (local.get $src) (local.get $tgt) (local.get $strictNull)))
         \\    (if (i32.ne (local.get $r) (i32.const -1))
         \\      (then (return (local.get $r))))
-        \\    ;; Assignable/comparable extras
-        \\    (if (i32.or (i32.eqz (local.get $rel))
-        \\               (i32.eq (local.get $rel) (i32.const 1))) (then
-        \\      ;; Any → anything (assignable)
-        \\      (if (i32.and (local.get $s) (i32.const 1))
-        \\        (then (return (i32.const 1))))
-        \\      ;; Number(8) → Enum(32)
-        \\      (if (i32.and
-        \\        (i32.ne (i32.and (local.get $s) (i32.const 8)) (i32.const 0))
-        \\        (i32.ne (i32.and (local.get $t) (i32.const 32)) (i32.const 0)))
-        \\        (then (return (i32.const 1))))
-        \\      ;; Number(8) → NumberLiteral+EnumLiteral
-        \\      (if (i32.and
-        \\        (i32.ne (i32.and (local.get $s) (i32.const 8)) (i32.const 0))
-        \\        (i32.and
-        \\          (i32.ne (i32.and (local.get $t) (i32.const 256)) (i32.const 0))
-        \\          (i32.ne (i32.and (local.get $t) (i32.const 1024)) (i32.const 0))))
-        \\        (then (return (i32.const 1))))))
+        \\    ;; Assignable extras removed — too many false positives.
+        \\    ;; TSC's assignable checks need value/enum context we can't check in WASM.
         \\    ;; TypeParameter(262144) with constraint === target → related
         \\    ;; (can't check constraint here — need type graph, fall through)
         \\    ;; Target is union → check source against members
         \\    (if (i32.and (i32.ne (i32.and (local.get $t) (i32.const 1048576)) (i32.const 0))
         \\               (i32.eqz (i32.and (local.get $s) (i32.const 3145728)))) (then
         \\      (local.set $r (call $checkSrcToUnion (local.get $flagsArr) (local.get $bloomArr)
-        \\        (local.get $unionArr) (local.get $src) (local.get $tgt)))
+        \\        (local.get $unionArr) (local.get $src) (local.get $tgt) (local.get $strictNull)))
         \\      (if (i32.ne (local.get $r) (i32.const -1))
         \\        (then (return (local.get $r))))))
         \\    ;; Source is union → check each member against target
         \\    (if (i32.ne (i32.and (local.get $s) (i32.const 1048576)) (i32.const 0)) (then
         \\      (local.set $r (call $checkSrcToUnion (local.get $flagsArr) (local.get $bloomArr)
-        \\        (local.get $unionArr) (local.get $tgt) (local.get $src)))
+        \\        (local.get $unionArr) (local.get $tgt) (local.get $src) (local.get $strictNull)))
         \\      (if (i32.ne (local.get $r) (i32.const -1))
         \\        (then (return (local.get $r))))))
         \\    (i32.const -1))
