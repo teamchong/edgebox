@@ -610,6 +610,8 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   }
   __edgebox_write_stderr('[recipe] POST-createProgram zig=' + zigParseCount + ' fb=' + zigFallbackCount + '\n');
   globalThis.__pc[ck] = program;
+
+
   var t2 = Date.now();
   __edgebox_write_stderr('[recipe] w' + workerId + ' zig=' + zigParseCount + ' fb=' + zigFallbackCount + '\n');
   var files = program.getSourceFiles();
