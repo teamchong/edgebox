@@ -357,25 +357,21 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   host.resolveModuleNames = function(moduleNames, containingFile) {
     return moduleNames.map(function(name) {
       var key = name + '\0' + containingFile;
-      // 1. Per-worker JS cache (fastest — same-worker repeat)
+      // 1. Per-worker JS cache
       var cached = globalThis.__mrCache.get(key);
       if (cached !== undefined) return cached;
-      // 2. Zig shared cache (cross-worker)
+      // 2. Zig shared resolve cache (cross-worker)
       if (hasZigResolveCache) {
         var zigResult = __edgebox_resolve_cache_get(key);
-        if (zigResult === -1) {
-          globalThis.__mrCache.set(key, null);
-          return undefined;
-        }
+        if (zigResult === -1) { globalThis.__mrCache.set(key, null); return undefined; }
         if (zigResult) {
-          // Cache hit — still need TSC resolve for full ResolvedModule object,
-          // but the Zig cache ensures fileExists calls hit Zig's file cache
+          // Cache hit — use TSC resolution (fast: fileExists already cached in Zig)
           var r2 = ts.resolveModuleName(name, containingFile, parsed.options, defaultHost).resolvedModule;
           globalThis.__mrCache.set(key, r2 || null);
           return r2;
         }
       }
-      // 3. Full resolution via TSC
+      // 3. TSC resolution
       var shouldResolve = name.charAt(0) === '.';
       if (!shouldResolve) {
         for (var pi = 0; pi < pathPrefixes.length; pi++) {
@@ -388,13 +384,8 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       if (shouldResolve) {
         var r = ts.resolveModuleName(name, containingFile, parsed.options, defaultHost).resolvedModule;
         globalThis.__mrCache.set(key, r || null);
-        // Store in Zig shared cache for other workers
         if (hasZigResolveCache) {
-          if (r && r.resolvedFileName) {
-            __edgebox_resolve_cache_set(key, r.resolvedFileName);
-          } else {
-            __edgebox_resolve_cache_set(key, '');
-          }
+          __edgebox_resolve_cache_set(key, r && r.resolvedFileName ? r.resolvedFileName : '');
         }
         return r;
       }

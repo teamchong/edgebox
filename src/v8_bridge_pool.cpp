@@ -136,6 +136,7 @@ static void SignalProgramReadyCallback(const v8::FunctionCallbackInfo<v8::Value>
 static void WaitProgramReadyCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void ResolveCacheGetCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void ResolveCacheSetCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void ResolveRelativeCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 // Dead stubs — type system migrated to WasmGC. Kept for external_refs compatibility.
 static void NoopCallback(const v8::FunctionCallbackInfo<v8::Value>&) {}
 
@@ -183,6 +184,7 @@ static const intptr_t g_external_refs[] = {
   reinterpret_cast<intptr_t>(WaitProgramReadyCallback),
   reinterpret_cast<intptr_t>(ResolveCacheGetCallback),
   reinterpret_cast<intptr_t>(ResolveCacheSetCallback),
+  reinterpret_cast<intptr_t>(ResolveRelativeCallback),
   0  // sentinel
 };
 
@@ -216,6 +218,7 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
     global->Set(isolate, "__edgebox_root", v8::FunctionTemplate::New(isolate, RootCallback));
     global->Set(isolate, "__edgebox_resolve_cache_get", v8::FunctionTemplate::New(isolate, ResolveCacheGetCallback));
     global->Set(isolate, "__edgebox_resolve_cache_set", v8::FunctionTemplate::New(isolate, ResolveCacheSetCallback));
+    global->Set(isolate, "__edgebox_resolve_relative", v8::FunctionTemplate::New(isolate, ResolveRelativeCallback));
     global->Set(isolate, "__edgebox_write_file", v8::FunctionTemplate::New(isolate, WriteFileCallback));
     // IsSimpleTypeRelated removed — migrated to WasmGC
     global->Set(isolate, "__edgebox_submit_result", v8::FunctionTemplate::New(isolate, SubmitResultCallback));
@@ -485,6 +488,23 @@ static void ResolveCacheSetCallback(const v8::FunctionCallbackInfo<v8::Value>& a
   v8::String::Utf8Value path(isolate, args[1]);
   if (!*key) return;
   edgebox_resolve_cache_set(*key, key.length(), *path ? *path : "", *path ? path.length() : 0);
+}
+
+extern "C" int edgebox_resolve_relative(const char* import_name, int import_len, const char* dir, int dir_len, const char** out_ptr, int* out_len);
+
+static void ResolveRelativeCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  // JS: __edgebox_resolve_relative(importName, containingDir) → string | undefined
+  if (args.Length() < 2) return;
+  auto* isolate = args.GetIsolate();
+  v8::String::Utf8Value import_name(isolate, args[0]);
+  v8::String::Utf8Value dir(isolate, args[1]);
+  if (!*import_name || !*dir) return;
+  const char* out_ptr = nullptr;
+  int out_len = 0;
+  int result = edgebox_resolve_relative(*import_name, import_name.length(), *dir, dir.length(), &out_ptr, &out_len);
+  if (result == 1 && out_ptr && out_len > 0) {
+    args.GetReturnValue().Set(v8::String::NewFromUtf8(isolate, out_ptr, v8::NewStringType::kNormal, out_len).ToLocalChecked());
+  }
 }
 
 // Setup context with IO globals. If snapshot exists, uses snapshot context.

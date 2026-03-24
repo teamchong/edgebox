@@ -114,6 +114,67 @@ export fn edgebox_resolve_cache_get(key_ptr: [*]const u8, key_len: c_int, out_pt
     return 0; // miss
 }
 
+/// Resolve a relative import in Zig — native speed, no V8 overhead.
+/// Tries extensions: .ts, .tsx, /index.ts, /index.tsx, .d.ts, .js
+/// Returns 1 on success (out_ptr/out_len set), 0 on failure.
+export fn edgebox_resolve_relative(
+    import_ptr: [*]const u8,
+    import_len: c_int,
+    dir_ptr: [*]const u8,
+    dir_len: c_int,
+    out_ptr: *?[*]const u8,
+    out_len: *c_int,
+) c_int {
+    if (import_len <= 0 or dir_len <= 0) return 0;
+    const import_name = import_ptr[0..@intCast(import_len)];
+    const dir = dir_ptr[0..@intCast(dir_len)];
+
+    // Build base path: dir + "/" + import
+    const base = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, import_name }) catch return 0;
+    defer alloc.free(base);
+
+    // Try extensions in order (most common first)
+    const extensions = [_][]const u8{ ".ts", ".tsx", "/index.ts", "/index.tsx", ".d.ts", ".js" };
+    for (extensions) |ext| {
+        const candidate = std.fmt.allocPrint(alloc, "{s}{s}", .{ base, ext }) catch continue;
+        // Check file existence via our cached fileExists
+        const exists = blk: {
+            exist_rwlock.lockShared();
+            defer exist_rwlock.unlockShared();
+            if (file_exist_cache.get(candidate)) |e| break :blk e;
+            break :blk null;
+        };
+        const file_exists = if (exists) |e|
+            e
+        else blk: {
+            const e = std.fs.cwd().access(candidate, .{}) != error.FileNotFound;
+            // Cache the result
+            const key_dup = alloc.dupe(u8, candidate) catch {
+                alloc.free(candidate);
+                continue;
+            };
+            exist_rwlock.lock();
+            defer exist_rwlock.unlock();
+            file_exist_cache.put(alloc, key_dup, e) catch {};
+            break :blk e;
+        };
+        if (file_exists) {
+            // Found — return the path (keep allocated, will be used as cache value)
+            out_ptr.* = candidate.ptr;
+            out_len.* = @intCast(candidate.len);
+            // Don't free candidate — it becomes the resolved path
+            // Store in resolve cache for other workers
+            const import_key = std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ import_name, dir }) catch return 1;
+            resolve_rwlock.lock();
+            defer resolve_rwlock.unlock();
+            resolve_cache.put(alloc, import_key, candidate) catch {};
+            return 1;
+        }
+        alloc.free(candidate);
+    }
+    return 0;
+}
+
 /// Store a module resolution result. path_len=0 means resolution failed.
 export fn edgebox_resolve_cache_set(key_ptr: [*]const u8, key_len: c_int, path_ptr: [*]const u8, path_len: c_int) void {
     if (key_len <= 0) return;
