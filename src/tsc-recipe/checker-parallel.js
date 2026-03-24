@@ -407,17 +407,19 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     parsed = ts.parseJsonConfigFileContent(cf.config, ts.sys, cwd);
     globalThis.__cc[cwd] = parsed;
   }
-  // Enable incremental compilation — persists type info to disk
-  parsed.options.incremental = true;
-  parsed.options.tsBuildInfoFile = cwd + '/.edgebox-tsbuildinfo';
+  // Incremental: only used for warm (in-memory builder). First cold uses createProgram.
+  // createIncrementalProgram adds ~96ms overhead on first cold for no benefit.
+  var useIncremental = !!globalThis.__bp[cwd + ':' + parsed.fileNames.length];
+  if (useIncremental) {
+    parsed.options.incremental = true;
+    parsed.options.tsBuildInfoFile = cwd + '/.edgebox-tsbuildinfo';
+  }
   var ck = cwd + ':' + parsed.fileNames.length;
   var t1 = Date.now();
 
   // Module resolution cache (public API: CompilerHost.resolveModuleNames).
   if (!globalThis.__mrCache) globalThis.__mrCache = new Map();
-  var defaultHost = ts.createIncrementalCompilerHost
-    ? ts.createIncrementalCompilerHost(parsed.options)
-    : ts.createCompilerHost(parsed.options);
+  var defaultHost = ts.createCompilerHost(parsed.options);
   var pathPrefixes = parsed.options.paths
     ? Object.keys(parsed.options.paths).map(function(k) { return k.replace('/*', ''); })
     : [];
@@ -445,31 +447,31 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     });
   };
 
-  // Read previous builder state — in-memory (warm) or tsbuildinfo (incremental cold)
-  var oldBuilder = globalThis.__bp[ck] || undefined;
-  var fromDisk = false;
-  if (!oldBuilder) {
-    oldBuilder = ts.readBuilderProgram(parsed.options, host) || undefined;
-    if (oldBuilder) fromDisk = true;
-  }
-  var isWarm = !!globalThis.__bp[ck]; // truly warm = in-memory, not from disk
+  var oldProgram = globalThis.__pc[ck] || undefined;
+  var isWarm = !!oldProgram;
   // Adaptive strategy:
-  // Warm (in-memory cache): worker 0 only — maximize TSC internal cache reuse.
-  // Incremental cold (tsbuildinfo from disk): ALL workers parallel — tsbuildinfo
-  //   only helps the CHECK phase, not parse. Workers still need parallel parsing.
+  // Cold: all workers in parallel with createProgram (fastest parse).
+  // Warm: worker 0 only with createIncrementalProgram (cache reuse + incremental check).
   if (isWarm && workerId > 0) {
     __edgebox_write_stderr('[recipe] w' + workerId + ' warm skip\n');
     return '';
   }
-  // createIncrementalProgram: uses tsbuildinfo to track changed files
-  var builder = ts.createIncrementalProgram({
-    rootNames: parsed.fileNames,
-    options: parsed.options,
-    host: host,
-    oldProgram: oldBuilder,
-  });
-  globalThis.__bp[ck] = builder;
-  var program = builder.getProgram();
+  var program, builder;
+  if (isWarm && useIncremental) {
+    // Warm: incremental program — only checks changed files
+    var oldBuilder = globalThis.__bp[ck] || undefined;
+    builder = ts.createIncrementalProgram({
+      rootNames: parsed.fileNames,
+      options: parsed.options,
+      host: host,
+      oldProgram: oldBuilder,
+    });
+    globalThis.__bp[ck] = builder;
+    program = builder.getProgram();
+  } else {
+    // Cold: plain createProgram — fastest parse, no incremental overhead
+    program = ts.createProgram(parsed.fileNames, parsed.options, host, oldProgram);
+  }
   globalThis.__pc[ck] = program;
   var t2 = Date.now();
   var files = program.getSourceFiles();
@@ -526,9 +528,8 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     dc.dirty = true;
   }
 
-  if (isWarm) {
-    // Warm: use builder's incremental API — only checks changed files.
-    // If no files changed → returns nothing → 0ms check time!
+  if (isWarm && builder) {
+    // Warm+incremental: use builder's API — only checks changed files.
     var affected;
     while (affected = builder.getSemanticDiagnosticsOfNextAffectedFile()) {
       filesChecked++;
@@ -541,6 +542,9 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
         }
       }
     }
+  } else if (isWarm) {
+    // Warm without incremental: check all files with cache reuse
+    for (var i = 0; i < checkFiles.length; i++) checkFile(checkFiles[i]);
   } else {
     // Cold: parallel work-stealing with per-file diagnostics.
     while (true) {
@@ -559,9 +563,8 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       if (!gd[g].file)
         output.push('error TS' + gd[g].code + ': ' + ts.flattenDiagnosticMessageText(gd[g].messageText, ' '));
     }
-    // Emit tsbuildinfo — persists incremental state for next cold start.
-    // Worker 0 does this on first cold run. Next run reads it back.
-    try { builder.emit(); } catch(e) {}
+    // Emit tsbuildinfo — persists incremental state for warm runs.
+    if (builder) try { builder.emit(); } catch(e) {}
   }
 
   // Persist diagnostic cache to disk (all workers — each has partial results)
