@@ -201,24 +201,11 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     var _pHA = globalThis.__gcPropHashArr;
     var _pTA = globalThis.__gcPropTypeArr;
     var _pCA = globalThis.__gcPropCountArr;
+    // isRelatedToFast: combined identity + flags + union check — entirely in WASM.
+    // Single call replaces the multi-step JS wrapper. No JS→WASM boundary overhead.
+    var _relFast = _checkerInst.exports.isRelatedToFast;
     globalThis.__gcCheck = function(_si, _ti) {
-      var r = _checker(_fA, _bA, _si, _ti);
-      if (r !== -1) return r;
-      // Source → Target Union: check source against each union member
-      if (_ti < 16384 && _si < 65536) {
-        var sf = _checkerInst.exports.getFlag(_fA, _si | 0);
-        var tf = _checkerInst.exports.getFlag(_fA, _ti | 0);
-        if ((tf & 1048576) && !(sf & 3145728)) {
-          var ur = _unionChecker(_fA, _bA, _uA, _si, _ti);
-          if (ur !== -1) return ur;
-        }
-        // Structural: Object → Object property comparison
-        if ((sf & 524288) && (tf & 524288) && _si < 16384 && _ti < 16384) {
-          var sr = _structChecker(_fA, _pHA, _pTA, _pCA, _si, _ti);
-          if (sr !== -1) return sr;
-        }
-      }
-      return -1;
+      return _relFast(_fA, _bA, _uA, _si, _ti, 0);
     };
     // 4. Warmup + force TurboFan
     var _gf = _checkerInst.exports.getFlag, _sf = _checkerInst.exports.setFlag;

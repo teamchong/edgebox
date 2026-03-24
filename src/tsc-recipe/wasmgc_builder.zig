@@ -369,7 +369,7 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\  ;; If target is a union (stored member IDs), check source against each member.
         \\  ;; Returns 1 if source is related to ANY member (safe positive).
         \\  ;; unionArr layout: [tgtId*4]=count, [tgtId*4+1..3]=member IDs
-        \\  (func (export "checkSrcToUnion")
+        \\  (func $checkSrcToUnion (export "checkSrcToUnion")
         \\    (param $flagsArr (ref null $flags))
         \\    (param $bloomArr (ref null $flags))
         \\    (param $unionArr (ref null $flags))
@@ -409,6 +409,50 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\          (local.get $src) (local.get $mid)))
         \\        (if (i32.eq (local.get $r) (i32.const 1)) (then (return (i32.const 1))))))))
         \\    ;; No member matched via flags → unknown
+        \\    (i32.const -1))
+        \\
+        \\  ;; isRelatedToFast: combined isRelatedTo + isSimpleTypeRelatedTo
+        \\  ;; Does identity check, flag checks, and union unwrap — entirely in WASM.
+        \\  ;; Takes type IDs, reads flags from GC array. Returns 1/0/-1.
+        \\  (func $isRelatedToFast (export "isRelatedToFast")
+        \\    (param $flagsArr (ref null $flags))
+        \\    (param $bloomArr (ref null $flags))
+        \\    (param $unionArr (ref null $flags))
+        \\    (param $src i32) (param $tgt i32) (param $rel i32)
+        \\    (result i32)
+        \\    (local $s i32) (local $t i32) (local $r i32)
+        \\    ;; Identity
+        \\    (if (i32.eq (local.get $src) (local.get $tgt))
+        \\      (then (return (i32.const 1))))
+        \\    ;; Read flags
+        \\    (local.set $s (array.get $flags (local.get $flagsArr) (local.get $src)))
+        \\    (local.set $t (array.get $flags (local.get $flagsArr) (local.get $tgt)))
+        \\    (if (i32.eqz (local.get $s)) (then (return (i32.const -1))))
+        \\    (if (i32.eqz (local.get $t)) (then (return (i32.const -1))))
+        \\    ;; Identity relation: flags must match
+        \\    (if (i32.eq (local.get $rel) (i32.const 4)) (then
+        \\      (if (i32.ne (local.get $s) (local.get $t)) (then (return (i32.const 0))))
+        \\      (if (i32.and (local.get $s) (i32.const 67358815))
+        \\        (then (return (i32.const 1))))
+        \\      (return (i32.const -1))))
+        \\    ;; Flag checks (isSimpleTypeRelatedTo)
+        \\    (local.set $r (call $checkRel (local.get $flagsArr) (local.get $bloomArr)
+        \\      (local.get $src) (local.get $tgt)))
+        \\    (if (i32.ne (local.get $r) (i32.const -1))
+        \\      (then (return (local.get $r))))
+        \\    ;; Target is union → check source against members
+        \\    (if (i32.and (i32.ne (i32.and (local.get $t) (i32.const 1048576)) (i32.const 0))
+        \\               (i32.eqz (i32.and (local.get $s) (i32.const 3145728)))) (then
+        \\      (local.set $r (call $checkSrcToUnion (local.get $flagsArr) (local.get $bloomArr)
+        \\        (local.get $unionArr) (local.get $src) (local.get $tgt)))
+        \\      (if (i32.ne (local.get $r) (i32.const -1))
+        \\        (then (return (local.get $r))))))
+        \\    ;; Source is union → check each member against target
+        \\    (if (i32.ne (i32.and (local.get $s) (i32.const 1048576)) (i32.const 0)) (then
+        \\      (local.set $r (call $checkSrcToUnion (local.get $flagsArr) (local.get $bloomArr)
+        \\        (local.get $unionArr) (local.get $tgt) (local.get $src)))
+        \\      (if (i32.ne (local.get $r) (i32.const -1))
+        \\        (then (return (local.get $r))))))
         \\    (i32.const -1))
         \\
         \\  ;; checkStructural: property-by-property structural comparison
