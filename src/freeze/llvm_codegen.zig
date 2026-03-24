@@ -1790,6 +1790,7 @@ fn numericStackEffect(instr: Instruction) i32 {
         .set_arg, .set_loc, .nop, .set_loc_uninitialized, .inc_loc, .dec_loc => 0,
         .binary_arith, .binary_cmp, .bitwise_binary, .array_get => -1, // pop 2, push 1
         .unary, .lnot, .inc_dec, .always_false, .array_length, .field_get => 0, // pop 1, push 1
+        .closure_read => 1, // push 1 (closure variable value)
         .post_inc_dec => 1, // pop 1, push 2
         .stack_dup => 1,
         .stack_dup2 => 2,
@@ -2797,6 +2798,16 @@ fn emitNumericInstruction(
             }
         },
 
+        .closure_read => {
+            // Closure variable read: push the captured value.
+            // TODO: map get_var_ref{N} to extra WASM param index.
+            // For now, push 0 (placeholder — needs trampoline to pass actual values).
+            const zero = switch (kind) {
+                .i32 => llvm.constInt32(0),
+                .f64 => llvm.constF64(0.0),
+            };
+            vstack.append(allocator, zero) catch return CodegenError.OutOfMemory;
+        },
         .field_get => {
             // obj.prop: pop struct pointer, load i32 at fixed field offset
             if (vstack.items.len < 1) return CodegenError.StackUnderflow;

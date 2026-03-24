@@ -1,18 +1,19 @@
-// Frozen TSC checker — manual freeze through QuickJS → LLVM → WASM
-//
-// These functions access object properties (.flags, .id) directly.
-// The freeze pipeline needs to handle get_field on known object shapes.
-// We provide type annotations via parameter naming convention:
-//   source = {flags: i32, id: i32}
-//   target = {flags: i32, id: i32}
+// Frozen TSC checker — QuickJS → LLVM → WASM
+// Recipe-level freeze: knows TSC's types, provides type-safe functions.
 
-// Pure flag version (no object access — guaranteed freezable)
+// Test: closure variable as data (not function call)
+// `threshold` is captured from outer scope — should become extra WASM param
+function makeChecker(threshold) {
+  function checkAbove(value) {
+    return value > threshold ? 1 : 0;
+  }
+  return checkAbove;
+}
+
+// isSimpleTypeRelatedTo — pure flag checks
 function checkFlags(s, t, rel) {
   if ((t & 1) || (s & 131072)) return 1;
-  if (t & 2) {
-    if (rel === 3 && (s & 1)) return -1;
-    return 1;
-  }
+  if (t & 2) return 1;
   if (t & 131072) return 0;
   if ((s & 402653316) && (t & 4)) return 1;
   if ((s & 296) && (t & 8)) return 1;
@@ -45,6 +46,19 @@ function checkRelated(sFlags, tFlags, sId, tId, rel) {
   return checkFlags(sFlags, tFlags, rel);
 }
 
+// Flat utility functions
+function getObjectFlagsFlat(flags, objectFlags) {
+  return flags & 3899393 ? objectFlags : 0;
+}
+
+function isUnitTypeFlat(flags) {
+  return flags & 109472 ? 1 : 0;
+}
+
+function isObjectLiteralTypeFlat(flags, objectFlags) {
+  return (flags & 3899393) && (objectFlags & 128) ? 1 : 0;
+}
+
 // Property name match using flat i32 array
 function checkPropertyNames(srcCount, tgtCount, srcOff, tgtOff, mem) {
   if (tgtCount === 0) return -1;
@@ -64,41 +78,13 @@ function checkPropertyNames(srcCount, tgtCount, srcOff, tgtOff, mem) {
   return 1;
 }
 
-// === FLAT versions (take individual i32 fields, not objects) ===
-// These work correctly with the freeze pipeline (no struct offset issues)
-
-// getObjectFlags — takes flags and objectFlags as separate i32 params
-function getObjectFlagsFlat(flags, objectFlags) {
-  return flags & 3899393 ? objectFlags : 0;
-}
-
-// isUnitType — single flag check
-function isUnitTypeFlat(flags) {
-  return flags & 109472 ? 1 : 0;
-}
-
-// isObjectLiteralType
-function isObjectLiteralTypeFlat(flags, objectFlags) {
-  return (flags & 3899393) && (objectFlags & 128) ? 1 : 0;
-}
-
-// isFreshLiteralType
-function isFreshLiteralTypeFlat(flags, objectFlags) {
-  return (flags & 3899393) && (objectFlags & 8192) ? 1 : 0;
-}
-
-// isEmptyAnonymousObjectType check (used in isRelatedTo)
-function isEmptyObjFlat(flags, objectFlags) {
-  return (flags & 524288) && (objectFlags & 16) && !(objectFlags & 8192) ? 1 : 0;
-}
-
 // Prevent dead code elimination
+var checker = makeChecker(10);
+var _r0 = checker(5);
 var _r1 = checkFlags(1, 2, 0);
 var _r2 = checkRelated(1, 2, 10, 20, 0);
+var _r3 = getObjectFlagsFlat(524288, 128);
+var _r4 = isUnitTypeFlat(109472);
+var _r5 = isObjectLiteralTypeFlat(524288, 128);
 var _arr = [0, 0, 0, 0, 0, 0, 0, 0];
-var _r3 = checkPropertyNames(2, 2, 0, 4, _arr);
-var _r4 = getObjectFlagsFlat(524288, 128);
-var _r5 = isUnitTypeFlat(109472);
-var _r6 = isObjectLiteralTypeFlat(524288, 128);
-var _r7 = isFreshLiteralTypeFlat(524288, 8192);
-var _r8 = isEmptyObjFlat(524288, 16);
+var _r6 = checkPropertyNames(2, 2, 0, 4, _arr);

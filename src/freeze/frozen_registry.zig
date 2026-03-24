@@ -1982,9 +1982,32 @@ pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
                 continue;
             }
             const handler = numeric_handlers.getHandler(func.instructions[si].opcode);
-            if (handler.pattern == .self_ref or handler.pattern == .call_self or handler.pattern == .tail_call_self) {
+            if (handler.pattern == .call_self or handler.pattern == .tail_call_self) {
                 if (debug) std.debug.print("[wasm-reject] {s}: non-recursive with call pattern '{s}'\n", .{ func.name, @tagName(func.instructions[si].opcode) });
                 return null;
+            }
+            if (handler.pattern == .self_ref) {
+                // Check if this get_var_ref is a function call or data read.
+                // Look ahead: if followed by call/call_method → function call → reject
+                // Otherwise → closure data read → treat as extra param (allow)
+                var is_call_target = false;
+                var look = si + 1;
+                while (look < func.instructions.len) {
+                    const lh = numeric_handlers.getHandler(func.instructions[look].opcode);
+                    if (lh.pattern == .call_self) { is_call_target = true; break; }
+                    // If we hit another self_ref or any stack-consuming op, this ref isn't a call target
+                    if (lh.pattern == .self_ref or lh.pattern == .binary_arith or
+                        lh.pattern == .binary_cmp or lh.pattern == .bitwise_binary or
+                        lh.pattern == .if_false or lh.pattern == .if_true or
+                        lh.pattern == .ret or lh.pattern == .field_get) break;
+                    look += 1;
+                }
+                if (is_call_target) {
+                    if (debug) std.debug.print("[wasm-reject] {s}: non-recursive with call pattern '{s}'\n", .{ func.name, @tagName(func.instructions[si].opcode) });
+                    return null;
+                }
+                // Data read — allowed as closure_read (extra WASM param)
+                if (debug) std.debug.print("[wasm-closure] {s}: get_var_ref as data read at {d}\n", .{ func.name, si });
             }
             si += 1;
         }
