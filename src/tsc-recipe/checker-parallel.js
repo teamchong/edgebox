@@ -212,30 +212,32 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     } catch(e) {}
     __edgebox_write_stderr('[recipe] WasmGC: checker=' + _checkerBuf.byteLength + 'B soa=' + _soaBuf.byteLength + 'B\n');
 
-    // 5. Load frozen_checker.wasm — 10 TSC functions compiled via freeze pipeline
-    // (QuickJS→LLVM→WASM). Native speed from first call, no JIT warmup.
+    // 5. Load frozen isSimpleTypeRelatedTo — ACTUAL TSC function as WASM.
+    // WASM imports call back to JS for enum/value/object checks.
     var _frozenBuf = __edgebox_read_binary(_root + '/src/tsc-recipe/frozen_checker.wasm');
     if (_frozenBuf && _frozenBuf instanceof ArrayBuffer && _frozenBuf.byteLength > 8) {
-      var _frozenInst = new WebAssembly.Instance(new WebAssembly.Module(_frozenBuf));
-      var _fe = _frozenInst.exports;
-      // Expose raw WASM functions
-      globalThis.__frozenCheckFlags = _fe.checkFlags;
-      globalThis.__frozenCheckRelated = _fe.checkRelated;
-      // Expose all frozen functions with JS trampolines for object field extraction
-      globalThis.__frozenCheckFlags = _fe.checkFlags;
-      globalThis.__frozenCheckRelated = _fe.checkRelated;
-      globalThis.__frozenGetObjectFlags = function(t) { return _fe.getObjectFlagsFlat(t.flags|0, t.objectFlags|0); };
-      globalThis.__frozenIsUnitType = function(t) { return _fe.isUnitTypeFlat(t.flags|0); };
-      globalThis.__frozenIsObjLiteral = function(t) { return _fe.isObjectLiteralTypeFlat(t.flags|0, t.objectFlags|0); };
-      globalThis.__frozenIsFreshLiteral = function(t) { return _fe.isFreshLiteralTypeFlat(t.flags|0, t.objectFlags|0); };
-      globalThis.__frozenIsEmptyObj = function(t) { return _fe.isEmptyObjFlat(t.flags|0, t.objectFlags|0); };
-      // Warmup all functions
-      for (var _fi = 0; _fi < 100; _fi++) {
-        _fe.checkFlags(1, 2, 0);
-        _fe.getObjectFlagsFlat(524288, 128);
-        _fe.isUnitTypeFlat(109472);
+      // JS imports: called FROM WASM for closure dependencies.
+      // Stubs until checker is created — then updated with real functions.
+      globalThis.__frozenImportValueEquals = function(a, b) { return 0; };
+      globalThis.__frozenImportEnumRelated = function(a, b) { return 0; };
+      globalThis.__frozenImportIsEmpty = function(a) { return 0; };
+      globalThis.__frozenImportGetOF = function(a) { return 0; };
+      globalThis.__frozenImportIsUnknown = function(a) { return 0; };
+      try {
+        var _frozenInst = new WebAssembly.Instance(new WebAssembly.Module(_frozenBuf), {
+          env: {
+            __import_valueEquals: function(a, b) { return globalThis.__frozenImportValueEquals(a, b); },
+            __import_isEnumTypeRelatedTo: function(a, b) { return globalThis.__frozenImportEnumRelated(a, b); },
+            __import_isEmptyAnonymousObjectType: function(a) { return globalThis.__frozenImportIsEmpty(a); },
+            __import_getObjectFlags: function(a) { return globalThis.__frozenImportGetOF(a); },
+            __import_isUnknownLikeUnionType: function(a) { return globalThis.__frozenImportIsUnknown(a); },
+          }
+        });
+        globalThis.__frozenIsSimple = _frozenInst.exports.isSimpleTypeRelatedTo;
+        __edgebox_write_stderr('[recipe] Frozen isSimpleTypeRelatedTo: ' + _frozenBuf.byteLength + 'B\n');
+      } catch(e) {
+        __edgebox_write_stderr('[recipe] Frozen load failed: ' + e.message + '\n');
       }
-      __edgebox_write_stderr('[recipe] Frozen checker: ' + _frozenBuf.byteLength + 'B (8 functions)\n');
     }
 
     } // close else (WASM available)
