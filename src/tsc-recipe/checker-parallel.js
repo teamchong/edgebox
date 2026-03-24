@@ -207,6 +207,10 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     globalThis.__gcCheck = function(_si, _ti) {
       return _relFast(_fA, _bA, _uA, _si, _ti, 0);
     };
+    // Relation-aware version for isSimpleTypeRelatedTo patch
+    globalThis.__gcCheckRel = function(_si, _ti, _rel) {
+      return _relFast(_fA, _bA, _uA, _si, _ti, _rel);
+    };
     // 4. Warmup + force TurboFan
     var _gf = _checkerInst.exports.getFlag, _sf = _checkerInst.exports.setFlag;
     for (var _wi = 0; _wi < 500; _wi++) {

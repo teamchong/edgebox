@@ -269,11 +269,11 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         return result;
     }
 
-    // Patch 1: createType — write flags to WasmGC array (TurboFan-inlinable setFlag)
+    // Patch 1: createType — write type.id→flags to WasmGC array.
     const ct_needle = "function createType(flags) {";
     const ct_inject = "function createType(flags) {" ++
-        "var _ga=globalThis.__gcFlagsArr,_gf=globalThis.__gcFlags;" ++
-        "if(_ga&&_gf){var _tid=typeCount+1;if(_tid<65536)_gf.setFlag(_ga,_tid|0,flags|0);}";
+        "if(typeCount<65535&&globalThis.__gcFlagsArr)" ++
+        "globalThis.__gcFlags.setFlag(globalThis.__gcFlagsArr,(typeCount+1)|0,flags|0);";
 
     const ct_idx = std.mem.indexOf(u8, result, ct_needle) orelse {
         _ = std.posix.write(2, "[v8pool] FATAL: createType needle not found in TSC source\n") catch {};
@@ -287,6 +287,13 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         @memcpy(ct_result[ct_idx .. ct_idx + ct_inject.len], ct_inject);
         @memcpy(ct_result[ct_idx + ct_inject.len .. ct_len], result[ct_idx + ct_needle.len ..]);
         result = ct_result;
+    }
+
+    // Skip expensive patches — only createType + isSimpleTypeRelatedTo for minimal overhead
+    const skip_expensive = std.posix.getenv("EDGEBOX_LEAN") != null;
+    if (skip_expensive) {
+        _ = std.posix.write(2, "[v8pool] lean mode: createType only (no isSimpleTypeRelatedTo patch)\n") catch {};
+        return result;
     }
 
     // Patch 2: createSourceFile — cache .d.ts parsed ASTs.

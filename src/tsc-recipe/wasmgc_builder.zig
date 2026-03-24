@@ -319,13 +319,17 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\      (i32.ne (i32.and (local.get $t) (i32.const 4096)) (i32.const 0)))
         \\      (then (return (i32.const 1))))
         \\
-        \\    ;; Undefined(32768) → Undefined|Void(49152)
+        \\    ;; Undefined(32768) — strictNullChecks aware
+        \\    ;; TSC: s & 32768 && (!strictNullChecks && !(t & 3145728) || t & 49152)
+        \\    ;; We can't check strictNullChecks in this function (no param).
+        \\    ;; Conservative: only return 1 when target HAS Undefined|Void bits.
+        \\    ;; Skip the !strictNullChecks case (fall through to JS).
         \\    (if (i32.and
         \\      (i32.ne (i32.and (local.get $s) (i32.const 32768)) (i32.const 0))
         \\      (i32.ne (i32.and (local.get $t) (i32.const 49152)) (i32.const 0)))
         \\      (then (return (i32.const 1))))
         \\
-        \\    ;; Null(65536) → Null(65536)
+        \\    ;; Null(65536) — conservative: only when target has Null
         \\    (if (i32.and
         \\      (i32.ne (i32.and (local.get $s) (i32.const 65536)) (i32.const 0))
         \\      (i32.ne (i32.and (local.get $t) (i32.const 65536)) (i32.const 0)))
