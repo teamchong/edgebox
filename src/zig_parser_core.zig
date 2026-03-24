@@ -1116,7 +1116,6 @@ export fn edgebox_zig_parse(
     @memcpy(copy, nodes_slice);
 
     // Debug: verify first node in the COPY
-    _ = std.posix.write(2, "[zig-parse] ") catch {};
     var dbuf: [128]u8 = undefined;
     const dmsg = std.fmt.bufPrint(&dbuf, "nodes={d} kind={d} fc={d}\n", .{
         copy.len, copy[0].kind, copy[0].first_child,

@@ -253,17 +253,6 @@
     sf.identifierCount = 0;
     sf.symbolCount = 0;
 
-    // DEBUG: verify flat AST structure
-    if (typeof __edgebox_write_stderr === 'function') {
-      __edgebox_write_stderr('[bridge] node0: kind=' + view.getUint16(0, true) +
-        ' firstChild=' + view.getUint32(16, true) +
-        ' nodeCount=' + nodeCount + '\n');
-      if (nodeCount > 1) {
-        __edgebox_write_stderr('[bridge] node1: kind=' + view.getUint16(24, true) +
-          ' nextSibling=' + view.getUint32(24 + 20, true) + '\n');
-      }
-    }
-
     // Get root node's children as statements
     var rootChildren = [];
     var rootFirstOff = 0 * 24 + 16;

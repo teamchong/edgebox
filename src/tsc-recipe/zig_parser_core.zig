@@ -838,6 +838,36 @@ pub const Parser = struct {
     }
 };
 
+// ── C ABI Export: parse a file, return flat AST buffer ──
+// Called from V8 via edgebox_parse_file callback.
+// Returns pointer to flat AST nodes, sets out_count to number of nodes.
+// Caller must NOT free — buffer lives in Zig's allocator (persists for program lifetime).
+
+const c_alloc = std.heap.page_allocator;
+
+export fn edgebox_zig_parse(
+    src_ptr: [*]const u8,
+    src_len: c_int,
+    out_nodes: *?[*]const u8,
+    out_count: *c_int,
+) c_int {
+    if (src_len <= 0) return 0;
+    const source = src_ptr[0..@intCast(src_len)];
+
+    var parser = Parser.init(source, c_alloc);
+    // Don't defer deinit — caller needs the AST to persist
+    _ = parser.parseSourceFile() catch return 0;
+
+    const nodes_slice = parser.ast.nodes.items;
+    if (nodes_slice.len == 0) return 0;
+
+    // Return pointer to the flat AST data
+    const bytes: [*]const u8 = @ptrCast(nodes_slice.ptr);
+    out_nodes.* = bytes;
+    out_count.* = @intCast(nodes_slice.len);
+    return 1;
+}
+
 // ── Benchmark ──
 
 pub fn main() !void {

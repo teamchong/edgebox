@@ -577,13 +577,6 @@ static void ZigParseCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
     void* data = ab->Data();
     if (data) {
       memcpy(data, out_nodes, byte_len);
-      // Verify first bytes match
-      fprintf(stderr, "[cpp-bridge] count=%d bytes=%zu src_kind=%d dst_kind=%d\n",
-        out_count, byte_len,
-        (int)((unsigned char)out_nodes[0] | ((unsigned char)out_nodes[1] << 8)),
-        (int)((unsigned char*)data)[0] | (((unsigned char*)data)[1] << 8));
-    } else {
-      fprintf(stderr, "[cpp-bridge] ab->Data() returned NULL!\n");
     }
     args.GetReturnValue().Set(ab);
   }
