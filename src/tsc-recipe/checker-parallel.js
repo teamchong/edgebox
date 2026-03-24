@@ -287,29 +287,31 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   // Zig parser: opt-in via EDGEBOX_ZIG_PARSE env (bridge overhead still too high for net benefit)
   // When enabled: 447 files parsed by Zig (32ms) + bridge (880ms) = 912ms vs TSC's 750ms
   // Need: C++ bridge (create nodes in native) or lazy materialization to beat TSC
-  // Zig parser: opt-in (AST too incomplete for TSC checker — causes hangs).
-  // SyntaxKind values fixed for TSC 5.9. Import moduleSpecifier working.
-  // Need: complete class/interface members, full expressions to avoid checker hangs.
-  var useZigParser = globalThis.__zigParseEnabled && typeof __edgebox_zig_parse === 'function' && typeof globalThis.__zigCreateSourceFile === 'function';
+  // Zig parser: disabled until AST is complete enough for forEachChild.
+  // TSC's createProgram walks ALL source file ASTs. If any node is missing
+  // required properties, forEachChild crashes and the whole program fails.
+  var useZigParser = false;
   var zigParseCount = 0, zigFallbackCount = 0;
   if (useZigParser) {
     var origGetSourceFile = host.getSourceFile;
     host.getSourceFile = function(fileName, languageVersionOrOptions, onError) {
-      // Read file content
-      var content = ts.sys.readFile(fileName);
-      if (content === undefined) return undefined;
-      // Try Zig parser
-      try {
-        var flatAST = __edgebox_zig_parse(content);
-        if (flatAST && flatAST.byteLength >= 24) {
-          var sf = globalThis.__zigCreateSourceFile(content, fileName, flatAST);
-          if (sf && sf.statements) {
-            zigParseCount++;
-            return sf;
-          }
+      // Use Zig parser for .ts files (implementation code).
+      // TSC handles .d.ts files (type declarations need complete AST).
+      if (!fileName.endsWith('.d.ts')) {
+        var content = ts.sys.readFile(fileName);
+        if (content !== undefined) {
+          try {
+            var flatAST = __edgebox_zig_parse(content);
+            if (flatAST && flatAST.byteLength >= 24) {
+              var sf = globalThis.__zigCreateSourceFile(content, fileName, flatAST);
+              if (sf && sf.statements && sf.statements.length > 0) {
+                zigParseCount++;
+                return sf;
+              }
+            }
+          } catch(e) {}
         }
-      } catch(e) {}
-      // Fallback to TSC parser
+      }
       zigFallbackCount++;
       return origGetSourceFile.call(this, fileName, languageVersionOrOptions, onError);
     };
