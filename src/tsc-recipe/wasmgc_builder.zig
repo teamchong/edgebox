@@ -432,6 +432,10 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\    ;; Identity
         \\    (if (i32.eq (local.get $src) (local.get $tgt))
         \\      (then (return (i32.const 1))))
+        \\    ;; Bounds check before array access
+        \\    (if (i32.or (i32.ge_u (local.get $src) (i32.const 65536))
+        \\               (i32.ge_u (local.get $tgt) (i32.const 65536)))
+        \\      (then (return (i32.const -1))))
         \\    ;; Read flags
         \\    (local.set $s (array.get $flags (local.get $flagsArr) (local.get $src)))
         \\    (local.set $t (array.get $flags (local.get $flagsArr) (local.get $tgt)))
@@ -452,15 +456,18 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\    ;; TSC's assignable checks need value/enum context we can't check in WASM.
         \\    ;; TypeParameter(262144) with constraint === target → related
         \\    ;; (can't check constraint here — need type graph, fall through)
-        \\    ;; Target is union → check source against members
-        \\    (if (i32.and (i32.ne (i32.and (local.get $t) (i32.const 1048576)) (i32.const 0))
-        \\               (i32.eqz (i32.and (local.get $s) (i32.const 3145728)))) (then
+        \\    ;; Target is union → check source against members (bounds: tgt < 16384)
+        \\    (if (i32.and
+        \\      (i32.and (i32.ne (i32.and (local.get $t) (i32.const 1048576)) (i32.const 0))
+        \\               (i32.eqz (i32.and (local.get $s) (i32.const 3145728))))
+        \\      (i32.lt_u (local.get $tgt) (i32.const 16384))) (then
         \\      (local.set $r (call $checkSrcToUnion (local.get $flagsArr) (local.get $bloomArr)
         \\        (local.get $unionArr) (local.get $src) (local.get $tgt) (local.get $strictNull)))
         \\      (if (i32.ne (local.get $r) (i32.const -1))
         \\        (then (return (local.get $r))))))
-        \\    ;; Source is union → check each member against target
-        \\    (if (i32.ne (i32.and (local.get $s) (i32.const 1048576)) (i32.const 0)) (then
+        \\    ;; Source is union → check each member against target (bounds: src < 16384)
+        \\    (if (i32.and (i32.ne (i32.and (local.get $s) (i32.const 1048576)) (i32.const 0))
+        \\               (i32.lt_u (local.get $src) (i32.const 16384))) (then
         \\      (local.set $r (call $checkSrcToUnion (local.get $flagsArr) (local.get $bloomArr)
         \\        (local.get $unionArr) (local.get $tgt) (local.get $src) (local.get $strictNull)))
         \\      (if (i32.ne (local.get $r) (i32.const -1))
