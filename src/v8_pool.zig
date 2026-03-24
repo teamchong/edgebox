@@ -296,8 +296,10 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
     if (skip_expensive) {
         _ = std.posix.write(2, "[v8pool] lean mode: createType + isSimpleTypeRelatedTo (strictNull-aware)\n") catch {};
         // Patch isSimpleTypeRelatedTo with strictNullChecks-aware WASM
-        const lean_needle = "function isSimpleTypeRelatedTo(source, target, relation, errorReporter) {";
-        const lean_inject = "function isSimpleTypeRelatedTo(source, target, relation, errorReporter) {" ++
+        const lean_needle = "function isTypeRelatedTo(source, target, relation) {";
+        // Patch isTypeRelatedTo (not isSimpleTypeRelatedTo) — called once per comparison.
+        // Skips fresh literal normalization + isSimpleTypeRelatedTo when WASM resolves.
+        const lean_inject = "function isTypeRelatedTo(source, target, relation) {" ++
             "var _si=source.id,_ti=target.id;" ++
             "if(_si>0&&_si<65536&&_ti>0&&_ti<65536&&globalThis.__gcCheckRel){" ++
             "var _rel=relation===assignableRelation?0:relation===comparableRelation?1:" ++
