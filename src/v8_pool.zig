@@ -343,14 +343,17 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         "if(_bloom)globalThis.__gcFlags.setFlag(globalThis.__gcBloomArr,_bid|0,_bloom|0);" ++
         "}" ++
         // Also populate property hash/type arrays for structural checking
-        "if(_bid>0&&_bid<16384&&globalThis.__gcPropHashArr){" ++
+        // Structural property population disabled — overhead > savings on cold.
+        // Property population adds ~100ms (forEach + setFlag per prop).
+        // Structural WASM check saves ~0ms (too few Object→Object comparisons).
+        "if(false&&_bid>0&&_bid<16384&&(type.flags&524288)&&globalThis.__gcPropHashArr){" ++
         "var _pSf=globalThis.__gcFlags.setFlag;" ++
         "var _pHA=globalThis.__gcPropHashArr;" ++
         "var _pTA=globalThis.__gcPropTypeArr;" ++
         "var _pCA=globalThis.__gcPropCountArr;" ++
-        "var _pi=0,_pBase=_bid*32;" ++
+        "var _pi=0,_pBase=_bid*8;" ++
         "members.forEach(function(_v,_k){" ++
-        "if(_pi>=32)return;" ++
+        "if(_pi>=8)return;" ++
         "if(_k.charCodeAt(0)===95&&_k.charCodeAt(1)===95)return;" ++
         // FNV-1a hash of property name
         "var _h=2166136261;" ++

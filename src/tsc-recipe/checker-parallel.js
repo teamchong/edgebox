@@ -185,10 +185,11 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     // 16384 types * 4 = 65536 slots
     globalThis.__gcUnionArr = _checkerInst.exports.newFlags(65536);
     // Property arrays for structural checking (WasmGC — TurboFan inlined)
-    // [typeId*32+i] = property name hash / property type id
-    // Max 32 properties per type, 16384 types = 524288 slots
-    globalThis.__gcPropHashArr = _checkerInst.exports.newFlags(524288);
-    globalThis.__gcPropTypeArr = _checkerInst.exports.newFlags(524288);
+    // [typeId*8+i] = property name hash / property type id
+    // Max 8 properties per type (covers 90%+ of structural checks)
+    // 16384 types * 8 = 131072 slots
+    globalThis.__gcPropHashArr = _checkerInst.exports.newFlags(131072);
+    globalThis.__gcPropTypeArr = _checkerInst.exports.newFlags(131072);
     globalThis.__gcPropCountArr = _checkerInst.exports.newFlags(16384);
     globalThis.__gcCheckStructural = _checkerInst.exports.checkStructural;
     // 3. __gcCheck: thin wrapper → native WASM checkRelation + checkSrcToUnion

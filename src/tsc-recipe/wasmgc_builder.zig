@@ -436,9 +436,9 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\    ;; No data → can't decide
         \\    (if (i32.eqz (local.get $tgtCount)) (then (return (i32.const -1))))
         \\    (if (i32.eqz (local.get $srcCount)) (then (return (i32.const -1))))
-        \\    ;; Compute base offsets
-        \\    (local.set $tgtBase (i32.mul (local.get $tgt) (i32.const 32)))
-        \\    (local.set $srcBase (i32.mul (local.get $src) (i32.const 32)))
+        \\    ;; Compute base offsets (8 props per type)
+        \\    (local.set $tgtBase (i32.mul (local.get $tgt) (i32.const 8)))
+        \\    (local.set $srcBase (i32.mul (local.get $src) (i32.const 8)))
         \\    ;; For each target property
         \\    (local.set $i (i32.const 0))
         \\    (block $done
