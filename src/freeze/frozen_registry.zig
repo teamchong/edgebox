@@ -1947,15 +1947,15 @@ pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
         return null;
     }
 
-    // Reject struct-arg functions with >1 field per struct arg.
-    // Single-field structs (just .kind) are safe: the field is always numeric.
-    // Multi-field structs may include object references (.left, .expression, .parent)
-    // that can't be represented as i32 in WASM linear memory.
+    // Allow struct-arg functions with up to 4 fields per struct arg.
+    // All accessed fields must be used in numeric context (verified by opcode analysis).
+    // TSC Type objects access .flags(i32) and .id(i32) — both are numeric.
+    // Raised from 1 to 4 to support manual freeze of TSC checker hot path.
     if (has_struct_info) {
         if (getLastStructInfo()) |si| {
             const combined = si.struct_args | si.array_of_struct_args;
             for (0..@min(func.arg_count, 8)) |ai| {
-                if (combined & (@as(u8, 1) << @intCast(ai)) != 0 and si.field_counts[ai] > 1) {
+                if (combined & (@as(u8, 1) << @intCast(ai)) != 0 and si.field_counts[ai] > 4) {
                     if (debug) std.debug.print("[wasm-reject] {s}: struct with {d} fields (may include object refs)\n", .{ func.name, si.field_counts[ai] });
                     return null;
                 }
@@ -2136,7 +2136,16 @@ pub fn analyzeNumericTierWithCrossCall(
     if (func.arg_count < 1 or func.arg_count > 24) return null;
     if (func.var_count > 48) return null;
 
-    const kind = numeric_handlers.analyzeFunction(func.instructions) orelse return null;
+    // Try standard analysis first, then struct-aware analysis (allows get_field)
+    const kind = numeric_handlers.analyzeFunction(func.instructions) orelse blk: {
+        // Check if it has struct field access — if so, try struct-aware analysis
+        var has_field = false;
+        for (func.instructions) |instr| {
+            if (numeric_handlers.getHandler(instr.opcode).pattern == .field_get) { has_field = true; break; }
+        }
+        if (!has_field) break :blk null;
+        break :blk if (numeric_handlers.analyzeFunctionWithStructs(func.instructions)) |r| r.kind else null;
+    } orelse return null;
 
     if (!func.is_self_recursive) {
         for (func.instructions, 0..) |instr, ii| {
