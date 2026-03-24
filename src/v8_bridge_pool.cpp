@@ -42,7 +42,21 @@ void edgebox_v8_init() {
   // --max-semi-space-size=16: larger young gen reduces GC during type creation (47K types)
   // --turbo-inline-js-wasm-calls: enable TurboFan inlining of WasmGC functions into JS
   // V8 source: requires kInlineJSToWasmCalls flag + supported GC instructions only
-  const char* flags = "--max-old-space-size=4096 --concurrent-sparkplug --max-semi-space-size=16 --turbo-inline-js-wasm-calls";
+  // V8 flags for TurboFan WasmGC inlining on cold start:
+  // --turbo-inline-js-wasm-calls: enable WasmGC function inlining into JS
+  // --allow-natives-syntax: enable %OptimizeFunctionOnNextCall to force TurboFan
+  //   compilation of specific hot functions IMMEDIATELY (no 3000-call warmup)
+  // --concurrent-sparkplug: baseline JIT on background threads
+  // --max-semi-space-size=16: larger young gen reduces GC during type creation
+  const char* extra_flags = getenv("EDGEBOX_V8_FLAGS");
+  const char* default_flags = "--max-old-space-size=4096 --concurrent-sparkplug --max-semi-space-size=16 --turbo-inline-js-wasm-calls --allow-natives-syntax";
+  char flags_buf[1024];
+  if (extra_flags && strlen(extra_flags) > 0) {
+    snprintf(flags_buf, sizeof(flags_buf), "%s %s", default_flags, extra_flags);
+  } else {
+    snprintf(flags_buf, sizeof(flags_buf), "%s", default_flags);
+  }
+  const char* flags = flags_buf;
   v8__V8__SetFlagsFromString(flags, strlen(flags));
   // 8 platform threads for background JIT compilation across 8 V8 isolates
   g_platform = v8__Platform__NewDefaultPlatform(8, false);

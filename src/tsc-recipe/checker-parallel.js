@@ -15,10 +15,9 @@ globalThis.__gcFlagsDone = false;
 // `types`, `members` etc. are added dynamically, creating hundreds of hidden classes.
 // Pre-initializing ALL properties in the constructor forces a single hidden class.
 // Uses ts.setObjectAllocator (public API) — no source patching.
-// Monomorphic Node constructor only. Type constructor left as-is.
-// DATA: Mono Node = 1.20x total (parse 1.70x, check 1.08x).
-//       Mono Type = 0.80x total (check 47% SLOWER — 45 undefined slots per type
-//       causes GC pressure + CPU cache pollution for 47K types = 17MB waste).
+// Monomorphic Node constructor via ts.setObjectAllocator (public API).
+// 19 pre-initialized props → single hidden class → V8 monomorphic IC.
+// DATA: 1.70x parse speedup, 1.08x check speedup, 1.20x total.
 (function() {
   if (!ts || !ts.setObjectAllocator || !ts.objectAllocator) { throw new Error('[recipe] FATAL: ts.setObjectAllocator not available'); }
   var origNodeProto = ts.objectAllocator.getNodeConstructor().prototype;
@@ -193,19 +192,62 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     globalThis.__gcFlags = _flagsInst.exports;
     // Create the flags array (65536 slots for type IDs)
     globalThis.__gcFlagsArr = _flagsInst.exports.newFlags(65536);
-    // Warmup TurboFan — call getFlag/setFlag to trigger Liftoff → TurboFan
-    var _gf = _flagsInst.exports.getFlag;
-    var _sf = _flagsInst.exports.setFlag;
-    var _a = globalThis.__gcFlagsArr;
+    // Load SOA module — used for objectFlags array (parallel to type flags)
+    var _soaBuf = __edgebox_read_binary(_root + '/src/tsc-recipe/soa_gc.wasm');
+    if (!_soaBuf || !(_soaBuf instanceof ArrayBuffer) || _soaBuf.byteLength < 8) {
+      throw new Error('[recipe] FATAL: soa_gc.wasm read failed');
+    }
+    var _soaInst = new WebAssembly.Instance(new WebAssembly.Module(_soaBuf));
+    globalThis.__gcSoa = _soaInst.exports;
+    // Create objectFlags array (same capacity as type flags)
+    globalThis.__gcObjFlagsArr = _soaInst.exports.newI32(65536);
+    // Warmup TurboFan — call getFlag/setFlag + getI32/setI32 to trigger Liftoff → TurboFan
+    var _gf = _flagsInst.exports.getFlag, _sf = _flagsInst.exports.setFlag;
+    var _gi = _soaInst.exports.getI32, _si = _soaInst.exports.setI32;
+    var _a = globalThis.__gcFlagsArr, _oa = globalThis.__gcObjFlagsArr;
     for (var _wi = 0; _wi < 500; _wi++) {
       _sf(_a, _wi % 100, _wi); _gf(_a, _wi % 100);
+      _si(_oa, _wi % 100, _wi); _gi(_oa, _wi % 100);
     }
-    // Also load SOA module for future use
-    var _soaBuf = __edgebox_read_binary(_root + '/src/tsc-recipe/soa_gc.wasm');
-    if (_soaBuf && _soaBuf instanceof ArrayBuffer && _soaBuf.byteLength >= 8) {
-      globalThis.__gcSoa = new WebAssembly.Instance(new WebAssembly.Module(_soaBuf)).exports;
+
+    // Define __gcCheck as a global function so we can force TurboFan compilation.
+    // This function does the WasmGC flag read + comparison.
+    // TurboFan inlines getFlag (array.get) inside this function → native MOV.
+    globalThis.__gcCheck = function(_si, _ti) {
+      var _ga = globalThis.__gcFlagsArr, _gf = globalThis.__gcFlags;
+      if (!_ga || !_gf) return -1;
+      var s = _gf.getFlag(_ga, _si | 0), t = _gf.getFlag(_ga, _ti | 0);
+      if (!s || !t) return -1;
+      if (t & 1 || s & 131072) return 1;    // Any/Never
+      if (t & 2) return 1;                   // Unknown
+      if (s & 402653316 && t & 4) return 1;  // StringLike→String
+      if (s & 296 && t & 8) return 1;        // NumberLike→Number
+      if (s & 2112 && t & 64) return 1;      // BigIntLike→BigInt
+      if (s & 528 && t & 16) return 1;       // BooleanLike→Boolean
+      if (s & 12288 && t & 4096) return 1;   // ESSymbolLike→ESSymbol
+      if (s & 32768 && (t & 49152)) return 1;// Undefined→Void
+      if (s & 65536 && t & 65536) return 1;  // Null→Null
+      if (s & 524288 && t & 67108864) return 1;// Object→NonPrimitive
+      return -1;
+    };
+
+    // Force TurboFan compilation of __gcCheck BEFORE any type checking.
+    // %PrepareFunctionForOptimization → feed IC → %OptimizeFunctionOnNextCall
+    // This makes WasmGC array.get inlined from the FIRST isTypeRelatedTo call.
+    try {
+      eval('%PrepareFunctionForOptimization(globalThis.__gcCheck)');
+      // Feed with representative args so IC has type feedback
+      globalThis.__gcCheck(1, 2);
+      globalThis.__gcCheck(100, 200);
+      eval('%OptimizeFunctionOnNextCall(globalThis.__gcCheck)');
+      // Trigger TurboFan compilation — this call compiles with WASM inlining
+      globalThis.__gcCheck(1, 2);
+      __edgebox_write_stderr('[recipe] __gcCheck force-compiled by TurboFan\n');
+    } catch(e) {
+      __edgebox_write_stderr('[recipe] TurboFan force-compile failed: ' + e.message + '\n');
     }
-    __edgebox_write_stderr('[recipe] WasmGC loaded: flags=' + _flagsBuf.byteLength + 'B soa=' + (_soaBuf ? _soaBuf.byteLength : 0) + 'B\n');
+
+    __edgebox_write_stderr('[recipe] WasmGC loaded: flags=' + _flagsBuf.byteLength + 'B soa=' + _soaBuf.byteLength + 'B\n');
   }
   if (!globalThis.__gcFlags) {
     throw new Error('[recipe] FATAL: WasmGC flags not loaded');

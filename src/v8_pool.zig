@@ -276,45 +276,32 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         result = csf_result;
     }
 
-    // Patch 3: isTypeRelatedTo — WasmGC flag read (TurboFan-inlinable array.get).
-    // V8 source: WasmIntoJsInliner inlines array.get/struct.get into JS callsite.
-    // Flag reads go through WasmGC getFlag → V8 compiles to direct memory MOV.
-    // Comparison logic stays in JS (TurboFan handles bitwise ops well).
-    const itr_needle = "function isTypeRelatedTo(source, target, relation) {";
+    // Patch 3a: isTypeRelatedTo — call globalThis.__gcCheck (force-compiled by TurboFan).
+    // __gcCheck is defined in recipe JS and force-compiled via %OptimizeFunctionOnNextCall.
+    // This means WasmGC getFlag is TurboFan-inlined from the FIRST call, not after 3000.
+    const helper_needle = "function isTypeRelatedTo(source, target, relation) {";
     const itr_inject = "function isTypeRelatedTo(source, target, relation) {" ++
-        "var _ga=globalThis.__gcFlagsArr,_gf=globalThis.__gcFlags;" ++
-        "if(_ga&&_gf&&relation!==identityRelation){" ++
+        "if(relation!==identityRelation){" ++
         "var _s=(source.flags&2976)&&source.freshType===source?source.regularType:source;" ++
         "var _t=(target.flags&2976)&&target.freshType===target?target.regularType:target;" ++
         "if(_s===_t)return true;" ++
         "var _si=_s.id,_ti=_t.id;" ++
         "if(_si<65536&&_ti<65536){" ++
-        // Read flags from WasmGC array — TurboFan inlines array.get
-        "var s=_gf.getFlag(_ga,_si|0),t=_gf.getFlag(_ga,_ti|0);" ++
-        "if(s&&t){" ++
-        "if(t&1||s&131072)return true;" ++ // target Any or source Never
-        "if(t&2)return true;" ++ // target Unknown
-        "if(s&402653316&&t&4)return true;" ++ // StringLike→String
-        "if(s&296&&t&8)return true;" ++ // NumberLike→Number
-        "if(s&2112&&t&64)return true;" ++ // BigIntLike→BigInt
-        "if(s&528&&t&16)return true;" ++ // BooleanLike→Boolean
-        "if(s&12288&&t&4096)return true;" ++ // ESSymbolLike→ESSymbol
-        "if(s&32768&&(t&49152))return true;" ++ // Undefined→Undefined|Void
-        "if(s&65536&&t&65536)return true;" ++ // Null→Null
-        "if(s&524288&&t&67108864)return true;" ++ // Object→NonPrimitive
-        "}}}";
+        "var _r=globalThis.__gcCheck(_si,_ti);" ++
+        "if(_r===1)return true;" ++
+        "}}";
 
-    const itr_idx = std.mem.indexOf(u8, result, itr_needle) orelse {
+    const itr_idx = std.mem.indexOf(u8, result, helper_needle) orelse {
         _ = std.posix.write(2, "[v8pool] FATAL: isTypeRelatedTo needle not found\n") catch {};
         return error.NeedleNotFound;
     };
     _ = std.posix.write(2, "[v8pool] patching isTypeRelatedTo → WASM registry\n") catch {};
     {
-        const itr_len = result.len - itr_needle.len + itr_inject.len;
+        const itr_len = result.len - helper_needle.len + itr_inject.len;
         const itr_result = try alloc.alloc(u8, itr_len);
         @memcpy(itr_result[0..itr_idx], result[0..itr_idx]);
         @memcpy(itr_result[itr_idx .. itr_idx + itr_inject.len], itr_inject);
-        @memcpy(itr_result[itr_idx + itr_inject.len .. itr_len], result[itr_idx + itr_needle.len ..]);
+        @memcpy(itr_result[itr_idx + itr_inject.len .. itr_len], result[itr_idx + helper_needle.len ..]);
         result = itr_result;
     }
 
