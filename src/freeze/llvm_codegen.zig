@@ -277,6 +277,69 @@ pub fn generateStandaloneWasm(
         }
     }
 
+    // === Pass 0: Declare WASM imports for closure function calls ===
+    // When a frozen function calls a closure variable (get_var_ref → call),
+    // the call target becomes a WASM import. The JS host provides the import
+    // when instantiating the WASM module.
+    // Import names are derived from closure_vars[var_ref_idx].name.
+    var import_names: [32][]const u8 = undefined;
+    var import_fns: [32]llvm.Value = undefined;
+    var import_count: u32 = 0;
+    {
+        for (functions) |sf| {
+            for (sf.func.instructions, 0..) |instr, ii| {
+                const handler = numeric_handlers.getHandler(instr.opcode);
+                if (handler.pattern != .self_ref) continue;
+                // Check if this is a closure call (followed by call)
+                var is_call = false;
+                var look = ii + 1;
+                while (look < sf.func.instructions.len) {
+                    const lh = numeric_handlers.getHandler(sf.func.instructions[look].opcode);
+                    if (lh.pattern == .call_self) { is_call = true; break; }
+                    if (lh.pattern == .self_ref or lh.pattern == .binary_arith or
+                        lh.pattern == .binary_cmp or lh.pattern == .bitwise_binary) break;
+                    look += 1;
+                }
+                if (!is_call) continue;
+                // Get closure var index
+                const var_idx: u32 = switch (instr.opcode) {
+                    .get_var_ref0 => 0,
+                    .get_var_ref1 => 1,
+                    .get_var_ref2 => 2,
+                    .get_var_ref3 => 3,
+                    else => switch (instr.operand) {
+                        .var_ref => |v| v,
+                        .u16 => |v| v,
+                        else => continue,
+                    },
+                };
+                if (var_idx >= sf.func.closure_vars.len) continue;
+                const name = sf.func.closure_vars[var_idx].name;
+                // Check if already declared
+                var found = false;
+                for (import_names[0..import_count]) |n| {
+                    if (std.mem.eql(u8, n, name)) { found = true; break; }
+                }
+                if (found) continue;
+                if (import_count >= import_names.len) continue;
+                // Declare import: extern function with i32 params → i32 result
+                // Convention: imported functions take/return i32 (numeric context)
+                var import_params = [_]llvm.Type{ llvm.i32Type(), llvm.i32Type(), llvm.i32Type() };
+                const import_fn_ty = llvm.functionType(llvm.i32Type(), &import_params, false);
+                var import_name_buf: [64]u8 = undefined;
+                const import_name_z = std.fmt.bufPrintZ(&import_name_buf, "__import_{s}", .{name}) catch continue;
+                const import_fn = native.module.addFunction(import_name_z, import_fn_ty);
+                llvm.setLinkage(import_fn, c.LLVMExternalLinkage);
+                import_names[import_count] = name;
+                import_fns[import_count] = import_fn;
+                import_count += 1;
+                if (std.posix.getenv("EDGEBOX_WASM_DEBUG") != null) {
+                    std.debug.print("[freeze-import] declared import: __import_{s}\n", .{name});
+                }
+            }
+        }
+    }
+
     // === Pass 1: Declare all functions (so cross-function calls can resolve) ===
     // For functions that access arr.length, we add extra i32 params for each array length.
     var length_args_buf: [64]u8 = undefined; // per-function length_args bitmask
@@ -331,6 +394,10 @@ pub fn generateStandaloneWasm(
     }
 
     // === Pass 2: Generate bodies (all callees already declared) ===
+    // Set import globals for closure_call codegen
+    import_names_global = import_names;
+    import_fns_global = import_fns;
+    import_count_global = import_count;
     var generated_count: u32 = 0;
     for (functions, 0..) |sf, fi| {
         const func = sf.func;
@@ -1405,6 +1472,11 @@ fn emitInt32Instruction(
 // Thread-local struct layout for field_get codegen (workaround for Zig 0.15
 // parameter tracking limitation in complex switch arms)
 var struct_layout_global: ?*const numeric_handlers.StructArgInfo = null;
+
+// Thread-local import data for closure_call codegen
+var import_names_global: [32][]const u8 = undefined;
+var import_fns_global: [32]llvm.Value = undefined;
+var import_count_global: u32 = 0;
 
 /// Generate function body for any numeric ValueKind using comptime dispatch.
 /// The i32 tier uses generateInt32Body (legacy, well-tested).
@@ -2800,13 +2872,89 @@ fn emitNumericInstruction(
         },
 
         .closure_call => {
-            // Closure function call: WASM imports the function from JS.
-            // TODO: generate actual WASM import call. For now, push -1 (unknown/fallthrough).
-            const neg_one = switch (kind) {
-                .i32 => llvm.constInt32(@bitCast(@as(i32, -1))),
-                .f64 => llvm.constF64(-1.0),
+            // Closure function call → WASM import call.
+            // Determine which closure var is being called.
+            const cvar_idx: u32 = switch (instr.opcode) {
+                .get_var_ref0 => 0,
+                .get_var_ref1 => 1,
+                .get_var_ref2 => 2,
+                .get_var_ref3 => 3,
+                .get_var_ref => switch (instr.operand) {
+                    .var_ref => |v| v,
+                    .u16 => |v| v,
+                    else => 0,
+                },
+                else => 0,
             };
-            vstack.append(allocator, neg_one) catch return CodegenError.OutOfMemory;
+            // Find the matching import function
+            var import_fn_val: ?llvm.Value = null;
+            if (cvar_idx < analyzed.closure_vars.len) {
+                const cname = analyzed.closure_vars[cvar_idx].name;
+                for (import_names_global[0..import_count_global], 0..) |iname, idx| {
+                    if (std.mem.eql(u8, iname, cname)) {
+                        import_fn_val = import_fns_global[idx];
+                        break;
+                    }
+                }
+            }
+            if (import_fn_val) |imp_fn| {
+                // Call import with up to 3 args from vstack.
+                // The call instruction (skipped by analysis) determines argc.
+                // Look ahead to find it.
+                var argc: u32 = 0;
+                // Look ahead in analyzed function's full instruction list
+                // to find the call instruction that follows this get_var_ref.
+                const all_instrs = analyzed.instructions;
+                // Find current instruction's position in full list
+                var full_pos: usize = 0;
+                for (all_instrs, 0..) |ai, aidx| {
+                    if (ai.pc == instr.pc) { full_pos = aidx; break; }
+                }
+                for (all_instrs[full_pos + 1 ..]) |next_instr| {
+                    switch (next_instr.opcode) {
+                        .call0 => { argc = 0; break; },
+                        .call1 => { argc = 1; break; },
+                        .call2 => { argc = 2; break; },
+                        .call3 => { argc = 3; break; },
+                        .call => {
+                            argc = switch (next_instr.operand) {
+                                .u16 => |v| v,
+                                .u8 => |v| v,
+                                else => 0,
+                            };
+                            break;
+                        },
+                        else => {},
+                    }
+                }
+                // Pop argc args from vstack, call import
+                var call_args: [3]llvm.Value = undefined;
+                const actual_argc = @min(argc, 3);
+                var ci: u32 = 0;
+                while (ci < actual_argc) : (ci += 1) {
+                    if (vstack.items.len > 0) {
+                        call_args[actual_argc - 1 - ci] = numVstackPop(vstack);
+                    } else {
+                        call_args[actual_argc - 1 - ci] = llvm.constInt32(0);
+                    }
+                }
+                // Build call to imported function
+                var imp_params = [_]llvm.Type{ llvm.i32Type(), llvm.i32Type(), llvm.i32Type() };
+                const imp_fn_ty = llvm.functionType(llvm.i32Type(), &imp_params, false);
+                const result_val = c.LLVMBuildCall2(
+                    builder.ref,
+                    imp_fn_ty,
+                    imp_fn,
+                    if (actual_argc > 0) &call_args else null,
+                    @intCast(actual_argc),
+                    "import_result",
+                );
+                // Push result to vstack
+                vstack.append(allocator, result_val) catch return CodegenError.OutOfMemory;
+            } else {
+                // No import found — push -1 (fallthrough)
+                vstack.append(allocator, llvm.constInt32(@bitCast(@as(i32, -1)))) catch return CodegenError.OutOfMemory;
+            }
         },
         .closure_read => {
             // Closure variable read: map get_var_ref{N} to extra WASM param.
