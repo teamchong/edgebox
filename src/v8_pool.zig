@@ -227,6 +227,17 @@ pub fn init(worker_count: u32) !void {
 fn applyRecipeTransform(src: []const u8) ![]const u8 {
     var result = src;
 
+    // Source injections: measured 50ms OVERHEAD on first cold start.
+    // createType, setStructuredTypeMembers, isTypeRelatedTo injections duplicate
+    // TSC's own fast-paths (isSimpleTypeRelatedTo does the same flag checks).
+    // Skip injections when EDGEBOX_LEAN_COLD=1 for fastest first cold.
+    // Keep them by default for warm mode where TurboFan inlines WasmGC.
+    const lean_cold = std.posix.getenv("EDGEBOX_LEAN_COLD") != null;
+    if (lean_cold) {
+        _ = std.posix.write(2, "[v8pool] LEAN COLD: skipping source injections (fastest parse+check)\n") catch {};
+        return result;
+    }
+
     // Patch 1: createType — write flags to WasmGC array (TurboFan-inlinable setFlag)
     const ct_needle = "function createType(flags) {";
     const ct_inject = "function createType(flags) {" ++
