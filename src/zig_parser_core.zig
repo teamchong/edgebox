@@ -220,6 +220,10 @@ pub const Parser = struct {
     fn parseVariableStatement(self: *Parser) ParseError!u32 {
         const start = self.pos();
         const stmt = try self.ast.addNode(NK.VariableStatement, start, 0, 0);
+        // Set NodeFlags: Const=2, Let=1, Var=0 (TSC uses these on VariableDeclarationList)
+        const kw = self.current_token;
+        if (kw == 87) self.ast.nodes.items[stmt].flags = 2 // const → NodeFlags.Const
+        else if (kw == 121) self.ast.nodes.items[stmt].flags = 1; // let → NodeFlags.Let
         self.nextToken(); // skip const/var/let
         // Parse declaration list
         const decl = try self.parseVariableDeclaration();
@@ -480,10 +484,9 @@ pub const Parser = struct {
         }
         // Skip extends/implements/type params
         while (self.current_token != SK.OpenBrace and self.current_token != SK.EndOfFile) self.nextToken();
-        if (self.current_token == SK.OpenBrace) {
-            const body = try self.parseBlock();
-            self.ast.addChild(decl, body);
-        }
+        // Skip class body entirely — don't parse as Block (causes checker hang).
+        // Bridge sets members = [] (empty). TSC will find no members on the class.
+        if (self.current_token == SK.OpenBrace) self.skipBraced();
         self.ast.setEnd(decl, self.endPos());
         return decl;
     }
@@ -497,8 +500,55 @@ pub const Parser = struct {
             self.ast.addChild(decl, name);
             self.nextToken();
         }
+        // Skip type parameters and extends clause
+        if (self.current_token == SK.LessThan) self.skipAngleBracketed();
         while (self.current_token != SK.OpenBrace and self.current_token != SK.EndOfFile) self.nextToken();
-        if (self.current_token == SK.OpenBrace) self.skipBraced();
+        // Parse interface body: property/method signatures
+        if (self.current_token == SK.OpenBrace) {
+            self.nextToken(); // skip {
+            while (self.current_token != SK.CloseBrace and self.current_token != SK.EndOfFile) {
+                const member_start = self.pos();
+                // Skip modifiers (readonly, static, etc.)
+                if (self.current_token == 148) self.nextToken(); // readonly
+                // Property or method signature
+                if (self.current_token == SK.Identifier or self.current_token == SK.StringLiteral or
+                    self.current_token == SK.OpenBracket) // computed/index signature
+                {
+                    const sig = try self.ast.addNode(NK.PropertySignature, member_start, 0, 0);
+                    if (self.current_token == SK.OpenBracket) {
+                        self.skipBracketed(); // index signature [key: string]
+                    } else {
+                        const mname = try self.ast.addNode(NK.Identifier, self.pos(), self.endPos(), 0);
+                        self.ast.addChild(sig, mname);
+                        self.nextToken();
+                    }
+                    // Optional ?
+                    if (self.current_token == SK.Question) self.nextToken();
+                    // Type annotation
+                    if (self.current_token == SK.Colon) {
+                        self.nextToken();
+                        const mtype = try self.parseTypeNode();
+                        self.ast.addChild(sig, mtype);
+                    }
+                    // Method signature: name(...): Type
+                    if (self.current_token == SK.OpenParen) {
+                        self.skipParenthesized();
+                        if (self.current_token == SK.Colon) {
+                            self.nextToken();
+                            const rtype = try self.parseTypeNode();
+                            self.ast.addChild(sig, rtype);
+                        }
+                    }
+                    self.ast.setEnd(sig, self.endPos());
+                    self.ast.addChild(decl, sig);
+                    if (self.current_token == SK.Semicolon or self.current_token == SK.Comma) self.nextToken();
+                } else {
+                    // Skip unknown member
+                    self.nextToken();
+                }
+            }
+            if (self.current_token == SK.CloseBrace) self.nextToken();
+        }
         self.ast.setEnd(decl, self.endPos());
         return decl;
     }
@@ -1114,13 +1164,6 @@ export fn edgebox_zig_parse(
     // The Parser's ArrayList items may be reclaimed when parser goes out of scope.
     const copy = c_alloc.alloc(FlatNode, nodes_slice.len) catch return 0;
     @memcpy(copy, nodes_slice);
-
-    // Debug: verify first node in the COPY
-    var dbuf: [128]u8 = undefined;
-    const dmsg = std.fmt.bufPrint(&dbuf, "nodes={d} kind={d} fc={d}\n", .{
-        copy.len, copy[0].kind, copy[0].first_child,
-    }) catch "err\n";
-    _ = std.posix.write(2, dmsg) catch {};
 
     out_nodes.* = @ptrCast(copy.ptr);
     out_count.* = @intCast(copy.len);

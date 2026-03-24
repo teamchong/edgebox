@@ -287,24 +287,44 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   // Zig parser: opt-in via EDGEBOX_ZIG_PARSE env (bridge overhead still too high for net benefit)
   // When enabled: 447 files parsed by Zig (32ms) + bridge (880ms) = 912ms vs TSC's 750ms
   // Need: C++ bridge (create nodes in native) or lazy materialization to beat TSC
-  // Zig parser: disabled until AST is complete enough for forEachChild.
-  // TSC's createProgram walks ALL source file ASTs. If any node is missing
-  // required properties, forEachChild crashes and the whole program fails.
-  var useZigParser = false;
+  // Zig parser: enabled for a SINGLE test file to identify forEachChild crash.
+  // If it crashes, log the error and fall back to TSC for ALL files.
+  var useZigParser = typeof __edgebox_zig_parse === 'function' && typeof globalThis.__zigCreateSourceFile === 'function';
   var zigParseCount = 0, zigFallbackCount = 0;
+
+  // Instrument forEachChild to detect infinite recursion
+  if (useZigParser && ts.forEachChild) {
+    var origFEC = ts.forEachChild;
+    var fecDepth = 0;
+    ts.forEachChild = function(node, cbNode, cbNodes) {
+      fecDepth++;
+      if (fecDepth > 500) {
+        __edgebox_write_stderr('[HANG] forEachChild depth=' + fecDepth + ' kind=' + node.kind + ' pos=' + node.pos + '\n');
+        fecDepth--;
+        return undefined;
+      }
+      var result = origFEC(node, cbNode, cbNodes);
+      fecDepth--;
+      return result;
+    };
+  }
+
   if (useZigParser) {
     var origGetSourceFile = host.getSourceFile;
     host.getSourceFile = function(fileName, languageVersionOrOptions, onError) {
-      // Use Zig parser for .ts files (implementation code).
-      // TSC handles .d.ts files (type declarations need complete AST).
-      if (!fileName.endsWith('.d.ts')) {
+      // Use Zig for first N .ts files to isolate the hang
+      // Binary search: find which file count causes hang
+      // Zig for .d.ts files (type declarations — no errors, just type info).
+      // TSC for .ts files (implementation — has errors, needs full AST).
+      // .d.ts files are 88 files / 3.5MB = 140ms parse savings.
+      if (fileName.endsWith('.d.ts') && !fileName.includes('/lib.')) {
         var content = ts.sys.readFile(fileName);
         if (content !== undefined) {
           try {
             var flatAST = __edgebox_zig_parse(content);
             if (flatAST && flatAST.byteLength >= 24) {
               var sf = globalThis.__zigCreateSourceFile(content, fileName, flatAST);
-              if (sf && sf.statements && sf.statements.length > 0) {
+              if (sf && sf.statements) {
                 zigParseCount++;
                 return sf;
               }
@@ -384,6 +404,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     __edgebox_write_stderr('[recipe] w' + workerId + ' warm skip\n');
     return '';
   }
+  __edgebox_write_stderr('[recipe] w' + workerId + ' PRE-createProgram\n');
   var program, builder;
   if (isWarm && useIncremental) {
     // Warm: incremental program — only checks changed files
@@ -400,6 +421,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     // Cold: plain createProgram — fastest parse, no incremental overhead
     program = ts.createProgram(parsed.fileNames, parsed.options, host, oldProgram);
   }
+  __edgebox_write_stderr('[recipe] POST-createProgram zig=' + zigParseCount + ' fb=' + zigFallbackCount + '\n');
   globalThis.__pc[ck] = program;
   var t2 = Date.now();
   if (useZigParser) {

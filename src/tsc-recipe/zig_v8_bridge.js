@@ -68,7 +68,15 @@
         node.statements = createNodeArray(children);
         break;
       case 244: // VariableStatement
-        if (children.length > 0) node.declarationList = children[0];
+        // TSC expects: VariableStatement.declarationList (262) → .declarations[]
+        // Our parser creates VariableDeclaration (261) children directly.
+        // Wrap them in a VariableDeclarationList.
+        var declList = new NodeCtor(262, node.pos, node.end); // VariableDeclarationList
+        declList.parent = node;
+        declList.flags = node.flags; // inherit const/let/var flags
+        declList.declarations = createNodeArray(children.filter(function(c) { return c.kind === 261; }));
+        for (var di = 0; di < declList.declarations.length; di++) declList.declarations[di].parent = declList;
+        node.declarationList = declList;
         break;
       case 262: // VariableDeclarationList
         node.declarations = createNodeArray(children);
@@ -110,23 +118,56 @@
         }
         break;
       case 264: // ClassDeclaration
-        if (children.length > 0) node.name = children[0];
-        node.members = createNodeArray(children.slice(1));
+        if (children.length > 0 && children[0].kind === 80) node.name = children[0];
+        node.members = createNodeArray([]); // empty — class body skipped by Zig parser
+        node.heritageClauses = void 0;
         break;
       case 265: // InterfaceDeclaration
-        if (children.length > 0) node.name = children[0];
-        node.members = createNodeArray(children.slice(1));
+        if (children.length > 0 && children[0].kind === 80) node.name = children[0];
+        // Members are PropertySignature (172) children
+        var ifMembers = [];
+        for (var im = 0; im < children.length; im++) {
+          if (children[im].kind === 172) ifMembers.push(children[im]);
+        }
+        node.members = createNodeArray(ifMembers);
+        break;
+      case 172: // PropertySignature
+        if (children.length > 0 && children[0].kind === 80) node.name = children[0];
+        // Type is any type node child after the name
+        for (var ps = 1; ps < children.length; ps++) {
+          var psk = children[ps].kind;
+          if ((psk >= 133 && psk <= 165) || (psk >= 183 && psk <= 202)) {
+            node.type = children[ps];
+            break;
+          }
+        }
         break;
       case 266: // TypeAliasDeclaration
         if (children.length > 0) node.name = children[0];
         break;
       case 273: // ImportDeclaration
-        // Last child should be the module specifier (StringLiteral)
+        // Last child = module specifier (StringLiteral)
         for (var ii = children.length - 1; ii >= 0; ii--) {
           if (children[ii].kind === 11) { node.moduleSpecifier = children[ii]; break; }
         }
+        // Create minimal importClause so TSC processes the import
+        if (node.moduleSpecifier) {
+          var clause = new NodeCtor(274, node.pos, node.end); // ImportClause
+          clause.parent = node;
+          clause.isTypeOnly = false;
+          // Create empty NamedImports (TSC will resolve from module exports)
+          var named = new NodeCtor(276, node.pos, node.end); // NamedImports
+          named.parent = clause;
+          named.elements = createNodeArray([]);
+          clause.namedBindings = named;
+          node.importClause = clause;
+        }
         break;
       case 279: // ExportDeclaration
+        // moduleSpecifier from StringLiteral child
+        for (var ei = children.length - 1; ei >= 0; ei--) {
+          if (children[ei].kind === 11) { node.moduleSpecifier = children[ei]; break; }
+        }
         break;
       case 227: // BinaryExpression
         if (children.length > 0) node.left = children[0];
@@ -165,10 +206,9 @@
         if (children.length > 0) node.elementType = children[0];
         break;
       default:
-        // Generic: store first child as expression
-        if (children.length > 0) {
-          node.expression = children[0];
-        }
+        // Do NOT set any child properties for unknown node kinds.
+        // Setting node.expression on arbitrary kinds causes forEachChild
+        // to walk children that reference back → infinite loop.
         break;
     }
   }
@@ -201,6 +241,13 @@
       var end = view.getUint32(off + 8, true);
       tscNodes[i] = new NodeCtor(kind, start, end);
       tscNodes[i].flags = view.getUint16(off + 2, true);
+      // Set .text on StringLiteral and Identifier (needed by TSC resolver + binder)
+      if (kind === 11) { // StringLiteral — strip quotes
+        tscNodes[i].text = sourceText.substring(start + 1, end - 1);
+      } else if (kind === 80) { // Identifier
+        tscNodes[i].text = sourceText.substring(start, end);
+        tscNodes[i].escapedText = sourceText.substring(start, end);
+      }
     }
 
     // Phase 2: Link parent-child relationships
@@ -230,7 +277,8 @@
 
     // Phase 4: Build SourceFile wrapper
     var SFCtor = ts.objectAllocator.getSourceFileConstructor();
-    var sf = new SFCtor(316, 0, sourceText.length);
+    var sf = new SFCtor(308, 0, sourceText.length); // 308 = SourceFile in TSC 5.9
+    sf.flags = 0; // CRITICAL: no PossiblyContainsDynamicImport (4194304) flag
     sf.text = sourceText;
     sf.fileName = fileName;
     sf.path = fileName.toLowerCase();
@@ -253,6 +301,13 @@
     sf.identifierCount = 0;
     sf.symbolCount = 0;
 
+    // Mark as external module if any statement is import/export
+    var hasModuleMarker = false;
+    // Pre-compute imports array from our ImportDeclaration module specifiers.
+    // This prevents collectExternalModuleReferences from walking our AST
+    // (which can trigger setParentRecursive on incomplete nodes → hang).
+    var preImports = [];
+
     // Get root node's children as statements
     var rootChildren = [];
     var rootFirstOff = 0 * 24 + 16;
@@ -265,6 +320,22 @@
       rc = view.getUint32(nextOff, true);
     }
     sf.statements = createNodeArray(rootChildren);
+
+    // Pre-set imports from our ImportDeclaration moduleSpecifiers.
+    // This prevents collectExternalModuleReferences from walking our AST.
+    for (var si = 0; si < rootChildren.length; si++) {
+      var sk = rootChildren[si].kind;
+      if (sk === 273 && rootChildren[si].moduleSpecifier) {
+        preImports.push(rootChildren[si].moduleSpecifier);
+        hasModuleMarker = true;
+      }
+      if (sk === 279 || sk === 278 || sk === 273) hasModuleMarker = true; // ExportDeclaration, ExportAssignment, ImportDeclaration
+    }
+    sf.imports = preImports;
+    sf.moduleAugmentations = [];
+    sf.ambientModuleNames = [];
+    // NOTE: Do NOT set externalModuleIndicator — it breaks module resolution.
+    // The 19 extra TS2306 errors are a smaller issue than 2000 missing diagnostics.
 
     // EndOfFileToken
     var TokenCtor = ts.objectAllocator.getTokenConstructor();
