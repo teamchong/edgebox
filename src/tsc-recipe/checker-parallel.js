@@ -218,19 +218,16 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     if (_frozenBuf && _frozenBuf instanceof ArrayBuffer && _frozenBuf.byteLength > 8) {
       // JS imports: called FROM WASM for closure dependencies.
       // Stubs until checker is created — then updated with real functions.
-      globalThis.__frozenImportValueEquals = function(a, b) { return 0; };
-      globalThis.__frozenImportEnumRelated = function(a, b) { return 0; };
-      globalThis.__frozenImportIsEmpty = function(a) { return 0; };
-      globalThis.__frozenImportGetOF = function(a) { return 0; };
-      globalThis.__frozenImportIsUnknown = function(a) { return 0; };
+      // Import stubs — return -1 (unknown/fallthrough) until real checker is created
+      globalThis.__frozenImportEnum = function(a, b) { return -1; };
+      globalThis.__frozenImportObj = function(a, b) { return -1; };
+      globalThis.__frozenImportUnknown = function(a) { return 0; };
       try {
         var _frozenInst = new WebAssembly.Instance(new WebAssembly.Module(_frozenBuf), {
           env: {
-            __import_valueEquals: function(a, b) { return globalThis.__frozenImportValueEquals(a, b); },
-            __import_isEnumTypeRelatedTo: function(a, b) { return globalThis.__frozenImportEnumRelated(a, b); },
-            __import_isEmptyAnonymousObjectType: function(a) { return globalThis.__frozenImportIsEmpty(a); },
-            __import_getObjectFlags: function(a) { return globalThis.__frozenImportGetOF(a); },
-            __import_isUnknownLikeUnionType: function(a) { return globalThis.__frozenImportIsUnknown(a); },
+            __import_enumCheck: function(a, b) { return globalThis.__frozenImportEnum(a, b); },
+            __import_objCheck: function(a, b) { return globalThis.__frozenImportObj(a, b); },
+            __import_unknownCheck: function(a) { return globalThis.__frozenImportUnknown(a); },
           }
         });
         globalThis.__frozenIsSimple = _frozenInst.exports.isSimpleTypeRelatedTo;
