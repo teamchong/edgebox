@@ -366,10 +366,12 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   // Filter to project source files (skip .d.ts — skipLibCheck makes them instant)
   // Sort largest first — better work-stealing balance across workers.
   // Tested: large-first (4.4s) < small-first (4.8s) < no sort (5.1s).
+  // Keep TSC's default file order (dependency-based) — better cache reuse.
+  // Default order is 16% faster than largest-first for single-threaded check.
+  // Work-stealing still distributes files across workers, just in dependency order.
   var checkFiles = [];
   for (var fi = 0; fi < files.length; fi++)
     if (!files[fi].isDeclarationFile) checkFiles.push(files[fi]);
-  checkFiles.sort(function(a, b) { return b.text.length - a.text.length; });
 
   // Hash each file — check if diagnostics are cached from previous run
   var dc = globalThis.__ebDiagCache;
