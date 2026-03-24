@@ -1969,6 +1969,7 @@ pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
     // Exception: get_var_ref{N} that refers to a destructured Math builtin is allowed
     if (!func.is_self_recursive) {
         var pending_destr: u32 = 0;
+        var pending_closure_call = false;
         var si: usize = 0;
         while (si < func.instructions.len) {
             // Skip destructured Math ref + its call
@@ -1984,6 +1985,13 @@ pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
             }
             const handler = numeric_handlers.getHandler(func.instructions[si].opcode);
             if (handler.pattern == .call_self or handler.pattern == .tail_call_self) {
+                // If this call is part of a closure import call, allow it (don't skip — codegen needs it)
+                if (pending_closure_call) {
+                    pending_closure_call = false;
+                    // Let it pass through — codegen's call_self_i32 will use pending_callee
+                    si += 1;
+                    continue; // TODO: need to NOT skip — but analysis counts aren't affected by continue
+                }
                 if (debug) std.debug.print("[wasm-reject] {s}: non-recursive with call pattern '{s}'\n", .{ func.name, @tagName(func.instructions[si].opcode) });
                 return null;
             }
@@ -2004,11 +2012,9 @@ pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
                     look += 1;
                 }
                 if (is_call_target) {
-                    // Closure function call — allow as WASM import.
-                    // Skip ahead past the call opcode too.
+                    // Closure function call — set flag so the following call_self is allowed
+                    pending_closure_call = true;
                     if (debug) std.debug.print("[wasm-import] {s}: closure call at {d} (will be WASM import)\n", .{ func.name, si });
-                    si = look + 1; // skip past the call opcode
-                    continue;
                 }
                 // Data read — allowed as closure_read (extra WASM param)
                 if (debug) std.debug.print("[wasm-closure] {s}: get_var_ref as data read at {d}\n", .{ func.name, si });

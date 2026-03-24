@@ -322,10 +322,24 @@ pub fn generateStandaloneWasm(
                 }
                 if (found) continue;
                 if (import_count >= import_names.len) continue;
-                // Declare import: extern function with i32 params → i32 result
-                // Convention: imported functions take/return i32 (numeric context)
-                var import_params = [_]llvm.Type{ llvm.i32Type(), llvm.i32Type(), llvm.i32Type() };
-                const import_fn_ty = llvm.functionType(llvm.i32Type(), &import_params, false);
+                // Determine argc from the call instruction that follows
+                var call_argc: u32 = 1; // default
+                var cl = look; // look points to the call instruction
+                if (cl < sf.func.instructions.len) {
+                    call_argc = switch (sf.func.instructions[cl].opcode) {
+                        .call0 => 0, .call1 => 1, .call2 => 2, .call3 => 3,
+                        .call => switch (sf.func.instructions[cl].operand) {
+                            .u16 => |v| v, .u8 => |v| v, else => 1,
+                        },
+                        else => 1,
+                    };
+                }
+                // Declare import with correct param count
+                var import_params: [8]llvm.Type = undefined;
+                var pi: u32 = 0;
+                _ = &import_params; // suppress unused warning
+                while (pi < @min(call_argc, 8)) : (pi += 1) import_params[pi] = llvm.i32Type();
+                const import_fn_ty = llvm.functionType(llvm.i32Type(), import_params[0..@min(call_argc, 8)], false);
                 var import_name_buf: [64]u8 = undefined;
                 const import_name_z = std.fmt.bufPrintZ(&import_name_buf, "__import_{s}", .{name}) catch continue;
                 const import_fn = native.module.addFunction(import_name_z, import_fn_ty);
@@ -1300,20 +1314,36 @@ fn emitInt32Instruction(
                     },
                     else => {},
                 }
-            } else if (instr.opcode == .get_var_ref0) {
+            } else {
                 // Closure variable ref — look up captured function by name
-                if (analyzed.closure_vars.len > 0) {
-                    const cv_name = analyzed.closure_vars[0].name;
-                    if (cv_name.len > 0) {
-                        // closure_vars names are slices, need null-terminated for LLVM lookup
+                const cv_idx: u32 = switch (instr.opcode) {
+                    .get_var_ref0 => 0, .get_var_ref1 => 1,
+                    .get_var_ref2 => 2, .get_var_ref3 => 3,
+                    else => blk: { break :blk switch (instr.operand) {
+                        .var_ref => |v| v, .u16 => |v| v, else => 255,
+                    }; },
+                };
+                if (cv_idx < analyzed.closure_vars.len) {
+                    const cv_name = analyzed.closure_vars[cv_idx].name;
+                    if (cv_name.len > 0 and cv_name.len < 240) {
+                        // Try direct name first (cross-call), then __import_ prefix (closure import)
                         var name_buf: [256]u8 = undefined;
-                        if (cv_name.len < name_buf.len) {
-                            @memcpy(name_buf[0..cv_name.len], cv_name);
-                            name_buf[cv_name.len] = 0;
-                            const name_z: [*:0]const u8 = @ptrCast(name_buf[0..cv_name.len]);
-                            if (module.getNamedFunction(name_z)) |callee_fn| {
-                                if (callee_fn != func) {
-                                    pending_callee.* = callee_fn;
+                        @memcpy(name_buf[0..cv_name.len], cv_name);
+                        name_buf[cv_name.len] = 0;
+                        const name_z: [*:0]const u8 = @ptrCast(name_buf[0..cv_name.len]);
+                        if (module.getNamedFunction(name_z)) |callee_fn| {
+                            if (callee_fn != func) pending_callee.* = callee_fn;
+                        } else {
+                            // Try __import_ prefix
+                            const prefix = "__import_";
+                            @memcpy(name_buf[0..prefix.len], prefix);
+                            @memcpy(name_buf[prefix.len .. prefix.len + cv_name.len], cv_name);
+                            name_buf[prefix.len + cv_name.len] = 0;
+                            const import_z: [*:0]const u8 = @ptrCast(name_buf[0 .. prefix.len + cv_name.len]);
+                            if (module.getNamedFunction(import_z)) |callee_fn| {
+                                pending_callee.* = callee_fn;
+                                if (std.posix.getenv("EDGEBOX_WASM_DEBUG") != null) {
+                                    std.debug.print("[freeze-codegen] set pending_callee to import: __import_{s}\n", .{cv_name});
                                 }
                             }
                         }
@@ -2597,6 +2627,30 @@ fn emitNumericInstruction(
                             if (module.getNamedFunction(name_z)) |callee_fn| {
                                 if (callee_fn != func) {
                                     pending_callee.* = callee_fn;
+                                }
+                            } else {
+                                // Try __import_ prefix (WASM import for closure calls)
+                                if (std.posix.getenv("EDGEBOX_WASM_DEBUG") != null) {
+                                    var ibuf2: [256]u8 = undefined;
+                                    const iprefix = "__import_";
+                                    @memcpy(ibuf2[0..iprefix.len], iprefix);
+                                    @memcpy(ibuf2[iprefix.len .. iprefix.len + cv_name.len], cv_name);
+                                    ibuf2[iprefix.len + cv_name.len] = 0;
+                                    const iz2: [*:0]const u8 = @ptrCast(ibuf2[0 .. iprefix.len + cv_name.len]);
+                                    const found = module.getNamedFunction(iz2);
+                                    std.debug.print("[freeze-codegen] self_ref: lookup '__import_{s}' → {s}\n", .{ cv_name, if (found != null) "FOUND" else "NULL" });
+                                }
+                                const prefix = "__import_";
+                                var ibuf: [256]u8 = undefined;
+                                @memcpy(ibuf[0..prefix.len], prefix);
+                                @memcpy(ibuf[prefix.len .. prefix.len + cv_name.len], cv_name);
+                                ibuf[prefix.len + cv_name.len] = 0;
+                                const iz: [*:0]const u8 = @ptrCast(ibuf[0 .. prefix.len + cv_name.len]);
+                                if (module.getNamedFunction(iz)) |callee_fn| {
+                                    pending_callee.* = callee_fn;
+                                    if (std.posix.getenv("EDGEBOX_WASM_DEBUG") != null) {
+                                        std.debug.print("[freeze-codegen] SET pending_callee for import '{s}'\n", .{cv_name});
+                                    }
                                 }
                             }
                         }
