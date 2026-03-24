@@ -694,23 +694,29 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   } else {
     // Cold: parallel work-stealing.
     var hasCachedDiags = Object.keys(dc.hashes).length > 0;
+    // Block allocation: claim 8 consecutive files at a time.
+    // TSC's type cache benefits from sequential file checking — types resolved
+    // for file N are reused by file N+1 (dependency-ordered).
+    var BLOCK = 8;
     while (true) {
-      var idx = __edgebox_claim_file();
-      if (idx >= checkFiles.length) break;
-      if (hasCachedDiags) {
-        checkFile(checkFiles[idx]);
-      } else {
-        filesChecked++;
-        var file = checkFiles[idx];
-        var _fT0 = Date.now();
-        var diags = program.getSemanticDiagnostics(file);
-        var _fT1 = Date.now();
-        if (_fT1 - _fT0 > 50) __edgebox_write_stderr('[slow] ' + file.fileName.split('/').pop() + ' ' + (_fT1-_fT0) + 'ms ' + diags.length + 'diags\n');
-        for (var k = 0; k < diags.length; k++) {
-          var d = diags[k];
-          if (d.file) {
-            var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
-            output.push(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' '));
+      var blockStart = __edgebox_claim_file();
+      if (blockStart >= checkFiles.length) break;
+      // Claim remaining BLOCK-1 files atomically
+      for (var _bi = 1; _bi < BLOCK; _bi++) __edgebox_claim_file();
+      var blockEnd = Math.min(blockStart + BLOCK, checkFiles.length);
+      for (var idx = blockStart; idx < blockEnd; idx++) {
+        if (hasCachedDiags) {
+          checkFile(checkFiles[idx]);
+        } else {
+          filesChecked++;
+          var file = checkFiles[idx];
+          var diags = program.getSemanticDiagnostics(file);
+          for (var k = 0; k < diags.length; k++) {
+            var d = diags[k];
+            if (d.file) {
+              var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
+              output.push(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' '));
+            }
           }
         }
       }

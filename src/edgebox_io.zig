@@ -727,8 +727,16 @@ export fn edgebox_io_free(ptr: ?[*]const u8, len: c_int) void {
 // Fast workers process more files; slow workers don't bottleneck.
 var work_file_index: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 
+/// Claim next file index for work-stealing.
+/// Uses block allocation (4 files at a time) for better TSC cache locality.
+/// Workers check consecutive files → dependency-ordered types stay in cache.
 export fn edgebox_claim_file() u32 {
     return work_file_index.fetchAdd(1, .monotonic);
+}
+
+/// Claim a block of files. Returns first index; caller checks first..first+block_size.
+export fn edgebox_claim_block(block_size: u32) u32 {
+    return work_file_index.fetchAdd(block_size, .monotonic);
 }
 
 export fn edgebox_reset_work() void {
