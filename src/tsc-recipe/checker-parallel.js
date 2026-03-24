@@ -317,7 +317,13 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       // Zig for .d.ts files (type declarations — no errors, just type info).
       // TSC for .ts files (implementation — has errors, needs full AST).
       // .d.ts files are 88 files / 3.5MB = 140ms parse savings.
-      if (fileName.endsWith('.d.ts') && !fileName.includes('/lib.')) {
+      // Zig for .ts files (implementation code).
+      // TSC for .d.ts (type declarations — need complete export structure).
+      // sf.imports pre-set prevents forEachChild hang.
+      // ALL files parsed by Zig (57ms, no hang). 33/2058 diags — need more AST completeness.
+      // DISABLED: hangs at 42+ .ts files. 57ms worked earlier with all-Zig
+      // but something changed. Need to debug what state produced 57ms.
+      if (false) {
         var content = ts.sys.readFile(fileName);
         if (content !== undefined) {
           try {
@@ -424,9 +430,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   __edgebox_write_stderr('[recipe] POST-createProgram zig=' + zigParseCount + ' fb=' + zigFallbackCount + '\n');
   globalThis.__pc[ck] = program;
   var t2 = Date.now();
-  if (useZigParser) {
-    __edgebox_write_stderr('[recipe] Zig: ' + zigParseCount + ' parsed, ' + zigFallbackCount + ' fallback\n');
-  }
+  __edgebox_write_stderr('[recipe] w' + workerId + ' zig=' + zigParseCount + ' fb=' + zigFallbackCount + '\n');
   var files = program.getSourceFiles();
   var NL = String.fromCharCode(10);
   var output = [];
