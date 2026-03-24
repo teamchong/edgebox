@@ -146,8 +146,16 @@
         }
         break;
       case 227: // BinaryExpression
-        if (children.length > 0) node.left = children[0];
-        if (children.length > 1) node.right = children[1];
+        // TSC expects: left, operatorToken, right (3 children)
+        if (children.length >= 3) {
+          node.left = children[0];
+          node.operatorToken = children[1];
+          node.right = children[2];
+        } else if (children.length === 2) {
+          // Fallback: old format without operator token
+          node.left = children[0];
+          node.right = children[1];
+        }
         break;
       case 214: // CallExpression
         if (children.length > 0) node.expression = children[0];
@@ -481,9 +489,17 @@
     sf.imports = preImports;
     sf.moduleAugmentations = [];
     sf.ambientModuleNames = [];
-    // externalModuleIndicator: NOT SET. Setting it breaks module resolution
-    // (causes 33 diags instead of 2077). The 19 extra TS2306 errors are
-    // "File is not a module" — minor. Will fix when bridge is more complete.
+    // Set externalModuleIndicator if file has import/export statements.
+    // This tells TSC the file is a module (enables require(), exports, etc.)
+    if (hasModuleMarker && rootChildren.length > 0) {
+      for (var emi = 0; emi < rootChildren.length; emi++) {
+        var emk = rootChildren[emi].kind;
+        if (emk === 273 || emk === 279 || emk === 278) {
+          sf.externalModuleIndicator = rootChildren[emi];
+          break;
+        }
+      }
+    }
 
     // EndOfFileToken
     var TokenCtor = ts.objectAllocator.getTokenConstructor();

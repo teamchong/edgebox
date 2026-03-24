@@ -675,6 +675,9 @@ pub const Parser = struct {
             const start = self.ast.nodes.items[left].start;
             const bin = try self.ast.addNode(NK.BinaryExpression, start, 0, 0);
             self.ast.addChild(bin, left);
+            // Emit operator token node
+            const op_token = try self.ast.addNode(self.current_token, self.pos(), self.endPos(), 0);
+            self.ast.addChild(bin, op_token);
             self.nextToken(); // skip operator
             const right = try self.parseAssignmentExpression(); // right-associative
             self.ast.addChild(bin, right);
@@ -687,10 +690,17 @@ pub const Parser = struct {
     fn parseTernaryExpression(self: *Parser) ParseError!u32 {
         const left = try self.parseBinaryExpression(0);
         if (self.current_token == SK.Question) {
-            self.nextToken();
-            _ = try self.parseAssignmentExpression(); // consequent (skip for now)
+            const start = self.ast.nodes.items[left].start;
+            const cond = try self.ast.addNode(228, start, 0, 0); // ConditionalExpression
+            self.ast.addChild(cond, left); // condition
+            self.nextToken(); // skip ?
+            const consequent = try self.parseAssignmentExpression();
+            self.ast.addChild(cond, consequent); // whenTrue
             if (self.current_token == SK.Colon) self.nextToken();
-            _ = try self.parseAssignmentExpression(); // alternate
+            const alternate = try self.parseAssignmentExpression();
+            self.ast.addChild(cond, alternate); // whenFalse
+            self.ast.setEnd(cond, self.endPos());
+            return cond;
         }
         return left;
     }
@@ -703,6 +713,9 @@ pub const Parser = struct {
             const start = self.ast.nodes.items[left].start;
             const bin = try self.ast.addNode(NK.BinaryExpression, start, 0, 0);
             self.ast.addChild(bin, left);
+            // Emit operator token node (TSC expects left, operatorToken, right)
+            const op_token = try self.ast.addNode(self.current_token, self.pos(), self.endPos(), 0);
+            self.ast.addChild(bin, op_token);
             self.nextToken(); // skip operator
             const right = try self.parseBinaryExpression(prec); // left-associative
             self.ast.addChild(bin, right);

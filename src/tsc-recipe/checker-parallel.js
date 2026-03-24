@@ -289,11 +289,10 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   // Need: C++ bridge (create nodes in native) or lazy materialization to beat TSC
   // Zig parser: enabled for a SINGLE test file to identify forEachChild crash.
   // If it crashes, log the error and fall back to TSC for ALL files.
-  // Zig parser: fast (37ms for 358 files) but bridge still has correctness issues:
-  // - utilsBundle.ts: require() not treated as module reference (44 missing diags)
-  // - Binder crash on some nodes (getAssignmentDeclarationKind)
-  // Net impact on cold: negligible (37ms saved vs 800ms createProgram + 1700ms check)
-  // Re-enable when bridge correctness reaches 100%.
+  // Zig parser disabled: 2024/2058 diags (34 missing from utilsBundle.ts require() handling).
+  // Bridge improvements: operator tokens, ternary expressions, 40+ SyntaxKind mappings.
+  // Remaining issues: typeof import() type annotations not treated as imports,
+  // binder crash on destructuring assignment flow. Re-enable after these fixes.
   var useZigParser = false;
   var zigParseCount = 0, zigFallbackCount = 0;
 
