@@ -367,7 +367,6 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         "if(_s===_t)return true;" ++
         "var _si=_s.id,_ti=_t.id;" ++
         "if(_si>0&&_si<65536&&_ti>0&&_ti<65536){" ++
-        // WasmGC flag check (TurboFan-compiled via %OptimizeFunctionOnNextCall)
         "var _r=globalThis.__gcCheck(_si,_ti);" ++
         "if(_r===1)return true;" ++
         "if(_r===0)return false;" ++
