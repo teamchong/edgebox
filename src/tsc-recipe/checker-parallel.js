@@ -364,12 +364,12 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       if (hasZigResolveCache) {
         var zigResult = __edgebox_resolve_cache_get(key);
         if (zigResult === -1) {
-          // Cached failure — module not found
           globalThis.__mrCache.set(key, null);
           return undefined;
         }
         if (zigResult) {
-          // Cached success — resolve to the cached path
+          // Cache hit — still need TSC resolve for full ResolvedModule object,
+          // but the Zig cache ensures fileExists calls hit Zig's file cache
           var r2 = ts.resolveModuleName(name, containingFile, parsed.options, defaultHost).resolvedModule;
           globalThis.__mrCache.set(key, r2 || null);
           return r2;
