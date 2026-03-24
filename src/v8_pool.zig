@@ -286,8 +286,12 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         "var _bloom=0;" ++
         "members.forEach(function(_v,_k){" ++
         // Skip optional members — only REQUIRED members matter for structural reject.
-        // If target has optional member 'a', source can omit it and still be compatible.
         "if(_v.flags&16777216)return;" ++ // SymbolFlags.Optional = 16777216
+        // Skip internal members (__index, __call, __new, __constructor) — these are
+        // index/call/construct signatures, not named properties. A type with an index
+        // signature ({[key:string]:string}) should NOT bloom "__index" — it would
+        // falsely reject types without index signatures.
+        "if(_k.charCodeAt(0)===95&&_k.charCodeAt(1)===95)return;" ++ // startsWith('__')
         // Each member name hashed INDEPENDENTLY — no carry-over
         "var _h=0;" ++
         "for(var _i=0;_i<_k.length;_i++){_h=((_h<<5)|(_h>>>27))^_k.charCodeAt(_i);}" ++

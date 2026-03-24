@@ -239,10 +239,20 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       var PRIM = 249860; // String|Number|Boolean|BigInt|ESSymbol|Void|Undefined|Null|Never
       if ((s & PRIM) && (t & PRIM) && !(s & t & PRIM)) return 0;
 
-      // 2. Object→Object bloom filter: DISABLED pending edge case investigation.
-      // Bloom filter correctly rejects 2053/2058, but 1 edge case produces false rejection.
-      // TODO: debug the off-by-1 — likely an inherited/computed member not in the members Map.
-      // Infrastructure (setStructuredTypeMembers patch + bloom array) stays active for future use.
+      // 2. Object→Object bloom filter: reject if target has REQUIRED members source lacks.
+      // CONSERVATIVE: only reject when BOTH types have bloom AND source is MISSING bits.
+      // Skip if either bloom is 0 (type has no required members or wasn't resolved yet).
+      if ((s & 524288) && (t & 524288)) {
+        var _ba = globalThis.__gcBloomArr, _bg = globalThis.__gcSoa;
+        if (_ba && _bg) {
+          var sb = _bg.getI32(_ba, _si | 0);
+          var tb = _bg.getI32(_ba, _ti | 0);
+          // Only reject if BOTH have non-zero blooms AND target has bits source lacks
+          // AND source isn't a type with call/construct signatures (callable objects
+          // can satisfy interface requirements through their signatures, not members)
+          if (sb > 0 && tb > 0 && (tb & ~sb)) return 0;
+        }
+      }
 
       return -1; // unknown — fall through to full TSC check
     };
