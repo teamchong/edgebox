@@ -435,11 +435,31 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\      (if (i32.and (local.get $s) (i32.const 67358815))
         \\        (then (return (i32.const 1))))
         \\      (return (i32.const -1))))
-        \\    ;; Flag checks (isSimpleTypeRelatedTo)
+        \\    ;; Flag checks (isSimpleTypeRelatedTo core)
         \\    (local.set $r (call $checkRel (local.get $flagsArr) (local.get $bloomArr)
         \\      (local.get $src) (local.get $tgt)))
         \\    (if (i32.ne (local.get $r) (i32.const -1))
         \\      (then (return (local.get $r))))
+        \\    ;; Assignable/comparable extras
+        \\    (if (i32.or (i32.eqz (local.get $rel))
+        \\               (i32.eq (local.get $rel) (i32.const 1))) (then
+        \\      ;; Any → anything (assignable)
+        \\      (if (i32.and (local.get $s) (i32.const 1))
+        \\        (then (return (i32.const 1))))
+        \\      ;; Number(8) → Enum(32)
+        \\      (if (i32.and
+        \\        (i32.ne (i32.and (local.get $s) (i32.const 8)) (i32.const 0))
+        \\        (i32.ne (i32.and (local.get $t) (i32.const 32)) (i32.const 0)))
+        \\        (then (return (i32.const 1))))
+        \\      ;; Number(8) → NumberLiteral+EnumLiteral
+        \\      (if (i32.and
+        \\        (i32.ne (i32.and (local.get $s) (i32.const 8)) (i32.const 0))
+        \\        (i32.and
+        \\          (i32.ne (i32.and (local.get $t) (i32.const 256)) (i32.const 0))
+        \\          (i32.ne (i32.and (local.get $t) (i32.const 1024)) (i32.const 0))))
+        \\        (then (return (i32.const 1))))))
+        \\    ;; TypeParameter(262144) with constraint === target → related
+        \\    ;; (can't check constraint here — need type graph, fall through)
         \\    ;; Target is union → check source against members
         \\    (if (i32.and (i32.ne (i32.and (local.get $t) (i32.const 1048576)) (i32.const 0))
         \\               (i32.eqz (i32.and (local.get $s) (i32.const 3145728)))) (then
