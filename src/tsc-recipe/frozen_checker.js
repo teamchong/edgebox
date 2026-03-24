@@ -1,104 +1,92 @@
-// Frozen TSC checker — QuickJS → LLVM → WASM
-// Recipe-level freeze with closure variable support.
+// Frozen TSC isSimpleTypeRelatedTo — compiled via QuickJS → LLVM → WASM
+//
+// This is the ACTUAL TSC function, refactored so closure dependencies
+// become function parameters or WASM imports.
+// The recipe provides the imports when instantiating the WASM module.
 
-// isSimpleTypeRelatedTo with strictNullChecks as closure variable
-// In TSC, strictNullChecks is captured from the checker's scope.
-// The freeze pipeline treats it as an extra WASM param.
-function makeSimpleChecker(strictNullChecks) {
-  function checkFlagsWithNull(s, t, rel) {
-    if ((t & 1) || (s & 131072)) return 1;
-    if (t & 2) return 1;
+// Closure dependencies become function params/imports:
+// - wildcardType → compared by ID, not object identity
+// - relation objects → converted to i32 enum by caller
+// - strictNullChecks → i32 param (1 or 0)
+// - isEnumTypeRelatedTo → WASM import (calls back to JS)
+// - getObjectFlags → WASM import
+// - isEmptyAnonymousObjectType → WASM import
+// - isUnknownLikeUnionType → WASM import
+// - source.value === target.value → WASM import (valueEquals)
+
+function makeIsSimpleTypeRelatedTo(
+  isEnumTypeRelatedTo,
+  getObjectFlags,
+  isEmptyAnonymousObjectType,
+  isUnknownLikeUnionType,
+  valueEquals
+) {
+  // This inner function captures the imports as closure variables.
+  // The freeze pipeline compiles it to WASM with the imports.
+  function isSimpleTypeRelatedTo(s, t, rel, strictNullChecks, srcId, tgtId, wildcardId) {
+    // target Any(1) or source Never(131072) or source === wildcardType
+    if (t & 1 || s & 131072 || srcId === wildcardId) return 1;
+    // target Unknown(2) — unless strictSubtype(3) && source Any
+    if (t & 2 && !(rel === 3 && s & 1)) return 1;
+    // target Never
     if (t & 131072) return 0;
-    if ((s & 402653316) && (t & 4)) return 1;
-    if ((s & 296) && (t & 8)) return 1;
-    if ((s & 2112) && (t & 64)) return 1;
-    if ((s & 528) && (t & 16)) return 1;
-    if ((s & 12288) && (t & 4096)) return 1;
-    // Undefined → Undefined|Void (strictNullChecks aware)
-    if ((s & 32768) && (strictNullChecks === 0 || (t & 49152))) return 1;
-    // Null → Null (strictNullChecks aware)
-    if ((s & 65536) && (strictNullChecks === 0 || (t & 65536))) return 1;
-    if ((s & 524288) && (t & 67108864)) return 1;
+    // StringLike → String
+    if (s & 402653316 && t & 4) return 1;
+    // StringLiteral+EnumLiteral → StringLiteral (need value check)
+    if (s & 128 && s & 1024 && t & 128 && !(t & 1024)) {
+      if (valueEquals(srcId, tgtId)) return 1;
+    }
+    // NumberLike → Number
+    if (s & 296 && t & 8) return 1;
+    // NumberLiteral+EnumLiteral → NumberLiteral (need value check)
+    if (s & 256 && s & 1024 && t & 256 && !(t & 1024)) {
+      if (valueEquals(srcId, tgtId)) return 1;
+    }
+    // BigIntLike → BigInt
+    if (s & 2112 && t & 64) return 1;
+    // BooleanLike → Boolean
+    if (s & 528 && t & 16) return 1;
+    // ESSymbolLike → ESSymbol
+    if (s & 12288 && t & 4096) return 1;
+    // Enum → Enum (need name + enum check via import)
+    if (s & 32 && t & 32) {
+      if (isEnumTypeRelatedTo(srcId, tgtId)) return 1;
+    }
+    // EnumLiteral → EnumLiteral
+    if (s & 1024 && t & 1024) {
+      if (s & 1048576 && t & 1048576) {
+        if (isEnumTypeRelatedTo(srcId, tgtId)) return 1;
+      }
+      if (s & 2944 && t & 2944) {
+        if (valueEquals(srcId, tgtId) && isEnumTypeRelatedTo(srcId, tgtId)) return 1;
+      }
+    }
+    // Undefined — strictNullChecks aware
+    if (s & 32768 && (strictNullChecks === 0 && !(t & 3145728) || t & 49152)) return 1;
+    // Null — strictNullChecks aware
+    if (s & 65536 && (strictNullChecks === 0 && !(t & 3145728) || t & 65536)) return 1;
+    // Object → NonPrimitive (with strictSubtype exception)
+    if (s & 524288 && t & 67108864) {
+      if (!(rel === 3 && isEmptyAnonymousObjectType(srcId) && !(getObjectFlags(srcId) & 8192))) return 1;
+    }
+    // Assignable/comparable extras
     if (rel === 0 || rel === 1) {
       if (s & 1) return 1;
-      if ((s & 8) && ((t & 32) || ((t & 256) && (t & 1024)))) return 1;
+      if (s & 8 && (t & 32 || t & 256 && t & 1024)) return 1;
+      if (s & 256 && !(s & 1024) && (t & 32 || t & 256 && t & 1024 && valueEquals(srcId, tgtId))) return 1;
+      if (isUnknownLikeUnionType(tgtId)) return 1;
     }
-    if ((s & 249860) && (t & 249860)) {
-      if (((s & t) & 249860) === 0) return 0;
-    }
-    return -1;
+    return 0;
   }
-  return checkFlagsWithNull;
+  return isSimpleTypeRelatedTo;
 }
 
-// Pure flag checks (no closures — guaranteed correct)
-function checkFlags(s, t, rel) {
-  if ((t & 1) || (s & 131072)) return 1;
-  if (t & 2) return 1;
-  if (t & 131072) return 0;
-  if ((s & 402653316) && (t & 4)) return 1;
-  if ((s & 296) && (t & 8)) return 1;
-  if ((s & 2112) && (t & 64)) return 1;
-  if ((s & 528) && (t & 16)) return 1;
-  if ((s & 12288) && (t & 4096)) return 1;
-  if ((s & 32768) && (t & 49152)) return 1;
-  if ((s & 65536) && (t & 65536)) return 1;
-  if ((s & 524288) && (t & 67108864)) return 1;
-  if (rel === 0 || rel === 1) {
-    if (s & 1) return 1;
-    if ((s & 8) && ((t & 32) || ((t & 256) && (t & 1024)))) return 1;
-  }
-  if ((s & 249860) && (t & 249860)) {
-    if (((s & t) & 249860) === 0) return 0;
-  }
-  return -1;
-}
+// Dummy imports for compilation
+function dummyEnumRel(a, b) { return 0; }
+function dummyGetOF(a) { return 0; }
+function dummyIsEmpty(a) { return 0; }
+function dummyIsUnknown(a) { return 0; }
+function dummyValueEq(a, b) { return 0; }
 
-function checkRelated(sFlags, tFlags, sId, tId, rel) {
-  if (sId === tId) return 1;
-  if ((sFlags & 524288) && (tFlags & 402784252)) {
-    return checkFlags(sFlags, tFlags, rel);
-  }
-  if (rel === 4) {
-    if (sFlags !== tFlags) return 0;
-    if (sFlags & 67358815) return 1;
-    return -1;
-  }
-  return checkFlags(sFlags, tFlags, rel);
-}
-
-function getObjectFlagsFlat(flags, objectFlags) {
-  return flags & 3899393 ? objectFlags : 0;
-}
-
-function isUnitTypeFlat(flags) {
-  return flags & 109472 ? 1 : 0;
-}
-
-function checkPropertyNames(srcCount, tgtCount, srcOff, tgtOff, mem) {
-  if (tgtCount === 0) return -1;
-  if (srcCount === 0) return -1;
-  var i = 0;
-  while (i < tgtCount) {
-    var tgtHash = mem[tgtOff + i];
-    var found = 0;
-    var j = 0;
-    while (j < srcCount) {
-      if (mem[srcOff + j] === tgtHash) { found = 1; j = srcCount; }
-      j = j + 1;
-    }
-    if (found === 0) return 0;
-    i = i + 1;
-  }
-  return 1;
-}
-
-// Prevent dead code elimination
-var _checker = makeSimpleChecker(1);
-var _r0 = _checker(32768, 49152, 0);
-var _r1 = checkFlags(1, 2, 0);
-var _r2 = checkRelated(1, 2, 10, 20, 0);
-var _r3 = getObjectFlagsFlat(524288, 128);
-var _r4 = isUnitTypeFlat(109472);
-var _arr = [0, 0, 0, 0];
-var _r5 = checkPropertyNames(2, 2, 0, 2, _arr);
+var fn = makeIsSimpleTypeRelatedTo(dummyEnumRel, dummyGetOF, dummyIsEmpty, dummyIsUnknown, dummyValueEq);
+var r = fn(1, 2, 0, 1, 10, 20, 999);
