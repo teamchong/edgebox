@@ -213,22 +213,67 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     // Define __gcCheck as a global function so we can force TurboFan compilation.
     // This function does the WasmGC flag read + comparison.
     // TurboFan inlines getFlag (array.get) inside this function → native MOV.
+    // Returns: 1=related, 0=NOT related, -1=unknown (fall through to TSC)
+    // Both positive AND negative fast-paths maximize hit rate.
+    // Negative paths are SAFE — returning 0 only when types are provably incompatible.
     globalThis.__gcCheck = function(_si, _ti) {
       var _ga = globalThis.__gcFlagsArr, _gf = globalThis.__gcFlags;
       if (!_ga || !_gf) return -1;
       var s = _gf.getFlag(_ga, _si | 0), t = _gf.getFlag(_ga, _ti | 0);
       if (!s || !t) return -1;
-      if (t & 1 || s & 131072) return 1;    // Any/Never
-      if (t & 2) return 1;                   // Unknown
+
+      // ── POSITIVE: source IS related to target ──
+      if (t & 1 || s & 131072) return 1;    // target Any or source Never → always related
+      if (t & 2) return 1;                   // target Unknown → always related
       if (s & 402653316 && t & 4) return 1;  // StringLike→String
       if (s & 296 && t & 8) return 1;        // NumberLike→Number
       if (s & 2112 && t & 64) return 1;      // BigIntLike→BigInt
       if (s & 528 && t & 16) return 1;       // BooleanLike→Boolean
       if (s & 12288 && t & 4096) return 1;   // ESSymbolLike→ESSymbol
-      if (s & 32768 && (t & 49152)) return 1;// Undefined→Void
+      if (s & 32768 && (t & 49152)) return 1;// Undefined→Undefined|Void
       if (s & 65536 && t & 65536) return 1;  // Null→Null
       if (s & 524288 && t & 67108864) return 1;// Object→NonPrimitive
-      return -1;
+
+      // ── NEGATIVE: source is NOT related to target ──
+      // SAFE: two concrete primitive types with no overlapping kind bits.
+      // String(4) vs Number(8) → NOT related. Number(8) vs Boolean(16) → NOT related.
+      // StringLiteral(128) is NOT in PRIM mask — handled by positive paths above.
+      // NOTE: Primitive→Object is NOT safe to reject (structural compatibility).
+      var PRIM = 249860; // String|Number|Boolean|BigInt|ESSymbol|Void|Undefined|Null|Never
+      if ((s & PRIM) && (t & PRIM) && !(s & t & PRIM)) return 0;
+
+      return -1; // unknown — fall through to full TSC check
+    };
+
+    // ── Relation cache: WasmGC-backed fast lookup ──
+    // TSC's isTypeRelatedTo is called 200K+ times, many with same (src,tgt) pair.
+    // TSC's internal cache uses Map with string keys (4% of runtime in FindOrderedHashMapEntry).
+    // Our cache uses a flat Int32Array indexed by hash — O(1) lookup, no string creation.
+    // Stores: key = (srcId << 16) | tgtId, value = 1 (true) or 2 (false)
+    // Hash table with open addressing, 64K entries (covers most type ID pairs).
+    var _relCacheSize = 65536;
+    var _relCacheKeys = new Int32Array(_relCacheSize);  // packed (srcId<<16)|tgtId
+    var _relCacheVals = new Int8Array(_relCacheSize);    // 0=empty, 1=true, 2=false
+    globalThis.__relCacheKeys = _relCacheKeys;
+    globalThis.__relCacheVals = _relCacheVals;
+    globalThis.__relCacheSize = _relCacheSize;
+
+    // Cache lookup — called from isTypeRelatedTo injection
+    // Returns: 1=related, 2=not related, 0=miss
+    globalThis.__relCacheLookup = function(_si, _ti) {
+      var key = ((_si << 16) | _ti) | 0;
+      var h = ((key * 2654435761) >>> 0) & 65535; // Knuth multiplicative hash
+      var k = _relCacheKeys[h];
+      if (k === key) return _relCacheVals[h];
+      return 0;
+    };
+
+    // Cache store — called after isTypeRelatedTo completes
+    globalThis.__relCacheStore = function(_si, _ti, _result) {
+      var key = ((_si << 16) | _ti) | 0;
+      var h = ((key * 2654435761) >>> 0) & 65535;
+      _relCacheKeys[h] = key;
+      _relCacheVals[h] = _result ? 1 : 2;
     };
 
     // Force TurboFan compilation of __gcCheck BEFORE any type checking.
@@ -240,7 +285,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       globalThis.__gcCheck(1, 2);
       globalThis.__gcCheck(100, 200);
       eval('%OptimizeFunctionOnNextCall(globalThis.__gcCheck)');
-      // Trigger TurboFan compilation — this call compiles with WASM inlining
+      // Trigger TurboFan compilation — WasmGC getFlag inlined from call #1
       globalThis.__gcCheck(1, 2);
       __edgebox_write_stderr('[recipe] __gcCheck force-compiled by TurboFan\n');
     } catch(e) {

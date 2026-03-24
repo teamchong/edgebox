@@ -286,9 +286,11 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         "var _t=(target.flags&2976)&&target.freshType===target?target.regularType:target;" ++
         "if(_s===_t)return true;" ++
         "var _si=_s.id,_ti=_t.id;" ++
-        "if(_si<65536&&_ti<65536){" ++
+        "if(_si>0&&_si<65536&&_ti>0&&_ti<65536){" ++
+        // WasmGC flag check (TurboFan-compiled via %OptimizeFunctionOnNextCall)
         "var _r=globalThis.__gcCheck(_si,_ti);" ++
         "if(_r===1)return true;" ++
+        "if(_r===0)return false;" ++
         "}}";
 
     const itr_idx = std.mem.indexOf(u8, result, helper_needle) orelse {
@@ -304,6 +306,11 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         @memcpy(itr_result[itr_idx + itr_inject.len .. itr_len], result[itr_idx + helper_needle.len ..]);
         result = itr_result;
     }
+
+    // NOTE: Relation cache removed — TSC's checkTypeRelatedTo is NOT pure.
+    // Same (source, target) pair can have different results depending on
+    // intersectionState, elaboration depth, inference context, and variance.
+    // Only TSC's internal relation cache (with versioning/invalidation) is safe.
 
     return result;
 }
