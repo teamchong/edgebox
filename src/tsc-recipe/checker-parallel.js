@@ -50,6 +50,9 @@ globalThis.__gcFlagsDone = false;
   // the main culprit: default constructor only sets flags+checker, all other
   // properties added dynamically → hundreds of hidden class transitions.
   var origTypeProto = ts.objectAllocator.getTypeConstructor().prototype;
+  // MonoType: 11 properties = sweet spot. Covers all properties actually set
+  // on playwright types. More = wasted memory. Fewer = hidden class transitions.
+  // Tested: 30 props (1.78s), 11 props (1.73s best), 5 props (1.76s).
   function MonoType(checker, flags) {
     this.flags = flags;
     this.checker = checker;
@@ -58,32 +61,15 @@ globalThis.__gcFlagsDone = false;
     this.intrinsicName = void 0;
     this.debugIntrinsicName = void 0;
     this.symbol = void 0;
-    this.members = void 0;
-    this.properties = void 0;
-    this.callSignatures = void 0;
-    this.constructSignatures = void 0;
-    this.indexInfos = void 0;
     this.immediateBaseConstraint = void 0;
-    this.aliasSymbol = void 0;
-    this.aliasTypeArguments = void 0;
-    this.regularType = void 0;
-    this.target = void 0;
-    this.resolvedTypeArguments = void 0;
-    this.freshType = void 0;
-    this.types = void 0;
-    this.origin = void 0;
     this.value = void 0;
-    this.resolvedBaseConstraint = void 0;
-    this.declaredProperties = void 0;
-    this.declaredCallSignatures = void 0;
-    this.declaredConstructSignatures = void 0;
-    this.declaredIndexInfos = void 0;
-    this.pattern = void 0;
+    this.regularType = void 0;
+    this.freshType = void 0;
   }
   MonoType.prototype = Object.create(origTypeProto);
   MonoType.prototype.constructor = MonoType;
 
-  // MonoSignature — pre-initialize common Signature properties
+  // MonoSignature — keep fat version (slimming hurt performance)
   var origSigProto = ts.objectAllocator.getSignatureConstructor().prototype;
   function MonoSignature(checker, flags) {
     this.flags = flags;
