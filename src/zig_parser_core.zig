@@ -10,43 +10,46 @@ const SK = @import("zig_scanner.zig").SK;
 const TokenKind = @import("zig_scanner.zig").TokenKind;
 
 // Node kinds that are AST nodes (not tokens)
+// SyntaxKind values — MUST match TSC 5.9 exactly (verified via ts.SyntaxKind)
 pub const NK = struct {
-    pub const SourceFile: u16 = 316;
-    pub const Block: u16 = 241;
-    pub const VariableStatement: u16 = 243;
-    pub const VariableDeclarationList: u16 = 261;
-    pub const VariableDeclaration: u16 = 260;
-    pub const ExpressionStatement: u16 = 244;
-    pub const IfStatement: u16 = 245;
-    pub const ReturnStatement: u16 = 253;
-    pub const FunctionDeclaration: u16 = 262;
-    pub const ClassDeclaration: u16 = 263;
-    pub const InterfaceDeclaration: u16 = 264;
-    pub const TypeAliasDeclaration: u16 = 265;
-    pub const EnumDeclaration: u16 = 266;
-    pub const ImportDeclaration: u16 = 272;
-    pub const ExportDeclaration: u16 = 278;
-    pub const ExportAssignment: u16 = 277;
+    pub const SourceFile: u16 = 308;
+    pub const Block: u16 = 242;
+    pub const VariableStatement: u16 = 244;
+    pub const VariableDeclarationList: u16 = 262;
+    pub const VariableDeclaration: u16 = 261;
+    pub const ExpressionStatement: u16 = 245;
+    pub const IfStatement: u16 = 246;
+    pub const ReturnStatement: u16 = 254;
+    pub const FunctionDeclaration: u16 = 263;
+    pub const ClassDeclaration: u16 = 264;
+    pub const InterfaceDeclaration: u16 = 265;
+    pub const TypeAliasDeclaration: u16 = 266;
+    pub const EnumDeclaration: u16 = 267;
+    pub const ImportDeclaration: u16 = 273;
+    pub const ExportDeclaration: u16 = 279;
+    pub const ExportAssignment: u16 = 278;
     // Expressions
     pub const Identifier: u16 = 80;
     pub const StringLiteral: u16 = 11;
     pub const NumericLiteral: u16 = 9;
-    pub const CallExpression: u16 = 213;
-    pub const PropertyAccessExpression: u16 = 211;
-    pub const ElementAccessExpression: u16 = 212;
-    pub const BinaryExpression: u16 = 226;
-    pub const ArrowFunction: u16 = 219;
-    pub const ObjectLiteralExpression: u16 = 210;
-    pub const ArrayLiteralExpression: u16 = 209;
-    pub const ParenthesizedExpression: u16 = 217;
+    pub const CallExpression: u16 = 214;
+    pub const PropertyAccessExpression: u16 = 212;
+    pub const ElementAccessExpression: u16 = 213;
+    pub const BinaryExpression: u16 = 227;
+    pub const ArrowFunction: u16 = 220;
+    pub const ObjectLiteralExpression: u16 = 211;
+    pub const ArrayLiteralExpression: u16 = 210;
+    pub const ParenthesizedExpression: u16 = 218;
+    pub const PrefixUnaryExpression: u16 = 225;
+    pub const TemplateExpression: u16 = 229;
     // Types
-    pub const TypeReference: u16 = 183;
+    pub const TypeReference: u16 = 184;
     pub const UnionType: u16 = 193;
-    pub const ArrayType: u16 = 188;
-    pub const LiteralType: u16 = 200;
-    pub const FunctionType: u16 = 184;
-    pub const Parameter: u16 = 169;
-    pub const PropertySignature: u16 = 171;
+    pub const ArrayType: u16 = 189;
+    pub const LiteralType: u16 = 202;
+    pub const FunctionType: u16 = 185;
+    pub const Parameter: u16 = 170;
+    pub const PropertySignature: u16 = 172;
 };
 
 // Flat AST node — 24 bytes, cache-friendly, zero GC.
@@ -190,9 +193,9 @@ pub const Parser = struct {
             109 => self.parseSwitchStatement(), // switch
             113 => self.parseTryCatchStatement(), // try
             111 => self.parseThrowStatement(), // throw
-            88 => blk: { self.nextToken(); if (self.current_token == SK.Semicolon) self.nextToken(); break :blk try self.ast.addNode(246, self.pos(), self.endPos(), 0); }, // continue
-            83 => blk: { self.nextToken(); if (self.current_token == SK.Semicolon) self.nextToken(); break :blk try self.ast.addNode(251, self.pos(), self.endPos(), 0); }, // break
-            89 => blk: { self.nextToken(); if (self.current_token == SK.Semicolon) self.nextToken(); break :blk try self.ast.addNode(249, self.pos(), self.endPos(), 0); }, // debugger
+            88 => blk: { self.nextToken(); if (self.current_token == SK.Semicolon) self.nextToken(); break :blk try self.ast.addNode(252, self.pos(), self.endPos(), 0); }, // continue
+            83 => blk: { self.nextToken(); if (self.current_token == SK.Semicolon) self.nextToken(); break :blk try self.ast.addNode(253, self.pos(), self.endPos(), 0); }, // break
+            89 => blk: { self.nextToken(); if (self.current_token == SK.Semicolon) self.nextToken(); break :blk try self.ast.addNode(260, self.pos(), self.endPos(), 0); }, // debugger
             128, 134, 138 => blk: { // abstract, async, declare — modifiers before declaration
                 self.nextToken();
                 break :blk try self.parseStatement();
@@ -234,16 +237,21 @@ pub const Parser = struct {
     fn parseVariableDeclaration(self: *Parser) ParseError!u32 {
         const start = self.pos();
         const decl = try self.ast.addNode(NK.VariableDeclaration, start, 0, 0);
-        // Name
+        // Name (can be identifier or destructuring pattern)
         if (self.current_token == SK.Identifier) {
             const name = try self.ast.addNode(NK.Identifier, self.pos(), self.endPos(), 0);
             self.ast.addChild(decl, name);
             self.nextToken();
+        } else if (self.current_token == SK.OpenBrace) {
+            self.skipBraced(); // object destructuring (simplified)
+        } else if (self.current_token == SK.OpenBracket) {
+            self.skipBracketed(); // array destructuring (simplified)
         }
-        // Optional type annotation
+        // Optional type annotation — creates real AST node
         if (self.current_token == SK.Colon) {
             self.nextToken();
-            self.skipTypeAnnotation();
+            const type_node = try self.parseTypeNode();
+            self.ast.addChild(decl, type_node);
         }
         // Optional initializer
         if (self.current_token == SK.Equals) {
@@ -299,7 +307,7 @@ pub const Parser = struct {
 
     fn parseForStatement(self: *Parser) ParseError!u32 {
         const start = self.pos();
-        const stmt = try self.ast.addNode(248, start, 0, 0); // ForStatement
+        const stmt = try self.ast.addNode(249, start, 0, 0); // ForStatement
         self.nextToken(); // skip 'for'
         self.skipParenthesized();
         const body = try self.parseStatement();
@@ -310,7 +318,7 @@ pub const Parser = struct {
 
     fn parseWhileStatement(self: *Parser) ParseError!u32 {
         const start = self.pos();
-        const stmt = try self.ast.addNode(247, start, 0, 0); // WhileStatement
+        const stmt = try self.ast.addNode(248, start, 0, 0); // WhileStatement
         self.nextToken(); // skip 'while'
         self.expect(SK.OpenParen);
         const cond = try self.parseExpression();
@@ -324,7 +332,7 @@ pub const Parser = struct {
 
     fn parseDoWhileStatement(self: *Parser) ParseError!u32 {
         const start = self.pos();
-        const stmt = try self.ast.addNode(246, start, 0, 0); // DoStatement
+        const stmt = try self.ast.addNode(247, start, 0, 0); // DoStatement
         self.nextToken(); // skip 'do'
         const body = try self.parseStatement();
         self.ast.addChild(stmt, body);
@@ -339,7 +347,7 @@ pub const Parser = struct {
 
     fn parseSwitchStatement(self: *Parser) ParseError!u32 {
         const start = self.pos();
-        const stmt = try self.ast.addNode(255, start, 0, 0); // SwitchStatement
+        const stmt = try self.ast.addNode(256, start, 0, 0); // SwitchStatement
         self.nextToken(); // skip 'switch'
         self.skipParenthesized();
         if (self.current_token == SK.OpenBrace) {
@@ -351,7 +359,7 @@ pub const Parser = struct {
 
     fn parseTryCatchStatement(self: *Parser) ParseError!u32 {
         const start = self.pos();
-        const stmt = try self.ast.addNode(258, start, 0, 0); // TryStatement
+        const stmt = try self.ast.addNode(259, start, 0, 0); // TryStatement
         self.nextToken(); // skip 'try'
         if (self.current_token == SK.OpenBrace) {
             const body = try self.parseBlock();
@@ -378,7 +386,7 @@ pub const Parser = struct {
 
     fn parseThrowStatement(self: *Parser) ParseError!u32 {
         const start = self.pos();
-        const stmt = try self.ast.addNode(257, start, 0, 0); // ThrowStatement
+        const stmt = try self.ast.addNode(258, start, 0, 0); // ThrowStatement
         self.nextToken(); // skip 'throw'
         const expr = try self.parseExpression();
         self.ast.addChild(stmt, expr);
@@ -390,6 +398,8 @@ pub const Parser = struct {
     fn parseFunctionDeclaration(self: *Parser) ParseError!u32 {
         const start = self.pos();
         const decl = try self.ast.addNode(NK.FunctionDeclaration, start, 0, 0);
+        // Skip asterisk for generators
+        if (self.current_token == 42) self.nextToken(); // *
         self.nextToken(); // skip 'function'
         // Name
         if (self.current_token == SK.Identifier) {
@@ -397,15 +407,66 @@ pub const Parser = struct {
             self.ast.addChild(decl, name);
             self.nextToken();
         }
-        // Skip params and body (simplified)
-        self.skipParenthesized();
-        if (self.current_token == SK.Colon) { self.nextToken(); self.skipTypeAnnotation(); }
+        // Type parameters <T>
+        if (self.current_token == SK.LessThan) self.skipAngleBracketed();
+        // Parameters
+        try self.parseParameterList(decl);
+        // Return type
+        if (self.current_token == SK.Colon) {
+            self.nextToken();
+            const ret_type = try self.parseTypeNode();
+            self.ast.addChild(decl, ret_type);
+        }
+        // Body
         if (self.current_token == SK.OpenBrace) {
             const body = try self.parseBlock();
             self.ast.addChild(decl, body);
         }
         self.ast.setEnd(decl, self.endPos());
         return decl;
+    }
+
+    fn parseParameterList(self: *Parser, parent: u32) ParseError!void {
+        if (self.current_token != SK.OpenParen) return;
+        self.nextToken(); // skip (
+        while (self.current_token != SK.CloseParen and self.current_token != SK.EndOfFile) {
+            // Skip modifiers (public, private, readonly, etc.)
+            while (self.current_token == 123 or self.current_token == 124 or
+                   self.current_token == 125 or self.current_token == 148 or
+                   self.current_token == 126) self.nextToken();
+            // Rest parameter
+            if (self.current_token == SK.DotDotDot) self.nextToken();
+            const param_start = self.pos();
+            const param = try self.ast.addNode(NK.Parameter, param_start, 0, 0);
+            // Name (identifier or destructuring)
+            if (self.current_token == SK.Identifier or self.current_token == 110) { // identifier or this
+                const name = try self.ast.addNode(NK.Identifier, self.pos(), self.endPos(), 0);
+                self.ast.addChild(param, name);
+                self.nextToken();
+            } else if (self.current_token == SK.OpenBrace) {
+                self.skipBraced();
+            } else if (self.current_token == SK.OpenBracket) {
+                self.skipBracketed();
+            }
+            // Optional marker ?
+            if (self.current_token == SK.Question) self.nextToken();
+            // Type annotation
+            if (self.current_token == SK.Colon) {
+                self.nextToken();
+                const type_node = try self.parseTypeNode();
+                self.ast.addChild(param, type_node);
+            }
+            // Default value
+            if (self.current_token == SK.Equals) {
+                self.nextToken();
+                const default_val = try self.parseAssignmentExpression();
+                self.ast.addChild(param, default_val);
+            }
+            self.ast.setEnd(param, self.endPos());
+            self.ast.addChild(parent, param);
+            if (self.current_token == SK.Comma) self.nextToken();
+        }
+        if (self.current_token == SK.CloseParen) self.nextToken();
     }
 
     fn parseClassDeclaration(self: *Parser) ParseError!u32 {
@@ -474,9 +535,42 @@ pub const Parser = struct {
     fn parseImportDeclaration(self: *Parser) ParseError!u32 {
         const start = self.pos();
         const decl = try self.ast.addNode(NK.ImportDeclaration, start, 0, 0);
-        // Skip everything until semicolon/newline
-        while (self.current_token != SK.Semicolon and self.current_token != SK.EndOfFile) {
-            if (self.current_token == SK.OpenBrace) { self.skipBraced(); continue; }
+        self.nextToken(); // skip 'import'
+        // import 'module' (side-effect import)
+        if (self.current_token == SK.StringLiteral) {
+            const spec = try self.ast.addNode(NK.StringLiteral, self.pos(), self.endPos(), 0);
+            self.ast.addChild(decl, spec);
+            self.nextToken();
+            if (self.current_token == SK.Semicolon) self.nextToken();
+            self.ast.setEnd(decl, self.endPos());
+            return decl;
+        }
+        // import type ...
+        if (self.current_token == 156) self.nextToken(); // skip 'type'
+        // import { ... } from '...' OR import X from '...' OR import * as X from '...'
+        if (self.current_token == SK.OpenBrace) {
+            self.skipBraced();
+        } else if (self.current_token == SK.Asterisk) {
+            self.nextToken(); // *
+            if (self.current_token == 130) self.nextToken(); // as
+            if (self.current_token == SK.Identifier) self.nextToken(); // name
+        } else if (self.current_token == SK.Identifier) {
+            self.nextToken(); // default import name
+            if (self.current_token == SK.Comma) {
+                self.nextToken();
+                if (self.current_token == SK.OpenBrace) self.skipBraced();
+                if (self.current_token == SK.Asterisk) {
+                    self.nextToken();
+                    if (self.current_token == 130) self.nextToken();
+                    if (self.current_token == SK.Identifier) self.nextToken();
+                }
+            }
+        }
+        // from 'module-specifier'
+        if (self.current_token == 161) self.nextToken(); // from
+        if (self.current_token == SK.StringLiteral) {
+            const spec = try self.ast.addNode(NK.StringLiteral, self.pos(), self.endPos(), 0);
+            self.ast.addChild(decl, spec);
             self.nextToken();
         }
         if (self.current_token == SK.Semicolon) self.nextToken();
@@ -563,7 +657,7 @@ pub const Parser = struct {
         // Prefix: !, ~, -, +, typeof, void, delete, ++, --, await
         if (isUnaryPrefix(self.current_token)) {
             const start = self.pos();
-            const node = try self.ast.addNode(224, start, 0, 0); // PrefixUnaryExpression
+            const node = try self.ast.addNode(225, start, 0, 0); // PrefixUnaryExpression
             self.nextToken();
             const operand = try self.parseUnaryExpression();
             self.ast.addChild(node, operand);
@@ -670,7 +764,7 @@ pub const Parser = struct {
             },
             SK.NoSubTemplate, SK.TemplateHead => blk: {
                 // Template literal
-                const node = try self.ast.addNode(228, start, 0, 0); // TemplateExpression
+                const node = try self.ast.addNode(229, start, 0, 0); // TemplateExpression
                 if (self.current_token == SK.NoSubTemplate) {
                     self.nextToken();
                     self.ast.setEnd(node, self.endPos());
@@ -792,8 +886,163 @@ pub const Parser = struct {
 
     // ── Helpers ──
 
+    /// Parse a type annotation and return the AST node.
+    /// Handles: keyword types, type references, union types, array types,
+    /// function types, literal types, tuple types, mapped types.
+    fn parseTypeNode(self: *Parser) ParseError!u32 {
+        const left = try self.parsePrimaryType();
+        // Union: T | U | V
+        if (self.current_token == SK.Bar) {
+            const start = self.ast.nodes.items[left].start;
+            const union_node = try self.ast.addNode(NK.UnionType, start, 0, 0);
+            self.ast.addChild(union_node, left);
+            while (self.current_token == SK.Bar) {
+                self.nextToken();
+                const member = try self.parsePrimaryType();
+                self.ast.addChild(union_node, member);
+            }
+            self.ast.setEnd(union_node, self.endPos());
+            return union_node;
+        }
+        // Intersection: T & U
+        if (self.current_token == SK.Ampersand) {
+            const start = self.ast.nodes.items[left].start;
+            const inter = try self.ast.addNode(194, start, 0, 0); // IntersectionType
+            self.ast.addChild(inter, left);
+            while (self.current_token == SK.Ampersand) {
+                self.nextToken();
+                const member = try self.parsePrimaryType();
+                self.ast.addChild(inter, member);
+            }
+            self.ast.setEnd(inter, self.endPos());
+            return inter;
+        }
+        return left;
+    }
+
+    fn parsePrimaryType(self: *Parser) ParseError!u32 {
+        const start = self.pos();
+        var base: u32 = switch (self.current_token) {
+            // Keyword types: string, number, boolean, any, void, never, etc.
+            133, 136, 146, 150, 151, 154, 155, 157, 159, 116 => blk: { // any,boolean,never,number,object,string,symbol,undefined,unknown,void
+                const node = try self.ast.addNode(self.current_token, start, self.endPos(), 0);
+                self.nextToken();
+                break :blk node;
+            },
+            // typeof type
+            114 => blk: { // typeof
+                self.nextToken();
+                const operand = try self.parsePrimaryType();
+                _ = operand;
+                break :blk try self.ast.addNode(187, start, self.endPos(), 0); // TypeQuery
+            },
+            // Literal types: true, false, null, string/number literals
+            97, 112, 106 => blk: { // false, true, null
+                const lit = try self.ast.addNode(NK.LiteralType, start, self.endPos(), 0);
+                self.nextToken();
+                break :blk lit;
+            },
+            SK.StringLiteral, SK.NumericLiteral => blk: {
+                const lit = try self.ast.addNode(NK.LiteralType, start, self.endPos(), 0);
+                self.nextToken();
+                break :blk lit;
+            },
+            // Parenthesized or function type
+            SK.OpenParen => blk: {
+                const node = try self.ast.addNode(NK.FunctionType, start, 0, 0);
+                self.skipParenthesized();
+                if (self.current_token == SK.Arrow) {
+                    self.nextToken();
+                    const ret = try self.parseTypeNode();
+                    self.ast.addChild(node, ret);
+                }
+                self.ast.setEnd(node, self.endPos());
+                break :blk node;
+            },
+            // Object type: { ... }
+            SK.OpenBrace => blk: {
+                const node = try self.ast.addNode(188, start, 0, 0); // TypeLiteral
+                self.skipBraced();
+                self.ast.setEnd(node, self.endPos());
+                break :blk node;
+            },
+            // Tuple type: [T, U]
+            SK.OpenBracket => blk: {
+                const node = try self.ast.addNode(190, start, 0, 0); // TupleType
+                self.skipBracketed();
+                self.ast.setEnd(node, self.endPos());
+                break :blk node;
+            },
+            // Type reference: Foo, Foo<T>, Promise<string>
+            SK.Identifier, 102 => blk: { // Identifier or import (for import("..."))
+                const ref = try self.ast.addNode(NK.TypeReference, start, 0, 0);
+                const name = try self.ast.addNode(NK.Identifier, start, self.endPos(), 0);
+                self.ast.addChild(ref, name);
+                self.nextToken();
+                // Qualified: Foo.Bar
+                while (self.current_token == SK.Dot) {
+                    self.nextToken();
+                    if (self.current_token == SK.Identifier) self.nextToken();
+                }
+                // Generic args: Foo<T, U>
+                if (self.current_token == SK.LessThan) {
+                    self.skipAngleBracketed();
+                }
+                self.ast.setEnd(ref, self.endPos());
+                break :blk ref;
+            },
+            // keyof T
+            143 => blk: { // keyof
+                self.nextToken();
+                const operand = try self.parsePrimaryType();
+                _ = operand;
+                break :blk try self.ast.addNode(199, start, self.endPos(), 0); // TypeOperator
+            },
+            // readonly type
+            148 => blk: {
+                self.nextToken();
+                break :blk try self.parsePrimaryType();
+            },
+            // infer T
+            140 => blk: {
+                self.nextToken();
+                if (self.current_token == SK.Identifier) self.nextToken();
+                break :blk try self.ast.addNode(196, start, self.endPos(), 0); // InferType
+            },
+            else => blk: {
+                // Unknown type — treat as identifier
+                const node = try self.ast.addNode(NK.Identifier, start, self.endPos(), 0);
+                self.nextToken();
+                break :blk node;
+            },
+        };
+        // Array type suffix: T[]
+        while (self.current_token == SK.OpenBracket and self.pos() < self.scanner.src.len) {
+            if (self.scanner.src[self.pos()] == ']') {
+                const arr = try self.ast.addNode(NK.ArrayType, self.ast.nodes.items[base].start, 0, 0);
+                self.ast.addChild(arr, base);
+                self.nextToken(); // [
+                self.nextToken(); // ]
+                self.ast.setEnd(arr, self.endPos());
+                base = arr;
+            } else break;
+        }
+        return base;
+    }
+
+    fn skipAngleBracketed(self: *Parser) void {
+        if (self.current_token != SK.LessThan) return;
+        var depth: u32 = 1;
+        self.nextToken();
+        while (depth > 0 and self.current_token != SK.EndOfFile) {
+            if (self.current_token == SK.LessThan) depth += 1;
+            if (self.current_token == SK.GreaterThan) depth -= 1;
+            self.nextToken();
+        }
+    }
+
     fn skipTypeAnnotation(self: *Parser) void {
-        // Skip type until we hit something that ends the type context
+        // Legacy: skip type without creating nodes (used where type nodes aren't needed)
         var depth: u32 = 0;
         while (self.current_token != SK.EndOfFile) {
             if (self.current_token == SK.LessThan) { depth += 1; self.nextToken(); continue; }

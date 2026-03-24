@@ -64,71 +64,108 @@
   // Map flat children to named properties expected by TSC's forEachChild
   function mapChildrenToProperties(node, children, kind) {
     switch (kind) {
-      case 316: // SourceFile — should NOT be created via this path
+      case 308: // SourceFile — should NOT be created via this path
         node.statements = createNodeArray(children);
         break;
-      case 243: // VariableStatement
+      case 244: // VariableStatement
         if (children.length > 0) node.declarationList = children[0];
         break;
-      case 261: // VariableDeclarationList
+      case 262: // VariableDeclarationList
         node.declarations = createNodeArray(children);
         break;
-      case 260: // VariableDeclaration
+      case 261: // VariableDeclaration
         if (children.length > 0) node.name = children[0];
-        if (children.length > 1) node.initializer = children[1];
+        // Children after name: type annotation (if kind is a type) and/or initializer
+        for (var ci = 1; ci < children.length; ci++) {
+          var ck = children[ci].kind;
+          // Type nodes: 133-165 (keyword types), 183-200 (constructed types)
+          if ((ck >= 133 && ck <= 165) || (ck >= 183 && ck <= 200) || ck === 80) {
+            if (!node.type) { node.type = children[ci]; continue; }
+          }
+          node.initializer = children[ci];
+        }
         break;
-      case 244: // ExpressionStatement
+      case 245: // ExpressionStatement
         if (children.length > 0) node.expression = children[0];
         break;
-      case 245: // IfStatement
+      case 246: // IfStatement
         if (children.length > 0) node.expression = children[0];
         if (children.length > 1) node.thenStatement = children[1];
         if (children.length > 2) node.elseStatement = children[2];
         break;
-      case 253: // ReturnStatement
+      case 254: // ReturnStatement
         if (children.length > 0) node.expression = children[0];
         break;
-      case 241: // Block
+      case 242: // Block
         node.statements = createNodeArray(children);
         break;
-      case 262: // FunctionDeclaration
-        if (children.length > 0) node.name = children[0];
+      case 263: // FunctionDeclaration
         node.parameters = createNodeArray([]);
-        if (children.length > 1) node.body = children[children.length - 1];
+        for (var fi = 0; fi < children.length; fi++) {
+          var fk = children[fi].kind;
+          if (fk === 80 && !node.name) node.name = children[fi]; // Identifier → name
+          else if (fk === 170) node.parameters.push(children[fi]); // Parameter
+          else if (fk === 242) node.body = children[fi]; // Block → body
+          else if ((fk >= 133 && fk <= 165) || (fk >= 183 && fk <= 200)) node.type = children[fi]; // type
+        }
         break;
-      case 263: // ClassDeclaration
+      case 264: // ClassDeclaration
         if (children.length > 0) node.name = children[0];
         node.members = createNodeArray(children.slice(1));
         break;
-      case 264: // InterfaceDeclaration
+      case 265: // InterfaceDeclaration
         if (children.length > 0) node.name = children[0];
         node.members = createNodeArray(children.slice(1));
         break;
-      case 265: // TypeAliasDeclaration
+      case 266: // TypeAliasDeclaration
         if (children.length > 0) node.name = children[0];
         break;
-      case 272: // ImportDeclaration
-        break; // Import details parsed by Zig are minimal
-      case 278: // ExportDeclaration
+      case 273: // ImportDeclaration
+        // Last child should be the module specifier (StringLiteral)
+        for (var ii = children.length - 1; ii >= 0; ii--) {
+          if (children[ii].kind === 11) { node.moduleSpecifier = children[ii]; break; }
+        }
         break;
-      case 226: // BinaryExpression
+      case 279: // ExportDeclaration
+        break;
+      case 227: // BinaryExpression
         if (children.length > 0) node.left = children[0];
         if (children.length > 1) node.right = children[1];
         break;
-      case 213: // CallExpression
+      case 214: // CallExpression
         if (children.length > 0) node.expression = children[0];
         node.arguments = createNodeArray(children.slice(1));
         break;
-      case 211: // PropertyAccessExpression
+      case 212: // PropertyAccessExpression
         if (children.length > 0) node.expression = children[0];
         if (children.length > 1) node.name = children[1];
         break;
-      case 219: // ArrowFunction
+      case 220: // ArrowFunction
         node.parameters = createNodeArray([]);
         if (children.length > 0) node.body = children[children.length - 1];
         break;
+      case 170: // Parameter
+        if (children.length > 0) node.name = children[0];
+        for (var pi = 1; pi < children.length; pi++) {
+          var pk = children[pi].kind;
+          if ((pk >= 133 && pk <= 165) || (pk >= 183 && pk <= 200)) node.type = children[pi];
+          else node.initializer = children[pi];
+        }
+        break;
+      case 184: // TypeReference
+        if (children.length > 0) node.typeName = children[0];
+        break;
+      case 193: // UnionType
+        node.types = createNodeArray(children);
+        break;
+      case 194: // IntersectionType
+        node.types = createNodeArray(children);
+        break;
+      case 189: // ArrayType
+        if (children.length > 0) node.elementType = children[0];
+        break;
       default:
-        // Generic: store all children
+        // Generic: store first child as expression
         if (children.length > 0) {
           node.expression = children[0];
         }
