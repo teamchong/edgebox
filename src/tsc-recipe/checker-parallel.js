@@ -281,7 +281,6 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
         var zigResult = __edgebox_resolve_cache_get(key);
         if (zigResult === -1) { globalThis.__mrCache.set(key, null); return undefined; }
         if (zigResult) {
-          // Cache hit — use TSC resolution (fast: fileExists already cached in Zig)
           var r2 = ts.resolveModuleName(name, containingFile, parsed.options, defaultHost).resolvedModule;
           globalThis.__mrCache.set(key, r2 || null);
           return r2;
@@ -300,9 +299,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       if (shouldResolve) {
         var r = ts.resolveModuleName(name, containingFile, parsed.options, defaultHost).resolvedModule;
         globalThis.__mrCache.set(key, r || null);
-        if (hasZigResolveCache) {
-          __edgebox_resolve_cache_set(key, r && r.resolvedFileName ? r.resolvedFileName : '');
-        }
+        if (hasZigResolveCache) __edgebox_resolve_cache_set(key, r && r.resolvedFileName ? r.resolvedFileName : '');
         return r;
       }
       globalThis.__mrCache.set(key, null);
