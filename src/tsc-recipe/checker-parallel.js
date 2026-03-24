@@ -574,11 +574,10 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     });
     globalThis.__bp[ck] = builder;
     program = builder.getProgram();
-  } else if (usePreProgram) {
-    // Pre-checked: skip createProgram entirely — reuse snapshot's program directly.
-    // The checker, types, and source files are all in the snapshot.
+  } else if (false && usePreProgram) {
+    // DISABLED: skip-createProgram produces wrong diagnostics (11521 vs 2058).
+    // TSC's checker state from snapshot warmup is corrupted — can't reuse.
     program = globalThis.__preProgram;
-    __edgebox_write_stderr('[recipe] w' + workerId + ' SKIP createProgram (pre-checked)\n');
   } else {
     // Cold: plain createProgram — fastest parse, no incremental overhead
     program = ts.createProgram(parsed.fileNames, parsed.options, host, oldProgram);
@@ -661,7 +660,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     // Warm without incremental: check all files with cache reuse
     for (var i = 0; i < checkFiles.length; i++) checkFile(checkFiles[i]);
   } else {
-    // Cold: parallel work-stealing. Skip diagnostic cache overhead on first cold.
+    // Cold: parallel work-stealing.
     var hasCachedDiags = Object.keys(dc.hashes).length > 0;
     while (true) {
       var idx = __edgebox_claim_file();
@@ -669,7 +668,6 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       if (hasCachedDiags) {
         checkFile(checkFiles[idx]);
       } else {
-        // Direct check — no hash, no cache lookup, no cache store
         filesChecked++;
         var file = checkFiles[idx];
         var diags = program.getSemanticDiagnostics(file);
