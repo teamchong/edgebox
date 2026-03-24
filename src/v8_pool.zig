@@ -308,10 +308,12 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
             "var _wid=globalThis.__wildcardTypeId||0;" ++
             "var _r=globalThis.__frozenIsSimple(source.flags|0,target.flags|0,_rel," ++
             "strictNullChecks?1:0,source.id|0,target.id|0,_wid);" ++
-            // ONLY short-circuit on POSITIVE (1=related). NEVER on 0 (not related).
-            // TSC's isSimpleTypeRelatedTo returning false means "need structural check",
-            // not "definitely not related". Only return true when frozen is certain.
-            "if(_r===1)return true;" ++
+            // DEBUG: log disagreements between frozen and JS
+            "if(_r===1){" ++
+            "if(!globalThis.__fdbg)globalThis.__fdbg=0;" ++
+            "if(globalThis.__fdbg<10){globalThis.__fdbg++;" ++
+            "__edgebox_write_stderr('[frozen-hit] s='+source.flags+' t='+target.flags+' rel='+_rel+'\\n');}" ++
+            "return true;}" ++
             "}";
         if (std.mem.indexOf(u8, result, lean_needle)) |idx2| {
             _ = std.posix.write(2, "[v8pool] patching isSimpleTypeRelatedTo → frozen WASM\n") catch {};

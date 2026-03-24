@@ -76,7 +76,7 @@ function makeIsSimpleTypeRelatedTo(
       if (s & 256 && !(s & 1024) && (t & 32 || t & 256 && t & 1024 && valueEquals(srcId, tgtId))) return 1;
       if (isUnknownLikeUnionType(tgtId)) return 1;
     }
-    return 0;
+    return -1;
   }
   return isSimpleTypeRelatedTo;
 }
