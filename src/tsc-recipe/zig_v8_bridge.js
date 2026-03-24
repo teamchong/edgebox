@@ -119,6 +119,7 @@
         break;
       case 266: // TypeAliasDeclaration
         if (children.length > 0) node.name = children[0];
+        if (children.length > 1) node.type = children[1];
         break;
       case 273: // ImportDeclaration
         // Last child = module specifier (StringLiteral)
@@ -180,6 +181,177 @@
       case 189: // ArrayType
         if (children.length > 0) node.elementType = children[0];
         break;
+      case 218: // ParenthesizedExpression
+        if (children.length > 0) node.expression = children[0];
+        break;
+      case 225: // PrefixUnaryExpression
+        if (children.length > 0) node.operand = children[0];
+        break;
+      case 228: // ConditionalExpression
+        if (children.length > 0) node.condition = children[0];
+        if (children.length > 1) node.whenTrue = children[1];
+        if (children.length > 2) node.whenFalse = children[2];
+        break;
+      case 210: // ArrayLiteralExpression
+        node.elements = createNodeArray(children);
+        break;
+      case 211: // ObjectLiteralExpression
+        node.properties = createNodeArray(children);
+        break;
+      case 229: // TemplateExpression
+        if (children.length > 0) node.head = children[0];
+        node.templateSpans = createNodeArray(children.slice(1));
+        break;
+      case 213: // ElementAccessExpression
+        if (children.length > 0) node.expression = children[0];
+        if (children.length > 1) node.argumentExpression = children[1];
+        break;
+      case 247: // DoStatement
+        if (children.length > 0) node.statement = children[0];
+        if (children.length > 1) node.expression = children[1];
+        break;
+      case 248: // WhileStatement
+        if (children.length > 0) node.expression = children[0];
+        if (children.length > 1) node.statement = children[1];
+        break;
+      case 249: // ForStatement
+        // for (initializer; condition; incrementor) statement
+        // TSC maps: [0]=initializer, [1]=condition, [2]=incrementor, [3]=statement
+        if (children.length > 0) node.initializer = children[0];
+        if (children.length > 1) node.condition = children[1];
+        if (children.length > 2) node.incrementor = children[2];
+        if (children.length > 3) node.statement = children[3];
+        break;
+      case 250: // ForInStatement
+        if (children.length > 0) node.initializer = children[0];
+        if (children.length > 1) node.expression = children[1];
+        if (children.length > 2) node.statement = children[2];
+        break;
+      case 251: // ForOfStatement
+        if (children.length > 0) node.initializer = children[0];
+        if (children.length > 1) node.expression = children[1];
+        if (children.length > 2) node.statement = children[2];
+        break;
+      case 256: // SwitchStatement
+        if (children.length > 0) node.expression = children[0];
+        if (children.length > 1) node.caseBlock = children[1];
+        break;
+      case 258: // ThrowStatement
+        if (children.length > 0) node.expression = children[0];
+        break;
+      case 259: // TryStatement
+        for (var ti = 0; ti < children.length; ti++) {
+          var tk = children[ti].kind;
+          if (tk === 242 && !node.tryBlock) node.tryBlock = children[ti]; // Block
+          else if (tk === 299) node.catchClause = children[ti]; // CatchClause
+          else if (tk === 242) node.finallyBlock = children[ti]; // second Block
+        }
+        break;
+      case 267: // EnumDeclaration
+        if (children.length > 0) node.name = children[0];
+        node.members = createNodeArray(children.slice(1));
+        break;
+      case 278: // ExportAssignment
+        if (children.length > 0) node.expression = children[0];
+        break;
+      case 171: // PropertySignature
+        if (children.length > 0) node.name = children[0];
+        for (var psi = 1; psi < children.length; psi++) {
+          var psk = children[psi].kind;
+          if ((psk >= 133 && psk <= 165) || (psk >= 183 && psk <= 200)) node.type = children[psi];
+          else node.initializer = children[psi];
+        }
+        break;
+      case 172: // PropertyDeclaration
+        if (children.length > 0) node.name = children[0];
+        for (var pdi = 1; pdi < children.length; pdi++) {
+          var pdk = children[pdi].kind;
+          if ((pdk >= 133 && pdk <= 165) || (pdk >= 183 && pdk <= 200)) node.type = children[pdi];
+          else node.initializer = children[pdi];
+        }
+        break;
+      case 174: // MethodDeclaration
+      case 173: // MethodSignature
+        node.parameters = createNodeArray([]);
+        for (var mi = 0; mi < children.length; mi++) {
+          var mk = children[mi].kind;
+          if (mk === 80 && !node.name) node.name = children[mi];
+          else if (mk === 170) node.parameters.push(children[mi]);
+          else if (mk === 242) node.body = children[mi];
+          else if ((mk >= 133 && mk <= 165) || (mk >= 183 && mk <= 200)) node.type = children[mi];
+        }
+        break;
+      case 176: // GetAccessor
+      case 177: // SetAccessor
+        node.parameters = createNodeArray([]);
+        for (var gi = 0; gi < children.length; gi++) {
+          var gk = children[gi].kind;
+          if (gk === 80 && !node.name) node.name = children[gi];
+          else if (gk === 170) node.parameters.push(children[gi]);
+          else if (gk === 242) node.body = children[gi];
+          else if ((gk >= 133 && gk <= 165) || (gk >= 183 && gk <= 200)) node.type = children[gi];
+        }
+        break;
+      case 185: // FunctionType
+        node.parameters = createNodeArray([]);
+        for (var fti = 0; fti < children.length; fti++) {
+          var ftk = children[fti].kind;
+          if (ftk === 170) node.parameters.push(children[fti]);
+          else if ((ftk >= 133 && ftk <= 165) || (ftk >= 183 && ftk <= 200)) node.type = children[fti];
+        }
+        break;
+      case 186: // ConstructorType
+        node.parameters = createNodeArray([]);
+        for (var cti = 0; cti < children.length; cti++) {
+          var ctk = children[cti].kind;
+          if (ctk === 170) node.parameters.push(children[cti]);
+          else if ((ctk >= 133 && ctk <= 165) || (ctk >= 183 && ctk <= 200)) node.type = children[cti];
+        }
+        break;
+      case 187: // TypeQuery — typeof expr
+        if (children.length > 0) node.exprName = children[0];
+        break;
+      case 188: // TypeLiteral — { ... }
+        node.members = createNodeArray(children);
+        break;
+      case 190: // TupleType
+        node.elements = createNodeArray(children);
+        break;
+      case 195: // ConditionalType
+        if (children.length > 0) node.checkType = children[0];
+        if (children.length > 1) node.extendsType = children[1];
+        if (children.length > 2) node.trueType = children[2];
+        if (children.length > 3) node.falseType = children[3];
+        break;
+      case 196: // InferType
+        if (children.length > 0) node.typeParameter = children[0];
+        break;
+      case 197: // ParenthesizedType
+        if (children.length > 0) node.type = children[0];
+        break;
+      case 199: // MappedType
+        node.members = createNodeArray(children);
+        break;
+      case 200: // LiteralType
+        if (children.length > 0) node.literal = children[0];
+        break;
+      case 202: // LiteralType (TSC 5.9)
+        if (children.length > 0) node.literal = children[0];
+        break;
+      case 299: // CatchClause
+        if (children.length > 0) node.variableDeclaration = children[0];
+        if (children.length > 1) node.block = children[1];
+        break;
+      case 257: // CaseBlock
+        node.clauses = createNodeArray(children);
+        break;
+      case 296: // CaseClause
+        if (children.length > 0) node.expression = children[0];
+        node.statements = createNodeArray(children.slice(1));
+        break;
+      case 297: // DefaultClause
+        node.statements = createNodeArray(children);
+        break;
       default:
         break;
     }
@@ -236,7 +408,8 @@
 
       var children = [];
       var ch = firstChild;
-      while (ch !== 0xFFFFFFFF && ch < nodeCount) {
+      var safetyLimit = 1000; // prevent infinite sibling loops
+      while (ch !== 0xFFFFFFFF && ch < nodeCount && safetyLimit-- > 0) {
         children.push(tscNodes[ch]);
         var chOff = ch * 24;
         ch = view.getUint32(chOff + 20, true);

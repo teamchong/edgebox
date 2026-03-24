@@ -158,12 +158,15 @@ pub const Parser = struct {
         const sf = try self.ast.addNode(NK.SourceFile, start, 0, 0xFFFFFFFF);
 
         while (self.current_token != SK.EndOfFile) {
+            const prev_pos = self.scanner.pos;
             const stmt = self.parseStatement() catch {
                 // Error recovery: skip token
                 self.nextToken();
                 continue;
             };
             self.ast.addChild(sf, stmt);
+            // Safety: if no progress was made, force advance to prevent infinite loop
+            if (self.scanner.pos == prev_pos) self.nextToken();
         }
 
         self.ast.setEnd(sf, self.pos());
@@ -405,8 +408,9 @@ pub const Parser = struct {
         // Skip asterisk for generators
         if (self.current_token == 42) self.nextToken(); // *
         self.nextToken(); // skip 'function'
-        // Name
-        if (self.current_token == SK.Identifier) {
+        // Name (can be identifier or contextual keyword like get/set/number/string)
+        if (self.current_token == SK.Identifier or
+            (self.current_token >= 133 and self.current_token <= 165)) {
             const name = try self.ast.addNode(NK.Identifier, self.pos(), self.endPos(), 0);
             self.ast.addChild(decl, name);
             self.nextToken();
@@ -434,6 +438,7 @@ pub const Parser = struct {
         if (self.current_token != SK.OpenParen) return;
         self.nextToken(); // skip (
         while (self.current_token != SK.CloseParen and self.current_token != SK.EndOfFile) {
+            const loop_start_pos = self.scanner.pos;
             // Skip modifiers (public, private, readonly, etc.)
             while (self.current_token == 123 or self.current_token == 124 or
                    self.current_token == 125 or self.current_token == 148 or
@@ -442,8 +447,10 @@ pub const Parser = struct {
             if (self.current_token == SK.DotDotDot) self.nextToken();
             const param_start = self.pos();
             const param = try self.ast.addNode(NK.Parameter, param_start, 0, 0);
-            // Name (identifier or destructuring)
-            if (self.current_token == SK.Identifier or self.current_token == 110) { // identifier or this
+            // Name (identifier, `this`, or contextual keywords like `number`, `string`, etc.)
+            // TypeScript allows type keywords (133-165) as parameter names.
+            if (self.current_token == SK.Identifier or self.current_token == 110 or
+                (self.current_token >= 133 and self.current_token <= 165)) {
                 const name = try self.ast.addNode(NK.Identifier, self.pos(), self.endPos(), 0);
                 self.ast.addChild(param, name);
                 self.nextToken();
@@ -469,6 +476,8 @@ pub const Parser = struct {
             self.ast.setEnd(param, self.endPos());
             self.ast.addChild(parent, param);
             if (self.current_token == SK.Comma) self.nextToken();
+            // Safety: if we didn't consume any tokens, force advance to prevent infinite loop
+            if (self.scanner.pos == loop_start_pos) self.nextToken();
         }
         if (self.current_token == SK.CloseParen) self.nextToken();
     }
@@ -907,7 +916,9 @@ pub const Parser = struct {
             switch (self.current_token) {
                 SK.Dot => {
                     self.nextToken();
-                    if (self.current_token == SK.Identifier) {
+                    // After '.', any identifier or keyword can be a property name
+                    if (self.current_token == SK.Identifier or
+                        (self.current_token >= 81 and self.current_token <= 165)) {
                         const prop = try self.ast.addNode(NK.PropertyAccessExpression, self.ast.nodes.items[result].start, self.endPos(), 0);
                         self.ast.addChild(prop, result);
                         self.nextToken();
@@ -1145,12 +1156,21 @@ pub const Parser = struct {
 
 const c_alloc = std.heap.page_allocator;
 
+// Mutex to serialize parse calls across V8 worker threads.
+// page_allocator (mmap) is thread-safe, but Parser internals (ArrayList
+// grow/realloc) under simultaneous pressure from 3+ threads causes hangs.
+// Serializing is fine: total Zig parse time is ~32ms for all files.
+var parse_mutex: std.Thread.Mutex = .{};
+
 export fn edgebox_zig_parse(
     src_ptr: [*]const u8,
     src_len: c_int,
     out_nodes: *?[*]const u8,
     out_count: *c_int,
 ) c_int {
+    parse_mutex.lock();
+    defer parse_mutex.unlock();
+
     if (src_len <= 0) return 0;
     const source = src_ptr[0..@intCast(src_len)];
 

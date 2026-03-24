@@ -289,7 +289,12 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   // Need: C++ bridge (create nodes in native) or lazy materialization to beat TSC
   // Zig parser: enabled for a SINGLE test file to identify forEachChild crash.
   // If it crashes, log the error and fall back to TSC for ALL files.
-  var useZigParser = typeof __edgebox_zig_parse === 'function' && typeof globalThis.__zigCreateSourceFile === 'function';
+  // Zig parser: fast (37ms for 358 files) but bridge still has correctness issues:
+  // - utilsBundle.ts: require() not treated as module reference (44 missing diags)
+  // - Binder crash on some nodes (getAssignmentDeclarationKind)
+  // Net impact on cold: negligible (37ms saved vs 800ms createProgram + 1700ms check)
+  // Re-enable when bridge correctness reaches 100%.
+  var useZigParser = false;
   var zigParseCount = 0, zigFallbackCount = 0;
 
   // Instrument forEachChild to detect infinite recursion
@@ -321,24 +326,10 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       // TSC for .d.ts (type declarations — need complete export structure).
       // sf.imports pre-set prevents forEachChild hang.
       // ALL files parsed by Zig (57ms, no hang). 33/2058 diags — need more AST completeness.
-      // Zig parser DISABLED: import resolution hangs when .text is set on StringLiteral.
-      // Without .text: 55ms, 33 diags (no import resolution).
-      // With .text: >30s (import resolution processes all files through bridge).
-      // Need: faster bridge or bypass processImportedModules for Zig-parsed files.
-      if (false) {
-        var content = ts.sys.readFile(fileName);
-        if (content !== undefined) {
-          try {
-            var flatAST = __edgebox_zig_parse(content);
-            if (flatAST && flatAST.byteLength >= 24) {
-              var sf = globalThis.__zigCreateSourceFile(content, fileName, flatAST);
-              if (sf && sf.statements) {
-                zigParseCount++;
-                return sf;
-              }
-            }
-          } catch(e) {}
-        }
+      // Zig parser: check pre-loaded cache first
+      if (globalThis.__zigSourceFileCache && globalThis.__zigSourceFileCache.has(fileName)) {
+        zigParseCount++;
+        return globalThis.__zigSourceFileCache.get(fileName);
       }
       zigFallbackCount++;
       return origGetSourceFile.call(this, fileName, languageVersionOrOptions, onError);
@@ -403,6 +394,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   var oldProgram = globalThis.__pc[ck] || undefined;
   if (!oldProgram && globalThis.__preProgram && globalThis.__preProject === cwd) {
     oldProgram = globalThis.__preProgram;
+    __edgebox_write_stderr('[recipe] w' + workerId + ' using preProgram (' + globalThis.__preProgram.getSourceFiles().length + ' files)\n');
   }
   var isWarm = !!globalThis.__pc[ck]; // truly warm = from previous check, not from snapshot
   // Adaptive strategy:
@@ -412,7 +404,61 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     __edgebox_write_stderr('[recipe] w' + workerId + ' warm skip\n');
     return '';
   }
-  __edgebox_write_stderr('[recipe] w' + workerId + ' PRE-createProgram\n');
+  // ── BATCH PRE-LOAD: Zig-parse ALL .ts files BEFORE createProgram ──
+  // This is the key to speed: createProgram calls getSourceFile for each
+  // imported file sequentially. If files are already cached, each call
+  // returns instantly from the Map. No sequential Zig+bridge overhead.
+  // Only worker 0 does batch pre-load — workers share nothing (separate isolates)
+  // so each would redundantly parse all files. Worker 0 parses, others use TSC.
+  __edgebox_write_stderr('[recipe] w' + workerId + ' batch-start useZig=' + useZigParser + '\n');
+  if (useZigParser && !globalThis.__zigSourceFileCache && workerId === 0) {
+    var cache = new Map();
+    var t_zig0 = Date.now();
+    __edgebox_write_stderr('[recipe] batch files: ' + parsed.fileNames.length + '\n');
+    var tsFileCount = 0;
+    for (var fi = 0; fi < parsed.fileNames.length; fi++) {
+      var fn = parsed.fileNames[fi];
+      if (fn.endsWith('.d.ts')) continue;
+      tsFileCount++;
+      var content = ts.sys.readFile(fn);
+      if (content === undefined) continue;
+      try {
+        var _tp0 = Date.now();
+        var flatAST = __edgebox_zig_parse(content);
+        var _tp1 = Date.now();
+        if (flatAST && flatAST.byteLength >= 24) {
+          var sf = globalThis.__zigCreateSourceFile(content, fn, flatAST);
+          var _tp2 = Date.now();
+          if (_tp2 - _tp0 > 100) __edgebox_write_stderr('[SLOW] ' + fn.split('/').pop() + ' zig=' + (_tp1-_tp0) + 'ms bridge=' + (_tp2-_tp1) + 'ms\n');
+          if (sf && sf.statements) {
+            if (sf.imports) {
+              for (var ii = 0; ii < sf.imports.length; ii++) {
+                var imp = sf.imports[ii];
+                if (imp.kind === 11 && !imp.text) {
+                  imp.text = content.substring(imp.pos + 1, imp.end - 1);
+                }
+              }
+            }
+            // Validate: try forEachChild on each statement to catch bridge bugs early.
+            // If any node has undefined children where TSC expects them, skip this file.
+            var valid = true;
+            try {
+              for (var vi = 0; vi < sf.statements.length; vi++) {
+                ts.forEachChild(sf.statements[vi], function(n) {
+                  if (n) ts.forEachChild(n, function() {}); // 2-deep validation
+                });
+              }
+            } catch(ve) { valid = false; }
+            if (valid) cache.set(fn, sf);
+          }
+        }
+      } catch(e) {}
+      if (tsFileCount % 50 === 0) __edgebox_write_stderr('[recipe] batch ' + tsFileCount + ' ts files processed\n');
+    }
+    globalThis.__zigSourceFileCache = cache;
+    __edgebox_write_stderr('[recipe] w' + workerId + ' batch Zig: ' + cache.size + ' files in ' + (Date.now() - t_zig0) + 'ms\n');
+  }
+
   var program, builder;
   if (isWarm && useIncremental) {
     // Warm: incremental program — only checks changed files
