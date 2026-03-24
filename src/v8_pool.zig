@@ -360,6 +360,12 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
     // __gcCheck is defined in recipe JS and force-compiled via %OptimizeFunctionOnNextCall.
     // This means WasmGC getFlag is TurboFan-inlined from the FIRST call, not after 3000.
     const helper_needle = "function isTypeRelatedTo(source, target, relation) {";
+    // Simplified: pass source.id and target.id directly to WASM.
+    // NO fresh literal normalization — WASM reads flags from GC array,
+    // and StringLiteral(128) already matches StringLike→String without normalization.
+    // This eliminates 4-6 megamorphic JS property reads (source.flags, source.freshType,
+    // source.regularType, target.flags, target.freshType, target.regularType).
+    // source.id is set once in constructor — more likely monomorphic IC.
     const itr_inject = "function isTypeRelatedTo(source, target, relation) {" ++
         "if(relation!==identityRelation){" ++
         "var _s=(source.flags&2976)&&source.freshType===source?source.regularType:source;" ++
