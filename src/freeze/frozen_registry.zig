@@ -2003,7 +2003,7 @@ pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
                 var look = si + 1;
                 while (look < func.instructions.len) {
                     const lh = numeric_handlers.getHandler(func.instructions[look].opcode);
-                    if (lh.pattern == .call_self) { is_call_target = true; break; }
+                    if (lh.pattern == .call_self or lh.pattern == .tail_call_self) { is_call_target = true; break; }
                     // If we hit another self_ref or any stack-consuming op, this ref isn't a call target
                     if (lh.pattern == .self_ref or lh.pattern == .binary_arith or
                         lh.pattern == .binary_cmp or lh.pattern == .bitwise_binary or
