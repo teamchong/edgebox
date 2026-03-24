@@ -1,93 +1,219 @@
-// V8 Bridge: Create TSC Node objects from Zig flat binary AST
+// V8 Bridge: Create TSC SourceFile from Zig flat binary AST
 //
-// Reads the flat AST buffer produced by the Zig parser (20 bytes per node)
-// and creates proper TSC Node objects using ts.factory methods.
-// This is called from the recipe as an alternative to ts.createSourceFile.
+// Reads flat AST buffer (24 bytes/node) and creates TSC Node tree.
+// Uses a simple approach: create nodes as plain objects with the
+// properties that TSC's binder/checker access via forEachChild.
 //
-// Architecture:
-//   1. Zig parser produces flat AST in shared memory (edgebox_parse_file C ABI)
-//   2. This bridge reads the flat AST via DataView
-//   3. Creates TSC Nodes using factory methods (correct named properties)
-//   4. Returns a SourceFile compatible with TSC's binder + checker
+// Called from recipe as: __zigCreateSourceFile(sourceText, fileName)
 
-// Node layout in flat AST (20 bytes each):
-// offset 0: kind (u16)
-// offset 2: flags (u16)
-// offset 4: start (u32)
-// offset 8: end (u32)
-// offset 12: parent (u32)
-// offset 16: first_child (u32)
-// offset 20: next_sibling (u32) -- actually at offset 16, recheck
+(function() {
+  if (!globalThis.ts) return;
+  var ts = globalThis.ts;
 
-// SyntaxKind constants (must match zig_parser_core.zig NK values)
-var NK = {
-  SourceFile: 316,
-  Block: 241,
-  VariableStatement: 243,
-  VariableDeclarationList: 261,
-  VariableDeclaration: 260,
-  ExpressionStatement: 244,
-  IfStatement: 245,
-  ReturnStatement: 253,
-  FunctionDeclaration: 262,
-  ClassDeclaration: 263,
-  InterfaceDeclaration: 264,
-  TypeAliasDeclaration: 265,
-  EnumDeclaration: 266,
-  ImportDeclaration: 272,
-  ExportDeclaration: 278,
-  Identifier: 80,
-  StringLiteral: 11,
-  NumericLiteral: 9,
-  CallExpression: 213,
-  PropertyAccessExpression: 211,
-  BinaryExpression: 226,
-  ArrowFunction: 219,
-};
-
-// Build a TSC SourceFile from a flat AST buffer
-// flatAST: ArrayBuffer (from Zig parser via C ABI)
-// sourceText: string (original source text)
-// fileName: string
-function buildSourceFile(ts, flatAST, sourceText, fileName) {
-  var view = new DataView(flatAST);
-  var nodeCount = flatAST.byteLength / 20;
-
-  // Read flat nodes
-  var nodes = [];
-  for (var i = 0; i < nodeCount; i++) {
-    var off = i * 20;
-    nodes.push({
+  // Read flat node from ArrayBuffer at index
+  function readNode(view, idx) {
+    var off = idx * 24;
+    return {
       kind: view.getUint16(off, true),
       flags: view.getUint16(off + 2, true),
       start: view.getUint32(off + 4, true),
       end: view.getUint32(off + 8, true),
       parent: view.getUint32(off + 12, true),
       firstChild: view.getUint32(off + 16, true),
-    });
+      nextSibling: view.getUint32(off + 20, true),
+    };
   }
 
-  // Get children of a flat node
-  function getChildren(idx) {
+  // Get all children of a flat node
+  function getChildren(view, nodeCount, idx) {
     var children = [];
-    var child = nodes[idx].firstChild;
-    while (child !== 0xFFFFFFFF && child < nodes.length) {
+    var flat = readNode(view, idx);
+    var child = flat.firstChild;
+    while (child !== 0xFFFFFFFF && child < nodeCount) {
       children.push(child);
-      // next_sibling would be at offset 16 in the NEXT node...
-      // Actually our FlatNode struct is only 20 bytes but has 7 fields × 4 bytes...
-      // Let me recalculate: kind(2) + flags(2) + start(4) + end(4) + parent(4) + first_child(4) + next_sibling(4) = 24 bytes
-      // TODO: fix byte layout
-      break; // For now, just get first child
+      var childFlat = readNode(view, child);
+      child = childFlat.nextSibling;
     }
     return children;
   }
 
-  // Create a minimal SourceFile
-  // For now, return TSC-parsed version (bridge is WIP)
-  return ts.createSourceFile(fileName, sourceText, 99, true);
-}
+  // Create a TSC-compatible node from flat AST
+  // Each node gets: kind, pos, end, flags, parent, and named child properties
+  function createTSCNode(view, nodeCount, sourceText, idx, parentNode) {
+    var flat = readNode(view, idx);
+    var node = Object.create(ts.objectAllocator.getNodeConstructor().prototype);
+    node.kind = flat.kind;
+    node.pos = flat.start;
+    node.end = flat.end;
+    node.flags = flat.flags;
+    node.id = 0;
+    node.modifierFlagsCache = 0;
+    node.transformFlags = 0;
+    node.parent = parentNode || undefined;
 
-// Export for use in recipe
-if (typeof globalThis !== 'undefined') {
-  globalThis.__zigBuildSourceFile = buildSourceFile;
-}
+    var children = getChildren(view, nodeCount, idx);
+    var childNodes = [];
+    for (var i = 0; i < children.length; i++) {
+      childNodes.push(createTSCNode(view, nodeCount, sourceText, children[i], node));
+    }
+
+    // Map children to named properties based on SyntaxKind
+    mapChildrenToProperties(node, childNodes, flat.kind);
+
+    return node;
+  }
+
+  // Map flat children to named properties expected by TSC's forEachChild
+  function mapChildrenToProperties(node, children, kind) {
+    switch (kind) {
+      case 316: // SourceFile — should NOT be created via this path
+        node.statements = createNodeArray(children);
+        break;
+      case 243: // VariableStatement
+        if (children.length > 0) node.declarationList = children[0];
+        break;
+      case 261: // VariableDeclarationList
+        node.declarations = createNodeArray(children);
+        break;
+      case 260: // VariableDeclaration
+        if (children.length > 0) node.name = children[0];
+        if (children.length > 1) node.initializer = children[1];
+        break;
+      case 244: // ExpressionStatement
+        if (children.length > 0) node.expression = children[0];
+        break;
+      case 245: // IfStatement
+        if (children.length > 0) node.expression = children[0];
+        if (children.length > 1) node.thenStatement = children[1];
+        if (children.length > 2) node.elseStatement = children[2];
+        break;
+      case 253: // ReturnStatement
+        if (children.length > 0) node.expression = children[0];
+        break;
+      case 241: // Block
+        node.statements = createNodeArray(children);
+        break;
+      case 262: // FunctionDeclaration
+        if (children.length > 0) node.name = children[0];
+        node.parameters = createNodeArray([]);
+        if (children.length > 1) node.body = children[children.length - 1];
+        break;
+      case 263: // ClassDeclaration
+        if (children.length > 0) node.name = children[0];
+        node.members = createNodeArray(children.slice(1));
+        break;
+      case 264: // InterfaceDeclaration
+        if (children.length > 0) node.name = children[0];
+        node.members = createNodeArray(children.slice(1));
+        break;
+      case 265: // TypeAliasDeclaration
+        if (children.length > 0) node.name = children[0];
+        break;
+      case 272: // ImportDeclaration
+        break; // Import details parsed by Zig are minimal
+      case 278: // ExportDeclaration
+        break;
+      case 226: // BinaryExpression
+        if (children.length > 0) node.left = children[0];
+        if (children.length > 1) node.right = children[1];
+        break;
+      case 213: // CallExpression
+        if (children.length > 0) node.expression = children[0];
+        node.arguments = createNodeArray(children.slice(1));
+        break;
+      case 211: // PropertyAccessExpression
+        if (children.length > 0) node.expression = children[0];
+        if (children.length > 1) node.name = children[1];
+        break;
+      case 219: // ArrowFunction
+        node.parameters = createNodeArray([]);
+        if (children.length > 0) node.body = children[children.length - 1];
+        break;
+      default:
+        // Generic: store all children
+        if (children.length > 0) {
+          node.expression = children[0];
+        }
+        break;
+    }
+  }
+
+  function createNodeArray(nodes) {
+    var arr = nodes.slice();
+    arr.pos = nodes.length > 0 ? nodes[0].pos : -1;
+    arr.end = nodes.length > 0 ? nodes[nodes.length - 1].end : -1;
+    arr.hasTrailingComma = false;
+    arr.transformFlags = 0;
+    return arr;
+  }
+
+  // Main entry: create a SourceFile from Zig-parsed flat AST
+  globalThis.__zigCreateSourceFile = function(sourceText, fileName, flatASTBuffer) {
+    if (!flatASTBuffer || flatASTBuffer.byteLength < 24) {
+      // Fallback to TSC parser
+      return ts.createSourceFile(fileName, sourceText, 99, true);
+    }
+
+    var view = new DataView(flatASTBuffer);
+    var nodeCount = flatASTBuffer.byteLength / 24;
+
+    // Root node should be SourceFile (kind 316)
+    var rootFlat = readNode(view, 0);
+    if (rootFlat.kind !== 316) {
+      return ts.createSourceFile(fileName, sourceText, 99, true);
+    }
+
+    // Create SourceFile node
+    var sf = Object.create(ts.objectAllocator.getSourceFileConstructor().prototype);
+    sf.kind = 316;
+    sf.pos = 0;
+    sf.end = sourceText.length;
+    sf.flags = 0;
+    sf.id = 0;
+    sf.modifierFlagsCache = 0;
+    sf.transformFlags = 0;
+    sf.text = sourceText;
+    sf.fileName = fileName;
+    sf.path = fileName.toLowerCase();
+    sf.resolvedPath = fileName.toLowerCase();
+    sf.originalFileName = fileName;
+    sf.languageVersion = 99;
+    sf.languageVariant = 0;
+    sf.scriptKind = 3; // TS
+    sf.isDeclarationFile = fileName.endsWith('.d.ts');
+    sf.hasNoDefaultLib = false;
+    sf.parseDiagnostics = [];
+    sf.bindDiagnostics = [];
+    sf.pragmas = new Map();
+    sf.referencedFiles = [];
+    sf.typeReferenceDirectives = [];
+    sf.libReferenceDirectives = [];
+    sf.amdDependencies = [];
+    sf.identifiers = new Map();
+    sf.nodeCount = nodeCount;
+    sf.identifierCount = 0;
+    sf.symbolCount = 0;
+
+    // Create statement nodes from flat AST children
+    var children = getChildren(view, nodeCount, 0);
+    var statements = [];
+    for (var i = 0; i < children.length; i++) {
+      var stmt = createTSCNode(view, nodeCount, sourceText, children[i], sf);
+      statements.push(stmt);
+    }
+    sf.statements = createNodeArray(statements);
+
+    // EndOfFileToken
+    sf.endOfFileToken = Object.create(ts.objectAllocator.getTokenConstructor().prototype);
+    sf.endOfFileToken.kind = 1; // EndOfFileToken
+    sf.endOfFileToken.pos = sourceText.length;
+    sf.endOfFileToken.end = sourceText.length;
+    sf.endOfFileToken.flags = 0;
+    sf.endOfFileToken.parent = sf;
+
+    // lineMap (required for diagnostic positions)
+    sf.lineMap = undefined; // Computed lazily by TSC
+
+    return sf;
+  };
+})();

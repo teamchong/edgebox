@@ -189,12 +189,41 @@ pub fn init(worker_count: u32) !void {
                 r_src = edgebox_read_file(rp.ptr, @intCast(rp.len), &r_len);
             }
 
-            _ = std.posix.write(2, "[v8pool] creating snapshot (with worker_init + recipe)...\n") catch {};
+            // Load Zig V8 bridge (creates __zigCreateSourceFile)
+            const bridge_path = std.fmt.allocPrint(alloc, "{s}/src/tsc-recipe/zig_v8_bridge.js", .{eb_root}) catch null;
+            var bridge_len: c_int = 0;
+            var bridge_src: ?[*]const u8 = null;
+            if (bridge_path) |bp| {
+                defer alloc.free(bp);
+                bridge_src = edgebox_read_file(bp.ptr, @intCast(bp.len), &bridge_len);
+            }
+            // Concatenate recipe + bridge
+            var full_recipe: ?[*]const u8 = null;
+            var full_recipe_len: c_int = 0;
+            if (r_src != null and bridge_src != null and bridge_len > 0) {
+                const total = @as(usize, @intCast(r_len)) + 1 + @as(usize, @intCast(bridge_len));
+                const buf = alloc.alloc(u8, total) catch null;
+                if (buf) |b| {
+                    const rl: usize = @intCast(r_len);
+                    const bl: usize = @intCast(bridge_len);
+                    @memcpy(b[0..rl], r_src.?[0..rl]);
+                    b[rl] = '\n';
+                    @memcpy(b[rl + 1 .. rl + 1 + bl], bridge_src.?[0..bl]);
+                    full_recipe = b.ptr;
+                    full_recipe_len = @intCast(total);
+                }
+            }
+            if (full_recipe == null) {
+                full_recipe = if (r_src) |rs| rs else "".ptr;
+                full_recipe_len = r_len;
+            }
+
+            _ = std.posix.write(2, "[v8pool] creating snapshot (with worker_init + recipe + bridge)...\n") catch {};
             const snap_size = edgebox_v8_create_snapshot(
                 final_src, final_len,
                 s.ptr, @intCast(s.len),
                 worker_init_js.ptr, @intCast(worker_init_js.len),
-                if (r_src) |rs| rs else "".ptr, r_len,
+                full_recipe.?, full_recipe_len,
             );
             if (snap_size > 0) {
                 var snap_msg: [64]u8 = undefined;

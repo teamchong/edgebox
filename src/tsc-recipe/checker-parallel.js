@@ -161,12 +161,13 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     __edgebox_write_stderr('[recipe] WasmGC: checker=' + _checkerBuf.byteLength + 'B soa=' + _soaBuf.byteLength + 'B\n');
     } // close else (WASM available)
   }
-  // Test Zig parser speed (if available)
-  if (typeof __edgebox_zig_parse === 'function') {
-    var _zigTestSrc = 'const x: number = 1; function foo(a: string): boolean { return a.length > 0; }';
-    var _zigResult = __edgebox_zig_parse(_zigTestSrc);
-    if (_zigResult) {
-      __edgebox_write_stderr('[recipe] Zig parser: ' + (_zigResult.byteLength / 24) + ' nodes from ' + _zigTestSrc.length + ' chars\n');
+  // Test Zig parser + V8 bridge (if available)
+  if (typeof __edgebox_zig_parse === 'function' && typeof globalThis.__zigCreateSourceFile === 'function') {
+    var _zigTestSrc = 'const x: number = 1;\nlet y = x + 2;\n';
+    var _zigAST = __edgebox_zig_parse(_zigTestSrc);
+    if (_zigAST) {
+      var _zigSF = globalThis.__zigCreateSourceFile(_zigTestSrc, 'test.ts', _zigAST);
+      __edgebox_write_stderr('[recipe] Zig bridge: ' + (_zigAST.byteLength / 24) + ' flat nodes → ' + (_zigSF.statements ? _zigSF.statements.length : 0) + ' statements\n');
     }
   }
 
