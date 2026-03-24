@@ -226,16 +226,21 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       // Expose raw WASM functions
       globalThis.__frozenCheckFlags = _fe.checkFlags;
       globalThis.__frozenCheckRelated = _fe.checkRelated;
-      // Use FLAT versions (no struct access) — these are guaranteed correct
-      // The struct-access versions (checkTypeSimple etc.) need freeze pipeline
-      // fix for multi-field offset tracking before they can be used.
+      // Expose all frozen functions with JS trampolines for object field extraction
       globalThis.__frozenCheckFlags = _fe.checkFlags;
       globalThis.__frozenCheckRelated = _fe.checkRelated;
-      // Warmup
+      globalThis.__frozenGetObjectFlags = function(t) { return _fe.getObjectFlagsFlat(t.flags|0, t.objectFlags|0); };
+      globalThis.__frozenIsUnitType = function(t) { return _fe.isUnitTypeFlat(t.flags|0); };
+      globalThis.__frozenIsObjLiteral = function(t) { return _fe.isObjectLiteralTypeFlat(t.flags|0, t.objectFlags|0); };
+      globalThis.__frozenIsFreshLiteral = function(t) { return _fe.isFreshLiteralTypeFlat(t.flags|0, t.objectFlags|0); };
+      globalThis.__frozenIsEmptyObj = function(t) { return _fe.isEmptyObjFlat(t.flags|0, t.objectFlags|0); };
+      // Warmup all functions
       for (var _fi = 0; _fi < 100; _fi++) {
-        _fe.checkFlags(1, 2, 0); _fe.checkRelated(1, 2, 10, 20, 0);
+        _fe.checkFlags(1, 2, 0);
+        _fe.getObjectFlagsFlat(524288, 128);
+        _fe.isUnitTypeFlat(109472);
       }
-      __edgebox_write_stderr('[recipe] Frozen checker: ' + _frozenBuf.byteLength + 'B (flat: checkFlags + checkRelated)\n');
+      __edgebox_write_stderr('[recipe] Frozen checker: ' + _frozenBuf.byteLength + 'B (8 functions)\n');
     }
 
     } // close else (WASM available)

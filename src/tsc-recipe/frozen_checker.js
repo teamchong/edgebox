@@ -6,51 +6,6 @@
 //   source = {flags: i32, id: i32}
 //   target = {flags: i32, id: i32}
 
-// isSimpleTypeRelatedTo — with OBJECT PARAMS (not flat integers)
-// This is the ACTUAL TSC function signature, accessing source.flags etc.
-function checkTypeSimple(source, target, rel) {
-  var s = source.flags;
-  var t = target.flags;
-  if ((t & 1) || (s & 131072)) return 1;
-  if (t & 2) {
-    if (rel === 3 && (s & 1)) return -1;
-    return 1;
-  }
-  if (t & 131072) return 0;
-  if ((s & 402653316) && (t & 4)) return 1;
-  if ((s & 296) && (t & 8)) return 1;
-  if ((s & 2112) && (t & 64)) return 1;
-  if ((s & 528) && (t & 16)) return 1;
-  if ((s & 12288) && (t & 4096)) return 1;
-  if ((s & 32768) && (t & 49152)) return 1;
-  if ((s & 65536) && (t & 65536)) return 1;
-  if ((s & 524288) && (t & 67108864)) return 1;
-  if (rel === 0 || rel === 1) {
-    if (s & 1) return 1;
-    if ((s & 8) && ((t & 32) || ((t & 256) && (t & 1024)))) return 1;
-  }
-  if ((s & 249860) && (t & 249860)) {
-    if (((s & t) & 249860) === 0) return 0;
-  }
-  return -1;
-}
-
-// isRelatedTo fast path — with object params
-function checkTypeRelated(source, target, rel) {
-  if (source.id === target.id) return 1;
-  var sf = source.flags;
-  var tf = target.flags;
-  if ((sf & 524288) && (tf & 402784252)) {
-    return checkTypeSimple(source, target, rel);
-  }
-  if (rel === 4) {
-    if (sf !== tf) return 0;
-    if (sf & 67358815) return 1;
-    return -1;
-  }
-  return checkTypeSimple(source, target, rel);
-}
-
 // Pure flag version (no object access — guaranteed freezable)
 function checkFlags(s, t, rel) {
   if ((t & 1) || (s & 131072)) return 1;
@@ -109,47 +64,41 @@ function checkPropertyNames(srcCount, tgtCount, srcOff, tgtOff, mem) {
   return 1;
 }
 
-// getObjectFlags — hot utility (called thousands of times per check)
-function getObjectFlags(type) {
-  return type.flags & 3899393 ? type.objectFlags : 0;
+// === FLAT versions (take individual i32 fields, not objects) ===
+// These work correctly with the freeze pipeline (no struct offset issues)
+
+// getObjectFlags — takes flags and objectFlags as separate i32 params
+function getObjectFlagsFlat(flags, objectFlags) {
+  return flags & 3899393 ? objectFlags : 0;
 }
 
-// isUnitType — flag check
-function isUnitType(type) {
-  return type.flags & 109472 ? 1 : 0;
+// isUnitType — single flag check
+function isUnitTypeFlat(flags) {
+  return flags & 109472 ? 1 : 0;
 }
 
-// isObjectLiteralType — combines getObjectFlags + flag check
-function isObjectLiteralType(type) {
-  return (type.flags & 3899393) && (type.objectFlags & 128) ? 1 : 0;
+// isObjectLiteralType
+function isObjectLiteralTypeFlat(flags, objectFlags) {
+  return (flags & 3899393) && (objectFlags & 128) ? 1 : 0;
 }
 
 // isFreshLiteralType
-function isFreshLiteralType(type) {
-  return (type.flags & 3899393) && (type.objectFlags & 8192) ? 1 : 0;
+function isFreshLiteralTypeFlat(flags, objectFlags) {
+  return (flags & 3899393) && (objectFlags & 8192) ? 1 : 0;
 }
 
-// getNormalizedFlags — handle fresh literal normalization
-// TSC normalizes fresh literals (source.freshType === source → use regularType)
-// This is used in isRelatedTo before calling isSimpleTypeRelatedTo
-function getNormalizedFlags(type) {
-  var f = type.flags;
-  // Fresh literal check: flags has Literal bits (2976) and freshType equals self
-  // We can't check object identity in WASM, so just return the flags
-  return f;
+// isEmptyAnonymousObjectType check (used in isRelatedTo)
+function isEmptyObjFlat(flags, objectFlags) {
+  return (flags & 524288) && (objectFlags & 16) && !(objectFlags & 8192) ? 1 : 0;
 }
 
 // Prevent dead code elimination
-var obj1 = {flags: 1, id: 10, objectFlags: 0};
-var obj2 = {flags: 2, id: 20, objectFlags: 0};
-var _r1 = checkTypeSimple(obj1, obj2, 0);
-var _r2 = checkTypeRelated(obj1, obj2, 0);
-var _r3 = checkFlags(1, 2, 0);
-var _r4 = checkRelated(1, 2, 10, 20, 0);
+var _r1 = checkFlags(1, 2, 0);
+var _r2 = checkRelated(1, 2, 10, 20, 0);
 var _arr = [0, 0, 0, 0, 0, 0, 0, 0];
-var _r5 = checkPropertyNames(2, 2, 0, 4, _arr);
-var _r6 = getObjectFlags(obj1);
-var _r7 = isUnitType(obj1);
-var _r8 = isObjectLiteralType(obj1);
-var _r9 = isFreshLiteralType(obj1);
-var _r10 = getNormalizedFlags(obj1);
+var _r3 = checkPropertyNames(2, 2, 0, 4, _arr);
+var _r4 = getObjectFlagsFlat(524288, 128);
+var _r5 = isUnitTypeFlat(109472);
+var _r6 = isObjectLiteralTypeFlat(524288, 128);
+var _r7 = isFreshLiteralTypeFlat(524288, 8192);
+var _r8 = isEmptyObjFlat(524288, 16);

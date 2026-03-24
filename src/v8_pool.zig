@@ -415,8 +415,19 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         result = simple_result;
     }
 
-    // TODO: Patch getObjectFlags with frozen WASM once freeze pipeline
-    // supports multi-field struct offset tracking (currently maps all fields to offset 0).
+    // Patch 3d: getObjectFlags — replace with frozen WASM (flat trampoline).
+    const gof_needle = "function getObjectFlags(type) {";
+    const gof_inject = "function getObjectFlags(type) {" ++
+        "if(globalThis.__frozenGetObjectFlags)return globalThis.__frozenGetObjectFlags(type);";
+    if (std.mem.indexOf(u8, result, gof_needle)) |gof_idx| {
+        _ = std.posix.write(2, "[v8pool] patching getObjectFlags → frozen WASM\n") catch {};
+        const gof_len = result.len - gof_needle.len + gof_inject.len;
+        const gof_result = try alloc.alloc(u8, gof_len);
+        @memcpy(gof_result[0..gof_idx], result[0..gof_idx]);
+        @memcpy(gof_result[gof_idx .. gof_idx + gof_inject.len], gof_inject);
+        @memcpy(gof_result[gof_idx + gof_inject.len .. gof_len], result[gof_idx + gof_needle.len ..]);
+        result = gof_result;
+    }
 
     return result;
 }
