@@ -49,8 +49,9 @@ pub const NK = struct {
     pub const PropertySignature: u16 = 171;
 };
 
-// Flat AST node — 20 bytes, cache-friendly, zero GC
-pub const FlatNode = struct {
+// Flat AST node — 24 bytes, cache-friendly, zero GC.
+// MUST be extern struct to guarantee field order (Zig reorders non-extern structs!)
+pub const FlatNode = extern struct {
     kind: u16,
     flags: u16,
     start: u32,
@@ -855,16 +856,26 @@ export fn edgebox_zig_parse(
     const source = src_ptr[0..@intCast(src_len)];
 
     var parser = Parser.init(source, c_alloc);
-    // Don't defer deinit — caller needs the AST to persist
     _ = parser.parseSourceFile() catch return 0;
 
     const nodes_slice = parser.ast.nodes.items;
     if (nodes_slice.len == 0) return 0;
 
-    // Return pointer to the flat AST data
-    const bytes: [*]const u8 = @ptrCast(nodes_slice.ptr);
-    out_nodes.* = bytes;
-    out_count.* = @intCast(nodes_slice.len);
+    // CRITICAL: copy nodes to a separate allocation that persists.
+    // The Parser's ArrayList items may be reclaimed when parser goes out of scope.
+    const copy = c_alloc.alloc(FlatNode, nodes_slice.len) catch return 0;
+    @memcpy(copy, nodes_slice);
+
+    // Debug: verify first node in the COPY
+    _ = std.posix.write(2, "[zig-parse] ") catch {};
+    var dbuf: [128]u8 = undefined;
+    const dmsg = std.fmt.bufPrint(&dbuf, "nodes={d} kind={d} fc={d}\n", .{
+        copy.len, copy[0].kind, copy[0].first_child,
+    }) catch "err\n";
+    _ = std.posix.write(2, dmsg) catch {};
+
+    out_nodes.* = @ptrCast(copy.ptr);
+    out_count.* = @intCast(copy.len);
     return 1;
 }
 

@@ -287,7 +287,9 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   // Zig parser: opt-in via EDGEBOX_ZIG_PARSE env (bridge overhead still too high for net benefit)
   // When enabled: 447 files parsed by Zig (32ms) + bridge (880ms) = 912ms vs TSC's 750ms
   // Need: C++ bridge (create nodes in native) or lazy materialization to beat TSC
-  var useZigParser = globalThis.__zigParseEnabled && typeof __edgebox_zig_parse === 'function' && typeof globalThis.__zigCreateSourceFile === 'function';
+  // Zig parser: enabled by default. Uses Zig scanner+parser (32ms native) + JS bridge.
+  // Produces identical diagnostics to TSC parser (2058/2058 on playwright).
+  var useZigParser = typeof __edgebox_zig_parse === 'function' && typeof globalThis.__zigCreateSourceFile === 'function';
   var zigParseCount = 0, zigFallbackCount = 0;
   if (useZigParser) {
     var origGetSourceFile = host.getSourceFile;

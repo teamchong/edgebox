@@ -37,18 +37,16 @@
     return children;
   }
 
+  // Cache the Node constructor for fast object creation
+  var NodeCtor = ts.objectAllocator.getNodeConstructor();
+
   // Create a TSC-compatible node from flat AST
-  // Each node gets: kind, pos, end, flags, parent, and named child properties
+  // Uses the MonoNode constructor (pre-initializes 19 properties in one call)
   function createTSCNode(view, nodeCount, sourceText, idx, parentNode) {
     var flat = readNode(view, idx);
-    var node = Object.create(ts.objectAllocator.getNodeConstructor().prototype);
-    node.kind = flat.kind;
-    node.pos = flat.start;
-    node.end = flat.end;
+    // MonoNode(kind, pos, end) — fastest V8 object creation path
+    var node = new NodeCtor(flat.kind, flat.start, flat.end);
     node.flags = flat.flags;
-    node.id = 0;
-    node.modifierFlagsCache = 0;
-    node.transformFlags = 0;
     node.parent = parentNode || undefined;
 
     var children = getChildren(view, nodeCount, idx);
@@ -147,31 +145,55 @@
     return arr;
   }
 
-  // Main entry: create a SourceFile from Zig-parsed flat AST
+  // Single-pass node creation: create ALL nodes first, then link children.
+  // Avoids recursive calls — flat loop is faster.
   globalThis.__zigCreateSourceFile = function(sourceText, fileName, flatASTBuffer) {
     if (!flatASTBuffer || flatASTBuffer.byteLength < 24) {
-      // Fallback to TSC parser
       return ts.createSourceFile(fileName, sourceText, 99, true);
     }
 
     var view = new DataView(flatASTBuffer);
     var nodeCount = flatASTBuffer.byteLength / 24;
 
-    // Root node should be SourceFile (kind 316)
-    var rootFlat = readNode(view, 0);
-    if (rootFlat.kind !== 316) {
-      return ts.createSourceFile(fileName, sourceText, 99, true);
+    // Phase 1: Create ALL nodes in a flat array (single pass, no recursion)
+    var tscNodes = new Array(nodeCount);
+    for (var i = 0; i < nodeCount; i++) {
+      var off = i * 24;
+      var kind = view.getUint16(off, true);
+      var start = view.getUint32(off + 4, true);
+      var end = view.getUint32(off + 8, true);
+      tscNodes[i] = new NodeCtor(kind, start, end);
+      tscNodes[i].flags = view.getUint16(off + 2, true);
     }
 
-    // Create SourceFile node
-    var sf = Object.create(ts.objectAllocator.getSourceFileConstructor().prototype);
-    sf.kind = 316;
-    sf.pos = 0;
-    sf.end = sourceText.length;
-    sf.flags = 0;
-    sf.id = 0;
-    sf.modifierFlagsCache = 0;
-    sf.transformFlags = 0;
+    // Phase 2: Link parent-child relationships
+    for (var j = 0; j < nodeCount; j++) {
+      var off2 = j * 24;
+      var parentIdx = view.getUint32(off2 + 12, true);
+      if (parentIdx !== 0xFFFFFFFF && parentIdx < nodeCount) {
+        tscNodes[j].parent = tscNodes[parentIdx];
+      }
+    }
+
+    // Phase 3: Collect children for each node and assign named properties
+    for (var k = 0; k < nodeCount; k++) {
+      var off3 = k * 24;
+      var firstChild = view.getUint32(off3 + 16, true);
+      if (firstChild === 0xFFFFFFFF) continue;
+
+      var children = [];
+      var ch = firstChild;
+      while (ch !== 0xFFFFFFFF && ch < nodeCount) {
+        children.push(tscNodes[ch]);
+        var chOff = ch * 24;
+        ch = view.getUint32(chOff + 20, true);
+      }
+      mapChildrenToProperties(tscNodes[k], children, tscNodes[k].kind);
+    }
+
+    // Phase 4: Build SourceFile wrapper
+    var SFCtor = ts.objectAllocator.getSourceFileConstructor();
+    var sf = new SFCtor(316, 0, sourceText.length);
     sf.text = sourceText;
     sf.fileName = fileName;
     sf.path = fileName.toLowerCase();
@@ -179,7 +201,7 @@
     sf.originalFileName = fileName;
     sf.languageVersion = 99;
     sf.languageVariant = 0;
-    sf.scriptKind = 3; // TS
+    sf.scriptKind = fileName.endsWith('.tsx') ? 4 : fileName.endsWith('.jsx') ? 2 : 3;
     sf.isDeclarationFile = fileName.endsWith('.d.ts');
     sf.hasNoDefaultLib = false;
     sf.parseDiagnostics = [];
@@ -194,25 +216,34 @@
     sf.identifierCount = 0;
     sf.symbolCount = 0;
 
-    // Create statement nodes from flat AST children
-    var children = getChildren(view, nodeCount, 0);
-    var statements = [];
-    for (var i = 0; i < children.length; i++) {
-      var stmt = createTSCNode(view, nodeCount, sourceText, children[i], sf);
-      statements.push(stmt);
+    // DEBUG: verify flat AST structure
+    if (typeof __edgebox_write_stderr === 'function') {
+      __edgebox_write_stderr('[bridge] node0: kind=' + view.getUint16(0, true) +
+        ' firstChild=' + view.getUint32(16, true) +
+        ' nodeCount=' + nodeCount + '\n');
+      if (nodeCount > 1) {
+        __edgebox_write_stderr('[bridge] node1: kind=' + view.getUint16(24, true) +
+          ' nextSibling=' + view.getUint32(24 + 20, true) + '\n');
+      }
     }
-    sf.statements = createNodeArray(statements);
+
+    // Get root node's children as statements
+    var rootChildren = [];
+    var rootFirstOff = 0 * 24 + 16;
+    var rootFirst = view.getUint32(rootFirstOff, true);
+    var rc = rootFirst;
+    while (rc !== 0xFFFFFFFF && rc < nodeCount) {
+      rootChildren.push(tscNodes[rc]);
+      tscNodes[rc].parent = sf;
+      var nextOff = rc * 24 + 20; // next_sibling offset
+      rc = view.getUint32(nextOff, true);
+    }
+    sf.statements = createNodeArray(rootChildren);
 
     // EndOfFileToken
-    sf.endOfFileToken = Object.create(ts.objectAllocator.getTokenConstructor().prototype);
-    sf.endOfFileToken.kind = 1; // EndOfFileToken
-    sf.endOfFileToken.pos = sourceText.length;
-    sf.endOfFileToken.end = sourceText.length;
-    sf.endOfFileToken.flags = 0;
+    var TokenCtor = ts.objectAllocator.getTokenConstructor();
+    sf.endOfFileToken = new TokenCtor(1, sourceText.length, sourceText.length);
     sf.endOfFileToken.parent = sf;
-
-    // lineMap (required for diagnostic positions)
-    sf.lineMap = undefined; // Computed lazily by TSC
 
     return sf;
   };
