@@ -218,9 +218,15 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     if (_frozenBuf && _frozenBuf instanceof ArrayBuffer && _frozenBuf.byteLength > 8) {
       // JS imports: called FROM WASM for closure dependencies.
       // Stubs until checker is created — then updated with real functions.
-      // Import stubs — return -1 (unknown/fallthrough) until real checker is created
+      // Import implementations for frozen checker.
+      // enumCheck: for enum/value comparisons, return -1 (fallthrough to JS).
+      // TSC's isEnumTypeRelatedTo is too complex to replicate here.
       globalThis.__frozenImportEnum = function(a, b) { return -1; };
+      // objCheck: for Object→NonPrimitive strict subtype check, return -1 (fallthrough).
       globalThis.__frozenImportObj = function(a, b) { return -1; };
+      // unknownCheck: isUnknownLikeUnionType — check if type is union of unknown.
+      // Always return 0 (not unknown-like). This is safe — if TSC's JS finds it IS
+      // unknown-like, it returns true anyway after the frozen check falls through.
       globalThis.__frozenImportUnknown = function(a) { return 0; };
       try {
         var _frozenInst = new WebAssembly.Instance(new WebAssembly.Module(_frozenBuf), {
