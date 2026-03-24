@@ -425,16 +425,32 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     : [];
 
   var host = Object.create(defaultHost);
+  // Check once if node_modules exists — skip bare module resolution if it doesn't.
+  // Projects without node_modules waste ~70ms on failed fileExists lookups.
+  var hasNodeModules = __edgebox_dir_exists(cwd + '/node_modules') === 1;
   host.resolveModuleNames = function(moduleNames, containingFile) {
     return moduleNames.map(function(name) {
       var key = name + '\0' + containingFile;
       var cached = globalThis.__mrCache.get(key);
       if (cached !== undefined) return cached;
-      // Resolve ALL modules through TSC — handles relative, path-mapped,
-      // bare packages (@types/node, etc.), and Node.js built-ins.
-      var r = ts.resolveModuleName(name, containingFile, parsed.options, defaultHost).resolvedModule;
-      globalThis.__mrCache.set(key, r || null);
-      return r;
+      // Relative imports or path-mapped: always resolve
+      var shouldResolve = name.charAt(0) === '.';
+      if (!shouldResolve) {
+        for (var pi = 0; pi < pathPrefixes.length; pi++) {
+          if (name === pathPrefixes[pi] || name.indexOf(pathPrefixes[pi] + '/') === 0) {
+            shouldResolve = true; break;
+          }
+        }
+      }
+      // Bare modules: only resolve if node_modules exists (saves ~70ms)
+      if (!shouldResolve && hasNodeModules) shouldResolve = true;
+      if (shouldResolve) {
+        var r = ts.resolveModuleName(name, containingFile, parsed.options, defaultHost).resolvedModule;
+        globalThis.__mrCache.set(key, r || null);
+        return r;
+      }
+      globalThis.__mrCache.set(key, null);
+      return undefined;
     });
   };
 
