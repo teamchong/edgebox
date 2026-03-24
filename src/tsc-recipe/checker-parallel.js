@@ -45,6 +45,63 @@ globalThis.__gcFlagsDone = false;
   MonoNode.prototype = Object.create(origNodeProto);
   MonoNode.prototype.constructor = MonoNode;
 
+  // MonoType — pre-initialize ALL properties to force single hidden class.
+  // V8 profile shows LoadIC_Megamorphic = 17% of runtime. Type objects are
+  // the main culprit: default constructor only sets flags+checker, all other
+  // properties added dynamically → hundreds of hidden class transitions.
+  var origTypeProto = ts.objectAllocator.getTypeConstructor().prototype;
+  function MonoType(checker, flags) {
+    this.flags = flags;
+    this.checker = checker;
+    this.id = 0;
+    this.objectFlags = 0;
+    this.intrinsicName = void 0;
+    this.debugIntrinsicName = void 0;
+    this.symbol = void 0;
+    this.members = void 0;
+    this.properties = void 0;
+    this.callSignatures = void 0;
+    this.constructSignatures = void 0;
+    this.indexInfos = void 0;
+    this.immediateBaseConstraint = void 0;
+    this.aliasSymbol = void 0;
+    this.aliasTypeArguments = void 0;
+    this.regularType = void 0;
+    this.target = void 0;
+    this.resolvedTypeArguments = void 0;
+    this.freshType = void 0;
+    this.types = void 0;
+    this.origin = void 0;
+    this.value = void 0;
+    this.resolvedBaseConstraint = void 0;
+    this.declaredProperties = void 0;
+    this.declaredCallSignatures = void 0;
+    this.declaredConstructSignatures = void 0;
+    this.declaredIndexInfos = void 0;
+    this.pattern = void 0;
+  }
+  MonoType.prototype = Object.create(origTypeProto);
+  MonoType.prototype.constructor = MonoType;
+
+  // MonoSignature — pre-initialize common Signature properties
+  var origSigProto = ts.objectAllocator.getSignatureConstructor().prototype;
+  function MonoSignature(checker, flags) {
+    this.flags = flags;
+    this.checker = checker;
+    this.parameters = void 0;
+    this.declaration = void 0;
+    this.typeParameters = void 0;
+    this.resolvedReturnType = void 0;
+    this.resolvedTypePredicate = void 0;
+    this.minArgumentCount = 0;
+    this.target = void 0;
+    this.mapper = void 0;
+    this.compositeSignatures = void 0;
+    this.compositeKind = 0;
+  }
+  MonoSignature.prototype = Object.create(origSigProto);
+  MonoSignature.prototype.constructor = MonoSignature;
+
   ts.setObjectAllocator({
     getNodeConstructor: function() { return MonoNode; },
     getTokenConstructor: function() { return MonoNode; },
@@ -52,8 +109,8 @@ globalThis.__gcFlagsDone = false;
     getPrivateIdentifierConstructor: function() { return MonoNode; },
     getSourceFileConstructor: ts.objectAllocator.getSourceFileConstructor,
     getSymbolConstructor: ts.objectAllocator.getSymbolConstructor,
-    getTypeConstructor: ts.objectAllocator.getTypeConstructor,
-    getSignatureConstructor: ts.objectAllocator.getSignatureConstructor,
+    getTypeConstructor: function() { return MonoType; },
+    getSignatureConstructor: function() { return MonoSignature; },
     getSourceMapSourceConstructor: ts.objectAllocator.getSourceMapSourceConstructor,
   });
 })();
@@ -159,6 +216,22 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       globalThis.__gcCheck(1, 2);
     } catch(e) {}
     __edgebox_write_stderr('[recipe] WasmGC: checker=' + _checkerBuf.byteLength + 'B soa=' + _soaBuf.byteLength + 'B\n');
+
+    // 5. Load frozen_checker.wasm — freeze-compiled (QuickJS→LLVM→WASM) checker functions
+    // These run at native speed from the FIRST call (no JIT warmup needed).
+    var _frozenBuf = __edgebox_read_binary(_root + '/src/tsc-recipe/frozen_checker.wasm');
+    if (_frozenBuf && _frozenBuf instanceof ArrayBuffer && _frozenBuf.byteLength > 8) {
+      var _frozenInst = new WebAssembly.Instance(new WebAssembly.Module(_frozenBuf));
+      globalThis.__frozenCheckFlags = _frozenInst.exports.checkFlags;
+      globalThis.__frozenCheckRelated = _frozenInst.exports.checkRelated;
+      // Warmup + force TurboFan
+      for (var _fi = 0; _fi < 200; _fi++) {
+        _frozenInst.exports.checkFlags(1, 2, 0);
+        _frozenInst.exports.checkRelated(1, 2, 10, 20, 0);
+      }
+      __edgebox_write_stderr('[recipe] Frozen checker: ' + _frozenBuf.byteLength + 'B (checkFlags + checkRelated)\n');
+    }
+
     } // close else (WASM available)
   }
   // Test Zig parser + V8 bridge (if available)

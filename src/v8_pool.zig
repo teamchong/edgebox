@@ -387,46 +387,33 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         result = union_result;
     }
 
-    // Patch 3c: isTypeRelatedTo — call globalThis.__gcCheck (force-compiled by TurboFan).
-    // __gcCheck is defined in recipe JS and force-compiled via %OptimizeFunctionOnNextCall.
-    // This means WasmGC getFlag is TurboFan-inlined from the FIRST call, not after 3000.
-    const helper_needle = "function isTypeRelatedTo(source, target, relation) {";
-    // Simplified: pass source.id and target.id directly to WASM.
-    // NO fresh literal normalization — WASM reads flags from GC array,
-    // and StringLiteral(128) already matches StringLike→String without normalization.
-    // This eliminates 4-6 megamorphic JS property reads (source.flags, source.freshType,
-    // source.regularType, target.flags, target.freshType, target.regularType).
-    // source.id is set once in constructor — more likely monomorphic IC.
-    const itr_inject = "function isTypeRelatedTo(source, target, relation) {" ++
-        "if(relation!==identityRelation){" ++
-        "var _s=(source.flags&2976)&&source.freshType===source?source.regularType:source;" ++
-        "var _t=(target.flags&2976)&&target.freshType===target?target.regularType:target;" ++
-        "if(_s===_t)return true;" ++
-        "var _si=_s.id,_ti=_t.id;" ++
-        "if(_si>0&&_si<65536&&_ti>0&&_ti<65536){" ++
-        "var _r=globalThis.__gcCheck(_si,_ti);" ++
+    // Patch 3c: isSimpleTypeRelatedTo — REPLACE flag checks with frozen WASM.
+    // Uses freeze-compiled checkFlags (QuickJS→LLVM→WASM) that runs at native
+    // speed from the FIRST call. No JIT warmup needed.
+    // Relation mapping: assignable=0, comparable=1, subtype=2, strictSubtype=3, identity=4
+    const simple_needle = "function isSimpleTypeRelatedTo(source, target, relation, errorReporter) {";
+    const simple_inject = "function isSimpleTypeRelatedTo(source, target, relation, errorReporter) {" ++
+        "if(globalThis.__frozenCheckFlags){" ++
+        "var _rel=relation===assignableRelation?0:relation===comparableRelation?1:" ++
+        "relation===strictSubtypeRelation?3:relation===identityRelation?4:2;" ++
+        "var _r=globalThis.__frozenCheckFlags(source.flags|0,target.flags|0,_rel);" ++
         "if(_r===1)return true;" ++
         "if(_r===0)return false;" ++
-        "}}";
+        "}";
 
-    const itr_idx = std.mem.indexOf(u8, result, helper_needle) orelse {
-        _ = std.posix.write(2, "[v8pool] FATAL: isTypeRelatedTo needle not found\n") catch {};
+    const simple_idx = std.mem.indexOf(u8, result, simple_needle) orelse {
+        _ = std.posix.write(2, "[v8pool] FATAL: isSimpleTypeRelatedTo needle not found\n") catch {};
         return error.NeedleNotFound;
     };
-    _ = std.posix.write(2, "[v8pool] patching isTypeRelatedTo → WASM registry\n") catch {};
+    _ = std.posix.write(2, "[v8pool] patching isSimpleTypeRelatedTo → WASM fast-path\n") catch {};
     {
-        const itr_len = result.len - helper_needle.len + itr_inject.len;
-        const itr_result = try alloc.alloc(u8, itr_len);
-        @memcpy(itr_result[0..itr_idx], result[0..itr_idx]);
-        @memcpy(itr_result[itr_idx .. itr_idx + itr_inject.len], itr_inject);
-        @memcpy(itr_result[itr_idx + itr_inject.len .. itr_len], result[itr_idx + helper_needle.len ..]);
-        result = itr_result;
+        const simple_len = result.len - simple_needle.len + simple_inject.len;
+        const simple_result = try alloc.alloc(u8, simple_len);
+        @memcpy(simple_result[0..simple_idx], result[0..simple_idx]);
+        @memcpy(simple_result[simple_idx .. simple_idx + simple_inject.len], simple_inject);
+        @memcpy(simple_result[simple_idx + simple_inject.len .. simple_len], result[simple_idx + simple_needle.len ..]);
+        result = simple_result;
     }
-
-    // NOTE: Relation cache removed — TSC's checkTypeRelatedTo is NOT pure.
-    // Same (source, target) pair can have different results depending on
-    // intersectionState, elaboration depth, inference context, and variance.
-    // Only TSC's internal relation cache (with versioning/invalidation) is safe.
 
     return result;
 }
