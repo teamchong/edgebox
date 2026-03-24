@@ -207,8 +207,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     globalThis.__gcCheck = function(_si, _ti) {
       return _relFast(_fA, _bA, _uA, _si, _ti, 0);
     };
-    // Relation-aware version with strictNullChecks for isSimpleTypeRelatedTo
-    // strictNullChecks is determined from compiler options at check time.
+    // Relation-aware: identity + flags + union, all in one WASM call
     globalThis.__gcCheckRel = function(_si, _ti, _rel, _sn) {
       return _relFast(_fA, _bA, _uA, _si, _ti, _rel, _sn);
     };

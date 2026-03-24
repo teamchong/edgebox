@@ -294,7 +294,7 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
     // Skip expensive patches — only createType + isSimpleTypeRelatedTo for minimal overhead
     const skip_expensive = std.posix.getenv("EDGEBOX_LEAN") != null;
     if (skip_expensive) {
-        _ = std.posix.write(2, "[v8pool] lean mode: createType + isSimpleTypeRelatedTo (strictNull-aware)\n") catch {};
+        _ = std.posix.write(2, "[v8pool] lean mode: createType + isTypeRelatedTo\n") catch {};
         // Patch isSimpleTypeRelatedTo with strictNullChecks-aware WASM
         const lean_needle = "function isTypeRelatedTo(source, target, relation) {";
         // Patch isTypeRelatedTo (not isSimpleTypeRelatedTo) — called once per comparison.
