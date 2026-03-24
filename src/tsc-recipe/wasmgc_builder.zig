@@ -260,9 +260,9 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\  (type $flags (array (mut i32)))
         \\
         \\  ;; checkRelation: native type comparison engine
-        \\  ;; Reads flags + bloom from GC arrays, does all checks in native WASM.
+        \\  ;; Reads flags + bloom + union members from GC arrays.
         \\  ;; Returns: 1=related, 0=not related, -1=unknown (fall through to TSC)
-        \\  (func (export "checkRelation")
+        \\  (func $checkRel (export "checkRelation")
         \\    (param $flagsArr (ref null $flags))
         \\    (param $bloomArr (ref null $flags))
         \\    (param $src i32) (param $tgt i32)
@@ -363,6 +363,52 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\            (then (return (i32.const 0)))))))
         \\
         \\    ;; Unknown — fall through to TSC
+        \\    (i32.const -1))
+        \\
+        \\  ;; checkSrcToUnion: Source → Target Union
+        \\  ;; If target is a union (stored member IDs), check source against each member.
+        \\  ;; Returns 1 if source is related to ANY member (safe positive).
+        \\  ;; unionArr layout: [tgtId*4]=count, [tgtId*4+1..3]=member IDs
+        \\  (func (export "checkSrcToUnion")
+        \\    (param $flagsArr (ref null $flags))
+        \\    (param $bloomArr (ref null $flags))
+        \\    (param $unionArr (ref null $flags))
+        \\    (param $src i32) (param $tgt i32)
+        \\    (result i32)
+        \\    (local $base i32) (local $cnt i32) (local $mid i32) (local $r i32)
+        \\    ;; Compute base offset: tgt * 4
+        \\    (local.set $base (i32.mul (local.get $tgt) (i32.const 4)))
+        \\    ;; Read member count
+        \\    (local.set $cnt (array.get $flags (local.get $unionArr) (local.get $base)))
+        \\    ;; No stored members → fall through
+        \\    (if (i32.eqz (local.get $cnt)) (then (return (i32.const -1))))
+        \\    ;; Check source against member 0 (bounds check member ID)
+        \\    (local.set $mid (array.get $flags (local.get $unionArr)
+        \\      (i32.add (local.get $base) (i32.const 1))))
+        \\    (if (i32.and (i32.gt_u (local.get $mid) (i32.const 0))
+        \\                 (i32.lt_u (local.get $mid) (i32.const 65536))) (then
+        \\      (local.set $r (call $checkRel (local.get $flagsArr) (local.get $bloomArr)
+        \\        (local.get $src) (local.get $mid)))
+        \\      (if (i32.eq (local.get $r) (i32.const 1)) (then (return (i32.const 1))))))
+        \\    ;; Check member 1 (if exists + bounds check)
+        \\    (if (i32.ge_u (local.get $cnt) (i32.const 2)) (then
+        \\      (local.set $mid (array.get $flags (local.get $unionArr)
+        \\        (i32.add (local.get $base) (i32.const 2))))
+        \\      (if (i32.and (i32.gt_u (local.get $mid) (i32.const 0))
+        \\                   (i32.lt_u (local.get $mid) (i32.const 65536))) (then
+        \\        (local.set $r (call $checkRel (local.get $flagsArr) (local.get $bloomArr)
+        \\          (local.get $src) (local.get $mid)))
+        \\        (if (i32.eq (local.get $r) (i32.const 1)) (then (return (i32.const 1))))))))
+        \\    ;; Check member 2 (if exists + bounds check)
+        \\    (if (i32.ge_u (local.get $cnt) (i32.const 3)) (then
+        \\      (local.set $mid (array.get $flags (local.get $unionArr)
+        \\        (i32.add (local.get $base) (i32.const 3))))
+        \\      (if (i32.and (i32.gt_u (local.get $mid) (i32.const 0))
+        \\                   (i32.lt_u (local.get $mid) (i32.const 65536))) (then
+        \\        (local.set $r (call $checkRel (local.get $flagsArr) (local.get $bloomArr)
+        \\          (local.get $src) (local.get $mid)))
+        \\        (if (i32.eq (local.get $r) (i32.const 1)) (then (return (i32.const 1))))))))
+        \\    ;; No member matched via flags → unknown
         \\    (i32.const -1))
         \\
         \\  ;; getFlag/setFlag/newFlags — same as type_flags_gc.wasm but in same module

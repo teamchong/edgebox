@@ -326,7 +326,37 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         result = ssm_result;
     }
 
-    // Patch 3b: isTypeRelatedTo — call globalThis.__gcCheck (force-compiled by TurboFan).
+    // Patch 3b: Store union member IDs when union types are created.
+    // Flat layout: unionMembers[typeId * 4] = count, [+1..+3] = member IDs (up to 3)
+    // For unions with >3 members, count is stored but we fall through to TSC.
+    const union_needle = "type.types = types;\n      type.origin = origin;";
+    const union_inject = "type.types = types;" ++
+        "if(type.id>0&&type.id<16384&&types.length>0&&types.length<=3){" ++
+        "var _ua=globalThis.__gcUnionArr,_uf=globalThis.__gcFlags;" ++
+        "if(_ua&&_uf){" ++
+        "var _ub=type.id*4;" ++
+        "_uf.setFlag(_ua,_ub|0,types.length|0);" ++
+        "for(var _ui=0;_ui<types.length;_ui++){" ++
+        "if(types[_ui].id>0&&types[_ui].id<65536)" ++
+        "_uf.setFlag(_ua,(_ub+_ui+1)|0,types[_ui].id|0);" ++
+        "}}}" ++
+        "\n      type.origin = origin;";
+
+    const union_idx = std.mem.indexOf(u8, result, union_needle) orelse {
+        _ = std.posix.write(2, "[v8pool] FATAL: union types needle not found\n") catch {};
+        return error.NeedleNotFound;
+    };
+    _ = std.posix.write(2, "[v8pool] patching union type → store member IDs\n") catch {};
+    {
+        const union_len = result.len - union_needle.len + union_inject.len;
+        const union_result = try alloc.alloc(u8, union_len);
+        @memcpy(union_result[0..union_idx], result[0..union_idx]);
+        @memcpy(union_result[union_idx .. union_idx + union_inject.len], union_inject);
+        @memcpy(union_result[union_idx + union_inject.len .. union_len], result[union_idx + union_needle.len ..]);
+        result = union_result;
+    }
+
+    // Patch 3c: isTypeRelatedTo — call globalThis.__gcCheck (force-compiled by TurboFan).
     // __gcCheck is defined in recipe JS and force-compiled via %OptimizeFunctionOnNextCall.
     // This means WasmGC getFlag is TurboFan-inlined from the FIRST call, not after 3000.
     const helper_needle = "function isTypeRelatedTo(source, target, relation) {";

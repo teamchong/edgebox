@@ -201,10 +201,31 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     globalThis.__gcSoa = _soaInst.exports;
     // Create objectFlags array (same capacity as type flags)
     globalThis.__gcObjFlagsArr = _soaInst.exports.newI32(65536);
-    // 3. __gcCheck: thin wrapper → native WASM checkRelation
+    // Union member array: flat layout, 4 slots per type ID
+    // [typeId*4] = count, [typeId*4+1..3] = member IDs (up to 3 members)
+    // 16384 types * 4 = 65536 slots
+    globalThis.__gcUnionArr = _checkerInst.exports.newFlags(65536);
+    // 3. __gcCheck: thin wrapper → native WASM checkRelation + checkSrcToUnion
     var _checker = _checkerInst.exports.checkRelation;
+    var _unionChecker = _checkerInst.exports.checkSrcToUnion;
     var _fA = globalThis.__gcFlagsArr, _bA = globalThis.__gcBloomArr;
-    globalThis.__gcCheck = function(_si, _ti) { return _checker(_fA, _bA, _si, _ti); };
+    var _uA = globalThis.__gcUnionArr;
+    globalThis.__gcCheck = function(_si, _ti) {
+      var r = _checker(_fA, _bA, _si, _ti);
+      if (r !== -1) return r;
+      // If target is a union (flags & 1048576), check source against each member
+      // Source → Target Union: only when source is NOT a union/intersection
+      // AND target ID is in bounds for union array (< 16384, since array = 16384*4 slots)
+      if (_ti < 16384 && _si < 65536) {
+        var sf = _checkerInst.exports.getFlag(_fA, _si | 0);
+        var tf = _checkerInst.exports.getFlag(_fA, _ti | 0);
+        if ((tf & 1048576) && !(sf & 3145728)) {
+          var ur = _unionChecker(_fA, _bA, _uA, _si, _ti);
+          if (ur !== -1) return ur;
+        }
+      }
+      return -1;
+    };
     // 4. Warmup + force TurboFan
     var _gf = _checkerInst.exports.getFlag, _sf = _checkerInst.exports.setFlag;
     for (var _wi = 0; _wi < 500; _wi++) {
