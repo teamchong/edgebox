@@ -113,22 +113,11 @@ globalThis.__sfCache = sfCache;
 // workers restore with pre-parsed ASTs — saves 573ms on cold start per worker.
 // The createSourceFile cache (recipe #1) stores the results across requests too.
 (function() {
-  // Pre-parse ONE small file to warm up scanner/parser JIT during snapshot.
-  // V8 snapshot preserves heap objects but NOT TurboFan-compiled code.
-  // However, Sparkplug baseline compilation IS preserved. Parsing a file
-  // triggers Sparkplug compilation of scanner + parser functions, which
-  // persist in the snapshot and run faster than interpreted code.
-  try {
-    if (typeof __edgebox_read_file === 'function') {
-      var root = typeof __edgebox_root === 'function' ? __edgebox_root() : '';
-      // Parse a small lib file to trigger Sparkplug for scan(), parseStatement(), etc.
-      var warmupContent = __edgebox_read_file(root + '/node_modules/typescript/lib/lib.es5.d.ts');
-      if (warmupContent) {
-        ts.createSourceFile('warmup.d.ts', warmupContent, 99, true);
-      }
-    }
-  } catch(e) {}
-  // REMOVED: pre-parse ALL 59 libs inflates snapshot 14MB→33MB.
+  // REMOVED: pre-parse during snapshot. Tested:
+  // - All 59 libs: +19MB snapshot, 300ms SLOWER (restore cost > parse savings)
+  // - One lib (es5.d.ts): +400KB snapshot, ~20ms savings (marginal)
+  // V8 snapshot preserves heap but NOT compiled code (Sparkplug/TurboFan).
+  // Parse JIT warmup happens naturally during the first createProgram call.
   return;
   try {
     var root = __edgebox_root();
