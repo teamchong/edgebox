@@ -236,8 +236,8 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
             __import_unknownCheck: function(a) { return globalThis.__frozenImportUnknown(a); },
           }
         });
-        globalThis.__frozenIsSimple = _frozenInst.exports.isSimpleTypeRelatedTo;
-        __edgebox_write_stderr('[recipe] Frozen isSimpleTypeRelatedTo: ' + _frozenBuf.byteLength + 'B\n');
+        globalThis.__frozenIsRelated = _frozenInst.exports.isRelatedToFast;
+        __edgebox_write_stderr('[recipe] Frozen isRelatedToFast: ' + _frozenBuf.byteLength + 'B\n');
       } catch(e) {
         __edgebox_write_stderr('[recipe] Frozen load failed: ' + e.message + '\n');
       }
