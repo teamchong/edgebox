@@ -324,7 +324,7 @@ pub fn generateStandaloneWasm(
                 if (import_count >= import_names.len) continue;
                 // Determine argc from the call instruction that follows
                 var call_argc: u32 = 1; // default
-                var cl = look; // look points to the call instruction
+                const cl = look; // look points to the call instruction
                 if (cl < sf.func.instructions.len) {
                     call_argc = switch (sf.func.instructions[cl].opcode) {
                         .call0 => 0, .call1 => 1, .call2 => 2, .call3 => 3,
@@ -2673,8 +2673,10 @@ fn emitNumericInstruction(
             // Determine call target: cross-function callee or self
             const call_target = if (pending_callee.*) |callee| blk: {
                 pending_callee.* = null;
-                if (c.LLVMCountParams(callee) == call_argc) break :blk callee;
-                break :blk func; // Mismatch — fall back to self
+                if (std.posix.getenv("EDGEBOX_WASM_DEBUG") != null) {
+                    std.debug.print("[freeze-codegen] call_self: using pending_callee, argc={d}, callee_params={d}\n", .{ call_argc, c.LLVMCountParams(callee) });
+                }
+                break :blk callee;
             } else func;
 
             var call_args: [8]llvm.Value = undefined;
