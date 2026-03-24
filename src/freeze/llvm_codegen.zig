@@ -2799,9 +2799,26 @@ fn emitNumericInstruction(
         },
 
         .closure_read => {
-            // Closure variable read: push the captured value.
-            // TODO: map get_var_ref{N} to extra WASM param index.
-            // For now, push 0 (placeholder — needs trampoline to pass actual values).
+            // Closure variable read: map get_var_ref{N} to extra WASM param.
+            // The JS trampoline passes closure values as extra i32 args after
+            // the regular function params.
+            const closure_idx: u32 = switch (instr.opcode) {
+                .get_var_ref0 => 0,
+                .get_var_ref1 => 1,
+                .get_var_ref2 => 2,
+                .get_var_ref3 => 3,
+                .get_var_ref => switch (instr.operand) {
+                    .var_ref => |v| v,
+                    .u16 => |v| v,
+                    else => 0,
+                },
+                else => 0,
+            };
+            // Read from param[arg_count + closure_idx]
+            // NOTE: currently extra params aren't added to WASM signature.
+            // This needs the function signature to include extra params.
+            // For now, push 0 (will be fixed when signature is extended).
+            _ = closure_idx;
             const zero = switch (kind) {
                 .i32 => llvm.constInt32(0),
                 .f64 => llvm.constF64(0.0),
