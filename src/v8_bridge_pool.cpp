@@ -134,6 +134,8 @@ static void SubmitResultCallback(const v8::FunctionCallbackInfo<v8::Value>& args
 static void WorkerDoneCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void SignalProgramReadyCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void WaitProgramReadyCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void ResolveCacheGetCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void ResolveCacheSetCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 // Dead stubs — type system migrated to WasmGC. Kept for external_refs compatibility.
 static void NoopCallback(const v8::FunctionCallbackInfo<v8::Value>&) {}
 
@@ -179,6 +181,8 @@ static const intptr_t g_external_refs[] = {
   reinterpret_cast<intptr_t>(WorkerDoneCallback),
   reinterpret_cast<intptr_t>(SignalProgramReadyCallback),
   reinterpret_cast<intptr_t>(WaitProgramReadyCallback),
+  reinterpret_cast<intptr_t>(ResolveCacheGetCallback),
+  reinterpret_cast<intptr_t>(ResolveCacheSetCallback),
   0  // sentinel
 };
 
@@ -210,6 +214,8 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
     global->Set(isolate, "__edgebox_wait_program_ready", v8::FunctionTemplate::New(isolate, WaitProgramReadyCallback));
     // IOStats removed — migrated to WasmGC
     global->Set(isolate, "__edgebox_root", v8::FunctionTemplate::New(isolate, RootCallback));
+    global->Set(isolate, "__edgebox_resolve_cache_get", v8::FunctionTemplate::New(isolate, ResolveCacheGetCallback));
+    global->Set(isolate, "__edgebox_resolve_cache_set", v8::FunctionTemplate::New(isolate, ResolveCacheSetCallback));
     global->Set(isolate, "__edgebox_write_file", v8::FunctionTemplate::New(isolate, WriteFileCallback));
     // IsSimpleTypeRelated removed — migrated to WasmGC
     global->Set(isolate, "__edgebox_submit_result", v8::FunctionTemplate::New(isolate, SubmitResultCallback));
@@ -446,6 +452,39 @@ static void WorkerDoneCallback(const v8::FunctionCallbackInfo<v8::Value>& args) 
   if (args.Length() < 1) return;
   int wid = args[0]->Int32Value(args.GetIsolate()->GetCurrentContext()).FromMaybe(0);
   edgebox_worker_done(wid);
+}
+
+// Module resolution cache — shared across workers via Zig
+extern "C" int edgebox_resolve_cache_get(const char* key, int key_len, const char** out_ptr, int* out_len);
+extern "C" void edgebox_resolve_cache_set(const char* key, int key_len, const char* path, int path_len);
+
+static void ResolveCacheGetCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  // JS: __edgebox_resolve_cache_get(key) → string (hit) | -1 (cached fail) | undefined (miss)
+  if (args.Length() < 1) return;
+  auto* isolate = args.GetIsolate();
+  v8::String::Utf8Value key(isolate, args[0]);
+  if (!*key) return;
+  const char* out_ptr = nullptr;
+  int out_len = 0;
+  int result = edgebox_resolve_cache_get(*key, key.length(), &out_ptr, &out_len);
+  if (result == 1 && out_ptr && out_len > 0) {
+    // Hit — return resolved path
+    args.GetReturnValue().Set(v8::String::NewFromUtf8(isolate, out_ptr, v8::NewStringType::kNormal, out_len).ToLocalChecked());
+  } else if (result == -1) {
+    // Cached failure
+    args.GetReturnValue().Set(v8::Integer::New(isolate, -1));
+  }
+  // result == 0: miss — return undefined (default)
+}
+
+static void ResolveCacheSetCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  // JS: __edgebox_resolve_cache_set(key, path)
+  if (args.Length() < 2) return;
+  auto* isolate = args.GetIsolate();
+  v8::String::Utf8Value key(isolate, args[0]);
+  v8::String::Utf8Value path(isolate, args[1]);
+  if (!*key) return;
+  edgebox_resolve_cache_set(*key, key.length(), *path ? *path : "", *path ? path.length() : 0);
 }
 
 // Setup context with IO globals. If snapshot exists, uses snapshot context.

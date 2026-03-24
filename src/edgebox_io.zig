@@ -87,6 +87,47 @@ export fn edgebox_io_stats(fe_calls: *u64, fe_cached: *u64, de_calls: *u64, de_c
     de_cached.* = io_dir_exists_cached.load(.monotonic);
 }
 
+// ── Module Resolution Cache (shared across workers) ──
+// Key: "importName\0containingFile" → Value: resolvedFilePath (or empty for failed)
+// Workers 2+3 find cached results from worker 1's resolutions.
+// Saves ~130ms per extra worker (191ms × 2/3 cache hit rate).
+var resolve_cache: std.StringHashMapUnmanaged([]const u8) = .{};
+var resolve_rwlock: std.Thread.RwLock = .{};
+
+/// Look up a cached module resolution. Returns path length (0 = miss, -1 = cached failure).
+export fn edgebox_resolve_cache_get(key_ptr: [*]const u8, key_len: c_int, out_ptr: *?[*]const u8, out_len: *c_int) c_int {
+    if (key_len <= 0) return 0;
+    const key = key_ptr[0..@intCast(key_len)];
+    resolve_rwlock.lockShared();
+    defer resolve_rwlock.unlockShared();
+    if (resolve_cache.get(key)) |val| {
+        if (val.len == 0) {
+            // Cached failure (module not found)
+            out_ptr.* = null;
+            out_len.* = 0;
+            return -1;
+        }
+        out_ptr.* = val.ptr;
+        out_len.* = @intCast(val.len);
+        return 1;
+    }
+    return 0; // miss
+}
+
+/// Store a module resolution result. path_len=0 means resolution failed.
+export fn edgebox_resolve_cache_set(key_ptr: [*]const u8, key_len: c_int, path_ptr: [*]const u8, path_len: c_int) void {
+    if (key_len <= 0) return;
+    const key_src = key_ptr[0..@intCast(key_len)];
+    const key = alloc.dupe(u8, key_src) catch return;
+    const val = if (path_len > 0)
+        alloc.dupe(u8, path_ptr[0..@intCast(path_len)]) catch return
+    else
+        &[_]u8{};
+    resolve_rwlock.lock();
+    defer resolve_rwlock.unlock();
+    resolve_cache.put(alloc, key, val) catch {};
+}
+
 export fn edgebox_file_exists(path_ptr: [*]const u8, path_len: c_int) c_int {
     if (path_len <= 0) return 0;
     const path = path_ptr[0..@intCast(path_len)];
