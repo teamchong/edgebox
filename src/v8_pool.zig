@@ -309,7 +309,7 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         // Set 3 bloom bits from this member's hash
         "_bloom|=(1<<(_h&31))|(1<<((_h>>>5)&31))|(1<<((_h>>>10)&31));" ++
         "});" ++
-        "if(_bloom)globalThis.__gcSoa.setI32(globalThis.__gcBloomArr,_bid|0,_bloom|0);" ++
+        "if(_bloom)globalThis.__gcFlags.setFlag(globalThis.__gcBloomArr,_bid|0,_bloom|0);" ++
         "}";
 
     const ssm_idx = std.mem.indexOf(u8, result, ssm_needle) orelse {

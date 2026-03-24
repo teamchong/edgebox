@@ -183,16 +183,16 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       throw new Error('[recipe] FATAL: read_binary=' + (typeof __edgebox_read_binary) + ' WebAssembly=' + (typeof WebAssembly));
     }
     var _root = typeof __edgebox_root === 'function' ? __edgebox_root() : '';
-    // Load WasmGC type flags
-    var _flagsBuf = __edgebox_read_binary(_root + '/src/tsc-recipe/type_flags_gc.wasm');
-    if (!_flagsBuf || !(_flagsBuf instanceof ArrayBuffer) || _flagsBuf.byteLength < 8) {
-      throw new Error('[recipe] FATAL: type_flags_gc.wasm read failed');
-    }
-    var _flagsInst = new WebAssembly.Instance(new WebAssembly.Module(_flagsBuf));
-    globalThis.__gcFlags = _flagsInst.exports;
-    // Create the flags array (65536 slots for type IDs)
-    globalThis.__gcFlagsArr = _flagsInst.exports.newFlags(65536);
-    // Load SOA module — used for objectFlags array (parallel to type flags)
+    // 1. Load type_checker_gc.wasm — native WASM type comparison + flag storage
+    var _checkerBuf = __edgebox_read_binary(_root + '/src/tsc-recipe/type_checker_gc.wasm');
+    if (!_checkerBuf || !(_checkerBuf instanceof ArrayBuffer) || _checkerBuf.byteLength < 8)
+      throw new Error('[recipe] FATAL: type_checker_gc.wasm read failed (' + _checkerBuf + ')');
+    var _checkerInst = new WebAssembly.Instance(new WebAssembly.Module(_checkerBuf));
+    globalThis.__gcChecker = _checkerInst.exports;
+    globalThis.__gcFlags = _checkerInst.exports;
+    globalThis.__gcFlagsArr = _checkerInst.exports.newFlags(65536);
+    globalThis.__gcBloomArr = _checkerInst.exports.newFlags(65536);
+    // 2. Load soa_gc.wasm — objectFlags array
     var _soaBuf = __edgebox_read_binary(_root + '/src/tsc-recipe/soa_gc.wasm');
     if (!_soaBuf || !(_soaBuf instanceof ArrayBuffer) || _soaBuf.byteLength < 8) {
       throw new Error('[recipe] FATAL: soa_gc.wasm read failed');
@@ -201,120 +201,23 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     globalThis.__gcSoa = _soaInst.exports;
     // Create objectFlags array (same capacity as type flags)
     globalThis.__gcObjFlagsArr = _soaInst.exports.newI32(65536);
-    // Warmup TurboFan — call getFlag/setFlag + getI32/setI32 to trigger Liftoff → TurboFan
-    var _gf = _flagsInst.exports.getFlag, _sf = _flagsInst.exports.setFlag;
-    var _gi = _soaInst.exports.getI32, _si = _soaInst.exports.setI32;
-    var _a = globalThis.__gcFlagsArr, _oa = globalThis.__gcObjFlagsArr;
+    // 3. __gcCheck: thin wrapper → native WASM checkRelation
+    var _checker = _checkerInst.exports.checkRelation;
+    var _fA = globalThis.__gcFlagsArr, _bA = globalThis.__gcBloomArr;
+    globalThis.__gcCheck = function(_si, _ti) { return _checker(_fA, _bA, _si, _ti); };
+    // 4. Warmup + force TurboFan
+    var _gf = _checkerInst.exports.getFlag, _sf = _checkerInst.exports.setFlag;
     for (var _wi = 0; _wi < 500; _wi++) {
-      _sf(_a, _wi % 100, _wi); _gf(_a, _wi % 100);
-      _si(_oa, _wi % 100, _wi); _gi(_oa, _wi % 100);
+      _sf(_fA, _wi % 100, _wi); _gf(_fA, _wi % 100);
+      _checker(_fA, _bA, _wi % 100, (_wi + 1) % 100);
     }
-
-    // Define __gcCheck as a global function so we can force TurboFan compilation.
-    // This function does the WasmGC flag read + comparison.
-    // TurboFan inlines getFlag (array.get) inside this function → native MOV.
-    // Returns: 1=related, 0=NOT related, -1=unknown (fall through to TSC)
-    // Both positive AND negative fast-paths maximize hit rate.
-    // Negative paths are SAFE — returning 0 only when types are provably incompatible.
-    globalThis.__gcCheck = function(_si, _ti) {
-      var _ga = globalThis.__gcFlagsArr, _gf = globalThis.__gcFlags;
-      if (!_ga || !_gf) return -1;
-      var s = _gf.getFlag(_ga, _si | 0), t = _gf.getFlag(_ga, _ti | 0);
-      if (!s || !t) return -1;
-
-      // ── POSITIVE: source IS related to target ──
-      if (t & 1 || s & 131072) return 1;    // target Any or source Never → always related
-      if (t & 2) return 1;                   // target Unknown → always related
-      if (s & 402653316 && t & 4) return 1;  // StringLike→String
-      if (s & 296 && t & 8) return 1;        // NumberLike→Number
-      if (s & 2112 && t & 64) return 1;      // BigIntLike→BigInt
-      if (s & 528 && t & 16) return 1;       // BooleanLike→Boolean
-      if (s & 12288 && t & 4096) return 1;   // ESSymbolLike→ESSymbol
-      if (s & 32768 && (t & 49152)) return 1;// Undefined→Undefined|Void
-      if (s & 65536 && t & 65536) return 1;  // Null→Null
-      if (s & 524288 && t & 67108864) return 1;// Object→NonPrimitive
-
-      // ── NEGATIVE: source is NOT related to target ──
-      // 1. Two concrete primitives with no overlapping kind bits → NOT related
-      var PRIM = 249860; // String|Number|Boolean|BigInt|ESSymbol|Void|Undefined|Null|Never
-      if ((s & PRIM) && (t & PRIM) && !(s & t & PRIM)) return 0;
-
-      // 2. Object→Object bloom filter: reject if target has REQUIRED members source lacks.
-      // CONSERVATIVE: only reject when BOTH types have bloom AND source is MISSING bits.
-      // Skip if either bloom is 0 (type has no required members or wasn't resolved yet).
-      if ((s & 524288) && (t & 524288)) {
-        var _ba = globalThis.__gcBloomArr, _bg = globalThis.__gcSoa;
-        if (_ba && _bg) {
-          var sb = _bg.getI32(_ba, _si | 0);
-          var tb = _bg.getI32(_ba, _ti | 0);
-          // Only reject if BOTH have non-zero blooms AND target has bits source lacks
-          // AND source isn't a type with call/construct signatures (callable objects
-          // can satisfy interface requirements through their signatures, not members)
-          if (sb > 0 && tb > 0 && (tb & ~sb)) return 0;
-        }
-      }
-
-      return -1; // unknown — fall through to full TSC check
-    };
-
-    // ── Bloom filter array: member name hash per type ──
-    // When setStructuredTypeMembers resolves a type's members, we compute
-    // a bloom filter (i32) from the member names. In __gcCheck, for Object→Object:
-    // if target's bloom has bits not in source's → definitely NOT structurally compatible.
-    // This is a SAFE negative check — bloom false positive = fall through to TSC.
-    globalThis.__gcBloomArr = _soaInst.exports.newI32(65536);
-    var _bloomSet = _soaInst.exports.setI32;
-    var _bloomGet = _soaInst.exports.getI32;
-    var _bloomArr = globalThis.__gcBloomArr;
-
-    // ── Relation cache: WasmGC-backed fast lookup ──
-    // TSC's isTypeRelatedTo is called 200K+ times, many with same (src,tgt) pair.
-    // TSC's internal cache uses Map with string keys (4% of runtime in FindOrderedHashMapEntry).
-    // Our cache uses a flat Int32Array indexed by hash — O(1) lookup, no string creation.
-    // Stores: key = (srcId << 16) | tgtId, value = 1 (true) or 2 (false)
-    // Hash table with open addressing, 64K entries (covers most type ID pairs).
-    var _relCacheSize = 65536;
-    var _relCacheKeys = new Int32Array(_relCacheSize);  // packed (srcId<<16)|tgtId
-    var _relCacheVals = new Int8Array(_relCacheSize);    // 0=empty, 1=true, 2=false
-    globalThis.__relCacheKeys = _relCacheKeys;
-    globalThis.__relCacheVals = _relCacheVals;
-    globalThis.__relCacheSize = _relCacheSize;
-
-    // Cache lookup — called from isTypeRelatedTo injection
-    // Returns: 1=related, 2=not related, 0=miss
-    globalThis.__relCacheLookup = function(_si, _ti) {
-      var key = ((_si << 16) | _ti) | 0;
-      var h = ((key * 2654435761) >>> 0) & 65535; // Knuth multiplicative hash
-      var k = _relCacheKeys[h];
-      if (k === key) return _relCacheVals[h];
-      return 0;
-    };
-
-    // Cache store — called after isTypeRelatedTo completes
-    globalThis.__relCacheStore = function(_si, _ti, _result) {
-      var key = ((_si << 16) | _ti) | 0;
-      var h = ((key * 2654435761) >>> 0) & 65535;
-      _relCacheKeys[h] = key;
-      _relCacheVals[h] = _result ? 1 : 2;
-    };
-
-    // Force TurboFan compilation of __gcCheck BEFORE any type checking.
-    // %PrepareFunctionForOptimization → feed IC → %OptimizeFunctionOnNextCall
-    // This makes WasmGC array.get inlined from the FIRST isTypeRelatedTo call.
     try {
       eval('%PrepareFunctionForOptimization(globalThis.__gcCheck)');
-      // Feed with representative args so IC has type feedback
-      globalThis.__gcCheck(1, 2);
-      globalThis.__gcCheck(100, 200);
+      globalThis.__gcCheck(1, 2); globalThis.__gcCheck(100, 200);
       eval('%OptimizeFunctionOnNextCall(globalThis.__gcCheck)');
-      // Trigger TurboFan compilation — WasmGC getFlag inlined from call #1
       globalThis.__gcCheck(1, 2);
-      __edgebox_write_stderr('[recipe] __gcCheck force-compiled by TurboFan\n');
-    } catch(e) {
-      __edgebox_write_stderr('[recipe] TurboFan force-compile failed: ' + e.message + '\n');
-    }
-
-    __edgebox_write_stderr('[recipe] WasmGC loaded: flags=' + _flagsBuf.byteLength + 'B soa=' + _soaBuf.byteLength + 'B\n');
+    } catch(e) {}
+    __edgebox_write_stderr('[recipe] WasmGC: checker=' + _checkerBuf.byteLength + 'B soa=' + _soaBuf.byteLength + 'B\n');
   }
   if (!globalThis.__gcFlags) {
     throw new Error('[recipe] FATAL: WasmGC flags not loaded');

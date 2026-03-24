@@ -247,6 +247,137 @@ fn compileWat(alloc: std.mem.Allocator, wat: []const u8, output_name: []const u8
     return wasm;
 }
 
+/// Build type_checker_gc.wasm — native WASM type comparison engine.
+/// Reads flags from WasmGC arrays, does ALL comparisons in native WASM.
+/// ONE call replaces: JS globalThis lookups + JS→WASM getFlag × 2 + JS bitwise ops.
+/// Runs at NATIVE speed — no megamorphic IC, no JIT uncertainty, no GC pressure.
+///
+/// NOT inlined by TurboFan (uses i32 arithmetic + control flow), but the
+/// WASM-tier TurboFan compiles it to native x86. Call overhead ~50ns.
+pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
+    const wat =
+        \\(module
+        \\  (type $flags (array (mut i32)))
+        \\
+        \\  ;; checkRelation: native type comparison engine
+        \\  ;; Reads flags + bloom from GC arrays, does all checks in native WASM.
+        \\  ;; Returns: 1=related, 0=not related, -1=unknown (fall through to TSC)
+        \\  (func (export "checkRelation")
+        \\    (param $flagsArr (ref null $flags))
+        \\    (param $bloomArr (ref null $flags))
+        \\    (param $src i32) (param $tgt i32)
+        \\    (result i32)
+        \\    (local $s i32) (local $t i32)
+        \\
+        \\    ;; Read source and target flags from GC array
+        \\    (local.set $s (array.get $flags (local.get $flagsArr) (local.get $src)))
+        \\    (local.set $t (array.get $flags (local.get $flagsArr) (local.get $tgt)))
+        \\
+        \\    ;; Both must have flags
+        \\    (if (i32.eqz (local.get $s)) (then (return (i32.const -1))))
+        \\    (if (i32.eqz (local.get $t)) (then (return (i32.const -1))))
+        \\
+        \\    ;; ── POSITIVE: source IS related to target ──
+        \\
+        \\    ;; target Any(1) or source Never(131072)
+        \\    (if (i32.or
+        \\      (i32.and (local.get $t) (i32.const 1))
+        \\      (i32.and (local.get $s) (i32.const 131072)))
+        \\      (then (return (i32.const 1))))
+        \\
+        \\    ;; target Unknown(2)
+        \\    (if (i32.and (local.get $t) (i32.const 2))
+        \\      (then (return (i32.const 1))))
+        \\
+        \\    ;; StringLike(402653316) → String(4)
+        \\    (if (i32.and
+        \\      (i32.ne (i32.and (local.get $s) (i32.const 402653316)) (i32.const 0))
+        \\      (i32.ne (i32.and (local.get $t) (i32.const 4)) (i32.const 0)))
+        \\      (then (return (i32.const 1))))
+        \\
+        \\    ;; NumberLike(296) → Number(8)
+        \\    (if (i32.and
+        \\      (i32.ne (i32.and (local.get $s) (i32.const 296)) (i32.const 0))
+        \\      (i32.ne (i32.and (local.get $t) (i32.const 8)) (i32.const 0)))
+        \\      (then (return (i32.const 1))))
+        \\
+        \\    ;; BigIntLike(2112) → BigInt(64)
+        \\    (if (i32.and
+        \\      (i32.ne (i32.and (local.get $s) (i32.const 2112)) (i32.const 0))
+        \\      (i32.ne (i32.and (local.get $t) (i32.const 64)) (i32.const 0)))
+        \\      (then (return (i32.const 1))))
+        \\
+        \\    ;; BooleanLike(528) → Boolean(16)
+        \\    (if (i32.and
+        \\      (i32.ne (i32.and (local.get $s) (i32.const 528)) (i32.const 0))
+        \\      (i32.ne (i32.and (local.get $t) (i32.const 16)) (i32.const 0)))
+        \\      (then (return (i32.const 1))))
+        \\
+        \\    ;; ESSymbolLike(12288) → ESSymbol(4096)
+        \\    (if (i32.and
+        \\      (i32.ne (i32.and (local.get $s) (i32.const 12288)) (i32.const 0))
+        \\      (i32.ne (i32.and (local.get $t) (i32.const 4096)) (i32.const 0)))
+        \\      (then (return (i32.const 1))))
+        \\
+        \\    ;; Undefined(32768) → Undefined|Void(49152)
+        \\    (if (i32.and
+        \\      (i32.ne (i32.and (local.get $s) (i32.const 32768)) (i32.const 0))
+        \\      (i32.ne (i32.and (local.get $t) (i32.const 49152)) (i32.const 0)))
+        \\      (then (return (i32.const 1))))
+        \\
+        \\    ;; Null(65536) → Null(65536)
+        \\    (if (i32.and
+        \\      (i32.ne (i32.and (local.get $s) (i32.const 65536)) (i32.const 0))
+        \\      (i32.ne (i32.and (local.get $t) (i32.const 65536)) (i32.const 0)))
+        \\      (then (return (i32.const 1))))
+        \\
+        \\    ;; Object(524288) → NonPrimitive(67108864)
+        \\    (if (i32.and
+        \\      (i32.ne (i32.and (local.get $s) (i32.const 524288)) (i32.const 0))
+        \\      (i32.ne (i32.and (local.get $t) (i32.const 67108864)) (i32.const 0)))
+        \\      (then (return (i32.const 1))))
+        \\
+        \\    ;; ── NEGATIVE: source is NOT related to target ──
+        \\
+        \\    ;; Two concrete primitives(249860) with no overlapping bits
+        \\    (if (i32.and
+        \\      (i32.ne (i32.and (local.get $s) (i32.const 249860)) (i32.const 0))
+        \\      (i32.ne (i32.and (local.get $t) (i32.const 249860)) (i32.const 0)))
+        \\      (then
+        \\        (if (i32.eqz (i32.and (i32.and (local.get $s) (local.get $t)) (i32.const 249860)))
+        \\          (then (return (i32.const 0))))))
+        \\
+        \\    ;; ── BLOOM: Object→Object structural fast-reject ──
+        \\    ;; If both are ObjectType(524288), check bloom filter
+        \\    (if (i32.and
+        \\      (i32.ne (i32.and (local.get $s) (i32.const 524288)) (i32.const 0))
+        \\      (i32.ne (i32.and (local.get $t) (i32.const 524288)) (i32.const 0)))
+        \\      (then
+        \\        (block $skipBloom
+        \\          (local.set $s (array.get $flags (local.get $bloomArr) (local.get $src)))
+        \\          (local.set $t (array.get $flags (local.get $bloomArr) (local.get $tgt)))
+        \\          (br_if $skipBloom (i32.eqz (local.get $s)))
+        \\          (br_if $skipBloom (i32.eqz (local.get $t)))
+        \\          ;; target has bloom bits source lacks → NOT related
+        \\          (if (i32.ne (i32.and (local.get $t) (i32.xor (local.get $s) (i32.const -1))) (i32.const 0))
+        \\            (then (return (i32.const 0)))))))
+        \\
+        \\    ;; Unknown — fall through to TSC
+        \\    (i32.const -1))
+        \\
+        \\  ;; getFlag/setFlag/newFlags — same as type_flags_gc.wasm but in same module
+        \\  (func (export "newFlags") (param $size i32) (result (ref $flags))
+        \\    (array.new_default $flags (local.get $size)))
+        \\  (func (export "getFlag") (param $arr (ref null $flags)) (param $idx i32) (result i32)
+        \\    (array.get $flags (local.get $arr) (local.get $idx)))
+        \\  (func (export "setFlag") (param $arr (ref null $flags)) (param $idx i32) (param $val i32)
+        \\    (array.set $flags (local.get $arr) (local.get $idx) (local.get $val)))
+        \\  (func (export "arrayLen") (param $arr (ref null $flags)) (result i32)
+        \\    (array.len (local.get $arr))))
+    ;
+    return try compileWat(alloc, wat, "type_checker_gc.wasm");
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -264,6 +395,11 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, target, "soa") or std.mem.eql(u8, target, "all")) {
         const wasm = try buildSoaModule(alloc);
+        defer alloc.free(wasm);
+    }
+
+    if (std.mem.eql(u8, target, "checker") or std.mem.eql(u8, target, "all")) {
+        const wasm = try buildTypeCheckerModule(alloc);
         defer alloc.free(wasm);
     }
 }
