@@ -283,6 +283,35 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   // Worker 1 resolves a module → stores in Zig cache → workers 2+3 find it instantly.
   // Saves ~130ms per extra worker (191ms resolution × 2/3 hit rate).
   var hasNodeModules = __edgebox_dir_exists(cwd + '/node_modules') === 1;
+  // Override getSourceFile to use Zig parser (when available and enabled)
+  // Zig parser: opt-in via EDGEBOX_ZIG_PARSE env (bridge overhead still too high for net benefit)
+  // When enabled: 447 files parsed by Zig (32ms) + bridge (880ms) = 912ms vs TSC's 750ms
+  // Need: C++ bridge (create nodes in native) or lazy materialization to beat TSC
+  var useZigParser = globalThis.__zigParseEnabled && typeof __edgebox_zig_parse === 'function' && typeof globalThis.__zigCreateSourceFile === 'function';
+  var zigParseCount = 0, zigFallbackCount = 0;
+  if (useZigParser) {
+    var origGetSourceFile = host.getSourceFile;
+    host.getSourceFile = function(fileName, languageVersionOrOptions, onError) {
+      // Read file content
+      var content = ts.sys.readFile(fileName);
+      if (content === undefined) return undefined;
+      // Try Zig parser
+      try {
+        var flatAST = __edgebox_zig_parse(content);
+        if (flatAST && flatAST.byteLength >= 24) {
+          var sf = globalThis.__zigCreateSourceFile(content, fileName, flatAST);
+          if (sf && sf.statements) {
+            zigParseCount++;
+            return sf;
+          }
+        }
+      } catch(e) {}
+      // Fallback to TSC parser
+      zigFallbackCount++;
+      return origGetSourceFile.call(this, fileName, languageVersionOrOptions, onError);
+    };
+  }
+
   var hasZigResolveCache = typeof __edgebox_resolve_cache_get === 'function';
   host.resolveModuleNames = function(moduleNames, containingFile) {
     return moduleNames.map(function(name) {
@@ -368,6 +397,9 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   }
   globalThis.__pc[ck] = program;
   var t2 = Date.now();
+  if (useZigParser) {
+    __edgebox_write_stderr('[recipe] Zig: ' + zigParseCount + ' parsed, ' + zigFallbackCount + ' fallback\n');
+  }
   var files = program.getSourceFiles();
   var NL = String.fromCharCode(10);
   var output = [];
