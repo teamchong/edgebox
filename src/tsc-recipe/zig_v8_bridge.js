@@ -68,15 +68,7 @@
         node.statements = createNodeArray(children);
         break;
       case 244: // VariableStatement
-        // TSC expects: VariableStatement.declarationList (262) → .declarations[]
-        // Our parser creates VariableDeclaration (261) children directly.
-        // Wrap them in a VariableDeclarationList.
-        var declList = new NodeCtor(262, node.pos, node.end); // VariableDeclarationList
-        declList.parent = node;
-        declList.flags = node.flags; // inherit const/let/var flags
-        declList.declarations = createNodeArray(children.filter(function(c) { return c.kind === 261; }));
-        for (var di = 0; di < declList.declarations.length; di++) declList.declarations[di].parent = declList;
-        node.declarationList = declList;
+        if (children.length > 0) node.declarationList = children[0];
         break;
       case 262: // VariableDeclarationList
         node.declarations = createNodeArray(children);
@@ -118,29 +110,12 @@
         }
         break;
       case 264: // ClassDeclaration
-        if (children.length > 0 && children[0].kind === 80) node.name = children[0];
-        node.members = createNodeArray([]); // empty — class body skipped by Zig parser
-        node.heritageClauses = void 0;
+        if (children.length > 0) node.name = children[0];
+        node.members = createNodeArray(children.slice(1));
         break;
       case 265: // InterfaceDeclaration
-        if (children.length > 0 && children[0].kind === 80) node.name = children[0];
-        // Members are PropertySignature (172) children
-        var ifMembers = [];
-        for (var im = 0; im < children.length; im++) {
-          if (children[im].kind === 172) ifMembers.push(children[im]);
-        }
-        node.members = createNodeArray(ifMembers);
-        break;
-      case 172: // PropertySignature
-        if (children.length > 0 && children[0].kind === 80) node.name = children[0];
-        // Type is any type node child after the name
-        for (var ps = 1; ps < children.length; ps++) {
-          var psk = children[ps].kind;
-          if ((psk >= 133 && psk <= 165) || (psk >= 183 && psk <= 202)) {
-            node.type = children[ps];
-            break;
-          }
-        }
+        if (children.length > 0) node.name = children[0];
+        node.members = createNodeArray(children.slice(1));
         break;
       case 266: // TypeAliasDeclaration
         if (children.length > 0) node.name = children[0];
@@ -206,9 +181,6 @@
         if (children.length > 0) node.elementType = children[0];
         break;
       default:
-        // Do NOT set any child properties for unknown node kinds.
-        // Setting node.expression on arbitrary kinds causes forEachChild
-        // to walk children that reference back → infinite loop.
         break;
     }
   }
@@ -241,13 +213,10 @@
       var end = view.getUint32(off + 8, true);
       tscNodes[i] = new NodeCtor(kind, start, end);
       tscNodes[i].flags = view.getUint16(off + 2, true);
-      // Set .text on StringLiteral and Identifier (needed by TSC resolver + binder)
-      if (kind === 11) { // StringLiteral — strip quotes
-        tscNodes[i].text = sourceText.substring(start + 1, end - 1);
-      } else if (kind === 80) { // Identifier
-        tscNodes[i].text = sourceText.substring(start, end);
-        tscNodes[i].escapedText = sourceText.substring(start, end);
-      }
+      // Set .text on StringLiteral ONLY if it's a module specifier for a .d.ts import.
+      // Setting .text on ALL StringLiterals causes processImportedModules to resolve
+      // imports to other Zig-parsed files → hang.
+      // We'll set .text selectively in the import processing below.
     }
 
     // Phase 2: Link parent-child relationships
@@ -281,8 +250,8 @@
     sf.flags = 0; // CRITICAL: no PossiblyContainsDynamicImport (4194304) flag
     sf.text = sourceText;
     sf.fileName = fileName;
-    sf.path = fileName.toLowerCase();
-    sf.resolvedPath = fileName.toLowerCase();
+    sf.path = ''; // TSC sets this via toPath3 in createProgram
+    sf.resolvedPath = ''; // TSC sets this
     sf.originalFileName = fileName;
     sf.languageVersion = 99;
     sf.languageVariant = 0;
@@ -326,10 +295,15 @@
     for (var si = 0; si < rootChildren.length; si++) {
       var sk = rootChildren[si].kind;
       if (sk === 273 && rootChildren[si].moduleSpecifier) {
-        preImports.push(rootChildren[si].moduleSpecifier);
+        var spec = rootChildren[si].moduleSpecifier;
+        // Set .text on the moduleSpecifier StringLiteral so TSC can resolve it
+        if (spec.kind === 11 && !spec.text) {
+          spec.text = sourceText.substring(spec.pos + 1, spec.end - 1);
+        }
+        preImports.push(spec);
         hasModuleMarker = true;
       }
-      if (sk === 279 || sk === 278 || sk === 273) hasModuleMarker = true; // ExportDeclaration, ExportAssignment, ImportDeclaration
+      if (sk === 279 || sk === 278 || sk === 273) hasModuleMarker = true;
     }
     sf.imports = preImports;
     sf.moduleAugmentations = [];

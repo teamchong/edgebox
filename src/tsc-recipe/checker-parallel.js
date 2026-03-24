@@ -321,8 +321,10 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       // TSC for .d.ts (type declarations — need complete export structure).
       // sf.imports pre-set prevents forEachChild hang.
       // ALL files parsed by Zig (57ms, no hang). 33/2058 diags — need more AST completeness.
-      // DISABLED: hangs at 42+ .ts files. 57ms worked earlier with all-Zig
-      // but something changed. Need to debug what state produced 57ms.
+      // Zig parser DISABLED: import resolution hangs when .text is set on StringLiteral.
+      // Without .text: 55ms, 33 diags (no import resolution).
+      // With .text: >30s (import resolution processes all files through bridge).
+      // Need: faster bridge or bypass processImportedModules for Zig-parsed files.
       if (false) {
         var content = ts.sys.readFile(fileName);
         if (content !== undefined) {
