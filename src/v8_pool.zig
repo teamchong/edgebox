@@ -415,6 +415,9 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         result = simple_result;
     }
 
+    // TODO: Patch getObjectFlags with frozen WASM once freeze pipeline
+    // supports multi-field struct offset tracking (currently maps all fields to offset 0).
+
     return result;
 }
 

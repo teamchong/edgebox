@@ -217,19 +217,25 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     } catch(e) {}
     __edgebox_write_stderr('[recipe] WasmGC: checker=' + _checkerBuf.byteLength + 'B soa=' + _soaBuf.byteLength + 'B\n');
 
-    // 5. Load frozen_checker.wasm — freeze-compiled (QuickJS→LLVM→WASM) checker functions
-    // These run at native speed from the FIRST call (no JIT warmup needed).
+    // 5. Load frozen_checker.wasm — 10 TSC functions compiled via freeze pipeline
+    // (QuickJS→LLVM→WASM). Native speed from first call, no JIT warmup.
     var _frozenBuf = __edgebox_read_binary(_root + '/src/tsc-recipe/frozen_checker.wasm');
     if (_frozenBuf && _frozenBuf instanceof ArrayBuffer && _frozenBuf.byteLength > 8) {
       var _frozenInst = new WebAssembly.Instance(new WebAssembly.Module(_frozenBuf));
-      globalThis.__frozenCheckFlags = _frozenInst.exports.checkFlags;
-      globalThis.__frozenCheckRelated = _frozenInst.exports.checkRelated;
-      // Warmup + force TurboFan
-      for (var _fi = 0; _fi < 200; _fi++) {
-        _frozenInst.exports.checkFlags(1, 2, 0);
-        _frozenInst.exports.checkRelated(1, 2, 10, 20, 0);
+      var _fe = _frozenInst.exports;
+      // Expose raw WASM functions
+      globalThis.__frozenCheckFlags = _fe.checkFlags;
+      globalThis.__frozenCheckRelated = _fe.checkRelated;
+      // Use FLAT versions (no struct access) — these are guaranteed correct
+      // The struct-access versions (checkTypeSimple etc.) need freeze pipeline
+      // fix for multi-field offset tracking before they can be used.
+      globalThis.__frozenCheckFlags = _fe.checkFlags;
+      globalThis.__frozenCheckRelated = _fe.checkRelated;
+      // Warmup
+      for (var _fi = 0; _fi < 100; _fi++) {
+        _fe.checkFlags(1, 2, 0); _fe.checkRelated(1, 2, 10, 20, 0);
       }
-      __edgebox_write_stderr('[recipe] Frozen checker: ' + _frozenBuf.byteLength + 'B (checkFlags + checkRelated)\n');
+      __edgebox_write_stderr('[recipe] Frozen checker: ' + _frozenBuf.byteLength + 'B (flat: checkFlags + checkRelated)\n');
     }
 
     } // close else (WASM available)
@@ -462,10 +468,13 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
 
   // Check for pre-parsed program from project-specific snapshot.
   // __preProgram is set during snapshot creation (EDGEBOX_PROJECT env).
-  // Using it as oldProgram lets createProgram reuse parsed source files.
+  // If the snapshot already ran getSemanticDiagnostics, the checker is fully warm —
+  // we can SKIP createProgram entirely and reuse the pre-checked program directly.
   var oldProgram = globalThis.__pc[ck] || undefined;
+  var usePreProgram = false;
   if (!oldProgram && globalThis.__preProgram && globalThis.__preProject === cwd) {
     oldProgram = globalThis.__preProgram;
+    usePreProgram = true;
     __edgebox_write_stderr('[recipe] w' + workerId + ' using preProgram (' + globalThis.__preProgram.getSourceFiles().length + ' files)\n');
   }
   var isWarm = !!globalThis.__pc[ck]; // truly warm = from previous check, not from snapshot
@@ -543,6 +552,11 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     });
     globalThis.__bp[ck] = builder;
     program = builder.getProgram();
+  } else if (usePreProgram) {
+    // Pre-checked: skip createProgram entirely — reuse snapshot's program directly.
+    // The checker, types, and source files are all in the snapshot.
+    program = globalThis.__preProgram;
+    __edgebox_write_stderr('[recipe] w' + workerId + ' SKIP createProgram (pre-checked)\n');
   } else {
     // Cold: plain createProgram — fastest parse, no incremental overhead
     program = ts.createProgram(parsed.fileNames, parsed.options, host, oldProgram);

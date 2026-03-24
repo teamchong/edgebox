@@ -2840,6 +2840,9 @@ fn emitNumericInstruction(
                         break;
                     }
                 }
+                if (std.posix.getenv("EDGEBOX_WASM_DEBUG") != null) {
+                    std.debug.print("[codegen] field_get: arg={d} atom={d} offset={d} fields={d}\n", .{ found_arg, atom, field_offset, si.field_counts[found_arg] });
+                }
             }
             const base_ptr = c.LLVMBuildIntToPtr(builder.ref, base_i32, llvm.ptrType(), "struct_ptr");
             const offset_val = llvm.constInt32(@intCast(field_offset));
