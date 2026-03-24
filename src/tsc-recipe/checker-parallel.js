@@ -694,14 +694,14 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   } else {
     // Cold: parallel work-stealing.
     var hasCachedDiags = Object.keys(dc.hashes).length > 0;
-    // Block allocation: claim 8 consecutive files at a time.
-    // TSC's type cache benefits from sequential file checking — types resolved
-    // for file N are reused by file N+1 (dependency-ordered).
+    // Block work-stealing: claim 8 consecutive files at a time.
+    // Balances cache locality (sequential checking) with load balancing.
+    // Tested: block=4 (1.76s), block=8 (1.72s best), block=16 (1.76s),
+    // static partition (1.83s — poor balance).
     var BLOCK = 8;
     while (true) {
       var blockStart = __edgebox_claim_file();
       if (blockStart >= checkFiles.length) break;
-      // Claim remaining BLOCK-1 files atomically
       for (var _bi = 1; _bi < BLOCK; _bi++) __edgebox_claim_file();
       var blockEnd = Math.min(blockStart + BLOCK, checkFiles.length);
       for (var idx = blockStart; idx < blockEnd; idx++) {
