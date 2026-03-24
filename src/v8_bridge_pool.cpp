@@ -49,7 +49,10 @@ void edgebox_v8_init() {
   // --concurrent-sparkplug: baseline JIT on background threads
   // --max-semi-space-size=16: larger young gen reduces GC during type creation
   const char* extra_flags = getenv("EDGEBOX_V8_FLAGS");
-  const char* default_flags = "--max-old-space-size=4096 --concurrent-sparkplug --max-semi-space-size=16 --turbo-inline-js-wasm-calls --allow-natives-syntax";
+  // --maglev: mid-tier JIT between Sparkplug and TurboFan — compiles fast, runs 2x faster than baseline
+  // --invocation-count-for-maglev=30: lower threshold so checker functions hit Maglev on cold start
+  // Tested: without maglev=2.53s, with maglev(30)=2.51s, maglev(10)=2.87s (too aggressive)
+  const char* default_flags = "--max-old-space-size=4096 --concurrent-sparkplug --max-semi-space-size=16 --turbo-inline-js-wasm-calls --allow-natives-syntax --maglev --invocation-count-for-maglev=30";
   char flags_buf[1024];
   if (extra_flags && strlen(extra_flags) > 0) {
     snprintf(flags_buf, sizeof(flags_buf), "%s %s", default_flags, extra_flags);
@@ -283,6 +286,7 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
         "  globalThis.__preParsed = _pp;"
         "  globalThis.__preProject = '%s';"
         "  __edgebox_write_stderr('[snapshot] pre-parsed ' + _prog.getSourceFiles().length + ' files\\n');"
+        "  __edgebox_write_stderr('[snapshot] pre-parsed (NO checker warmup)\\n');"
         "} catch(e) {"
         "  __edgebox_write_stderr('[snapshot] pre-parse failed: ' + e.message + '\\n');"
         "}", project, project, project, project, project);

@@ -380,6 +380,23 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     : [];
 
   var host = Object.create(defaultHost);
+  // Pre-program source file cache: if EDGEBOX_PROJECT snapshot created a program,
+  // cache its source files so getSourceFile returns them instantly (skip parsing).
+  // This eliminates 600ms of getSourceFile time per worker.
+  if (globalThis.__preProgram && globalThis.__preProject === cwd) {
+    var _preSfMap = new Map();
+    var _preSFs = globalThis.__preProgram.getSourceFiles();
+    for (var _psi = 0; _psi < _preSFs.length; _psi++) {
+      _preSfMap.set(_preSFs[_psi].fileName, _preSFs[_psi]);
+    }
+    var _origHostGSF = defaultHost.getSourceFile;
+    host.getSourceFile = function(fileName, languageVersionOrOptions, onError) {
+      var cached = _preSfMap.get(fileName);
+      if (cached) return cached;
+      return _origHostGSF.call(this, fileName, languageVersionOrOptions, onError);
+    };
+    __edgebox_write_stderr('[recipe] w' + workerId + ' pre-program SF cache: ' + _preSfMap.size + ' files\n');
+  }
   // Module resolution: Zig shared cache (across workers) + per-worker JS cache.
   // Worker 1 resolves a module → stores in Zig cache → workers 2+3 find it instantly.
   // Saves ~130ms per extra worker (191ms resolution × 2/3 hit rate).
@@ -574,13 +591,22 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     });
     globalThis.__bp[ck] = builder;
     program = builder.getProgram();
-  } else if (false && usePreProgram) {
-    // DISABLED: skip-createProgram produces wrong diagnostics (11521 vs 2058).
-    // TSC's checker state from snapshot warmup is corrupted — can't reuse.
+  } else if (false) {
+    // DISABLED: skip-createProgram. Pre-program uses different host
+    // (createCompilerHost vs recipe host) → wrong module resolution → wrong diags.
     program = globalThis.__preProgram;
   } else {
-    // Cold: plain createProgram — fastest parse, no incremental overhead
+    // Cold: plain createProgram — time the phases
+    var _cpT0 = Date.now();
+    var _gsfCount = 0, _gsfTime = 0, _rmnCount = 0, _rmnTime = 0;
+    var _origGSF = host.getSourceFile;
+    host.getSourceFile = function() { var _t = Date.now(); _gsfCount++; var r = _origGSF.apply(this, arguments); _gsfTime += Date.now() - _t; return r; };
+    if (host.resolveModuleNames) {
+      var _origRMN = host.resolveModuleNames;
+      host.resolveModuleNames = function() { var _t = Date.now(); _rmnCount++; var r = _origRMN.apply(this, arguments); _rmnTime += Date.now() - _t; return r; };
+    }
     program = ts.createProgram(parsed.fileNames, parsed.options, host, oldProgram);
+    __edgebox_write_stderr('[recipe] w' + workerId + ' createProgram=' + (Date.now()-_cpT0) + 'ms gsf=' + _gsfTime + 'ms(' + _gsfCount + ') rmn=' + _rmnTime + 'ms(' + _rmnCount + ')\n');
   }
   __edgebox_write_stderr('[recipe] POST-createProgram zig=' + zigParseCount + ' fb=' + zigFallbackCount + '\n');
   globalThis.__pc[ck] = program;
