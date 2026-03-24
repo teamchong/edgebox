@@ -334,8 +334,9 @@
     sf.imports = preImports;
     sf.moduleAugmentations = [];
     sf.ambientModuleNames = [];
-    // NOTE: Do NOT set externalModuleIndicator — it breaks module resolution.
-    // The 19 extra TS2306 errors are a smaller issue than 2000 missing diagnostics.
+    // externalModuleIndicator: NOT SET. Setting it breaks module resolution
+    // (causes 33 diags instead of 2077). The 19 extra TS2306 errors are
+    // "File is not a module" — minor. Will fix when bridge is more complete.
 
     // EndOfFileToken
     var TokenCtor = ts.objectAllocator.getTokenConstructor();
