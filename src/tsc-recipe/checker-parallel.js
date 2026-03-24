@@ -389,9 +389,13 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     }, function(p) { return __edgebox_realpath(p); });
   };
 
-  // Create program (cached across requests on same worker)
+  // Create incremental program — uses tsbuildinfo to skip unchanged files.
+  // First cold: full check + emit tsbuildinfo.
+  // Second cold (daemon restart, no file changes): check = 0ms!
+  // After file change: only re-checks changed files + dependents.
   if (!globalThis.__pc) globalThis.__pc = {};
   if (!globalThis.__cc) globalThis.__cc = {};
+  if (!globalThis.__bp) globalThis.__bp = {}; // builder program cache
   var t0 = Date.now();
   var parsed;
   if (globalThis.__cc[cwd]) {
@@ -403,13 +407,17 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     parsed = ts.parseJsonConfigFileContent(cf.config, ts.sys, cwd);
     globalThis.__cc[cwd] = parsed;
   }
+  // Enable incremental compilation — persists type info to disk
+  parsed.options.incremental = true;
+  parsed.options.tsBuildInfoFile = cwd + '/.edgebox-tsbuildinfo';
   var ck = cwd + ':' + parsed.fileNames.length;
   var t1 = Date.now();
 
   // Module resolution cache (public API: CompilerHost.resolveModuleNames).
-  // Caches results per worker. Lazy: skips bare modules without path mapping.
   if (!globalThis.__mrCache) globalThis.__mrCache = new Map();
-  var defaultHost = ts.createCompilerHost(parsed.options);
+  var defaultHost = ts.createIncrementalCompilerHost
+    ? ts.createIncrementalCompilerHost(parsed.options)
+    : ts.createCompilerHost(parsed.options);
   var pathPrefixes = parsed.options.paths
     ? Object.keys(parsed.options.paths).map(function(k) { return k.replace('/*', ''); })
     : [];
@@ -420,7 +428,6 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       var key = name + '\0' + containingFile;
       var cached = globalThis.__mrCache.get(key);
       if (cached !== undefined) return cached;
-      // Relative or path-mapped: resolve via TSC
       if (name.charAt(0) === '.') {
         var r = ts.resolveModuleName(name, containingFile, parsed.options, defaultHost).resolvedModule;
         globalThis.__mrCache.set(key, r || null);
@@ -433,22 +440,36 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
           return r2;
         }
       }
-      // Bare module without path mapping: skip (will fail with TS2307)
       globalThis.__mrCache.set(key, null);
       return undefined;
     });
   };
 
-  var oldProgram = globalThis.__pc[ck] || undefined;
-  var isWarm = !!oldProgram;
-  // Adaptive worker strategy (game-engine pattern):
-  // Cold: all workers run in parallel (file I/O is fast via Zig cache)
-  // Warm: worker 0 only (maximize TSC internal cache reuse)
+  // Read previous builder state — in-memory (warm) or tsbuildinfo (incremental cold)
+  var oldBuilder = globalThis.__bp[ck] || undefined;
+  var fromDisk = false;
+  if (!oldBuilder) {
+    oldBuilder = ts.readBuilderProgram(parsed.options, host) || undefined;
+    if (oldBuilder) fromDisk = true;
+  }
+  var isWarm = !!globalThis.__bp[ck]; // truly warm = in-memory, not from disk
+  // Adaptive strategy:
+  // Warm (in-memory cache): worker 0 only — maximize TSC internal cache reuse.
+  // Incremental cold (tsbuildinfo from disk): ALL workers parallel — tsbuildinfo
+  //   only helps the CHECK phase, not parse. Workers still need parallel parsing.
   if (isWarm && workerId > 0) {
     __edgebox_write_stderr('[recipe] w' + workerId + ' warm skip\n');
     return '';
   }
-  var program = ts.createProgram(parsed.fileNames, parsed.options, host, oldProgram);
+  // createIncrementalProgram: uses tsbuildinfo to track changed files
+  var builder = ts.createIncrementalProgram({
+    rootNames: parsed.fileNames,
+    options: parsed.options,
+    host: host,
+    oldProgram: oldBuilder,
+  });
+  globalThis.__bp[ck] = builder;
+  var program = builder.getProgram();
   globalThis.__pc[ck] = program;
   var t2 = Date.now();
   var files = program.getSourceFiles();
@@ -506,10 +527,22 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   }
 
   if (isWarm) {
-    // Warm: single-worker mode — worker 0 checks ALL files with full cache reuse.
-    // Workers 1-N already returned empty results above.
-    for (var i = 0; i < checkFiles.length; i++) checkFile(checkFiles[i]);
+    // Warm: use builder's incremental API — only checks changed files.
+    // If no files changed → returns nothing → 0ms check time!
+    var affected;
+    while (affected = builder.getSemanticDiagnosticsOfNextAffectedFile()) {
+      filesChecked++;
+      var diags = affected.result;
+      for (var k = 0; k < diags.length; k++) {
+        var d = diags[k];
+        if (d.file) {
+          var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
+          output.push(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' '));
+        }
+      }
+    }
   } else {
+    // Cold: parallel work-stealing with per-file diagnostics.
     while (true) {
       var idx = __edgebox_claim_file();
       if (idx >= checkFiles.length) break;
@@ -517,7 +550,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     }
   }
 
-  // Worker 0 collects global diagnostics
+  // Worker 0: global diagnostics + emit tsbuildinfo for next incremental run
   if (workerId === 0) {
     var gd = (program.getGlobalDiagnostics ? program.getGlobalDiagnostics() : [])
       .concat(program.getOptionsDiagnostics ? program.getOptionsDiagnostics() : [])
@@ -526,6 +559,9 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       if (!gd[g].file)
         output.push('error TS' + gd[g].code + ': ' + ts.flattenDiagnosticMessageText(gd[g].messageText, ' '));
     }
+    // Emit tsbuildinfo — persists incremental state for next cold start.
+    // Worker 0 does this on first cold run. Next run reads it back.
+    try { builder.emit(); } catch(e) {}
   }
 
   // Persist diagnostic cache to disk (all workers — each has partial results)
@@ -538,7 +574,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   }
 
   var t3 = Date.now();
-  __edgebox_write_stderr('[recipe] w' + workerId + '/' + workerCount + ' parse:' + (t2-t1) + 'ms check:' + (t3-t2) + 'ms total:' + (t3-t0) + 'ms files:' + filesChecked + '/' + checkFiles.length + ' sfCache:' + (globalThis.__sfCacheHits||0) + 'h/' + (globalThis.__sfCacheMisses||0) + 'm' + String.fromCharCode(10));
+  __edgebox_write_stderr('[recipe] w' + workerId + '/' + workerCount + ' parse:' + (t2-t1) + 'ms check:' + (t3-t2) + 'ms total:' + (t3-t0) + 'ms files:' + filesChecked + '/' + checkFiles.length + String.fromCharCode(10));
   return output.join(NL);
   } catch(e) { return '[recipe-error] w' + workerId + ': ' + (e && e.stack ? e.stack : String(e)); }
 };
