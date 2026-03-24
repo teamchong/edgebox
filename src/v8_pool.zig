@@ -294,19 +294,24 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
     // Skip expensive patches — only createType + isSimpleTypeRelatedTo for minimal overhead
     const skip_expensive = std.posix.getenv("EDGEBOX_LEAN") != null;
     if (skip_expensive) {
-        _ = std.posix.write(2, "[v8pool] lean mode: createType + isTypeRelatedTo\n") catch {};
-        // Patch isSimpleTypeRelatedTo with strictNullChecks-aware WASM
-        const lean_needle = "function isTypeRelatedTo(source, target, relation) {";
-        // Patch isTypeRelatedTo (not isSimpleTypeRelatedTo) — called once per comparison.
-        // Skips fresh literal normalization + isSimpleTypeRelatedTo when WASM resolves.
-        const lean_inject = "function isTypeRelatedTo(source, target, relation) {" ++
-            "var _si=source.id,_ti=target.id;" ++
-            "if(_si>0&&_si<131072&&_ti>0&&_ti<131072&&globalThis.__gcCheckRel){" ++
+        _ = std.posix.write(2, "[v8pool] lean mode: frozen isSimpleTypeRelatedTo only\n") catch {};
+        // Skip createType patch — just test frozen isSimpleTypeRelatedTo alone
+        // (createType not needed since frozen function takes flags as params)
+        // Patch isSimpleTypeRelatedTo with FROZEN WASM version.
+        // Same algorithm as TSC's JS, compiled to native WASM speed.
+        // WASM imports handle enum/value checks by calling back to JS.
+        const lean_needle = "function isSimpleTypeRelatedTo(source, target, relation, errorReporter) {";
+        const lean_inject = "function isSimpleTypeRelatedTo(source, target, relation, errorReporter) {" ++
+            "if(globalThis.__frozenIsSimple){" ++
             "var _rel=relation===assignableRelation?0:relation===comparableRelation?1:" ++
             "relation===strictSubtypeRelation?3:relation===identityRelation?4:2;" ++
-            "var _r=globalThis.__gcCheckRel(_si,_ti,_rel,strictNullChecks?1:0);" ++
+            "var _wid=globalThis.__wildcardTypeId||0;" ++
+            "var _r=globalThis.__frozenIsSimple(source.flags|0,target.flags|0,_rel," ++
+            "strictNullChecks?1:0,source.id|0,target.id|0,_wid);" ++
+            // ONLY short-circuit on POSITIVE (1=related). NEVER on 0 (not related).
+            // TSC's isSimpleTypeRelatedTo returning false means "need structural check",
+            // not "definitely not related". Only return true when frozen is certain.
             "if(_r===1)return true;" ++
-            "if(_r===0)return false;" ++
             "}";
         if (std.mem.indexOf(u8, result, lean_needle)) |idx2| {
             _ = std.posix.write(2, "[v8pool] patching isSimpleTypeRelatedTo → frozen WASM\n") catch {};

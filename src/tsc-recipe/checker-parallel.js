@@ -592,8 +592,12 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   // Pre-initialize the TypeChecker — this creates intrinsic types, global symbols.
   // Without this, the FIRST getSemanticDiagnostics call pays ~300ms initialization.
   // getTypeChecker() is cheap if checker already exists.
-  program.getTypeChecker();
+  var _tc2 = program.getTypeChecker();
   globalThis.__pc[ck] = program;
+  // Set wildcardType ID for frozen checker
+  // wildcardType is an internal checker type — access via internal API
+  // For now set to 0 (frozen checker returns -1 for wildcard checks → falls through)
+  if (!globalThis.__wildcardTypeId) globalThis.__wildcardTypeId = 0;
 
 
   var t2 = Date.now();
