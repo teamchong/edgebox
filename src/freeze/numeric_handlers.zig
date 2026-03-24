@@ -112,6 +112,10 @@ pub const NumericPattern = enum {
     /// get_var_ref{N} when used as data (not as function call target).
     /// The recipe's JS trampoline passes the closure value as an extra i32 arg.
     closure_read,
+    /// Closure function call: get_var_ref{N} → call.
+    /// The function is imported into WASM from JS.
+    /// Recipe provides the import when instantiating the WASM module.
+    closure_call,
     /// Unsupported in numeric mode
     unsupported,
 };
@@ -369,7 +373,7 @@ fn analyzeFunctionFullImpl(instructions: anytype, allow_field_get: bool) ?Analys
             uses_structs = true;
             continue;
         }
-        if (handler.pattern == .closure_read) {
+        if (handler.pattern == .closure_read or handler.pattern == .closure_call) {
             has_computing_op = true;
             continue;
         }
@@ -414,7 +418,7 @@ pub fn isComputingPattern(pattern: NumericPattern) bool {
         .push_bool, .call_self, .tail_call_self,
         .add_loc, .inc_loc, .dec_loc,
         .array_get, .array_get2, .array_put, .array_length,
-        .field_get, .closure_read,
+        .field_get, .closure_read, .closure_call,
         => true,
         else => false,
     };
@@ -601,6 +605,12 @@ pub fn detectArrayArgs(instructions: anytype, arg_count: u32) u8 {
                 // Closure variable read: pushes 1 value (not an arg)
                 if (sp < stack.len) { stack[sp] = -1; sp += 1; }
             },
+            .closure_call => {
+                // Closure function call: pops args + function ref, pushes result
+                // Stack effect depends on call arity — approximate as pop all, push 1
+                sp = 0;
+                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+            },
             .field_get => {
                 // Pop object, push field value. Object might be an arg (struct arg detection).
                 // Don't set array_args bit — struct args are tracked separately.
@@ -715,7 +725,7 @@ pub fn detectMutatedArgs(instructions: anytype, arg_count: u32) u8 {
                 // Pop array base, push length (not an arg). No mutation.
                 if (sp >= 1) { stack[sp - 1] = -1; }
             },
-            .always_false, .field_get, .closure_read => {
+            .always_false, .field_get, .closure_read, .closure_call => {
                 if (sp >= 1) { stack[sp - 1] = -1; }
             },
             .nop, .goto_br, .set_loc_uninitialized, .tail_call_self => {},
@@ -836,7 +846,7 @@ pub fn detectReadArrayArgs(instructions: anytype, arg_count: u32) u8 {
                 // Length access does NOT count as element read — just update stack
                 if (sp >= 1) { stack[sp - 1] = -1; }
             },
-            .always_false, .field_get, .closure_read => {
+            .always_false, .field_get, .closure_read, .closure_call => {
                 if (sp >= 1) { stack[sp - 1] = -1; }
             },
             .nop, .goto_br, .set_loc_uninitialized, .tail_call_self => {},
@@ -895,7 +905,7 @@ pub fn detectLengthArgs(instructions: anytype, arg_count: u32) u8 {
             .binary_arith, .binary_cmp, .bitwise_binary => {
                 if (sp >= 2) { sp -= 1; stack[sp - 1] = -1; }
             },
-            .unary, .lnot, .inc_dec, .always_false, .field_get, .closure_read => {
+            .unary, .lnot, .inc_dec, .always_false, .field_get, .closure_read, .closure_call => {
                 if (sp >= 1) { stack[sp - 1] = -1; }
             },
             .post_inc_dec => {
@@ -1069,6 +1079,12 @@ pub fn detectStructArgs(instructions: anytype, arg_count: u32) ?StructArgInfo {
             },
             .closure_read => {
                 // Closure variable: pushes 1 value, not a field access
+                if (sp < stack.len) { stack[sp] = -1; sp += 1; }
+                continue;
+            },
+            .closure_call => {
+                // Closure function call: reset stack (call consumes args)
+                sp = 0;
                 if (sp < stack.len) { stack[sp] = -1; sp += 1; }
                 continue;
             },

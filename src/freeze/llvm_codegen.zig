@@ -1791,6 +1791,7 @@ fn numericStackEffect(instr: Instruction) i32 {
         .binary_arith, .binary_cmp, .bitwise_binary, .array_get => -1, // pop 2, push 1
         .unary, .lnot, .inc_dec, .always_false, .array_length, .field_get => 0, // pop 1, push 1
         .closure_read => 1, // push 1 (closure variable value)
+        .closure_call => 0, // variable — depends on call arity (handled in codegen)
         .post_inc_dec => 1, // pop 1, push 2
         .stack_dup => 1,
         .stack_dup2 => 2,
@@ -2798,6 +2799,15 @@ fn emitNumericInstruction(
             }
         },
 
+        .closure_call => {
+            // Closure function call: WASM imports the function from JS.
+            // TODO: generate actual WASM import call. For now, push -1 (unknown/fallthrough).
+            const neg_one = switch (kind) {
+                .i32 => llvm.constInt32(@bitCast(@as(i32, -1))),
+                .f64 => llvm.constF64(-1.0),
+            };
+            vstack.append(allocator, neg_one) catch return CodegenError.OutOfMemory;
+        },
         .closure_read => {
             // Closure variable read: map get_var_ref{N} to extra WASM param.
             // The JS trampoline passes closure values as extra i32 args after

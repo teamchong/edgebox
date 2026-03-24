@@ -1941,9 +1941,10 @@ pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
         break :blk struct_result.kind;
     };
 
-    // Reject functions that capture closure variables (callbacks WASM can't call).
-    if (func.closure_vars.len > 1) {
-        if (debug) std.debug.print("[wasm-reject] {s}: {d} closure vars (likely calls JS callbacks)\n", .{ func.name, func.closure_vars.len });
+    // Allow up to 8 closure variables (data reads become extra params,
+    // function calls become WASM imports).
+    if (func.closure_vars.len > 8) {
+        if (debug) std.debug.print("[wasm-reject] {s}: {d} closure vars (too many)\n", .{ func.name, func.closure_vars.len });
         return null;
     }
 
@@ -2003,8 +2004,11 @@ pub fn analyzeNumericTier(func: AnalyzedFunction) ?numeric_handlers.ValueKind {
                     look += 1;
                 }
                 if (is_call_target) {
-                    if (debug) std.debug.print("[wasm-reject] {s}: non-recursive with call pattern '{s}'\n", .{ func.name, @tagName(func.instructions[si].opcode) });
-                    return null;
+                    // Closure function call — allow as WASM import.
+                    // Skip ahead past the call opcode too.
+                    if (debug) std.debug.print("[wasm-import] {s}: closure call at {d} (will be WASM import)\n", .{ func.name, si });
+                    si = look + 1; // skip past the call opcode
+                    continue;
                 }
                 // Data read — allowed as closure_read (extra WASM param)
                 if (debug) std.debug.print("[wasm-closure] {s}: get_var_ref as data read at {d}\n", .{ func.name, si });
