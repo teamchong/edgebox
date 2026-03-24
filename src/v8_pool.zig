@@ -232,9 +232,11 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
     // TSC's own fast-paths (isSimpleTypeRelatedTo does the same flag checks).
     // Skip injections when EDGEBOX_LEAN_COLD=1 for fastest first cold.
     // Keep them by default for warm mode where TurboFan inlines WasmGC.
-    const lean_cold = std.posix.getenv("EDGEBOX_LEAN_COLD") != null;
-    if (lean_cold) {
-        _ = std.posix.write(2, "[v8pool] LEAN COLD: skipping source injections (fastest parse+check)\n") catch {};
+    // Source injections add ~100ms overhead on first cold (duplicate TSC's isSimpleTypeRelatedTo).
+    // Default: skip injections. Set EDGEBOX_PATCHES=1 to enable (useful for warm mode).
+    const enable_patches = std.posix.getenv("EDGEBOX_PATCHES") != null;
+    if (!enable_patches) {
+        _ = std.posix.write(2, "[v8pool] clean cold: no source injections (fastest first cold)\n") catch {};
         return result;
     }
 
