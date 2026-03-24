@@ -213,9 +213,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     globalThis.__gcCheck = function(_si, _ti) {
       var r = _checker(_fA, _bA, _si, _ti);
       if (r !== -1) return r;
-      // If target is a union (flags & 1048576), check source against each member
-      // Source → Target Union: only when source is NOT a union/intersection
-      // AND target ID is in bounds for union array (< 16384, since array = 16384*4 slots)
+      // Source → Target Union: check source against each union member
       if (_ti < 16384 && _si < 65536) {
         var sf = _checkerInst.exports.getFlag(_fA, _si | 0);
         var tf = _checkerInst.exports.getFlag(_fA, _ti | 0);
