@@ -430,20 +430,11 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       var key = name + '\0' + containingFile;
       var cached = globalThis.__mrCache.get(key);
       if (cached !== undefined) return cached;
-      if (name.charAt(0) === '.') {
-        var r = ts.resolveModuleName(name, containingFile, parsed.options, defaultHost).resolvedModule;
-        globalThis.__mrCache.set(key, r || null);
-        return r;
-      }
-      for (var pi = 0; pi < pathPrefixes.length; pi++) {
-        if (name === pathPrefixes[pi] || name.indexOf(pathPrefixes[pi] + '/') === 0) {
-          var r2 = ts.resolveModuleName(name, containingFile, parsed.options, defaultHost).resolvedModule;
-          globalThis.__mrCache.set(key, r2 || null);
-          return r2;
-        }
-      }
-      globalThis.__mrCache.set(key, null);
-      return undefined;
+      // Resolve ALL modules through TSC — handles relative, path-mapped,
+      // bare packages (@types/node, etc.), and Node.js built-ins.
+      var r = ts.resolveModuleName(name, containingFile, parsed.options, defaultHost).resolvedModule;
+      globalThis.__mrCache.set(key, r || null);
+      return r;
     });
   };
 
