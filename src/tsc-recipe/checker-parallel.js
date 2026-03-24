@@ -169,8 +169,9 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     var _checkerInst = new WebAssembly.Instance(new WebAssembly.Module(_checkerBuf));
     globalThis.__gcChecker = _checkerInst.exports;
     globalThis.__gcFlags = _checkerInst.exports;
-    globalThis.__gcFlagsArr = _checkerInst.exports.newFlags(65536);
-    globalThis.__gcBloomArr = _checkerInst.exports.newFlags(65536);
+    // 131072 = 128K entries. Playwright creates ~76K types.
+    globalThis.__gcFlagsArr = _checkerInst.exports.newFlags(131072);
+    globalThis.__gcBloomArr = _checkerInst.exports.newFlags(131072);
     // 2. Load soa_gc.wasm — objectFlags array
     var _soaBuf = __edgebox_read_binary(_root + '/src/tsc-recipe/soa_gc.wasm');
     if (!_soaBuf || !(_soaBuf instanceof ArrayBuffer) || _soaBuf.byteLength < 8) {

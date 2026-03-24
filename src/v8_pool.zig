@@ -274,7 +274,7 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
     const ct_inject = "function createType(flags) {" ++
         // typeCount++ happens AFTER this patch code. type.id = typeCount (after ++).
         // So type.id = typeCount + 1 at this point. Store at typeCount+1.
-        "if(typeCount<65534&&globalThis.__gcFlagsArr)" ++
+        "if(typeCount<131070&&globalThis.__gcFlagsArr)" ++
         "globalThis.__gcFlags.setFlag(globalThis.__gcFlagsArr,(typeCount+1)|0,flags|0);";
 
     const ct_idx = std.mem.indexOf(u8, result, ct_needle) orelse {
@@ -301,7 +301,7 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         // Skips fresh literal normalization + isSimpleTypeRelatedTo when WASM resolves.
         const lean_inject = "function isTypeRelatedTo(source, target, relation) {" ++
             "var _si=source.id,_ti=target.id;" ++
-            "if(_si>0&&_si<65536&&_ti>0&&_ti<65536&&globalThis.__gcCheckRel){" ++
+            "if(_si>0&&_si<131072&&_ti>0&&_ti<131072&&globalThis.__gcCheckRel){" ++
             "var _rel=relation===assignableRelation?0:relation===comparableRelation?1:" ++
             "relation===strictSubtypeRelation?3:relation===identityRelation?4:2;" ++
             "var _r=globalThis.__gcCheckRel(_si,_ti,_rel,strictNullChecks?1:0);" ++

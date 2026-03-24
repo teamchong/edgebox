@@ -432,9 +432,9 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\    ;; Identity
         \\    (if (i32.eq (local.get $src) (local.get $tgt))
         \\      (then (return (i32.const 1))))
-        \\    ;; Bounds check before array access
-        \\    (if (i32.or (i32.ge_u (local.get $src) (i32.const 65536))
-        \\               (i32.ge_u (local.get $tgt) (i32.const 65536)))
+        \\    ;; Bounds check before array access (131072 = 128K entries)
+        \\    (if (i32.or (i32.ge_u (local.get $src) (i32.const 131072))
+        \\               (i32.ge_u (local.get $tgt) (i32.const 131072)))
         \\      (then (return (i32.const -1))))
         \\    ;; Read flags
         \\    (local.set $s (array.get $flags (local.get $flagsArr) (local.get $src)))
