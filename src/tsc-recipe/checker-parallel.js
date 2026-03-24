@@ -273,14 +273,15 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   host.resolveModuleNames = function(moduleNames, containingFile) {
     return moduleNames.map(function(name) {
       var key = name + '\0' + containingFile;
-      // 1. Per-worker JS cache
+      // 1. Per-worker JS cache (fastest — avoids all other lookups)
       var cached = globalThis.__mrCache.get(key);
       if (cached !== undefined) return cached;
-      // 2. Zig shared resolve cache (cross-worker)
+      // 2. Zig shared resolve cache (cross-worker — workers 2+3 benefit from worker 1)
       if (hasZigResolveCache) {
         var zigResult = __edgebox_resolve_cache_get(key);
         if (zigResult === -1) { globalThis.__mrCache.set(key, null); return undefined; }
         if (zigResult) {
+          // Cache hit from another worker — TSC resolve is fast (fileExists cached)
           var r2 = ts.resolveModuleName(name, containingFile, parsed.options, defaultHost).resolvedModule;
           globalThis.__mrCache.set(key, r2 || null);
           return r2;
