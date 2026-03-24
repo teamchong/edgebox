@@ -131,7 +131,7 @@ pub const Scanner = struct {
             '^' => self.scanCaret(),
             '\'' => self.scanString(),
             '"' => self.scanString(),
-            '`' => blk: { self.pos += 1; break :blk SK.Backtick; },
+            '`' => self.scanTemplateLiteral(),
             '0'...'9' => self.scanNumber(),
             'a'...'z', 'A'...'Z', '_', '$' => self.scanIdentifier(),
             else => blk: { self.pos += 1; break :blk SK.Unknown; },
@@ -281,6 +281,46 @@ pub const Scanner = struct {
         self.pos += 1;
         if (self.peek(0) == '=') { self.pos += 1; return SK.CaretEquals; }
         return SK.Caret;
+    }
+
+    fn scanTemplateLiteral(self: *Scanner) TokenKind {
+        self.pos += 1; // skip opening backtick
+        while (self.pos < self.src.len) {
+            const ch = self.src[self.pos];
+            if (ch == '`') {
+                self.pos += 1;
+                return SK.NoSubTemplate; // no substitution template literal
+            }
+            if (ch == '$' and self.pos + 1 < self.src.len and self.src[self.pos + 1] == '{') {
+                self.pos += 2;
+                return SK.TemplateHead; // template with expression: `...${
+            }
+            if (ch == '\\') self.pos += 1; // skip escape
+            self.pos += 1;
+        }
+        return SK.NoSubTemplate; // unterminated — treat as no-sub
+    }
+
+    /// Scan template middle/tail (called after expression inside template)
+    pub fn scanTemplateMiddleOrTail(self: *Scanner) Token {
+        const start = self.pos;
+        while (self.pos < self.src.len) {
+            const ch = self.src[self.pos];
+            if (ch == '`') {
+                self.pos += 1;
+                self.token = .{ .kind = SK.TemplateTail, .start = start, .end = self.pos };
+                return self.token;
+            }
+            if (ch == '$' and self.pos + 1 < self.src.len and self.src[self.pos + 1] == '{') {
+                self.pos += 2;
+                self.token = .{ .kind = SK.TemplateMiddle, .start = start, .end = self.pos };
+                return self.token;
+            }
+            if (ch == '\\') self.pos += 1;
+            self.pos += 1;
+        }
+        self.token = .{ .kind = SK.TemplateTail, .start = start, .end = self.pos };
+        return self.token;
     }
 
     fn scanString(self: *Scanner) TokenKind {
