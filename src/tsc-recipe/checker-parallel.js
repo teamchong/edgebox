@@ -609,6 +609,10 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     __edgebox_write_stderr('[recipe] w' + workerId + ' createProgram=' + (Date.now()-_cpT0) + 'ms gsf=' + _gsfTime + 'ms(' + _gsfCount + ') rmn=' + _rmnTime + 'ms(' + _rmnCount + ')\n');
   }
   __edgebox_write_stderr('[recipe] POST-createProgram zig=' + zigParseCount + ' fb=' + zigFallbackCount + '\n');
+  // Pre-initialize the TypeChecker — this creates intrinsic types, global symbols.
+  // Without this, the FIRST getSemanticDiagnostics call pays ~300ms initialization.
+  // getTypeChecker() is cheap if checker already exists.
+  program.getTypeChecker();
   globalThis.__pc[ck] = program;
 
 
@@ -698,7 +702,10 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       } else {
         filesChecked++;
         var file = checkFiles[idx];
+        var _fT0 = Date.now();
         var diags = program.getSemanticDiagnostics(file);
+        var _fT1 = Date.now();
+        if (_fT1 - _fT0 > 50) __edgebox_write_stderr('[slow] ' + file.fileName.split('/').pop() + ' ' + (_fT1-_fT0) + 'ms ' + diags.length + 'diags\n');
         for (var k = 0; k < diags.length; k++) {
           var d = diags[k];
           if (d.file) {
