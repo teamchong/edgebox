@@ -2952,7 +2952,11 @@ fn emitNumericInstruction(
                 // Push result to vstack
                 vstack.append(allocator, result_val) catch return CodegenError.OutOfMemory;
             } else {
-                // No import found — push -1 (fallthrough)
+                // No import found
+                if (std.posix.getenv("EDGEBOX_WASM_DEBUG") != null) {
+                    const dbg_name = if (cvar_idx < analyzed.closure_vars.len) analyzed.closure_vars[cvar_idx].name else "?";
+                    std.debug.print("[freeze-codegen] closure_call: var_idx={d} name='{s}' imports={d} → NOT FOUND\n", .{ cvar_idx, dbg_name, import_count_global });
+                }
                 vstack.append(allocator, llvm.constInt32(@bitCast(@as(i32, -1)))) catch return CodegenError.OutOfMemory;
             }
         },
