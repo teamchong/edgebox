@@ -5,6 +5,8 @@ const std = @import("std");
 const v8_pool = @import("v8_pool.zig");
 const alloc = std.heap.page_allocator;
 
+extern fn edgebox_io_stats(fe_calls: *u64, fe_cached: *u64, de_calls: *u64, de_cached: *u64) void;
+
 const SOCKET_PATH = "/tmp/edgebox.sock";
 
 fn fatal(msg: []const u8) noreturn {
@@ -71,7 +73,6 @@ fn handleClient(fd: std.posix.fd_t) void {
     var timer = std.time.Timer.start() catch null;
 
     v8_pool.dispatch(cwd);
-    const t_dispatch = if (timer) |*t| t.read() else 0;
 
     const result = v8_pool.collect() catch {
         log("[daemon] collect error\n");
@@ -79,7 +80,6 @@ fn handleClient(fd: std.posix.fd_t) void {
         return;
     };
     defer alloc.free(result);
-    const t_collect = if (timer) |*t| t.read() else 0;
 
     var written: usize = 0;
     while (written < result.len) {
@@ -90,15 +90,21 @@ fn handleClient(fd: std.posix.fd_t) void {
         if (w == 0) break;
         written += w;
     }
-    const t_write = if (timer) |*t| t.read() else 0;
+    const t_total = if (timer) |*t| t.read() else 0;
+
+    // IO stats
+    var fe_calls: u64 = 0;
+    var fe_cached: u64 = 0;
+    var de_calls: u64 = 0;
+    var de_cached: u64 = 0;
+    edgebox_io_stats(&fe_calls, &fe_cached, &de_calls, &de_cached);
 
     // Timing breakdown (nanoseconds → milliseconds)
     var tbuf: [256]u8 = undefined;
-    const tmsg = std.fmt.bufPrint(&tbuf, "[daemon] dispatch:{d}ms collect:{d}ms write:{d}ms total:{d}ms bytes:{d}\n", .{
-        t_dispatch / std.time.ns_per_ms,
-        (t_collect - t_dispatch) / std.time.ns_per_ms,
-        (t_write - t_collect) / std.time.ns_per_ms,
-        t_write / std.time.ns_per_ms,
+    const tmsg = std.fmt.bufPrint(&tbuf, "[daemon] {d}ms fe:{d}/{d} de:{d}/{d} bytes:{d}\n", .{
+        t_total / std.time.ns_per_ms,
+        fe_cached, fe_calls,
+        de_cached, de_calls,
         result.len,
     }) catch "[daemon] timing error\n";
     log(tmsg);
