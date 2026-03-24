@@ -113,11 +113,11 @@ globalThis.__sfCache = sfCache;
 // workers restore with pre-parsed ASTs — saves 573ms on cold start per worker.
 // The createSourceFile cache (recipe #1) stores the results across requests too.
 (function() {
-  // REMOVED: pre-parse during snapshot. Tested:
-  // - All 59 libs: +19MB snapshot, 300ms SLOWER (restore cost > parse savings)
-  // - One lib (es5.d.ts): +400KB snapshot, ~20ms savings (marginal)
-  // V8 snapshot preserves heap but NOT compiled code (Sparkplug/TurboFan).
-  // Parse JIT warmup happens naturally during the first createProgram call.
+  // TESTED: pre-parse in snapshot doesn't help.
+  // - All 59 libs: +19MB snapshot, 300ms SLOWER
+  // - lib.dom.d.ts only: +16MB snapshot (1.8MB source → 16MB AST), SLOWER
+  // - lib.es5.d.ts only: +400KB snapshot, marginal (~20ms)
+  // V8 snapshot AST serialization is too expensive vs re-parsing.
   return;
   try {
     var root = __edgebox_root();
