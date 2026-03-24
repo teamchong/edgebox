@@ -58,9 +58,8 @@ void edgebox_v8_init() {
   }
   const char* flags = flags_buf;
   v8__V8__SetFlagsFromString(flags, strlen(flags));
-  // 8 platform threads for background JIT compilation across 8 V8 isolates
-  // 8 platform threads for background JIT compilation (Sparkplug/TurboFan).
-  // Tested: 2 threads = 3.1s (20% slower due to insufficient background JIT).
+  // Platform threads for background JIT compilation (Sparkplug/TurboFan).
+  // Tested: 2 = 3.1s (20% slower), 8 = 2.56s, 16 = 2.60s
   g_platform = v8__Platform__NewDefaultPlatform(8, false);
   v8__V8__InitializePlatform(g_platform);
   v8__V8__Initialize();
