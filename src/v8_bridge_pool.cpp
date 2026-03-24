@@ -298,7 +298,7 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
         "  globalThis.__preParsed = _pp;"
         "  globalThis.__preProject = '%s';"
         "  __edgebox_write_stderr('[snapshot] pre-parsed ' + _prog.getSourceFiles().length + ' files\\n');"
-        "  __edgebox_write_stderr('[snapshot] pre-parsed (NO checker warmup)\\n');"
+        "  __edgebox_write_stderr('[snapshot] pre-parsed (no checker warmup)\\n');"
         "} catch(e) {"
         "  __edgebox_write_stderr('[snapshot] pre-parse failed: ' + e.message + '\\n');"
         "}", project, project, project, project, project);
