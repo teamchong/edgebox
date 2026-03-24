@@ -452,8 +452,17 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\      (local.get $src) (local.get $tgt) (local.get $strictNull)))
         \\    (if (i32.ne (local.get $r) (i32.const -1))
         \\      (then (return (local.get $r))))
-        \\    ;; Assignable extras removed — too many false positives.
-        \\    ;; TSC's assignable checks need value/enum context we can't check in WASM.
+        \\    ;; Assignable/comparable extras (safe subset — no value/enum context needed)
+        \\    (if (i32.or (i32.eqz (local.get $rel))
+        \\               (i32.eq (local.get $rel) (i32.const 1))) (then
+        \\      ;; Any(1) source → anything (assignable/comparable only)
+        \\      (if (i32.ne (i32.and (local.get $s) (i32.const 1)) (i32.const 0))
+        \\        (then (return (i32.const 1))))
+        \\      ;; Number(8) → Enum(32) (assignable only)
+        \\      (if (i32.and
+        \\        (i32.ne (i32.and (local.get $s) (i32.const 8)) (i32.const 0))
+        \\        (i32.ne (i32.and (local.get $t) (i32.const 32)) (i32.const 0)))
+        \\        (then (return (i32.const 1))))))
         \\    ;; TypeParameter(262144) with constraint === target → related
         \\    ;; (can't check constraint here — need type graph, fall through)
         \\    ;; Target is union → check source against members (bounds: tgt < 16384)
