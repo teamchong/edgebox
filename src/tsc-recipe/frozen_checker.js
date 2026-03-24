@@ -109,12 +109,47 @@ function checkPropertyNames(srcCount, tgtCount, srcOff, tgtOff, mem) {
   return 1;
 }
 
+// getObjectFlags — hot utility (called thousands of times per check)
+function getObjectFlags(type) {
+  return type.flags & 3899393 ? type.objectFlags : 0;
+}
+
+// isUnitType — flag check
+function isUnitType(type) {
+  return type.flags & 109472 ? 1 : 0;
+}
+
+// isObjectLiteralType — combines getObjectFlags + flag check
+function isObjectLiteralType(type) {
+  return (type.flags & 3899393) && (type.objectFlags & 128) ? 1 : 0;
+}
+
+// isFreshLiteralType
+function isFreshLiteralType(type) {
+  return (type.flags & 3899393) && (type.objectFlags & 8192) ? 1 : 0;
+}
+
+// getNormalizedFlags — handle fresh literal normalization
+// TSC normalizes fresh literals (source.freshType === source → use regularType)
+// This is used in isRelatedTo before calling isSimpleTypeRelatedTo
+function getNormalizedFlags(type) {
+  var f = type.flags;
+  // Fresh literal check: flags has Literal bits (2976) and freshType equals self
+  // We can't check object identity in WASM, so just return the flags
+  return f;
+}
+
 // Prevent dead code elimination
-var obj1 = {flags: 1, id: 10};
-var obj2 = {flags: 2, id: 20};
+var obj1 = {flags: 1, id: 10, objectFlags: 0};
+var obj2 = {flags: 2, id: 20, objectFlags: 0};
 var _r1 = checkTypeSimple(obj1, obj2, 0);
 var _r2 = checkTypeRelated(obj1, obj2, 0);
 var _r3 = checkFlags(1, 2, 0);
 var _r4 = checkRelated(1, 2, 10, 20, 0);
 var _arr = [0, 0, 0, 0, 0, 0, 0, 0];
 var _r5 = checkPropertyNames(2, 2, 0, 4, _arr);
+var _r6 = getObjectFlags(obj1);
+var _r7 = isUnitType(obj1);
+var _r8 = isObjectLiteralType(obj1);
+var _r9 = isFreshLiteralType(obj1);
+var _r10 = getNormalizedFlags(obj1);
