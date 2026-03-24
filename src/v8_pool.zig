@@ -442,17 +442,12 @@ fn prewarmDir(dir_path: []const u8) void {
 var first_dispatch: bool = true;
 
 pub fn dispatch(cwd: []const u8) void {
-    // Reset work counter for work-stealing
     edgebox_reset_work();
     if (first_dispatch) {
-        // First dispatch: lib files already cached from init(). Don't clear.
-        // Just prewarm PROJECT files on top of the lib cache.
         first_dispatch = false;
     } else {
-        // Subsequent dispatches: clear stale file cache for fresh content.
         edgebox_clear_file_cache();
     }
-    // Pre-warm file cache — reads project files into Zig mmap cache
     prewarmDir(cwd);
     for (0..pool_size) |i| {
         workers[i].cwd = cwd;
