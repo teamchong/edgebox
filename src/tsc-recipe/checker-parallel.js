@@ -503,8 +503,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     // Warm without incremental: check all files with cache reuse
     for (var i = 0; i < checkFiles.length; i++) checkFile(checkFiles[i]);
   } else {
-    // Cold: parallel work-stealing. Skip diagnostic cache overhead on first cold —
-    // empty cache means every hash + lookup is wasted work.
+    // Cold: parallel work-stealing. Skip diagnostic cache overhead on first cold.
     var hasCachedDiags = Object.keys(dc.hashes).length > 0;
     while (true) {
       var idx = __edgebox_claim_file();
