@@ -237,6 +237,54 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
     // 5. Eval recipe (__edgebox_check defined)
     EvalInContext(isolate, context, recipe_code, recipe_len);
 
+    // 6. Project-specific snapshot: pre-run createProgram during snapshot creation.
+    //    EDGEBOX_PROJECT=/path/to/project → snapshot includes parsed program.
+    //    Workers restore with program pre-loaded → skip 750ms parse.
+    // Project-specific snapshot: pre-create program during snapshot.
+    // Only createProgram (parse + bind) — NOT check. Keeps snapshot small.
+    // Workers restore with parsed program → createProgram(oldProgram) reuses it.
+    const char* project = getenv("EDGEBOX_PROJECT");
+    if (project && strlen(project) > 0) {
+      fprintf(stderr, "[v8pool] project snapshot: pre-parsing %s\n", project);
+      char pre_parse[4096];
+      snprintf(pre_parse, sizeof(pre_parse),
+        "try {"
+        "  if (!ts.sys && ts.setSys) ts.setSys({"
+        "    args:[],newLine:'\\n',useCaseSensitiveFileNames:true,"
+        "    write:function(){},writeOutputIsTTY:function(){return false;},"
+        "    readFile:function(){return undefined;},writeFile:function(){},"
+        "    fileExists:function(){return false;},directoryExists:function(){return false;},"
+        "    createDirectory:function(){},getExecutingFilePath:function(){return '/';},"
+        "    getCurrentDirectory:function(){return '/';},getDirectories:function(){return[];},"
+        "    readDirectory:function(){return[];},exit:function(){},"
+        "    realpath:function(p){return p;},getEnvironmentVariable:function(){return '';}"
+        "  });"
+        "  ts.sys.readFile = function(p) { return __edgebox_read_file(String(p)) || undefined; };"
+        "  ts.sys.fileExists = function(p) { return __edgebox_file_exists(String(p)) === 1; };"
+        "  ts.sys.directoryExists = function(p) { return __edgebox_dir_exists(String(p)) === 1; };"
+        "  ts.sys.realpath = function(p) { return __edgebox_realpath(String(p)); };"
+        "  ts.sys.getCurrentDirectory = function() { return '%s'; };"
+        "  ts.sys.getDirectories = function(p) {"
+        "    var j = __edgebox_readdir(String(p)); if(!j||j.charAt(0)!=='{')return[];"
+        "    return JSON.parse(j).d||[]; };"
+        "  ts.sys.readDirectory = function(root,ext,exc,inc,depth) {"
+        "    return ts.matchFiles(root,ext,exc,inc,true,'%s',depth,function(p){"
+        "      var j=__edgebox_readdir(p||'.');if(!j||j.charAt(0)!=='{')return{files:[],directories:[]};"
+        "      var t=JSON.parse(j);return{files:t.f||[],directories:t.d||[]};},function(p){return __edgebox_realpath(p);});};"
+        "  var _pp = ts.parseJsonConfigFileContent("
+        "    ts.readConfigFile('%s/tsconfig.json', ts.sys.readFile).config, ts.sys, '%s');"
+        "  var _host = ts.createCompilerHost(_pp.options);"
+        "  var _prog = ts.createProgram(_pp.fileNames, _pp.options, _host);"
+        "  globalThis.__preProgram = _prog;"
+        "  globalThis.__preParsed = _pp;"
+        "  globalThis.__preProject = '%s';"
+        "  __edgebox_write_stderr('[snapshot] pre-parsed ' + _prog.getSourceFiles().length + ' files\\n');"
+        "} catch(e) {"
+        "  __edgebox_write_stderr('[snapshot] pre-parse failed: ' + e.message + '\\n');"
+        "}", project, project, project, project, project);
+      EvalInContext(isolate, context, pre_parse, strlen(pre_parse));
+    }
+
     creator.SetDefaultContext(context);
   }
 

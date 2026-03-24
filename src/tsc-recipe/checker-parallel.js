@@ -98,8 +98,12 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   if (!globalThis.__gcFlagsDone) {
     globalThis.__gcFlagsDone = true;
     if (typeof __edgebox_read_binary !== 'function' || typeof WebAssembly === 'undefined') {
-      throw new Error('[recipe] FATAL: read_binary=' + (typeof __edgebox_read_binary) + ' WebAssembly=' + (typeof WebAssembly));
-    }
+      // WebAssembly not available (snapshot creation). Skip WASM loading.
+      // createProgram still works — only type checking fast-paths need WASM.
+      // Reset flag so workers can load WASM after snapshot restore.
+      globalThis.__gcFlagsDone = false;
+      __edgebox_write_stderr('[recipe] WASM not available (snapshot context) — skipping\n');
+    } else {
     var _root = typeof __edgebox_root === 'function' ? __edgebox_root() : '';
     // 1. Load type_checker_gc.wasm — native WASM type comparison + flag storage
     var _checkerBuf = __edgebox_read_binary(_root + '/src/tsc-recipe/type_checker_gc.wasm');
@@ -155,10 +159,10 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       globalThis.__gcCheck(1, 2);
     } catch(e) {}
     __edgebox_write_stderr('[recipe] WasmGC: checker=' + _checkerBuf.byteLength + 'B soa=' + _soaBuf.byteLength + 'B\n');
+    } // close else (WASM available)
   }
-  if (!globalThis.__gcFlags) {
-    throw new Error('[recipe] FATAL: WasmGC flags not loaded');
-  }
+  // WASM may not be loaded during snapshot creation — that's OK.
+  // Workers will load WASM on first __edgebox_check after snapshot restore.
 
   // Create ts.sys if missing (snapshot restore doesn't init it)
   if (!ts.sys && ts.setSys) {
@@ -321,8 +325,14 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     });
   };
 
+  // Check for pre-parsed program from project-specific snapshot.
+  // __preProgram is set during snapshot creation (EDGEBOX_PROJECT env).
+  // Using it as oldProgram lets createProgram reuse parsed source files.
   var oldProgram = globalThis.__pc[ck] || undefined;
-  var isWarm = !!oldProgram;
+  if (!oldProgram && globalThis.__preProgram && globalThis.__preProject === cwd) {
+    oldProgram = globalThis.__preProgram;
+  }
+  var isWarm = !!globalThis.__pc[ck]; // truly warm = from previous check, not from snapshot
   // Adaptive strategy:
   // Cold: all workers in parallel with createProgram (fastest parse).
   // Warm: worker 0 only with createIncrementalProgram (cache reuse + incremental check).
