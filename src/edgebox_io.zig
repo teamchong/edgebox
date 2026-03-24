@@ -7,6 +7,11 @@
 const std = @import("std");
 const alloc = std.heap.page_allocator;
 
+// Import Zig parser — exports edgebox_zig_parse C ABI function
+comptime {
+    _ = @import("zig_parser_core.zig");
+}
+
 // ── File Cache (shared across all V8 pool worker threads) ──
 
 var file_cache: std.StringHashMapUnmanaged([]const u8) = .{};

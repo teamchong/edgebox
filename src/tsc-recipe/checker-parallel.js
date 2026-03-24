@@ -161,6 +161,15 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     __edgebox_write_stderr('[recipe] WasmGC: checker=' + _checkerBuf.byteLength + 'B soa=' + _soaBuf.byteLength + 'B\n');
     } // close else (WASM available)
   }
+  // Test Zig parser speed (if available)
+  if (typeof __edgebox_zig_parse === 'function') {
+    var _zigTestSrc = 'const x: number = 1; function foo(a: string): boolean { return a.length > 0; }';
+    var _zigResult = __edgebox_zig_parse(_zigTestSrc);
+    if (_zigResult) {
+      __edgebox_write_stderr('[recipe] Zig parser: ' + (_zigResult.byteLength / 24) + ' nodes from ' + _zigTestSrc.length + ' chars\n');
+    }
+  }
+
   // WASM may not be loaded during snapshot creation — that's OK.
   // Workers will load WASM on first __edgebox_check after snapshot restore.
 
