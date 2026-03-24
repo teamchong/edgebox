@@ -298,7 +298,16 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
         "  globalThis.__preParsed = _pp;"
         "  globalThis.__preProject = '%s';"
         "  __edgebox_write_stderr('[snapshot] pre-parsed ' + _prog.getSourceFiles().length + ' files\\n');"
-        "  __edgebox_write_stderr('[snapshot] pre-parsed (no checker warmup)\\n');"
+        // Warm up V8's type feedback by checking a few files.
+        // This populates feedback vectors for ALL checker functions.
+        // Workers restore with warm feedback → Maglev compiles on first call.
+        // The checker STATE is discarded (workers create fresh programs).
+        // Only the FEEDBACK VECTORS survive in the snapshot.
+        "  var _tc3 = _prog.getTypeChecker();"
+        "  var _warmFiles = _prog.getSourceFiles().filter(function(f){return !f.isDeclarationFile;});"
+        "  var _warmN = Math.min(_warmFiles.length, 50);"
+        "  for(var _wi=0;_wi<_warmN;_wi++) _prog.getSemanticDiagnostics(_warmFiles[_wi]);"
+        "  __edgebox_write_stderr('[snapshot] warmed feedback on ' + _warmN + '/' + _warmFiles.length + ' files\\n');"
         "} catch(e) {"
         "  __edgebox_write_stderr('[snapshot] pre-parse failed: ' + e.message + '\\n');"
         "}", project, project, project, project, project);

@@ -294,16 +294,16 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
     // Skip expensive patches — only createType + isSimpleTypeRelatedTo for minimal overhead
     const skip_expensive = std.posix.getenv("EDGEBOX_LEAN") != null;
     if (skip_expensive) {
-        _ = std.posix.write(2, "[v8pool] lean mode: frozen isRelatedToFast\n") catch {};
-        // Patch isTypeRelatedTo with combined frozen checker.
-        // One WASM call: identity + Object→Primitive + flags + identity relation.
+        _ = std.posix.write(2, "[v8pool] lean mode: WasmGC isRelatedToFast (TurboFan inlined)\n") catch {};
+        // Patch isTypeRelatedTo with WasmGC isRelatedToFast.
+        // WasmGC array.get is TurboFan-inlined → zero JS↔WASM boundary crossing.
+        // Reads flags from GC arrays populated by createType patch.
         const lean_needle = "function isTypeRelatedTo(source, target, relation) {";
         const lean_inject = "function isTypeRelatedTo(source, target, relation) {" ++
-            "if(globalThis.__frozenIsRelated){" ++
+            "if(globalThis.__gcCheckRel){" ++
             "var _rel=relation===assignableRelation?0:relation===comparableRelation?1:" ++
             "relation===strictSubtypeRelation?3:relation===identityRelation?4:2;" ++
-            "var _r=globalThis.__frozenIsRelated(source.flags|0,target.flags|0,_rel," ++
-            "strictNullChecks?1:0,source.id|0,target.id|0,0);" ++
+            "var _r=globalThis.__gcCheckRel(source.id|0,target.id|0,_rel,strictNullChecks?1:0);" ++
             "if(_r===1)return true;" ++
             "}";
         if (std.mem.indexOf(u8, result, lean_needle)) |idx2| {
