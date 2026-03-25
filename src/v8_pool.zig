@@ -270,10 +270,9 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
     // Keep them by default for warm mode where TurboFan inlines WasmGC.
     // Source injections add ~100ms overhead on first cold (duplicate TSC's isSimpleTypeRelatedTo).
     // Default: skip injections. Set EDGEBOX_PATCHES=1 to enable (useful for warm mode).
-    const enable_patches = std.posix.getenv("EDGEBOX_PATCHES") != null;
-    if (!enable_patches) {
-        return result;
-    }
+    // LEAN mode: always enabled — createType flags + isTypeRelatedTo WASM fast-path.
+    // Only the heavy patches (setStructuredTypeMembers, bloom filter, etc.) are gated.
+    const enable_heavy_patches = std.posix.getenv("EDGEBOX_PATCHES") != null;
 
     // Patch 1: createType — write type.id→flags to WasmGC array.
     const ct_needle = "function createType(flags) {";
@@ -297,20 +296,16 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         result = ct_result;
     }
 
-    // Skip expensive patches — only createType + isSimpleTypeRelatedTo for minimal overhead
-    const skip_expensive = std.posix.getenv("EDGEBOX_LEAN") != null;
-    if (skip_expensive) {
-        _ = std.posix.write(2, "[v8pool] lean mode: WasmGC isRelatedToFast (TurboFan inlined)\n") catch {};
+    // Always patch isTypeRelatedTo with WASM fast-path (zero overhead with TurboFan).
+    {
+        _ = std.posix.write(2, "[v8pool] WASM: isRelatedToFast wired into isTypeRelatedTo\n") catch {};
         // Patch isTypeRelatedTo with WasmGC isRelatedToFast.
         // WasmGC array.get is TurboFan-inlined → zero JS↔WASM boundary crossing.
         // Reads flags from GC arrays populated by createType patch.
         const lean_needle = "function isTypeRelatedTo(source, target, relation) {";
         const lean_inject = "function isTypeRelatedTo(source, target, relation) {" ++
             "if(source===target)return true;" ++
-            "var _sf=source.flags|0,_tf=target.flags|0;" ++
-            // Pre-filter: only call WASM for types with simple flags (not Object/Union/etc.)
-            // 67358815 = Any|String|Number|Boolean|Enum|StringLiteral|NumberLiteral|BooleanLiteral|BigInt|BigIntLiteral|Void|Undefined|Null|Never|ESSymbol|UniqueESSymbol|NonPrimitive
-            "if((_sf&67358815)&&(_tf&67358815)&&globalThis.__gcCheckRel){" ++
+            "if(globalThis.__gcCheckRel){" ++
             "var _rel=relation===assignableRelation?0:relation===comparableRelation?1:" ++
             "relation===strictSubtypeRelation?3:relation===identityRelation?4:2;" ++
             "var _r=globalThis.__gcCheckRel(source.id|0,target.id|0,_rel,strictNullChecks?1:0);" ++
@@ -325,6 +320,10 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
             @memcpy(r2[idx2 + lean_inject.len .. len2], result[idx2 + lean_needle.len ..]);
             result = r2;
         }
+    }
+
+    // Heavy patches: only enabled with EDGEBOX_PATCHES=1
+    if (!enable_heavy_patches) {
         return result;
     }
 
