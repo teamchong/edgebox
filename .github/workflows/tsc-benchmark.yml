@@ -47,15 +47,14 @@ jobs:
           cd benchmark
           npm install
 
-      - name: Build EdgeBox CLI (if rusty_v8 available)
-        continue-on-error: true
+      - name: Build EdgeBox CLI
         run: |
-          if [ -f vendor/v8/librusty_v8_release_x86_64-unknown-linux-gnu.a ]; then
-            zig build edgebox-cli -p zig-out -Doptimize=ReleaseFast
-            echo "EdgeBox CLI built: $(ls -lh zig-out/bin/edgebox)"
-          else
-            echo "rusty_v8 not available — EdgeBox benchmark will be skipped"
+          if [ ! -f vendor/v8/librusty_v8_release_x86_64-unknown-linux-gnu.a ]; then
+            echo "::error::rusty_v8 not available — cannot build EdgeBox CLI"
+            exit 1
           fi
+          zig build edgebox-cli -p zig-out -Doptimize=ReleaseFast
+          echo "EdgeBox CLI built: $(ls -lh zig-out/bin/edgebox)"
 
       - name: Install VS Code dependencies (for proper tsconfig benchmark)
         continue-on-error: true
@@ -83,7 +82,7 @@ jobs:
         with:
           name: tsc-benchmark-results
           path: benchmark/results.json
-          if-no-files-found: ignore
+          if-no-files-found: error
 
       - name: Generate Summary
         run: |
@@ -155,21 +154,26 @@ jobs:
 
       - name: Check Diagnostic Counts
         run: |
-          if [ -f benchmark/results.json ]; then
-            node -e "
-              const results = require('./benchmark/results.json');
-              const mismatches = results.filter(r => !r.outputMatch);
-              if (mismatches.length > 0) {
-                console.log('Diagnostic count mismatches:');
-                for (const r of mismatches) {
-                  console.log('  ' + r.project + ': Node=' + r.nodeDiagnostics + ' EdgeBox=' + r.edgeboxDiagnostics);
-                }
-                process.exit(1);
-              } else {
-                console.log('All diagnostics match Node.js tsc');
-              }
-            "
+          if [ ! -f benchmark/results.json ]; then
+            echo "::error::benchmark/results.json not found — benchmark did not produce results"
+            exit 1
           fi
+          node -e "
+            const results = require('./benchmark/results.json');
+            if (!results || results.length === 0) {
+              console.error('ERROR: results.json is empty');
+              process.exit(1);
+            }
+            const mismatches = results.filter(r => !r.outputMatch);
+            if (mismatches.length > 0) {
+              console.error('Diagnostic count mismatches:');
+              for (const r of mismatches) {
+                console.error('  ' + r.project + ': Node=' + r.nodeDiagnostics + ' EdgeBox=' + r.edgeboxDiagnostics);
+              }
+              process.exit(1);
+            }
+            console.log('All ' + results.length + ' projects: diagnostics match Node.js tsc');
+          "
 
       - name: Post PR Comment
         if: github.event_name == 'pull_request'
