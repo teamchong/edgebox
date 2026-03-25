@@ -668,26 +668,29 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   }
   // Override with freeze-compiled WASM (falls through to JS fallback for unknowns)
   // Frozen WASM disabled — false positives (44 diags). Need to fix WASM correctness.
-  if (false) {
+  if (globalThis.__frozenIsRelated) {
     var _frozenCheck = globalThis.__frozenIsRelated;
     var _jsFallback = globalThis.__eb_isSimpleTypeRelatedTo;
+    var _symHashGet = globalThis.__gcChecker ? globalThis.__gcChecker.getFlag : null;
+    var _symHashArr = globalThis.__gcSymbolHashArr;
     globalThis.__eb_isSimpleTypeRelatedTo = function(source, target, relation, errorReporter,
         strictNullChecks, wildcardType, assignableRelation, comparableRelation, strictSubtypeRelation) {
       var sf = source.flags | 0, tf = target.flags | 0;
       var rel = relation === assignableRelation ? 0 : relation === comparableRelation ? 1 :
                 relation === strictSubtypeRelation ? 3 : 4;
-      var r = _frozenCheck(source.id | 0, target.id | 0, sf, tf, rel, strictNullChecks ? 1 : 0);
-      // Validate: compare WASM result with JS result
-      if (r !== -1) {
-        var jsResult = _jsFallback(source, target, relation, errorReporter,
-            strictNullChecks, wildcardType, assignableRelation, comparableRelation, strictSubtypeRelation);
-        var wasmBool = r === 1;
-        if (wasmBool !== jsResult) {
-          __edgebox_write_stderr('[WASM MISMATCH] src=' + source.id + '(f=' + sf + ') tgt=' + target.id + '(f=' + tf + ') rel=' + rel + ' wasm=' + r + ' js=' + jsResult + '\n');
-        }
-        return jsResult; // always use JS result for correctness during validation
+      var srcSH = 0, tgtSH = 0;
+      if (_symHashGet && _symHashArr) {
+        if (source.symbol && source.symbol.id > 0 && source.symbol.id < 131072)
+          srcSH = _symHashGet(_symHashArr, source.symbol.id);
+        if (target.symbol && target.symbol.id > 0 && target.symbol.id < 131072)
+          tgtSH = _symHashGet(_symHashArr, target.symbol.id);
       }
-      // -1 = unknown, fall through to JS
+      var srcV = source.value !== void 0 ? source.value | 0 : 0;
+      var tgtV = target.value !== void 0 ? target.value | 0 : 0;
+      var r = _frozenCheck(source.id | 0, target.id | 0, sf, tf, rel, strictNullChecks ? 1 : 0,
+                            srcSH, tgtSH, srcV, tgtV);
+      if (r === 1) return true;
+      if (r === 0) return false;
       return _jsFallback(source, target, relation, errorReporter,
             strictNullChecks, wildcardType, assignableRelation, comparableRelation, strictSubtypeRelation);
     };
