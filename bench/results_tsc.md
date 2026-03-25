@@ -7,7 +7,7 @@ Tests use real-world TypeScript patterns from popular libraries.
 - Apple M1/M2/M3 Mac (ARM64)
 - Node.js v20.18.0
 - Bun 1.3.5
-- TypeScript 5.9.3
+- TypeScript 6.0.2
 
 ## Results
 

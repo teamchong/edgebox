@@ -9,6 +9,6 @@
   "devDependencies": {
     "tinybench": "^3.0.0",
     "tsx": "^4.0.0",
-    "typescript": "^5.9.3"
+    "typescript": "^6.0.2"
   }
 }

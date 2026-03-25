@@ -131,7 +131,7 @@ runs:
       if: steps.cache-edgebox.outputs.cache-hit != 'true'
       shell: bash
       run: |
-        npm install typescript@5.9.3 --no-save 2>/dev/null || npm install typescript --no-save
+        npm install typescript@6.0.2 --no-save 2>/dev/null || npm install typescript --no-save
         ls node_modules/typescript/lib/typescript.js && echo "TypeScript installed"
 
     # === Build Zig IO library  ===

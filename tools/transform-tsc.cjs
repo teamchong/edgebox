@@ -140,7 +140,7 @@ for (const t of transforms) {
   // Create wrapper with WasmGC fast-path + inline fallback
   const paramNames = t.params.split(',').map(s => s.trim());
   let wasmFastPath = '';
-  if (t.name === 'isSimpleTypeRelatedTo') {
+  if (false && t.name === "isSimpleTypeRelatedTo") {
     // WasmGC isRelatedToFast: built at build time, runs in snapshot.
     // Handles flag checks as pure integer ops — no closure refs needed.
     // Falls through to inline fallback for string/value/object cases.
@@ -157,20 +157,22 @@ for (const t of transforms) {
     // Freeze-compiled WASM (correct, from actual TSC logic).
     // Minimal extraction: .id + .flags (V8 inline cache, fast).
     // WASM IS the function — no pre-check, no fallback.
+    // WASM IS the function — lightweight wrapper with name hash for enums.
+    // No JS function calls (isEnumTypeRelatedTo etc.) — only property access.
     wasmFastPath = `
     var _srcSH = source.symbol ? source.symbol._nameHash | 0 : 0;
     var _tgtSH = target.symbol ? target.symbol._nameHash | 0 : 0;
-    var _srcV = source.value !== void 0 ? source.value | 0 : 0;
-    var _tgtV = target.value !== void 0 ? target.value | 0 : 0;
+    var _rel = relation === assignableRelation ? 0 : relation === comparableRelation ? 1 :
+      relation === strictSubtypeRelation ? 3 : relation === identityRelation ? 4 : 2;
+    var _tgtUL = (_rel <= 1 && target.objectFlags & 67108864) ? 1 : 0;
     var _r = globalThis.__frozenIsRelated(source.id | 0, target.id | 0,
-      source.flags | 0, target.flags | 0,
-      relation === assignableRelation ? 0 : relation === comparableRelation ? 1 :
-      relation === strictSubtypeRelation ? 3 : relation === identityRelation ? 4 : 2,
-      strictNullChecks ? 1 : 0, _srcSH, _tgtSH, _srcV, _tgtV);
+      source.flags | 0, target.flags | 0, _rel, strictNullChecks ? 1 : 0,
+      _srcSH, _tgtSH, source.value === target.value ? 1 : 0,
+      source === wildcardType ? 1 : 0, _tgtUL);
     return _r === 1;`;
   }
 
-  // For functions with WASM fast-path: WASM IS the function, no inline fallback
+  // For functions with WASM replacement: WASM IS the function, no fallback.
   if (wasmFastPath) {
     const wrapper = `function ${t.name}(${t.params}) {${wasmFastPath}}`;
     src = src.substring(0, bounds.start) + wrapper + src.substring(bounds.end);
