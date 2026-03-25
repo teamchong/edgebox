@@ -50,9 +50,9 @@ globalThis.__gcFlagsDone = false;
   // the main culprit: default constructor only sets flags+checker, all other
   // properties added dynamically → hundreds of hidden class transitions.
   var origTypeProto = ts.objectAllocator.getTypeConstructor().prototype;
-  // MonoType: 11 properties = sweet spot. Covers all properties actually set
-  // on playwright types. More = wasted memory. Fewer = hidden class transitions.
-  // Tested: 30 props (1.78s), 11 props (1.73s best), 5 props (1.76s).
+  // MonoType: 11 properties = sweet spot for hidden class.
+  // Data stays as direct JS properties (fastest for V8 inline cache).
+  // WASM arrays are populated separately via createType patch for WASM checker.
   function MonoType(checker, flags) {
     this.flags = flags;
     this.checker = checker;
@@ -183,6 +183,8 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     globalThis.__gcPropTypeArr = _checkerInst.exports.newFlags(131072);
     globalThis.__gcPropCountArr = _checkerInst.exports.newFlags(16384);
     globalThis.__gcCheckStructural = _checkerInst.exports.checkStructural;
+    // WASM arrays populated via createType patch (flags) and
+    // setStructuredTypeMembers patch (bloom + properties).
     // 3. __gcCheck: thin wrapper → native WASM checkRelation + checkSrcToUnion
     var _checker = _checkerInst.exports.checkRelation;
     var _unionChecker = _checkerInst.exports.checkSrcToUnion;
