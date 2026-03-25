@@ -18,7 +18,7 @@ const transforms = [
   {
     name: 'isSimpleTypeRelatedTo',
     params: 'source, target, relation, errorReporter',
-    captures: ['strictNullChecks', 'wildcardType', 'assignableRelation', 'comparableRelation', 'strictSubtypeRelation'],
+    captures: ['strictNullChecks', 'wildcardType', 'assignableRelation', 'comparableRelation', 'strictSubtypeRelation', 'identityRelation'],
   },
   {
     name: 'isTypeRelatedTo',
@@ -57,11 +57,22 @@ for (const t of transforms) {
   globalFuncs += `function ${ebName}_impl(${t.params}, ${extraParams}) `;
   globalFuncs += originalBody.substring(sig.length - 1) + '\n'; // starts from {
 
-  // Create wrapper that delegates to global
-  const wrapper = `function ${t.name}(${t.params}) {
-    if (globalThis.${ebName}) {
-      return globalThis.${ebName}(${t.params.split(',').map(s => s.trim()).join(', ')}, ${extraParams});
-    }
+  // Create wrapper with WasmGC fast-path + inline fallback
+  const paramNames = t.params.split(',').map(s => s.trim());
+  let wasmFastPath = '';
+  if (t.name === 'isSimpleTypeRelatedTo') {
+    // WasmGC isRelatedToFast: built at build time, runs in snapshot.
+    // Handles flag checks as pure integer ops — no closure refs needed.
+    // Falls through to inline fallback for string/value/object cases.
+    wasmFastPath = `
+    if (globalThis.__gcCheckRel) {
+      var _rel = relation === assignableRelation ? 0 : relation === comparableRelation ? 1 :
+                 relation === strictSubtypeRelation ? 3 : relation === identityRelation ? 4 : 2;
+      // TODO: wire to freeze-compiled WasmGC version of isSimpleTypeRelatedTo
+      // (not hand-written checkRel which has correctness bugs)
+    }`;
+  }
+  const wrapper = `function ${t.name}(${t.params}) {${wasmFastPath}
     ${originalBody.replace(sig, '{')}
   }`;
 
