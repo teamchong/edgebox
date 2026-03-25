@@ -369,9 +369,10 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
 
   g_snapshot = creator.CreateBlob(v8::SnapshotCreator::FunctionCodeHandling::kKeep);
 
-  // Create code cache in a SNAPSHOT-RESTORED isolate (must match worker flags).
-  // V8 rejects code cache if flags differ between creation and consumption.
-  if (g_ts_code && g_ts_code_len > 0 && g_snapshot.data) {
+  // Code cache disabled — V8's CreateCodeCache only stores Sparkplug bytecode,
+  // NOT TurboFan native code. The warmup overhead (~5s) isn't worth the ~30ms savings.
+  // TurboFan is handled by __edgebox_force_turbofan at the recipe level.
+  if (false && g_ts_code && g_ts_code_len > 0 && g_snapshot.data) {
     v8::Isolate::CreateParams params;
     params.array_buffer_allocator = v8::ArrayBuffer::Allocator::NewDefaultAllocator();
     params.snapshot_blob = &g_snapshot;

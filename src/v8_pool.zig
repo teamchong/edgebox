@@ -595,16 +595,7 @@ fn workerLoop(worker_id: u32) void {
 
     // If code cache available, compile TSC from it to get TurboFan code instantly.
     // Code cache was created at build time after warmup — contains TurboFan native code.
-    if (edgebox_v8_has_code_cache() == 1) {
-        var cc_err_len: c_int = 0;
-        const cc_err = edgebox_v8_compile_ts_cached(isolate, context, &cc_err_len);
-        if (cc_err != null and cc_err_len > 0) {
-            _ = std.posix.write(2, "[v8pool] code cache error: ") catch {};
-            _ = std.posix.write(2, cc_err.?[0..@intCast(cc_err_len)]) catch {};
-            _ = std.posix.write(2, "\n") catch {};
-            edgebox_v8_free(cc_err);
-        }
-    }
+    // Code cache disabled — TurboFan handled by __edgebox_force_turbofan at recipe level.
     _ = std.posix.write(2, "[v8pool] worker ready\n") catch {};
 
     while (!workers[wid].shutdown.load(.acquire)) {
