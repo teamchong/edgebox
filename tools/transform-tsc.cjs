@@ -140,7 +140,7 @@ for (const t of transforms) {
   // Create wrapper with WasmGC fast-path + inline fallback
   const paramNames = t.params.split(',').map(s => s.trim());
   let wasmFastPath = '';
-  if (false) { // WASM fast-path disabled — needs unified module with correct freeze logic
+  if (t.name === 'isSimpleTypeRelatedTo') {
     // WasmGC isRelatedToFast: built at build time, runs in snapshot.
     // Handles flag checks as pure integer ops — no closure refs needed.
     // Falls through to inline fallback for string/value/object cases.
@@ -156,14 +156,12 @@ for (const t of transforms) {
     // source.value is integer for number literals.
     // Freeze-compiled WASM (correct, from actual TSC logic).
     // Minimal extraction: .id + .flags (V8 inline cache, fast).
-    // ONE code path: __gcCheckRel calls unified WasmGC module.
-    // WASM reads flags from GC array by type ID — no JS extraction.
-    // Only pass IDs + relation. WASM does the rest.
     wasmFastPath = `
-    var _r = globalThis.__DISABLED_gcCheckRel(source.id | 0, target.id | 0,
+    var _r = globalThis.__frozenIsRelated(source.id | 0, target.id | 0,
+      source.flags | 0, target.flags | 0,
       relation === assignableRelation ? 0 : relation === comparableRelation ? 1 :
       relation === strictSubtypeRelation ? 3 : relation === identityRelation ? 4 : 2,
-      strictNullChecks ? 1 : 0);
+      strictNullChecks ? 1 : 0, 0, 0, 0, 0);
     if (_r === 1) return true;
     if (_r === 0) return false;`;
   }
