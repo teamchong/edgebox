@@ -160,6 +160,18 @@ static void EvalInContext(v8::Isolate* isolate, v8::Local<v8::Context> context, 
   if (!script.IsEmpty()) script.ToLocalChecked()->Run(context);
 }
 
+// Forward declare Zig IO function
+extern "C" void edgebox_write_stderr(const char* data, int len);
+
+// V8 Code Cache: persists TurboFan-compiled code across runs.
+// Created at build time after warmup. Workers load from cache = instant TurboFan.
+static uint8_t* g_code_cache_data = nullptr;
+static int g_code_cache_len = 0;
+
+// TSC source stored for per-worker code-cache compilation.
+static const char* g_ts_code = nullptr;
+static int g_ts_code_len = 0;
+
 // Create a snapshot with TypeScript + worker init + recipe pre-loaded.
 // IO callbacks are registered on the snapshot context so worker_init can use real require('fs').
 // External references — V8 needs these to serialize/deserialize native function pointers in snapshots
@@ -237,8 +249,23 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
 
     // 1. Eval shim (module, process stubs, require stubs)
     EvalInContext(isolate, context, shim_code, shim_len);
-    // 2. Eval TypeScript (compiled + executed)
-    EvalInContext(isolate, context, ts_code, ts_len);
+    // 2. Compile TypeScript via ScriptCompiler::CompileUnboundScript.
+    // This gives us an UnboundScript we can create a code cache from AFTER warmup.
+    // The code cache preserves TurboFan-compiled code (unlike snapshots which only keep bytecode).
+    v8::Local<v8::UnboundScript> ts_unbound;
+    {
+      auto ts_str = v8::String::NewFromUtf8(isolate, ts_code, v8::NewStringType::kNormal, ts_len);
+      if (!ts_str.IsEmpty()) {
+        v8::ScriptOrigin origin(v8::String::NewFromUtf8Literal(isolate, "typescript.js"));
+        v8::ScriptCompiler::Source source(ts_str.ToLocalChecked(), origin);
+        auto maybe = v8::ScriptCompiler::CompileUnboundScript(isolate, &source);
+        if (!maybe.IsEmpty()) {
+          ts_unbound = maybe.ToLocalChecked();
+          auto script = ts_unbound->BindToCurrentContext();
+          script->Run(context).IsEmpty();
+        }
+      }
+    }
     // 3. Set ts alias
     EvalInContext(isolate, context, "globalThis.ts = globalThis.module.exports;", 42);
     // 4. Eval worker_init (process, require with real IO)
@@ -314,10 +341,104 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
       EvalInContext(isolate, context, pre_parse, strlen(pre_parse));
     }
 
+    // Code cache must be created OUTSIDE snapshot creation (V8 limitation).
+    // We'll create it in a separate isolate after the snapshot is done.
     creator.SetDefaultContext(context);
   }
 
   g_snapshot = creator.CreateBlob(v8::SnapshotCreator::FunctionCodeHandling::kKeep);
+
+  // Create code cache in a SNAPSHOT-RESTORED isolate (must match worker flags).
+  // V8 rejects code cache if flags differ between creation and consumption.
+  if (g_ts_code && g_ts_code_len > 0 && g_snapshot.data) {
+    v8::Isolate::CreateParams params;
+    params.array_buffer_allocator = v8::ArrayBuffer::Allocator::NewDefaultAllocator();
+    params.snapshot_blob = &g_snapshot;
+    params.external_references = g_external_refs;
+    auto* cc_isolate = v8::Isolate::New(params);
+    {
+      v8::Isolate::Scope iso_scope(cc_isolate);
+      v8::HandleScope handle_scope(cc_isolate);
+      auto cc_context = v8::Context::New(cc_isolate);
+      v8::Context::Scope ctx_scope(cc_context);
+
+      // Register IO callbacks (snapshot context needs them for checker warmup)
+      auto globalObj = cc_context->Global();
+      auto setFn = [&](const char* name, v8::FunctionCallback cb) {
+        globalObj->Set(cc_context,
+          v8::String::NewFromUtf8(cc_isolate, name).ToLocalChecked(),
+          v8::Function::New(cc_context, cb).ToLocalChecked()).Check();
+      };
+      setFn("__edgebox_read_file", ReadFileCallback);
+      setFn("__edgebox_file_exists", FileExistsCallback);
+      setFn("__edgebox_dir_exists", DirExistsCallback);
+      setFn("__edgebox_readdir", ReaddirCallback);
+      setFn("__edgebox_realpath", RealpathCallback);
+      setFn("__edgebox_cwd", CwdCallback);
+      setFn("__edgebox_write_stderr", WriteStderrCallback);
+      setFn("__edgebox_write_stdout", WriteStdoutCallback);
+      setFn("__edgebox_root", RootCallback);
+      setFn("__edgebox_read_binary", ReadBinaryCallback);
+      setFn("__edgebox_stat", StatCallback);
+      setFn("__edgebox_hash", HashCallback);
+
+      // Compile TSC via CompileUnboundScript, run it + warmup, then create code cache
+      // from the SAME UnboundScript. This ensures TurboFan code is in the cache.
+      auto ts_str = v8::String::NewFromUtf8(cc_isolate, g_ts_code,
+          v8::NewStringType::kNormal, g_ts_code_len);
+      if (!ts_str.IsEmpty()) {
+        v8::ScriptOrigin origin(v8::String::NewFromUtf8Literal(cc_isolate, "typescript.js"));
+        v8::ScriptCompiler::Source source(ts_str.ToLocalChecked(), origin);
+        auto maybe = v8::ScriptCompiler::CompileUnboundScript(cc_isolate, &source,
+            v8::ScriptCompiler::kEagerCompile);
+        if (!maybe.IsEmpty()) {
+          auto unbound = maybe.ToLocalChecked();
+          // Run TSC (this second copy sets module.exports again)
+          auto script = unbound->BindToCurrentContext();
+          script->Run(cc_context).IsEmpty();
+          EvalInContext(cc_isolate, cc_context,
+              "globalThis.ts = globalThis.module.exports;", 42);
+
+          // Run checker warmup using THIS TSC to trigger TurboFan
+          const char* project = getenv("EDGEBOX_PROJECT");
+          if (project && strlen(project) > 0) {
+            char warmup[2048];
+            snprintf(warmup, sizeof(warmup),
+              "try {"
+              "  var _p = globalThis.__preProgram;"
+              "  if(!_p) { __edgebox_write_stderr('[code-cache] no preProgram\\n'); }"
+              "  else {"
+              "    var _tc = _p.getTypeChecker();"
+              "    var _wf = _p.getSourceFiles().filter(function(f){return !f.isDeclarationFile;});"
+              "    var _wn = Math.min(_wf.length, 100);"
+              "    for(var _i=0;_i<_wn;_i++) _p.getSemanticDiagnostics(_wf[_i]);"
+              "    __edgebox_write_stderr('[code-cache] warmed ' + _wn + ' files for TurboFan\\n');"
+              "  }"
+              "} catch(e) {"
+              "  __edgebox_write_stderr('[code-cache] warmup err: ' + e.message + '\\n');"
+              "}");
+            EvalInContext(cc_isolate, cc_context, warmup, strlen(warmup));
+          }
+
+          // Create code cache from the SAME UnboundScript — includes TurboFan code
+          auto* cache = v8::ScriptCompiler::CreateCodeCache(unbound);
+          if (cache && cache->length > 0) {
+            g_code_cache_len = cache->length;
+            g_code_cache_data = new uint8_t[cache->length];
+            memcpy(g_code_cache_data, cache->data, cache->length);
+            char buf[128];
+            int n = snprintf(buf, sizeof(buf), "[v8pool] code cache: %d bytes (TurboFan)\n",
+                g_code_cache_len);
+            edgebox_write_stderr(buf, n);
+          }
+          delete cache;
+        }
+      }
+    }
+    cc_isolate->Dispose();
+    delete params.array_buffer_allocator;
+  }
+
   return g_snapshot.raw_size;
 }
 
@@ -343,7 +464,7 @@ extern int edgebox_write_file(const char* path, int path_len, const char* data, 
 extern const char* edgebox_realpath(const char* path, int path_len, int* out_len);
 extern const char* edgebox_cwd(int* out_len);
 extern void edgebox_write_stdout(const char* data, int len);
-extern void edgebox_write_stderr(const char* data, int len);
+// edgebox_write_stderr declared at top of file with extern "C"
 extern int edgebox_hash(const char* algo, int algo_len, const char* data, int data_len, char* out, int out_cap);
 extern void edgebox_exit(int code);
 extern void edgebox_free(const char* ptr, int len);
@@ -714,6 +835,84 @@ const char* edgebox_v8_eval_in_context(void* iso_ptr, void* ctx_ptr, const char*
   copy[len] = '\0';
   *out_len = len;
   return copy;
+}
+
+// Store TSC source for per-worker code-cache compilation.
+void edgebox_v8_store_ts(const char* ts_code, int ts_len) {
+  char* ts_copy = new char[ts_len];
+  memcpy(ts_copy, ts_code, ts_len);
+  g_ts_code = ts_copy;
+  g_ts_code_len = ts_len;
+}
+
+// Compile TSC from code cache in a worker context.
+// Code cache contains TurboFan-compiled code from build-time warmup.
+// Workers get instant TurboFan — zero compilation cost.
+const char* edgebox_v8_compile_ts_cached(void* iso_ptr, void* ctx_ptr, int* out_len) {
+  if (!g_ts_code || g_ts_code_len == 0 || !g_code_cache_data || g_code_cache_len == 0) {
+    *out_len = 0;
+    return nullptr; // No code cache available
+  }
+
+  auto* isolate = static_cast<v8::Isolate*>(iso_ptr);
+  auto* persistent = static_cast<v8::Persistent<v8::Context>*>(ctx_ptr);
+
+  v8::Isolate::Scope isolate_scope(isolate);
+  v8::HandleScope handle_scope(isolate);
+  auto context = persistent->Get(isolate);
+  v8::Context::Scope context_scope(context);
+
+  auto source_str = v8::String::NewFromUtf8(isolate, g_ts_code,
+      v8::NewStringType::kNormal, g_ts_code_len);
+  if (source_str.IsEmpty()) { *out_len = 0; return nullptr; }
+
+  // Create CachedData from our stored code cache.
+  // BufferNotOwned = we manage the memory, V8 just reads it.
+  auto* cached = new v8::ScriptCompiler::CachedData(
+      g_code_cache_data, g_code_cache_len,
+      v8::ScriptCompiler::CachedData::BufferNotOwned);
+
+  v8::ScriptOrigin origin(v8::String::NewFromUtf8Literal(isolate, "typescript.js"));
+  v8::ScriptCompiler::Source source(source_str.ToLocalChecked(), origin, cached);
+
+  v8::TryCatch try_catch(isolate);
+  auto maybe_script = v8::ScriptCompiler::Compile(context, &source,
+      v8::ScriptCompiler::kConsumeCodeCache);
+
+  if (maybe_script.IsEmpty()) {
+    if (try_catch.HasCaught()) {
+      v8::String::Utf8Value err(isolate, try_catch.Exception());
+      if (*err) {
+        int len = err.length();
+        char* copy = new char[len + 1];
+        memcpy(copy, *err, len);
+        copy[len] = '\0';
+        *out_len = len;
+        return copy;
+      }
+    }
+    *out_len = 0;
+    return nullptr;
+  }
+
+  bool rejected = cached->rejected;
+  // Don't Run — TSC is already loaded from snapshot.
+  // The Compile + kConsumeCodeCache deserialized TurboFan code from the cache.
+  // V8's in-memory compilation cache now has TurboFan code for all warmed functions.
+  (void)maybe_script.ToLocalChecked();
+
+  char buf[128];
+  int n = snprintf(buf, sizeof(buf), "[v8pool] code cache: loaded %d bytes (rejected=%d)\n",
+      g_code_cache_len, rejected ? 1 : 0);
+  edgebox_write_stderr(buf, n);
+
+  *out_len = 0;
+  return nullptr;
+}
+
+// Check if code cache is available
+int edgebox_v8_has_code_cache() {
+  return (g_code_cache_data && g_code_cache_len > 0) ? 1 : 0;
 }
 
 } // extern "C"

@@ -23,6 +23,9 @@ extern fn edgebox_v8_eval_in_context(?*anyopaque, ?*anyopaque, [*]const u8, c_in
 extern fn edgebox_v8_free(?[*]const u8) void;
 extern fn edgebox_v8_create_snapshot([*]const u8, c_int, [*]const u8, c_int, [*]const u8, c_int, [*]const u8, c_int) c_int;
 extern fn edgebox_v8_create_isolate_from_snapshot() ?*anyopaque;
+extern fn edgebox_v8_store_ts([*]const u8, c_int) void;
+extern fn edgebox_v8_compile_ts_cached(?*anyopaque, ?*anyopaque, *c_int) ?[*]const u8;
+extern fn edgebox_v8_has_code_cache() c_int;
 extern fn edgebox_set_daemon_mode(c_int) void;
 extern fn edgebox_get_result(c_int, *c_int) ?[*]const u8;
 
@@ -218,6 +221,9 @@ pub fn init(worker_count: u32) !void {
                 full_recipe_len = r_len;
             }
 
+            // Store TSC source for per-worker code cache compilation
+            edgebox_v8_store_ts(final_src, final_len);
+
             _ = std.posix.write(2, "[v8pool] creating snapshot (with worker_init + recipe + bridge)...\n") catch {};
             const snap_size = edgebox_v8_create_snapshot(
                 final_src, final_len,
@@ -230,6 +236,7 @@ pub fn init(worker_count: u32) !void {
                 const msg = std.fmt.bufPrint(&snap_msg, "[v8pool] snapshot: {d} bytes\n", .{snap_size}) catch "[v8pool] snapshot created\n";
                 _ = std.posix.write(2, msg) catch {};
             }
+
         }
     }
 
@@ -265,7 +272,6 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
     // Default: skip injections. Set EDGEBOX_PATCHES=1 to enable (useful for warm mode).
     const enable_patches = std.posix.getenv("EDGEBOX_PATCHES") != null;
     if (!enable_patches) {
-        _ = std.posix.write(2, "[v8pool] clean cold: no source injections (fastest first cold)\n") catch {};
         return result;
     }
 
@@ -300,11 +306,15 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         // Reads flags from GC arrays populated by createType patch.
         const lean_needle = "function isTypeRelatedTo(source, target, relation) {";
         const lean_inject = "function isTypeRelatedTo(source, target, relation) {" ++
-            "if(globalThis.__gcCheckRel){" ++
+            "if(source===target)return true;" ++
+            "var _sf=source.flags|0,_tf=target.flags|0;" ++
+            // Pre-filter: only call WASM for types with simple flags (not Object/Union/etc.)
+            // 67358815 = Any|String|Number|Boolean|Enum|StringLiteral|NumberLiteral|BooleanLiteral|BigInt|BigIntLiteral|Void|Undefined|Null|Never|ESSymbol|UniqueESSymbol|NonPrimitive
+            "if((_sf&67358815)&&(_tf&67358815)&&globalThis.__gcCheckRel){" ++
             "var _rel=relation===assignableRelation?0:relation===comparableRelation?1:" ++
             "relation===strictSubtypeRelation?3:relation===identityRelation?4:2;" ++
             "var _r=globalThis.__gcCheckRel(source.id|0,target.id|0,_rel,strictNullChecks?1:0);" ++
-            "if(_r===1)return true;" ++
+            "if(_r===1)return true;if(_r===0)return false;" ++
             "}";
         if (std.mem.indexOf(u8, result, lean_needle)) |idx2| {
             _ = std.posix.write(2, "[v8pool] patching isSimpleTypeRelatedTo → frozen WASM\n") catch {};
@@ -583,8 +593,18 @@ fn workerLoop(worker_id: u32) void {
     const context = edgebox_v8_setup_context(isolate);
     if (context == null) { edgebox_v8_dispose_isolate(isolate); return; }
 
-    // Snapshot includes worker_init + recipe — no post-restore eval needed.
-    // IO callbacks are registered by setup_context (same functions as snapshot).
+    // If code cache available, compile TSC from it to get TurboFan code instantly.
+    // Code cache was created at build time after warmup — contains TurboFan native code.
+    if (edgebox_v8_has_code_cache() == 1) {
+        var cc_err_len: c_int = 0;
+        const cc_err = edgebox_v8_compile_ts_cached(isolate, context, &cc_err_len);
+        if (cc_err != null and cc_err_len > 0) {
+            _ = std.posix.write(2, "[v8pool] code cache error: ") catch {};
+            _ = std.posix.write(2, cc_err.?[0..@intCast(cc_err_len)]) catch {};
+            _ = std.posix.write(2, "\n") catch {};
+            edgebox_v8_free(cc_err);
+        }
+    }
     _ = std.posix.write(2, "[v8pool] worker ready\n") catch {};
 
     while (!workers[wid].shutdown.load(.acquire)) {

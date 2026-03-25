@@ -730,7 +730,9 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   }
 
   var t3 = Date.now();
-  __edgebox_write_stderr('[recipe] w' + workerId + '/' + workerCount + ' parse:' + (t2-t1) + 'ms check:' + (t3-t2) + 'ms total:' + (t3-t0) + 'ms files:' + filesChecked + '/' + checkFiles.length + String.fromCharCode(10));
+  var _gcInfo = '';
+  if (globalThis.__gcTotal) _gcInfo = ' gc:Y' + (globalThis.__gcHit||0) + '/N' + (globalThis.__gcHitNo||0) + '/?' + (globalThis.__gcMiss||0) + '(fl:' + (globalThis.__gcMissFlags||0) + ')=' + Math.round(100*((globalThis.__gcHit||0)+(globalThis.__gcHitNo||0))/globalThis.__gcTotal) + '%';
+  __edgebox_write_stderr('[recipe] w' + workerId + '/' + workerCount + ' parse:' + (t2-t1) + 'ms check:' + (t3-t2) + 'ms total:' + (t3-t0) + 'ms files:' + filesChecked + '/' + checkFiles.length + _gcInfo + String.fromCharCode(10));
   return output.join(NL);
   } catch(e) { return '[recipe-error] w' + workerId + ': ' + (e && e.stack ? e.stack : String(e)); }
 };

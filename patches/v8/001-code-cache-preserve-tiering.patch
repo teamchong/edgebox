@@ -1,0 +1,35 @@
+diff --git a/src/flags/flag-definitions.h b/src/flags/flag-definitions.h
+index aab9435dbb5..3f113a91cb1 100644
+--- a/src/flags/flag-definitions.h
++++ b/src/flags/flag-definitions.h
+@@ -1833,6 +1833,8 @@ DEFINE_BOOL_READONLY(verify_turboshaft, false,
+ DEFINE_BOOL(profile_guided_optimization, true, "profile guided optimization")
+ DEFINE_BOOL(profile_guided_optimization_for_empty_feedback_vector, true,
+             "profile guided optimization for empty feedback vector")
++DEFINE_BOOL(code_cache_preserve_tiering, false,
++            "preserve TurboFan tiering decisions in code cache (embedder opt-in)")
+ DEFINE_INT(invocation_count_for_early_optimization, 30,
+            "invocation count threshold for early optimization")
+ DEFINE_INT(invocation_count_for_maglev_with_delay, 600,
+diff --git a/src/snapshot/code-serializer.cc b/src/snapshot/code-serializer.cc
+index 6149ee8f1de..7eea0346f13 100644
+--- a/src/snapshot/code-serializer.cc
++++ b/src/snapshot/code-serializer.cc
+@@ -191,7 +191,8 @@ void CodeSerializer::SerializeObjectImpl(Handle<HeapObject> obj,
+       }
+       if (v8_flags.profile_guided_optimization) {
+         cached_tiering_decision = sfi->cached_tiering_decision();
+-        if (cached_tiering_decision > CachedTieringDecision::kEarlySparkplug) {
++        if (!v8_flags.code_cache_preserve_tiering &&
++            cached_tiering_decision > CachedTieringDecision::kEarlySparkplug) {
+           sfi->set_cached_tiering_decision(
+               CachedTieringDecision::kEarlySparkplug);
+         }
+@@ -205,6 +206,7 @@ void CodeSerializer::SerializeObjectImpl(Handle<HeapObject> obj,
+                                   isolate());
+     }
+     if (v8_flags.profile_guided_optimization &&
++        !v8_flags.code_cache_preserve_tiering &&
+         cached_tiering_decision > CachedTieringDecision::kEarlySparkplug) {
+       sfi->set_cached_tiering_decision(cached_tiering_decision);
+     }
