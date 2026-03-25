@@ -147,25 +147,18 @@ for (const t of transforms) {
     // __frozenIsRelated = freeze-compiled isRelatedToFast from frozen_checker.js.
     // Same logic as this function, compiled to WASM at build time.
     // Returns 1=true, 0=false, -1=unknown (fall through to inline JS).
+    // WASM fast-path: always call freeze-compiled isRelatedToFast.
+    // No conditionals — WASM is always loaded at this point.
+    // TurboFan inlines the WASM call at the JS callsite.
+    // WASM fast-path — freeze-compiled at build time, native speed.
     wasmFastPath = `
-    if (globalThis.__frozenIsRelated) {
-      var _sf = source.flags | 0, _tf = target.flags | 0;
-      var _rel = relation === assignableRelation ? 0 : relation === comparableRelation ? 1 :
-                 relation === strictSubtypeRelation ? 3 : relation === identityRelation ? 4 : 2;
-      // Shared cache: check if another worker already computed this relation.
-      // Key = hash of (sourceFlags, targetFlags, relation, strictNull).
-      var _ck = ((_sf * 31 + _tf) * 7 + _rel) * 3 + (strictNullChecks ? 1 : 0);
-      if (_ck !== 0 && typeof __edgebox_shared_cache_get === 'function') {
-        var _cv = __edgebox_shared_cache_get(_ck | 0);
-        if (_cv === 1) return true;
-        if (_cv === 2) return false;
-      }
-      // WASM fast-path: freeze-compiled flag checks.
-      var _r = globalThis.__frozenIsRelated(source.id | 0, target.id | 0,
-        _sf, _tf, _rel, strictNullChecks ? 1 : 0);
-      if (_r === 1) { if (typeof __edgebox_shared_cache_set === 'function') __edgebox_shared_cache_set(_ck | 0, 1); return true; }
-      if (_r === 0) { if (typeof __edgebox_shared_cache_set === 'function') __edgebox_shared_cache_set(_ck | 0, 2); return false; }
-    }`;
+    var _r = globalThis.__frozenIsRelated(source.id | 0, target.id | 0,
+      source.flags | 0, target.flags | 0,
+      relation === assignableRelation ? 0 : relation === comparableRelation ? 1 :
+      relation === strictSubtypeRelation ? 3 : relation === identityRelation ? 4 : 2,
+      strictNullChecks ? 1 : 0);
+    if (_r === 1) return true;
+    if (_r === 0) return false;`;
   }
   const wrapper = `function ${t.name}(${t.params}) {${wasmFastPath}
     ${originalBody.replace(sig, '{')}
