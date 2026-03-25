@@ -1819,6 +1819,59 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                         };
                         if (link_ok) {
                             has_standalone_wasm = true;
+                            // Strip memory section → WasmGC-compatible.
+                            // Pure integer functions don't use linear memory.
+                            // Without memory, WASM works in V8 snapshots and
+                            // gets TurboFan-inlined at JS callsites.
+                            const strip_result = runCommand(allocator, &.{
+                                "wasm-tools", "print", sw,
+                            }) catch null;
+                            if (strip_result) |sr| {
+                                defer {
+                                    if (sr.stdout) |s| allocator.free(s);
+                                    if (sr.stderr) |s| allocator.free(s);
+                                }
+                                if (sr.stdout) |wat_text| {
+                                    // Remove memory, globals, memory export, __wasm_call_ctors
+                                    var stripped = std.ArrayListUnmanaged(u8){};
+                                    defer stripped.deinit(allocator);
+                                    var lines = std.mem.splitScalar(u8, wat_text, '\n');
+                                    while (lines.next()) |line| {
+                                        const trimmed = std.mem.trimLeft(u8, line, " ");
+                                        if (std.mem.startsWith(u8, trimmed, "(memory")) continue;
+                                        if (std.mem.startsWith(u8, trimmed, "(global")) continue;
+                                        if (std.mem.startsWith(u8, trimmed, "(data")) continue;
+                                        // Keep only function exports (strip memory/global exports)
+                                        if (std.mem.startsWith(u8, trimmed, "(export")) {
+                                            if (std.mem.indexOf(u8, line, "(func") == null) continue;
+                                            if (std.mem.indexOf(u8, line, "__wasm_call_ctors") != null) continue;
+                                        }
+                                        if (std.mem.indexOf(u8, line, "__wasm_call_ctors")) |_| continue;
+                                        stripped.appendSlice(allocator, line) catch {};
+                                        stripped.append(allocator, '\n') catch {};
+                                    }
+                                    // Write stripped WAT to temp file
+                                    var tmp_wat_buf: [4096]u8 = undefined;
+                                    const tmp_wat = std.fmt.bufPrintZ(&tmp_wat_buf, "{s}.stripped.wat", .{sw}) catch null;
+                                    if (tmp_wat) |tw| {
+                                        if (std.fs.cwd().createFile(tw, .{})) |f| {
+                                            defer f.close();
+                                            f.writeAll(stripped.items) catch {};
+                                            // Recompile stripped WAT → WASM (no memory)
+                                            const parse_result = runCommand(allocator, &.{
+                                                "wasm-tools", "parse", tw, "-o", sw,
+                                            }) catch null;
+                                            if (parse_result) |pr| {
+                                                defer {
+                                                    if (pr.stdout) |s2| allocator.free(s2);
+                                                    if (pr.stderr) |s2| allocator.free(s2);
+                                                }
+                                            }
+                                            std.fs.cwd().deleteFile(tw) catch {};
+                                        } else |_| {}
+                                    }
+                                }
+                            }
                             if (std.fs.cwd().statFile(sw)) |stat| {
                                 std.debug.print("[build] Standalone WASM: {s} ({d} bytes)\n", .{ sw, stat.size });
                             } else |_| {}
