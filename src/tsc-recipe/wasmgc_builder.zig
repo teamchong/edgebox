@@ -426,6 +426,9 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\    (param $flagsArr (ref null $flags))
         \\    (param $bloomArr (ref null $flags))
         \\    (param $unionArr (ref null $flags))
+        \\    (param $propHashArr (ref null $flags))
+        \\    (param $propTypeArr (ref null $flags))
+        \\    (param $propCountArr (ref null $flags))
         \\    (param $src i32) (param $tgt i32) (param $rel i32) (param $strictNull i32)
         \\    (result i32)
         \\    (local $s i32) (local $t i32) (local $r i32)
@@ -481,6 +484,23 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\        (local.get $unionArr) (local.get $tgt) (local.get $src) (local.get $strictNull)))
         \\      (if (i32.ne (local.get $r) (i32.const -1))
         \\        (then (return (local.get $r))))))
+        \\    ;; Object vs Object: try structural property comparison (recursive in WASM)
+        \\    (local.set $s (array.get $flags (local.get $flagsArr) (local.get $src)))
+        \\    (local.set $t (array.get $flags (local.get $flagsArr) (local.get $tgt)))
+        \\    (if (i32.and
+        \\      (i32.and
+        \\        (i32.ne (i32.and (local.get $s) (i32.const 524288)) (i32.const 0))
+        \\        (i32.ne (i32.and (local.get $t) (i32.const 524288)) (i32.const 0)))
+        \\      (i32.and
+        \\        (i32.eqz (i32.and (local.get $s) (i32.const 3670016)))
+        \\        (i32.eqz (i32.and (local.get $t) (i32.const 3670016)))))
+        \\      (then
+        \\        (local.set $r (call $checkStructural
+        \\          (local.get $flagsArr) (local.get $propHashArr)
+        \\          (local.get $propTypeArr) (local.get $propCountArr)
+        \\          (local.get $src) (local.get $tgt)))
+        \\        (if (i32.ne (local.get $r) (i32.const -1))
+        \\          (then (return (local.get $r))))))
         \\    ;; Complex types: fall through to JS checker.
         \\    (i32.const -1))
         \\
@@ -541,21 +561,14 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\                           (i32.gt_u (local.get $tgtPropType) (i32.const 0)))
         \\                  (i32.ne (local.get $srcPropType) (local.get $tgtPropType)))
         \\                  (then
-        \\                    ;; Different prop types — check flag compatibility
-        \\                    (local.set $sf (array.get $flags (local.get $flagsArr) (local.get $srcPropType)))
-        \\                    (local.set $tf (array.get $flags (local.get $flagsArr) (local.get $tgtPropType)))
-        \\                    ;; Quick flag check: StringLike→String, NumberLike→Number, etc.
-        \\                    (if (i32.eqz (i32.or
-        \\                      (i32.or
-        \\                        (i32.and (i32.ne (i32.and (local.get $sf) (i32.const 402653316)) (i32.const 0))
-        \\                                 (i32.ne (i32.and (local.get $tf) (i32.const 4)) (i32.const 0)))
-        \\                        (i32.and (i32.ne (i32.and (local.get $sf) (i32.const 296)) (i32.const 0))
-        \\                                 (i32.ne (i32.and (local.get $tf) (i32.const 8)) (i32.const 0))))
-        \\                      (i32.or
-        \\                        (i32.and (i32.ne (i32.and (local.get $sf) (i32.const 528)) (i32.const 0))
-        \\                                 (i32.ne (i32.and (local.get $tf) (i32.const 16)) (i32.const 0)))
-        \\                        (i32.or (i32.and (local.get $tf) (i32.const 1))
-        \\                                (i32.and (local.get $sf) (i32.const 131072))))))
+        \\                    ;; RECURSIVE: use checkRel for full flag comparison on property types.
+        \\                    ;; This stays in WASM — no JS boundary crossing.
+        \\                    (local.set $sf (call $checkRel
+        \\                      (local.get $flagsArr) (local.get $propCountArr)
+        \\                      (local.get $srcPropType) (local.get $tgtPropType) (i32.const 0)))
+        \\                    (if (i32.eq (local.get $sf) (i32.const 0))
+        \\                      (then (return (i32.const 0))))
+        \\                    (if (i32.eq (local.get $sf) (i32.const -1))
         \\                      (then (return (i32.const -1))))))
         \\                (br $innerDone)))
         \\            (local.set $j (i32.add (local.get $j) (i32.const 1)))

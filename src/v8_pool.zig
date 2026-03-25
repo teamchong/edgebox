@@ -322,6 +322,42 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         }
     }
 
+    // Always-on: setStructuredTypeMembers → populate bloom + property arrays in WASM.
+    // This is the data model for WASM structural checking. No behavior change — just data.
+    {
+        const ssm_lite_needle = "function setStructuredTypeMembers(type, members, callSignatures, constructSignatures, indexInfos) {";
+        const ssm_lite_inject = "function setStructuredTypeMembers(type, members, callSignatures, constructSignatures, indexInfos) {" ++
+            "var _bid=type.id;" ++
+            "if(_bid>0&&_bid<16384&&members&&members!==emptySymbols&&globalThis.__gcPropHashArr){" ++
+            "var _pSf=globalThis.__gcFlags.setFlag;" ++
+            "var _pHA=globalThis.__gcPropHashArr,_pTA=globalThis.__gcPropTypeArr,_pCA=globalThis.__gcPropCountArr;" ++
+            "var _bA=globalThis.__gcBloomArr,_bloom=0,_pi=0,_pBase=_bid*8;" ++
+            "members.forEach(function(_v,_k){" ++
+            "if(_v.flags&16777216)return;" ++ // skip optional
+            "if(_k.charCodeAt(0)===95&&_k.charCodeAt(1)===95)return;" ++ // skip __internal
+            "var _h=2166136261;" ++ // FNV-1a hash
+            "for(var _ci=0;_ci<_k.length;_ci++){_h=Math.imul(_h^_k.charCodeAt(_ci),16777619);}" ++
+            "_bloom|=(1<<(_h&31))|(1<<((_h>>>5)&31))|(1<<((_h>>>10)&31));" ++ // bloom bits
+            "if(_pi<8){" ++ // max 8 props per type
+            "_pSf(_pHA,(_pBase+_pi)|0,_h|0);" ++
+            "var _pTid=0;if(_v.links&&_v.links.type&&_v.links.type.id>0)_pTid=_v.links.type.id;" ++
+            "_pSf(_pTA,(_pBase+_pi)|0,_pTid|0);_pi++;}" ++
+            "});" ++
+            "if(_bloom)_pSf(_bA,_bid|0,_bloom|0);" ++
+            "_pSf(_pCA,_bid|0,_pi|0);" ++
+            "}";
+
+        if (std.mem.indexOf(u8, result, ssm_lite_needle)) |ssm_idx| {
+            _ = std.posix.write(2, "[v8pool] WASM: property data populated for structural checks\n") catch {};
+            const ssm_len = result.len - ssm_lite_needle.len + ssm_lite_inject.len;
+            const ssm_result = try alloc.alloc(u8, ssm_len);
+            @memcpy(ssm_result[0..ssm_idx], result[0..ssm_idx]);
+            @memcpy(ssm_result[ssm_idx .. ssm_idx + ssm_lite_inject.len], ssm_lite_inject);
+            @memcpy(ssm_result[ssm_idx + ssm_lite_inject.len .. ssm_len], result[ssm_idx + ssm_lite_needle.len ..]);
+            result = ssm_result;
+        }
+    }
+
     // Heavy patches: only enabled with EDGEBOX_PATCHES=1
     if (!enable_heavy_patches) {
         return result;
@@ -380,11 +416,9 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
         "});" ++
         "if(_bloom)globalThis.__gcFlags.setFlag(globalThis.__gcBloomArr,_bid|0,_bloom|0);" ++
         "}" ++
-        // Also populate property hash/type arrays for structural checking
-        // Structural property population disabled — overhead > savings on cold.
-        // Property population adds ~100ms (forEach + setFlag per prop).
-        // Structural WASM check saves ~0ms (too few Object→Object comparisons).
-        "if(false&&_bid>0&&_bid<16384&&(type.flags&524288)&&globalThis.__gcPropHashArr){" ++
+        // Populate property hash/type arrays for structural WASM checking.
+        // WASM checkStructural uses these for recursive property comparison.
+        "if(_bid>0&&_bid<16384&&(type.flags&524288)&&globalThis.__gcPropHashArr){" ++
         "var _pSf=globalThis.__gcFlags.setFlag;" ++
         "var _pHA=globalThis.__gcPropHashArr;" ++
         "var _pTA=globalThis.__gcPropTypeArr;" ++
