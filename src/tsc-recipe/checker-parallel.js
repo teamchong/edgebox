@@ -104,13 +104,52 @@ globalThis.__gcFlagsDone = false;
   MonoSignature.prototype = Object.create(origSigProto);
   MonoSignature.prototype.constructor = MonoSignature;
 
+  // MonoSymbol: hashes escapedName to i32 for WASM comparison.
+  // Stored in _symbolNameHash[symbol.id] → WASM reads hash, compares as i32.
+  var origSymProto = ts.objectAllocator.getSymbolConstructor().prototype;
+  var _symbolNameHashArr = null;
+  var _symbolSetFlag = null;
+  var _symbolCount = 0;
+  globalThis.__connectMonoSymbol = function(hashArr, setFlag) {
+    _symbolNameHashArr = hashArr;
+    _symbolSetFlag = setFlag;
+    _symbolCount = 0;
+  };
+  function MonoSymbol(flags, name) {
+    this.flags = flags;
+    this.escapedName = name;
+    this.declarations = void 0;
+    this.valueDeclaration = void 0;
+    this.id = 0;
+    this.mergeId = 0;
+    this.parent = void 0;
+    this.members = void 0;
+    this.exports = void 0;
+    this.exportSymbol = void 0;
+    this.constEnumOnlyModule = void 0;
+    this.isReferenced = void 0;
+    this.lastAssignmentPos = void 0;
+    this.links = void 0;
+    // Hash escapedName for WASM comparison
+    if (_symbolSetFlag && name) {
+      _symbolCount++;
+      if (_symbolCount < 131072) {
+        var h = 2166136261;
+        for (var i = 0; i < name.length; i++) h = Math.imul(h ^ name.charCodeAt(i), 16777619);
+        _symbolSetFlag(_symbolNameHashArr, _symbolCount, h | 0);
+      }
+    }
+  }
+  MonoSymbol.prototype = Object.create(origSymProto);
+  MonoSymbol.prototype.constructor = MonoSymbol;
+
   ts.setObjectAllocator({
     getNodeConstructor: function() { return MonoNode; },
     getTokenConstructor: function() { return MonoNode; },
     getIdentifierConstructor: function() { return MonoNode; },
     getPrivateIdentifierConstructor: function() { return MonoNode; },
     getSourceFileConstructor: ts.objectAllocator.getSourceFileConstructor,
-    getSymbolConstructor: ts.objectAllocator.getSymbolConstructor,
+    getSymbolConstructor: function() { return MonoSymbol; },
     getTypeConstructor: function() { return MonoType; },
     getSignatureConstructor: function() { return MonoSignature; },
     getSourceMapSourceConstructor: ts.objectAllocator.getSourceMapSourceConstructor,
@@ -203,6 +242,13 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     if (globalThis.__connectMonoType) {
       globalThis.__connectMonoType(globalThis.__gcFlagsArr, _checkerInst.exports.setFlag);
     }
+    // Symbol name hash array for WASM enum comparison
+    globalThis.__gcSymbolHashArr = _checkerInst.exports.newFlags(131072);
+    if (globalThis.__connectMonoSymbol) {
+      globalThis.__connectMonoSymbol(globalThis.__gcSymbolHashArr, _checkerInst.exports.setFlag);
+    }
+    // Type value array for literal comparison (stores value as i32 hash)
+    globalThis.__gcValueArr = _checkerInst.exports.newFlags(131072);
     // 3. __gcCheck: thin wrapper → native WASM checkRelation + checkSrcToUnion
     var _checker = _checkerInst.exports.checkRelation;
     var _unionChecker = _checkerInst.exports.checkSrcToUnion;
