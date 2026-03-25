@@ -481,8 +481,7 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\        (local.get $unionArr) (local.get $tgt) (local.get $src) (local.get $strictNull)))
         \\      (if (i32.ne (local.get $r) (i32.const -1))
         \\        (then (return (local.get $r))))))
-        \\    ;; Structural check disabled in isRelatedToFast — false negatives
-        \\    ;; from incomplete property data. Available as separate checkStructural export.
+        \\    ;; Complex types: fall through to JS checker.
         \\    (i32.const -1))
         \\
         \\  ;; checkStructural: property-by-property structural comparison
