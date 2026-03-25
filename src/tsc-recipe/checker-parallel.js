@@ -248,16 +248,10 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       // unknown-like, it returns true anyway after the frozen check falls through.
       globalThis.__frozenImportUnknown = function(a) { return 0; };
       try {
-        var _frozenImports = {
-          env: {
-            __import_enumCheck: function(a, b) { return globalThis.__frozenImportEnum(a, b); },
-            __import_objCheck: function(a, b) { return globalThis.__frozenImportObj(a, b); },
-            __import_unknownCheck: function(a) { return globalThis.__frozenImportUnknown(a); },
-          }
-        };
+        // Freeze-compiled WASM — no imports needed (pure numeric functions)
         var _frozenInst = globalThis.__edgebox_instantiate_wasm
-          ? globalThis.__edgebox_instantiate_wasm(_frozenBuf, _frozenImports)
-          : new WebAssembly.Instance(new WebAssembly.Module(_frozenBuf), _frozenImports);
+          ? globalThis.__edgebox_instantiate_wasm(_frozenBuf)
+          : new WebAssembly.Instance(new WebAssembly.Module(_frozenBuf));
         globalThis.__frozenIsRelated = _frozenInst.exports.isRelatedToFast;
         // __frozenIsRelated already force-TurboFan'd by __edgebox_instantiate_wasm
         __edgebox_write_stderr('[recipe] Frozen isRelatedToFast: ' + _frozenBuf.byteLength + 'B\n');
@@ -619,10 +613,36 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   // Without this, the FIRST getSemanticDiagnostics call pays ~300ms initialization.
   // getTypeChecker() is cheap if checker already exists.
   var _tc2 = program.getTypeChecker();
-  // Activate build-time transformed globals (closure → global conversion).
-  // Each global is force-TurboFan'd for instant native speed.
-  // TODO: replace with freeze-compiled WASM versions.
-  var _ebFuncs = ['isSimpleTypeRelatedTo', 'isTypeRelatedTo'];
+  // Activate freeze-compiled WASM for isSimpleTypeRelatedTo.
+  // The frozen WASM takes integer flags — the wrapper extracts source.flags, target.flags.
+  // Falls through to JS for cases WASM returns -1 (unknown).
+  // Set JS fallback first (before WASM override)
+  if (typeof __eb_isSimpleTypeRelatedTo_impl === 'function') {
+    globalThis.__eb_isSimpleTypeRelatedTo = __eb_isSimpleTypeRelatedTo_impl;
+  }
+  // Override with freeze-compiled WASM (falls through to JS fallback for unknowns)
+  // Frozen WASM disabled — false positives (44 diags). Need to fix WASM correctness.
+  if (false && globalThis.__frozenIsRelated) {
+    var _frozenCheck = globalThis.__frozenIsRelated;
+    var _jsFallback = globalThis.__eb_isSimpleTypeRelatedTo;
+    globalThis.__eb_isSimpleTypeRelatedTo = function(source, target, relation, errorReporter,
+        strictNullChecks, wildcardType, assignableRelation, comparableRelation, strictSubtypeRelation) {
+      var sf = source.flags | 0, tf = target.flags | 0;
+      var rel = relation === assignableRelation ? 0 : relation === comparableRelation ? 1 :
+                relation === strictSubtypeRelation ? 3 : 4;
+      var r = _frozenCheck(source.id | 0, target.id | 0, sf, tf, rel, strictNullChecks ? 1 : 0);
+      if (r === 1) return true;
+      if (r === 0) return false;
+      // -1 = unknown, fall through to JS
+      return _jsFallback(source, target, relation, errorReporter,
+            strictNullChecks, wildcardType, assignableRelation, comparableRelation, strictSubtypeRelation);
+    };
+    if (globalThis.__edgebox_force_turbofan) {
+      globalThis.__edgebox_force_turbofan(globalThis.__eb_isSimpleTypeRelatedTo);
+    }
+  }
+  // Activate other globals (force-TurboFan on JS impls — future: freeze to WASM)
+  var _ebFuncs = ['isTypeRelatedTo'];
   for (var _ebi = 0; _ebi < _ebFuncs.length; _ebi++) {
     var _ebName = '__eb_' + _ebFuncs[_ebi];
     var _ebImpl = globalThis[_ebName + '_impl'];

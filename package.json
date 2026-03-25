@@ -34,7 +34,7 @@
   },
   "homepage": "https://github.com/teamchong/edgebox#readme",
   "devDependencies": {
-    "typescript": "^5.9.3"
+    "typescript": "5.9.0-dev.20250304"
   },
   "dependencies": {
     "@typescript/native-preview": "^7.0.0-dev.20260321.1",

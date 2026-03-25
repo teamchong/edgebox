@@ -270,9 +270,14 @@ fn applyRecipeTransform(src: []const u8) ![]const u8 {
     // Keep them by default for warm mode where TurboFan inlines WasmGC.
     // Source injections add ~100ms overhead on first cold (duplicate TSC's isSimpleTypeRelatedTo).
     // Default: skip injections. Set EDGEBOX_PATCHES=1 to enable (useful for warm mode).
-    // LEAN mode: always enabled — createType flags + isTypeRelatedTo WASM fast-path.
-    // Only the heavy patches (setStructuredTypeMembers, bloom filter, etc.) are gated.
-    const enable_heavy_patches = std.posix.getenv("EDGEBOX_PATCHES") != null;
+    // Source injections break V8 feedback vectors (A/B tested: +50ms overhead).
+    // Disabled by default. WASM checker only helps when savings > injection cost.
+    // Set EDGEBOX_PATCHES=1 to enable (for warm mode where TurboFan is active).
+    const enable_patches = std.posix.getenv("EDGEBOX_PATCHES") != null;
+    if (!enable_patches) {
+        return result;
+    }
+    const enable_heavy_patches = enable_patches;
 
     // Patch 1: createType — write type.id→flags to WasmGC array.
     const ct_needle = "function createType(flags) {";
