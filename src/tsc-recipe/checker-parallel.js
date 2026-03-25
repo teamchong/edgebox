@@ -668,36 +668,10 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   }
   // Override with freeze-compiled WASM (falls through to JS fallback for unknowns)
   // Frozen WASM disabled — false positives (44 diags). Need to fix WASM correctness.
-  if (false && globalThis.__frozenIsRelated) { // disabled: WASM correctness issue
-    var _frozenCheck = globalThis.__frozenIsRelated;
-    var _jsFallback = globalThis.__eb_isSimpleTypeRelatedTo;
-    var _symHashGet = globalThis.__gcChecker ? globalThis.__gcChecker.getFlag : null;
-    var _symHashArr = globalThis.__gcSymbolHashArr;
-    globalThis.__eb_isSimpleTypeRelatedTo = function(source, target, relation, errorReporter,
-        strictNullChecks, wildcardType, assignableRelation, comparableRelation, strictSubtypeRelation) {
-      var sf = source.flags | 0, tf = target.flags | 0;
-      var rel = relation === assignableRelation ? 0 : relation === comparableRelation ? 1 :
-                relation === strictSubtypeRelation ? 3 : 4;
-      var srcSH = 0, tgtSH = 0;
-      if (_symHashGet && _symHashArr) {
-        if (source.symbol && source.symbol.id > 0 && source.symbol.id < 131072)
-          srcSH = _symHashGet(_symHashArr, source.symbol.id);
-        if (target.symbol && target.symbol.id > 0 && target.symbol.id < 131072)
-          tgtSH = _symHashGet(_symHashArr, target.symbol.id);
-      }
-      var srcV = source.value !== void 0 ? source.value | 0 : 0;
-      var tgtV = target.value !== void 0 ? target.value | 0 : 0;
-      var r = _frozenCheck(source.id | 0, target.id | 0, sf, tf, rel, strictNullChecks ? 1 : 0,
-                            srcSH, tgtSH, srcV, tgtV);
-      if (r === 1) return true;
-      if (r === 0) return false;
-      return _jsFallback(source, target, relation, errorReporter,
-            strictNullChecks, wildcardType, assignableRelation, comparableRelation, strictSubtypeRelation);
-    };
-    if (globalThis.__edgebox_force_turbofan) {
-      globalThis.__edgebox_force_turbofan(globalThis.__eb_isSimpleTypeRelatedTo);
-    }
-  }
+  // Frozen WASM checker disabled — loading during snapshot corrupts warmup state.
+  // The WasmGC isRelatedToFast (type_checker_gc.wasm) handles flag checks via
+  // source injection. The freeze-compiled checker is redundant.
+  // TODO: load frozen WASM only on workers (not during snapshot creation).
   // Activate other globals (force-TurboFan on JS impls — future: freeze to WASM)
   var _ebFuncs = ['isTypeRelatedTo'];
   for (var _ebi = 0; _ebi < _ebFuncs.length; _ebi++) {

@@ -2,7 +2,7 @@
 // Contains: print capture, error handling, console, timers
 
 // Capture native print function (QuickJS's js_std_add_helpers provides it)
-const __native_print = typeof print === 'function' ? print : () => {};
+var __native_print = typeof print === 'function' ? print : () => {};
 
 // GUARD: Skip if already initialized (Wizer pre-initialized case)
 if (globalThis._runtimePolyfillsInitialized) {
