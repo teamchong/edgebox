@@ -74,13 +74,8 @@ globalThis.__gcFlagsDone = false;
     this.value = void 0;
     this.regularType = void 0;
     this.freshType = void 0;
-    // Write flags to WASM array — no source injection needed.
-    // TSC will set this.id = typeCount right after this constructor.
-    // typeCount starts at 1 and increments by 1 per createType call.
-    _monoTypeCount++;
-    if (_monoSetFlag && _monoTypeCount < 131072) {
-      _monoSetFlag(_monoFlagsArr, _monoTypeCount, flags | 0);
-    }
+    // Flags written to WASM array by createType wrapper (after type.id is set).
+    // No prediction needed — createType has the actual type.id.
   }
   MonoType.prototype = Object.create(origTypeProto);
   MonoType.prototype.constructor = MonoType;

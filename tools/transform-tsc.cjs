@@ -140,11 +140,11 @@ for (const t of transforms) {
   // Create wrapper with WasmGC fast-path + inline fallback
   const paramNames = t.params.split(',').map(s => s.trim());
   let wasmFastPath = '';
-  if (t.name === 'isSimpleTypeRelatedTo') {
+  if (false) { // WASM fast-path disabled — needs unified module with correct freeze logic
     // WasmGC isRelatedToFast: built at build time, runs in snapshot.
     // Handles flag checks as pure integer ops — no closure refs needed.
     // Falls through to inline fallback for string/value/object cases.
-    // __frozenIsRelated = freeze-compiled isRelatedToFast from frozen_checker.js.
+    // __gcCheckRel = freeze-compiled isRelatedToFast from frozen_checker.js.
     // Same logic as this function, compiled to WASM at build time.
     // Returns 1=true, 0=false, -1=unknown (fall through to inline JS).
     // WASM fast-path: always call freeze-compiled isRelatedToFast.
@@ -154,21 +154,33 @@ for (const t of transforms) {
     // WASM fast-path with enum hash + value comparison (10 params).
     // MonoSymbol stores name hash in __gcSymbolHashArr.
     // source.value is integer for number literals.
+    // Freeze-compiled WASM (correct, from actual TSC logic).
+    // Minimal extraction: .id + .flags (V8 inline cache, fast).
+    // ONE code path: __gcCheckRel calls unified WasmGC module.
+    // WASM reads flags from GC array by type ID — no JS extraction.
+    // Only pass IDs + relation. WASM does the rest.
     wasmFastPath = `
-    var _srcSH = 0, _tgtSH = 0, _srcV = 0, _tgtV = 0;
-    if (source.symbol) _srcSH = source.symbol._nameHash | 0;
-    if (target.symbol) _tgtSH = target.symbol._nameHash | 0;
-    if (source.value !== void 0) _srcV = source.value | 0;
-    if (target.value !== void 0) _tgtV = target.value | 0;
-    var _r = globalThis.__frozenIsRelated(source.id | 0, target.id | 0,
-      source.flags | 0, target.flags | 0,
+    var _r = globalThis.__DISABLED_gcCheckRel(source.id | 0, target.id | 0,
       relation === assignableRelation ? 0 : relation === comparableRelation ? 1 :
       relation === strictSubtypeRelation ? 3 : relation === identityRelation ? 4 : 2,
-      strictNullChecks ? 1 : 0, _srcSH, _tgtSH, _srcV, _tgtV);
+      strictNullChecks ? 1 : 0);
     if (_r === 1) return true;
     if (_r === 0) return false;`;
   }
-  const wrapper = `function ${t.name}(${t.params}) {${wasmFastPath}
+  let postCall = '';
+  if (false && t.name === 'createType') {
+    // After createType runs, type.id is set. Write flags to WASM array.
+    // No prediction — use the actual type.id that TSC assigned.
+    postCall = `
+    var _ct_result = (function(${t.params}) ${originalBody.substring(sig.length - 1)})(${paramNames.join(', ')});
+    if (_ct_result && _ct_result.id > 0 && _ct_result.id < 131072 && globalThis.__gcFlags) {
+      globalThis.__gcFlags.setFlag(globalThis.__gcFlagsArr, _ct_result.id | 0, flags | 0);
+    }
+    return _ct_result;`;
+  }
+  const wrapper = postCall
+    ? `function ${t.name}(${t.params}) {${wasmFastPath}${postCall}}`
+    : `function ${t.name}(${t.params}) {${wasmFastPath}
     ${originalBody.replace(sig, '{')}
   }`;
 
