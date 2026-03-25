@@ -266,7 +266,28 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
         }
       }
     }
-    // 3. Set ts alias
+    // 3. EdgeBox infrastructure: force TurboFan + WASM instantiation with auto-TurboFan.
+    // These are EdgeBox APIs, not recipe-specific. Any recipe's WASM wrappers get instant TurboFan.
+    {
+      const char* infra_code =
+          // Force instant TurboFan on a JS function.
+          // Uses V8 %PrepareFunctionForOptimization + %OptimizeFunctionOnNextCall.
+          "globalThis.__edgebox_force_turbofan = function(fn) {"
+          "  try {"
+          "    %PrepareFunctionForOptimization(fn);"
+          "    %OptimizeFunctionOnNextCall(fn, 'concurrent');"
+          "  } catch(e) {}"
+          "};"
+          // Instantiate a WASM module. WASM exports are already native —
+          // they DON'T need %OptimizeFunctionOnNextCall (that crashes on WASM).
+          // The JS WRAPPERS the recipe creates around WASM exports are what need TurboFan.
+          // Recipe calls __edgebox_force_turbofan on its wrapper functions.
+          "globalThis.__edgebox_instantiate_wasm = function(buf, imports) {"
+          "  return new WebAssembly.Instance(new WebAssembly.Module(buf), imports);"
+          "};";
+      EvalInContext(isolate, context, infra_code, strlen(infra_code));
+    }
+    // 4. Set ts alias
     EvalInContext(isolate, context, "globalThis.ts = globalThis.module.exports;", 42);
     // 4. Eval worker_init (process, require with real IO)
     EvalInContext(isolate, context, init_code, init_len);

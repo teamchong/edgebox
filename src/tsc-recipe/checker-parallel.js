@@ -152,7 +152,9 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     var _checkerBuf = __edgebox_read_binary(_root + '/src/tsc-recipe/type_checker_gc.wasm');
     if (!_checkerBuf || !(_checkerBuf instanceof ArrayBuffer) || _checkerBuf.byteLength < 8)
       throw new Error('[recipe] FATAL: type_checker_gc.wasm read failed (' + _checkerBuf + ')');
-    var _checkerInst = new WebAssembly.Instance(new WebAssembly.Module(_checkerBuf));
+    var _checkerInst = globalThis.__edgebox_instantiate_wasm
+      ? globalThis.__edgebox_instantiate_wasm(_checkerBuf)
+      : new WebAssembly.Instance(new WebAssembly.Module(_checkerBuf));
     globalThis.__gcChecker = _checkerInst.exports;
     globalThis.__gcFlags = _checkerInst.exports;
     // 131072 = 128K entries. Playwright creates ~76K types.
@@ -163,7 +165,9 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     if (!_soaBuf || !(_soaBuf instanceof ArrayBuffer) || _soaBuf.byteLength < 8) {
       throw new Error('[recipe] FATAL: soa_gc.wasm read failed');
     }
-    var _soaInst = new WebAssembly.Instance(new WebAssembly.Module(_soaBuf));
+    var _soaInst = globalThis.__edgebox_instantiate_wasm
+      ? globalThis.__edgebox_instantiate_wasm(_soaBuf)
+      : new WebAssembly.Instance(new WebAssembly.Module(_soaBuf));
     globalThis.__gcSoa = _soaInst.exports;
     // Create objectFlags array (same capacity as type flags)
     globalThis.__gcObjFlagsArr = _soaInst.exports.newI32(65536);
@@ -198,18 +202,13 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     globalThis.__gcCheckRel = function(_si, _ti, _rel, _sn) {
       return _relFast(_fA, _bA, _uA, _si, _ti, _rel, _sn);
     };
-    // 4. Warmup + force TurboFan
-    var _gf = _checkerInst.exports.getFlag, _sf = _checkerInst.exports.setFlag;
-    for (var _wi = 0; _wi < 500; _wi++) {
-      _sf(_fA, _wi % 100, _wi); _gf(_fA, _wi % 100);
-      _checker(_fA, _bA, _wi % 100, (_wi + 1) % 100);
+    // WASM wrappers (__gcCheck, __gcCheckRel) created from exports of
+    // __edgebox_instantiate_wasm — already have instant TurboFan.
+    // Recipe-created wrappers also get force-optimized:
+    if (globalThis.__edgebox_force_turbofan) {
+      globalThis.__edgebox_force_turbofan(globalThis.__gcCheck);
+      globalThis.__edgebox_force_turbofan(globalThis.__gcCheckRel);
     }
-    try {
-      eval('%PrepareFunctionForOptimization(globalThis.__gcCheck)');
-      globalThis.__gcCheck(1, 2); globalThis.__gcCheck(100, 200);
-      eval('%OptimizeFunctionOnNextCall(globalThis.__gcCheck)');
-      globalThis.__gcCheck(1, 2);
-    } catch(e) {}
     __edgebox_write_stderr('[recipe] WasmGC: checker=' + _checkerBuf.byteLength + 'B soa=' + _soaBuf.byteLength + 'B\n');
 
     // 5. Load frozen isSimpleTypeRelatedTo — ACTUAL TSC function as WASM.
@@ -229,14 +228,18 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       // unknown-like, it returns true anyway after the frozen check falls through.
       globalThis.__frozenImportUnknown = function(a) { return 0; };
       try {
-        var _frozenInst = new WebAssembly.Instance(new WebAssembly.Module(_frozenBuf), {
+        var _frozenImports = {
           env: {
             __import_enumCheck: function(a, b) { return globalThis.__frozenImportEnum(a, b); },
             __import_objCheck: function(a, b) { return globalThis.__frozenImportObj(a, b); },
             __import_unknownCheck: function(a) { return globalThis.__frozenImportUnknown(a); },
           }
-        });
+        };
+        var _frozenInst = globalThis.__edgebox_instantiate_wasm
+          ? globalThis.__edgebox_instantiate_wasm(_frozenBuf, _frozenImports)
+          : new WebAssembly.Instance(new WebAssembly.Module(_frozenBuf), _frozenImports);
         globalThis.__frozenIsRelated = _frozenInst.exports.isRelatedToFast;
+        // __frozenIsRelated already force-TurboFan'd by __edgebox_instantiate_wasm
         __edgebox_write_stderr('[recipe] Frozen isRelatedToFast: ' + _frozenBuf.byteLength + 'B\n');
       } catch(e) {
         __edgebox_write_stderr('[recipe] Frozen load failed: ' + e.message + '\n');
