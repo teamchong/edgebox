@@ -335,7 +335,7 @@ pub fn generateStandaloneWasm(
                     };
                 }
                 // Declare import with correct param count
-                var import_params: [8]llvm.Type = undefined;
+                var import_params: [16]llvm.Type = undefined;
                 var pi: u32 = 0;
                 _ = &import_params; // suppress unused warning
                 while (pi < @min(call_argc, 8)) : (pi += 1) import_params[pi] = llvm.i32Type();
@@ -391,7 +391,7 @@ pub fn generateStandaloneWasm(
         // Count extra length params (one per array arg with .length)
         var extra_len_count: u32 = 0;
         for (0..func.arg_count) |i| {
-            if (length_args & (@as(u8, 1) << @intCast(i)) != 0) extra_len_count += 1;
+            if (i < 8 and length_args & (@as(u8, 1) << @as(u3, @intCast(i))) != 0) extra_len_count += 1;
         }
 
         var param_types_buf: [16]llvm.Type = undefined;
@@ -479,7 +479,7 @@ pub fn generateStandaloneWasm(
         var struct_stride: u32 = 0;
         var struct_arg_idx: u3 = 0;
         for (0..@min(func.arg_count, 8)) |ai| {
-            if (si.struct_args & (@as(u8, 1) << @intCast(ai)) != 0) {
+            if (si.struct_args & (@as(u8, 1) << @as(u3, @intCast(@min(ai, 7)))) != 0) {
                 struct_stride += si.field_counts[ai];
                 struct_arg_idx = @intCast(ai);
                 break; // batch over first struct arg only
@@ -500,7 +500,7 @@ pub fn generateStandaloneWasm(
         // Count scalar (non-struct) args
         var scalar_count: u32 = 0;
         for (0..func.arg_count) |ai| {
-            if (si.struct_args & (@as(u8, 1) << @intCast(ai)) == 0) scalar_count += 1;
+            if (si.struct_args & (@as(u8, 1) << @as(u3, @intCast(@min(ai, 7)))) == 0) scalar_count += 1;
         }
 
         // Batch function: (pool_ptr: i32, count: i32, ...scalar_args: elem_type) → elem_type
@@ -513,7 +513,7 @@ pub fn generateStandaloneWasm(
         batch_params[1] = llvm.i32Type(); // count
         var bp_idx: u32 = 2;
         for (0..func.arg_count) |ai| {
-            if (si.struct_args & (@as(u8, 1) << @intCast(ai)) == 0) {
+            if (si.struct_args & (@as(u8, 1) << @as(u3, @intCast(@min(ai, 7)))) == 0) {
                 batch_params[bp_idx] = elem_type;
                 bp_idx += 1;
             }
@@ -552,7 +552,7 @@ pub fn generateStandaloneWasm(
         var ca_idx: u32 = 0;
         var scalar_param_idx: u32 = 2;
         for (0..func.arg_count) |ai| {
-            if (si.struct_args & (@as(u8, 1) << @intCast(ai)) != 0) {
+            if (si.struct_args & (@as(u8, 1) << @as(u3, @intCast(@min(ai, 7)))) != 0) {
                 // Struct arg → pointer (i32 in i32 tier, convert for f64 tier)
                 call_args[ca_idx] = switch (sf.value_kind) {
                     .i32 => ptr,
@@ -752,7 +752,7 @@ fn generateInt32Function(
     const hot_name = std.fmt.bufPrintZ(&hot_name_buf, "{s}_hot", .{sf.llvm_func_name}) catch
         return CodegenError.FormatError;
 
-    var param_types_buf: [8]llvm.Type = undefined;
+    var param_types_buf: [16]llvm.Type = undefined;
     for (0..func.arg_count) |i| {
         param_types_buf[i] = llvm.i32Type();
     }
@@ -812,7 +812,7 @@ fn generateInt32Function(
     const argv_param = c.LLVMGetParam(wrapper_fn, 3); // argv: ptr
     const argc_param = c.LLVMGetParam(wrapper_fn, 2); // argc: i32
 
-    var call_args_buf: [8]llvm.Value = undefined;
+    var call_args_buf: [16]llvm.Value = undefined;
     for (0..func.arg_count) |i| {
         // Check if i < argc
         const idx = llvm.constInt32(@intCast(i));
@@ -891,7 +891,7 @@ fn generateInt32Body(
     // Shadow function parameters with allocas so set_arg can store to them.
     // LLVM function params are immutable SSA values — can't buildStore to them.
     // mem2reg will promote these back to SSA if they're never stored to.
-    var params_buf: [8]llvm.Value = undefined;
+    var params_buf: [16]llvm.Value = undefined;
     for (0..analyzed.arg_count) |i| {
         var arg_name: [16]u8 = undefined;
         const name = std.fmt.bufPrintZ(&arg_name, "arg_{d}", .{i}) catch "arg";
@@ -951,7 +951,7 @@ fn emitInt32Instruction(
     builder: llvm.Builder,
     vstack: *std.ArrayListUnmanaged(llvm.Value),
     instr: Instruction,
-    params: *[8]llvm.Value,
+    params: *[16]llvm.Value,
     arg_count: u32,
     locals: *[256]llvm.Value,
     local_count: u32,
@@ -1374,7 +1374,7 @@ fn emitInt32Instruction(
             } else func;
 
             // Pop args in reverse order
-            var call_args: [8]llvm.Value = undefined;
+            var call_args: [16]llvm.Value = undefined;
             var i: u32 = call_argc;
             while (i > 0) {
                 i -= 1;
@@ -1382,7 +1382,7 @@ fn emitInt32Instruction(
             }
 
             // Build the call
-            var param_types_buf: [8]llvm.Type = undefined;
+            var param_types_buf: [16]llvm.Type = undefined;
             for (0..call_argc) |j| {
                 param_types_buf[j] = llvm.i32Type();
             }
@@ -1404,14 +1404,14 @@ fn emitInt32Instruction(
                 break :blk func;
             } else func;
 
-            var call_args: [8]llvm.Value = undefined;
+            var call_args: [16]llvm.Value = undefined;
             var i: u32 = call_argc;
             while (i > 0) {
                 i -= 1;
                 call_args[i] = i32VstackPop(vstack);
             }
 
-            var param_types_buf: [8]llvm.Type = undefined;
+            var param_types_buf: [16]llvm.Type = undefined;
             for (0..call_argc) |j| {
                 param_types_buf[j] = llvm.i32Type();
             }
@@ -1568,7 +1568,7 @@ fn generateNumericBody(
     }
 
     // Shadow function parameters with allocas
-    var params_buf: [8]llvm.Value = undefined;
+    var params_buf: [16]llvm.Value = undefined;
     for (0..analyzed.arg_count) |i| {
         var arg_name: [16]u8 = undefined;
         const name = std.fmt.bufPrintZ(&arg_name, "arg_{d}", .{i}) catch "arg";
@@ -1583,7 +1583,7 @@ fn generateNumericBody(
     {
         var len_param_idx: u32 = analyzed.arg_count;
         for (0..analyzed.arg_count) |i| {
-            if (length_args & (@as(u8, 1) << @intCast(i)) != 0) {
+            if (length_args & (@as(u8, 1) << @as(u3, @intCast(@min(i, 7)))) != 0) {
                 length_params[i] = c.LLVMGetParam(func, @intCast(len_param_idx));
                 len_param_idx += 1;
             }
@@ -2045,7 +2045,7 @@ fn emitNumericInstruction(
     builder: llvm.Builder,
     vstack: *std.ArrayListUnmanaged(llvm.Value),
     instr: Instruction,
-    params: *[8]llvm.Value,
+    params: *[16]llvm.Value,
     arg_count: u32,
     locals: *[256]llvm.Value,
     local_count: u32,
@@ -2679,7 +2679,7 @@ fn emitNumericInstruction(
                 break :blk callee;
             } else func;
 
-            var call_args: [8]llvm.Value = undefined;
+            var call_args: [16]llvm.Value = undefined;
             var i: u32 = call_argc;
             while (i > 0) {
                 i -= 1;
@@ -2708,7 +2708,7 @@ fn emitNumericInstruction(
                 }
             }
 
-            var param_types_buf: [8]llvm.Type = undefined;
+            var param_types_buf: [16]llvm.Type = undefined;
             const call_elem = if (needs_conv) callee_ret else elem_type;
             for (0..call_argc) |j| {
                 param_types_buf[j] = call_elem;
@@ -2736,7 +2736,7 @@ fn emitNumericInstruction(
                 break :blk func;
             } else func;
 
-            var call_args: [8]llvm.Value = undefined;
+            var call_args: [16]llvm.Value = undefined;
             var i: u32 = call_argc;
             while (i > 0) {
                 i -= 1;
@@ -2759,7 +2759,7 @@ fn emitNumericInstruction(
                 }
             }
 
-            var param_types_buf: [8]llvm.Type = undefined;
+            var param_types_buf: [16]llvm.Type = undefined;
             const tc_elem = if (tc_needs_conv) tc_callee_ret else elem_type;
             for (0..call_argc) |j| {
                 param_types_buf[j] = tc_elem;
@@ -2894,7 +2894,7 @@ fn emitNumericInstruction(
                     if (c.LLVMGetInstructionOpcode(source) == c.LLVMLoad)
                         source = c.LLVMGetOperand(source, 0);
                     for (0..@min(arg_count, 8)) |ai| {
-                        if (si.array_of_struct_args & (@as(u8, 1) << @intCast(ai)) != 0 and
+                        if (si.array_of_struct_args & (@as(u8, 1) << @as(u3, @intCast(@min(ai, 7)))) != 0 and
                             params.*[@intCast(ai)] == source)
                         {
                             // Stride in bytes: field_count * sizeof(i32)
@@ -3072,7 +3072,7 @@ fn emitNumericInstruction(
                 const combined_mask = si.struct_args | si.array_of_struct_args;
                 var found_arg: u3 = 0;
                 for (0..@min(arg_count, 8)) |ai| {
-                    if (combined_mask & (@as(u8, 1) << @intCast(ai)) != 0 and
+                    if (combined_mask & (@as(u8, 1) << @as(u3, @intCast(@min(ai, 7)))) != 0 and
                         params.*[@intCast(ai)] == source_alloca)
                     {
                         found_arg = @intCast(ai);

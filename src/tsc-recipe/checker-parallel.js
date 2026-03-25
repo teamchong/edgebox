@@ -131,13 +131,18 @@ globalThis.__gcFlagsDone = false;
     this.lastAssignmentPos = void 0;
     this.links = void 0;
     // Hash escapedName for WASM comparison
-    if (_symbolSetFlag && name) {
-      _symbolCount++;
-      if (_symbolCount < 131072) {
-        var h = 2166136261;
-        for (var i = 0; i < name.length; i++) h = Math.imul(h ^ name.charCodeAt(i), 16777619);
-        _symbolSetFlag(_symbolNameHashArr, _symbolCount, h | 0);
+    if (name) {
+      var h = 2166136261;
+      for (var i = 0; i < name.length; i++) h = Math.imul(h ^ name.charCodeAt(i), 16777619);
+      this._nameHash = h | 0;
+      if (_symbolSetFlag) {
+        _symbolCount++;
+        if (_symbolCount < 131072) {
+          _symbolSetFlag(_symbolNameHashArr, _symbolCount, h | 0);
+        }
       }
+    } else {
+      this._nameHash = 0;
     }
   }
   MonoSymbol.prototype = Object.create(origSymProto);

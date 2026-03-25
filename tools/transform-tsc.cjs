@@ -151,12 +151,20 @@ for (const t of transforms) {
     // No conditionals — WASM is always loaded at this point.
     // TurboFan inlines the WASM call at the JS callsite.
     // WASM fast-path — freeze-compiled at build time, native speed.
+    // WASM fast-path with enum hash + value comparison (10 params).
+    // MonoSymbol stores name hash in __gcSymbolHashArr.
+    // source.value is integer for number literals.
     wasmFastPath = `
+    var _srcSH = 0, _tgtSH = 0, _srcV = 0, _tgtV = 0;
+    if (source.symbol) _srcSH = source.symbol._nameHash | 0;
+    if (target.symbol) _tgtSH = target.symbol._nameHash | 0;
+    if (source.value !== void 0) _srcV = source.value | 0;
+    if (target.value !== void 0) _tgtV = target.value | 0;
     var _r = globalThis.__frozenIsRelated(source.id | 0, target.id | 0,
       source.flags | 0, target.flags | 0,
       relation === assignableRelation ? 0 : relation === comparableRelation ? 1 :
       relation === strictSubtypeRelation ? 3 : relation === identityRelation ? 4 : 2,
-      strictNullChecks ? 1 : 0);
+      strictNullChecks ? 1 : 0, _srcSH, _tgtSH, _srcV, _tgtV);
     if (_r === 1) return true;
     if (_r === 0) return false;`;
   }
