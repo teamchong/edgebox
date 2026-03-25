@@ -47,10 +47,26 @@ jobs:
           cd benchmark
           npm install
 
+      - name: Download rusty_v8 (if not cached)
+        run: |
+          if [ ! -f vendor/v8/librusty_v8_release_x86_64-unknown-linux-gnu.a ]; then
+            echo "Downloading rusty_v8 v146.1.0..."
+            mkdir -p vendor/v8
+            gh release download v146.1.0 --repo denoland/rusty_v8 \
+              --pattern "librusty_v8_release_x86_64-unknown-linux-gnu.a.gz" \
+              --dir /tmp/rv8
+            gunzip -c /tmp/rv8/librusty_v8_release_x86_64-unknown-linux-gnu.a.gz \
+              > vendor/v8/librusty_v8_release_x86_64-unknown-linux-gnu.a
+            rm -rf /tmp/rv8
+            echo "Downloaded: $(ls -lh vendor/v8/librusty_v8_release_x86_64-unknown-linux-gnu.a)"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Build EdgeBox CLI
         run: |
           if [ ! -f vendor/v8/librusty_v8_release_x86_64-unknown-linux-gnu.a ]; then
-            echo "::error::rusty_v8 not available — cannot build EdgeBox CLI"
+            echo "::error::rusty_v8 not available after download — cannot build"
             exit 1
           fi
           zig build edgebox-cli -p zig-out -Doptimize=ReleaseFast
