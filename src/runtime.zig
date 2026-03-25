@@ -1804,80 +1804,119 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             if (std.fs.cwd().access(so, .{})) |_| {
                 const standalone_wasm = std.fmt.bufPrint(&standalone_wasm_path_buf, "{s}/{s}-standalone.wasm", .{ output_dir, output_base }) catch null;
                 if (standalone_wasm) |sw| {
-                    const link_result = runCommand(allocator, &.{
-                        "wasm-ld-19", "--no-entry", "--export-all", "--export-memory",
-                        "--allow-undefined", "--initial-memory=131072", "-o", sw, so,
+                    // Convert .o directly to standalone WASM (skip wasm-ld).
+                    // The .o is a valid WASM module from LLVM. Just need to:
+                    // 1. Remove memory import (pure integer functions don't use memory)
+                    // 2. Add function exports
+                    // This produces snapshot-safe WASM (no linear memory = no corruption).
+                    const decompile_result = runCommand(allocator, &.{
+                        "wasm-tools", "print", so,
                     }) catch null;
-                    if (link_result) |lr| {
+                    if (decompile_result) |dr| {
                         defer {
-                            if (lr.stdout) |s| allocator.free(s);
-                            if (lr.stderr) |s| allocator.free(s);
+                            if (dr.stdout) |s| allocator.free(s);
+                            if (dr.stderr) |s| allocator.free(s);
                         }
-                        const link_ok = switch (lr.term) {
-                            .Exited => |code| code == 0,
-                            else => false,
-                        };
-                        if (link_ok) {
-                            has_standalone_wasm = true;
-                            // Strip memory section → WasmGC-compatible.
-                            // Pure integer functions don't use linear memory.
-                            // Without memory, WASM works in V8 snapshots and
-                            // gets TurboFan-inlined at JS callsites.
-                            const strip_result = runCommand(allocator, &.{
-                                "wasm-tools", "print", sw,
-                            }) catch null;
-                            if (strip_result) |sr| {
-                                defer {
-                                    if (sr.stdout) |s| allocator.free(s);
-                                    if (sr.stderr) |s| allocator.free(s);
-                                }
-                                if (sr.stdout) |wat_text| {
-                                    // Remove memory, globals, memory export, __wasm_call_ctors
-                                    var stripped = std.ArrayListUnmanaged(u8){};
-                                    defer stripped.deinit(allocator);
-                                    var lines = std.mem.splitScalar(u8, wat_text, '\n');
-                                    while (lines.next()) |line| {
-                                        const trimmed = std.mem.trimLeft(u8, line, " ");
-                                        if (std.mem.startsWith(u8, trimmed, "(memory")) continue;
-                                        if (std.mem.startsWith(u8, trimmed, "(global")) continue;
-                                        if (std.mem.startsWith(u8, trimmed, "(data")) continue;
-                                        // Keep only function exports (strip memory/global exports)
-                                        if (std.mem.startsWith(u8, trimmed, "(export")) {
-                                            if (std.mem.indexOf(u8, line, "(func") == null) continue;
-                                            if (std.mem.indexOf(u8, line, "__wasm_call_ctors") != null) continue;
-                                        }
-                                        if (std.mem.indexOf(u8, line, "__wasm_call_ctors")) |_| continue;
-                                        stripped.appendSlice(allocator, line) catch {};
-                                        stripped.append(allocator, '\n') catch {};
-                                    }
-                                    // Write stripped WAT to temp file
-                                    var tmp_wat_buf: [4096]u8 = undefined;
-                                    const tmp_wat = std.fmt.bufPrintZ(&tmp_wat_buf, "{s}.stripped.wat", .{sw}) catch null;
-                                    if (tmp_wat) |tw| {
-                                        if (std.fs.cwd().createFile(tw, .{})) |f| {
-                                            defer f.close();
-                                            f.writeAll(stripped.items) catch {};
-                                            // Recompile stripped WAT → WASM (no memory)
-                                            const parse_result = runCommand(allocator, &.{
-                                                "wasm-tools", "parse", tw, "-o", sw,
-                                            }) catch null;
-                                            if (parse_result) |pr| {
-                                                defer {
-                                                    if (pr.stdout) |s2| allocator.free(s2);
-                                                    if (pr.stderr) |s2| allocator.free(s2);
-                                                }
-                                            }
-                                            std.fs.cwd().deleteFile(tw) catch {};
-                                        } else |_| {}
-                                    }
-                                }
+                        if (dr.stdout) |wat_text| {
+                            var stripped = std.ArrayListUnmanaged(u8){};
+                            defer stripped.deinit(allocator);
+                            // Parse function names from linking custom section
+                            // Format in WAT: (@custom "linking" ... "\0acheckFlags\00...")
+                            // For now, use the standalone_manifest.json to get names
+                            var func_count: u32 = 0;
+                            var lines = std.mem.splitScalar(u8, wat_text, '\n');
+                            while (lines.next()) |line| {
+                                const trimmed = std.mem.trimLeft(u8, line, " ");
+                                // Skip memory import and custom sections
+                                if (std.mem.startsWith(u8, trimmed, "(import")) continue;
+                                if (std.mem.startsWith(u8, trimmed, "(@custom")) continue;
+                                // Count functions
+                                if (std.mem.startsWith(u8, trimmed, "(func ")) func_count += 1;
+                                stripped.appendSlice(allocator, line) catch {};
+                                stripped.append(allocator, '\n') catch {};
                             }
-                            if (std.fs.cwd().statFile(sw)) |stat| {
-                                std.debug.print("[build] Standalone WASM: {s} ({d} bytes)\n", .{ sw, stat.size });
-                            } else |_| {}
-                        } else {
-                            std.debug.print("[warn] Standalone WASM linking failed\n", .{});
+                            // Read function names from manifest
+                            var manifest_buf: [4096]u8 = undefined;
+                            const manifest_file = std.fmt.bufPrint(&manifest_buf, "{s}/standalone_manifest.json", .{cache_dir}) catch null;
+                            if (manifest_file) |mf_path| {
+                                if (std.fs.cwd().readFile(mf_path, &manifest_buf)) |mf_content| {
+                                    _ = mf_content;
+                                } else |_| {}
+                            }
+                            // Add exports before closing paren.
+                            // Find last ")" and replace with exports + ")"
+                            if (stripped.items.len > 2) {
+                                // Find last ')' — it's the module close
+                                var close_pos: usize = stripped.items.len;
+                                while (close_pos > 0) {
+                                    close_pos -= 1;
+                                    if (stripped.items[close_pos] == ')') break;
+                                }
+                                stripped.shrinkRetainingCapacity(close_pos);
+                                // Read manifest to get function names
+                                var mf_buf2: [8192]u8 = undefined;
+                                const mf_path2 = std.fmt.bufPrint(&mf_buf2, "{s}/standalone_manifest.json", .{cache_dir}) catch null;
+                                if (mf_path2) |mp| {
+                                    if (std.fs.cwd().readFileAllocOptions(allocator, mp, 65536, null, .of(u8), null)) |manifest_data| {
+                                        defer allocator.free(manifest_data);
+                                        // Simple JSON parse: find "name":"xxx" entries
+                                        var fi: u32 = 0;
+                                        var pos: usize = 0;
+                                        while (std.mem.indexOf(u8, manifest_data[pos..], "\"name\":\"")) |idx| {
+                                            const name_start = pos + idx + 8;
+                                            const name_end = std.mem.indexOf(u8, manifest_data[name_start..], "\"") orelse break;
+                                            const name = manifest_data[name_start .. name_start + name_end];
+                                            // Skip internal functions
+                                            if (name.len < 2 or (name[0] != '_' or name[1] != '_')) {
+                                                stripped.appendSlice(allocator, "  (export \"") catch {};
+                                                stripped.appendSlice(allocator, name) catch {};
+                                                stripped.appendSlice(allocator, "\" (func ") catch {};
+                                                var idx_buf: [8]u8 = undefined;
+                                                const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{fi}) catch "0";
+                                                stripped.appendSlice(allocator, idx_str) catch {};
+                                                stripped.appendSlice(allocator, "))\n") catch {};
+                                            }
+                                            fi += 1;
+                                            pos = name_start + name_end + 1;
+                                        }
+                                    } else |_| {}
+                                }
+                                stripped.appendSlice(allocator, ")\n") catch {};
+                            }
+                            // Write WAT and compile to WASM
+                            var tmp_wat_buf: [4096]u8 = undefined;
+                            const tmp_wat = std.fmt.bufPrintZ(&tmp_wat_buf, "{s}.wat", .{sw}) catch null;
+                            if (tmp_wat) |tw| {
+                                if (std.fs.cwd().createFile(tw, .{})) |f| {
+                                    defer f.close();
+                                    f.writeAll(stripped.items) catch {};
+                                } else |_| {}
+                                const parse_result = runCommand(allocator, &.{
+                                    "wasm-tools", "parse", tw, "-o", sw,
+                                }) catch null;
+                                if (parse_result) |pr| {
+                                    defer {
+                                        if (pr.stdout) |s2| allocator.free(s2);
+                                        if (pr.stderr) |s2| allocator.free(s2);
+                                    }
+                                    const parse_ok = switch (pr.term) {
+                                        .Exited => |code| code == 0,
+                                        else => false,
+                                    };
+                                    if (parse_ok) {
+                                        has_standalone_wasm = true;
+                                    }
+                                }
+                                std.fs.cwd().deleteFile(tw) catch {};
+                            }
                         }
+                    }
+                    if (has_standalone_wasm) {
+                        if (std.fs.cwd().statFile(sw)) |stat| {
+                            std.debug.print("[build] Standalone WASM: {s} ({d} bytes)\n", .{ sw, stat.size });
+                        } else |_| {}
+                    } else {
+                        std.debug.print("[warn] Standalone WASM conversion failed\n", .{});
                     }
                 }
             } else |_| {} // No standalone.o — no pure int32 functions
