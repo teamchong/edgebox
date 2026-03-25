@@ -699,7 +699,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     }
   }
   // Activate other globals (force-TurboFan on JS impls — future: freeze to WASM)
-  var _ebFuncs = [];
+  var _ebFuncs = ['isTypeRelatedTo'];
   for (var _ebi = 0; _ebi < _ebFuncs.length; _ebi++) {
     var _ebName = '__eb_' + _ebFuncs[_ebi];
     var _ebImpl = globalThis[_ebName + '_impl'];
