@@ -619,13 +619,18 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   // Without this, the FIRST getSemanticDiagnostics call pays ~300ms initialization.
   // getTypeChecker() is cheap if checker already exists.
   var _tc2 = program.getTypeChecker();
-  // Activate global __eb_isSimpleTypeRelatedTo (build-time transformed).
-  // The closure version delegates to this global. Use native JS impl for now.
-  // TODO: replace with freeze-compiled WASM version for native speed.
-  if (typeof __eb_isSimpleTypeRelatedTo_impl === 'function') {
-    globalThis.__eb_isSimpleTypeRelatedTo = __eb_isSimpleTypeRelatedTo_impl;
-    if (globalThis.__edgebox_force_turbofan) {
-      globalThis.__edgebox_force_turbofan(globalThis.__eb_isSimpleTypeRelatedTo);
+  // Activate build-time transformed globals (closure → global conversion).
+  // Each global is force-TurboFan'd for instant native speed.
+  // TODO: replace with freeze-compiled WASM versions.
+  var _ebFuncs = ['isSimpleTypeRelatedTo', 'isTypeRelatedTo'];
+  for (var _ebi = 0; _ebi < _ebFuncs.length; _ebi++) {
+    var _ebName = '__eb_' + _ebFuncs[_ebi];
+    var _ebImpl = globalThis[_ebName + '_impl'];
+    if (typeof _ebImpl === 'function') {
+      globalThis[_ebName] = _ebImpl;
+      if (globalThis.__edgebox_force_turbofan) {
+        globalThis.__edgebox_force_turbofan(_ebImpl);
+      }
     }
   }
   globalThis.__pc[ck] = program;
