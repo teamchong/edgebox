@@ -426,9 +426,6 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\    (param $flagsArr (ref null $flags))
         \\    (param $bloomArr (ref null $flags))
         \\    (param $unionArr (ref null $flags))
-        \\    (param $propHashArr (ref null $flags))
-        \\    (param $propTypeArr (ref null $flags))
-        \\    (param $propCountArr (ref null $flags))
         \\    (param $src i32) (param $tgt i32) (param $rel i32) (param $strictNull i32)
         \\    (result i32)
         \\    (local $s i32) (local $t i32) (local $r i32)
@@ -484,23 +481,6 @@ pub fn buildTypeCheckerModule(alloc: std.mem.Allocator) ![]const u8 {
         \\        (local.get $unionArr) (local.get $tgt) (local.get $src) (local.get $strictNull)))
         \\      (if (i32.ne (local.get $r) (i32.const -1))
         \\        (then (return (local.get $r))))))
-        \\    ;; Object vs Object: try structural property comparison (recursive in WASM)
-        \\    (local.set $s (array.get $flags (local.get $flagsArr) (local.get $src)))
-        \\    (local.set $t (array.get $flags (local.get $flagsArr) (local.get $tgt)))
-        \\    (if (i32.and
-        \\      (i32.and
-        \\        (i32.ne (i32.and (local.get $s) (i32.const 524288)) (i32.const 0))
-        \\        (i32.ne (i32.and (local.get $t) (i32.const 524288)) (i32.const 0)))
-        \\      (i32.and
-        \\        (i32.eqz (i32.and (local.get $s) (i32.const 3670016)))
-        \\        (i32.eqz (i32.and (local.get $t) (i32.const 3670016)))))
-        \\      (then
-        \\        (local.set $r (call $checkStructural
-        \\          (local.get $flagsArr) (local.get $propHashArr)
-        \\          (local.get $propTypeArr) (local.get $propCountArr)
-        \\          (local.get $src) (local.get $tgt)))
-        \\        (if (i32.ne (local.get $r) (i32.const -1))
-        \\          (then (return (local.get $r))))))
         \\    ;; Complex types: fall through to JS checker.
         \\    (i32.const -1))
         \\

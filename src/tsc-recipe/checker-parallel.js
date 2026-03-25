@@ -262,11 +262,11 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     // Single call replaces the multi-step JS wrapper. No JS→WASM boundary overhead.
     var _relFast = _checkerInst.exports.isRelatedToFast;
     globalThis.__gcCheck = function(_si, _ti) {
-      return _relFast(_fA, _bA, _uA, _pHA, _pTA, _pCA, _si, _ti, 0, 0);
+      return _relFast(_fA, _bA, _uA, _si, _ti, 0, 0);
     };
     // Relation-aware: identity + flags + union + structural, all in one WASM call
     globalThis.__gcCheckRel = function(_si, _ti, _rel, _sn) {
-      return _relFast(_fA, _bA, _uA, _pHA, _pTA, _pCA, _si, _ti, _rel, _sn);
+      return _relFast(_fA, _bA, _uA, _si, _ti, _rel, _sn);
     };
     // WASM wrappers (__gcCheck, __gcCheckRel) created from exports of
     // __edgebox_instantiate_wasm — already have instant TurboFan.
@@ -668,7 +668,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   }
   // Override with freeze-compiled WASM (falls through to JS fallback for unknowns)
   // Frozen WASM disabled — false positives (44 diags). Need to fix WASM correctness.
-  if (globalThis.__frozenIsRelated) {
+  if (false && globalThis.__frozenIsRelated) { // disabled: WASM correctness issue
     var _frozenCheck = globalThis.__frozenIsRelated;
     var _jsFallback = globalThis.__eb_isSimpleTypeRelatedTo;
     var _symHashGet = globalThis.__gcChecker ? globalThis.__gcChecker.getFlag : null;
