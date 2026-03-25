@@ -25,6 +25,86 @@ const transforms = [
     params: 'source, target, relation',
     captures: ['comparableRelation', 'identityRelation'],
   },
+  {
+    name: 'checkBinaryLikeExpression',
+    params: 'left, operatorToken, right, checkMode, errorNode',
+    captures: [],
+  },
+  {
+    name: 'resolveStructuredTypeMembers',
+    params: 'type',
+    captures: [],
+  },
+  {
+    name: 'checkVariableDeclaration',
+    params: 'node',
+    captures: [],
+  },
+  {
+    name: 'instantiateType',
+    params: 'type, mapper',
+    captures: [],
+  },
+  {
+    name: 'checkExpression',
+    params: 'node, checkMode, forceTuple',
+    captures: ['currentNode', 'instantiationCount'],
+  },
+  {
+    name: 'checkSourceElementWorker',
+    params: 'node',
+    captures: ['cancellationToken', 'compilerOptions'],
+  },
+  {
+    name: 'getTypeOfExpression',
+    params: 'node',
+    captures: ['flowInvocationCount', 'flowTypeCache'],
+  },
+  {
+    name: 'getTypeArguments',
+    params: 'type',
+    captures: ['currentNode', 'errorType'],
+  },
+  {
+    name: 'getSignaturesOfType',
+    params: 'type, kind',
+    captures: ['globalArrayType', 'globalReadonlyArrayType'],
+  },
+  {
+    name: 'createType',
+    params: 'flags',
+    captures: ['Type7', 'checker', 'typeCount'],
+  },
+  {
+    name: 'checkReturnStatement',
+    params: 'node',
+    captures: ['compilerOptions', 'strictNullChecks', 'undefinedType'],
+  },
+  {
+    name: 'checkCallExpression',
+    params: 'node, checkMode',
+    captures: ['anyType', 'noImplicitAny', 'resolvingSignature', 'silentNeverType', 'voidType'],
+  },
+  {
+    name: 'getResolvedSignature',
+    params: 'node, candidatesOutArray, checkMode',
+    captures: ['flowLoopCount', 'flowLoopStart', 'resolutionStart', 'resolutionTargets', 'resolvingSignature'],
+  },
+  {
+    name: 'getPropertyOfType',
+    params: 'type, name, skipObjectFunctionPropertyAugment, includeTypeOnlyMembers',
+    captures: ['anyFunctionType', 'globalCallableFunctionType', 'globalFunctionType', 'globalNewableFunctionType', 'globalObjectType'],
+  },
+  {
+    name: 'chooseOverload',
+    params: 'candidates2, relation, isSingleNonGenericCandidate2, signatureHelpTrailingComma2 = false',
+    captures: [],
+  },
+  {
+    name: 'getApparentType',
+    params: 'type',
+    captures: ['emptyObjectType', 'globalBooleanType', 'globalNumberType', 'globalStringType', 'strictNullChecks', 'stringNumberSymbolType', 'unknownType'],
+  },
 ];
 
 function findFuncBounds(source, signature) {
