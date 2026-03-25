@@ -770,6 +770,45 @@ export fn edgebox_wait_program_ready() void {
     }
 }
 
+// ── Shared Cache (cross-worker, lock-free for reads) ──
+// Generic key→value cache shared across all worker threads.
+// EdgeBox provides the cache; recipes use it for cross-worker deduplication.
+// Example: TSC recipe caches type relation results so worker 1 can reuse
+// worker 0's computation of isTypeRelatedTo(TypeA, TypeB).
+
+const SHARED_CACHE_SIZE: u32 = 65536; // 64K entries, power of 2 for fast modulo
+const SHARED_CACHE_EMPTY: i32 = 0;
+
+var shared_cache_keys: [SHARED_CACHE_SIZE]std.atomic.Value(i32) = [_]std.atomic.Value(i32){std.atomic.Value(i32).init(0)} ** SHARED_CACHE_SIZE;
+var shared_cache_vals: [SHARED_CACHE_SIZE]std.atomic.Value(i32) = [_]std.atomic.Value(i32){std.atomic.Value(i32).init(0)} ** SHARED_CACHE_SIZE;
+
+/// Get value from shared cross-worker cache. Returns 0 if not found.
+/// Lock-free: uses atomic load. Safe to call from any worker thread.
+export fn edgebox_shared_cache_get(key: i32) callconv(.c) i32 {
+    if (key == SHARED_CACHE_EMPTY) return 0;
+    const idx = @as(u32, @bitCast(key)) & (SHARED_CACHE_SIZE - 1);
+    const stored_key = shared_cache_keys[idx].load(.acquire);
+    if (stored_key == key) {
+        return shared_cache_vals[idx].load(.acquire);
+    }
+    return 0;
+}
+
+/// Set value in shared cross-worker cache. Lock-free: uses atomic store.
+/// Collisions silently overwrite (cache, not map — losing an entry is OK).
+export fn edgebox_shared_cache_set(key: i32, value: i32) callconv(.c) void {
+    if (key == SHARED_CACHE_EMPTY) return;
+    const idx = @as(u32, @bitCast(key)) & (SHARED_CACHE_SIZE - 1);
+    shared_cache_keys[idx].store(key, .release);
+    shared_cache_vals[idx].store(value, .release);
+}
+
+/// Clear shared cache. Called between requests to prevent stale data.
+export fn edgebox_shared_cache_clear() callconv(.c) void {
+    for (&shared_cache_keys) |*k| k.store(0, .release);
+    for (&shared_cache_vals) |*v| v.store(0, .release);
+}
+
 // All type data lives in WasmGC modules:
 //   type_flags_gc.wasm — GC array for type flags (TurboFan-inlinable array.get/set)
 //   soa_gc.wasm — GC structs for auto SOA + columns (TurboFan-inlinable struct.get/set)

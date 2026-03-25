@@ -147,6 +147,25 @@ static void ZigParseCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 // Dead stubs — type system migrated to WasmGC. Kept for external_refs compatibility.
 static void NoopCallback(const v8::FunctionCallbackInfo<v8::Value>&) {}
 
+// ── Shared Cache — cross-worker lock-free cache ──
+extern "C" int edgebox_shared_cache_get(int key);
+extern "C" void edgebox_shared_cache_set(int key, int value);
+extern "C" void edgebox_shared_cache_clear();
+
+static void SharedCacheGetCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 1) { args.GetReturnValue().Set(0); return; }
+  int key = args[0]->Int32Value(args.GetIsolate()->GetCurrentContext()).FromJust();
+  args.GetReturnValue().Set(edgebox_shared_cache_get(key));
+}
+
+static void SharedCacheSetCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 2) return;
+  auto ctx = args.GetIsolate()->GetCurrentContext();
+  int key = args[0]->Int32Value(ctx).FromJust();
+  int value = args[1]->Int32Value(ctx).FromJust();
+  edgebox_shared_cache_set(key, value);
+}
+
 // ── Snapshot: pre-compile TypeScript for instant worker startup ──
 
 static v8::StartupData g_snapshot = {nullptr, 0};
@@ -205,6 +224,8 @@ static const intptr_t g_external_refs[] = {
   reinterpret_cast<intptr_t>(ResolveCacheSetCallback),
   reinterpret_cast<intptr_t>(ResolveRelativeCallback),
   reinterpret_cast<intptr_t>(ZigParseCallback),
+  reinterpret_cast<intptr_t>(SharedCacheGetCallback),
+  reinterpret_cast<intptr_t>(SharedCacheSetCallback),
   0  // sentinel
 };
 
@@ -240,6 +261,8 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
     global->Set(isolate, "__edgebox_resolve_cache_set", v8::FunctionTemplate::New(isolate, ResolveCacheSetCallback));
     global->Set(isolate, "__edgebox_resolve_relative", v8::FunctionTemplate::New(isolate, ResolveRelativeCallback));
     global->Set(isolate, "__edgebox_zig_parse", v8::FunctionTemplate::New(isolate, ZigParseCallback));
+    global->Set(isolate, "__edgebox_shared_cache_get", v8::FunctionTemplate::New(isolate, SharedCacheGetCallback));
+    global->Set(isolate, "__edgebox_shared_cache_set", v8::FunctionTemplate::New(isolate, SharedCacheSetCallback));
     global->Set(isolate, "__edgebox_write_file", v8::FunctionTemplate::New(isolate, WriteFileCallback));
     // IsSimpleTypeRelated removed — migrated to WasmGC
     global->Set(isolate, "__edgebox_submit_result", v8::FunctionTemplate::New(isolate, SubmitResultCallback));
