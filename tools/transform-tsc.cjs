@@ -156,14 +156,26 @@ for (const t of transforms) {
     // source.value is integer for number literals.
     // Freeze-compiled WASM (correct, from actual TSC logic).
     // Minimal extraction: .id + .flags (V8 inline cache, fast).
+    // WASM IS the function — no pre-check, no fallback.
     wasmFastPath = `
+    var _srcSH = source.symbol ? source.symbol._nameHash | 0 : 0;
+    var _tgtSH = target.symbol ? target.symbol._nameHash | 0 : 0;
+    var _srcV = source.value !== void 0 ? source.value | 0 : 0;
+    var _tgtV = target.value !== void 0 ? target.value | 0 : 0;
     var _r = globalThis.__frozenIsRelated(source.id | 0, target.id | 0,
       source.flags | 0, target.flags | 0,
       relation === assignableRelation ? 0 : relation === comparableRelation ? 1 :
       relation === strictSubtypeRelation ? 3 : relation === identityRelation ? 4 : 2,
-      strictNullChecks ? 1 : 0, 0, 0, 0, 0);
-    if (_r === 1) return true;
-    if (_r === 0) return false;`;
+      strictNullChecks ? 1 : 0, _srcSH, _tgtSH, _srcV, _tgtV);
+    return _r === 1;`;
+  }
+
+  // For functions with WASM fast-path: WASM IS the function, no inline fallback
+  if (wasmFastPath) {
+    const wrapper = `function ${t.name}(${t.params}) {${wasmFastPath}}`;
+    src = src.substring(0, bounds.start) + wrapper + src.substring(bounds.end);
+    console.log(`[transform-tsc] ${t.name}: ${t.captures.length} captures, ${originalBody.length} chars (WASM replaces)`);
+    continue;
   }
   let postCall = '';
   if (false && t.name === 'createType') {
