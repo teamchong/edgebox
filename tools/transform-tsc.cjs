@@ -64,12 +64,17 @@ for (const t of transforms) {
     // WasmGC isRelatedToFast: built at build time, runs in snapshot.
     // Handles flag checks as pure integer ops — no closure refs needed.
     // Falls through to inline fallback for string/value/object cases.
+    // __frozenIsRelated = freeze-compiled isRelatedToFast from frozen_checker.js.
+    // Same logic as this function, compiled to WASM at build time.
+    // Returns 1=true, 0=false, -1=unknown (fall through to inline JS).
     wasmFastPath = `
-    if (globalThis.__gcCheckRel) {
+    if (globalThis.__frozenIsRelated) {
       var _rel = relation === assignableRelation ? 0 : relation === comparableRelation ? 1 :
                  relation === strictSubtypeRelation ? 3 : relation === identityRelation ? 4 : 2;
-      // TODO: wire to freeze-compiled WasmGC version of isSimpleTypeRelatedTo
-      // (not hand-written checkRel which has correctness bugs)
+      var _r = globalThis.__frozenIsRelated(source.id | 0, target.id | 0,
+        source.flags | 0, target.flags | 0, _rel, strictNullChecks ? 1 : 0);
+      if (_r === 1) return true;
+      if (_r === 0) return false;
     }`;
   }
   const wrapper = `function ${t.name}(${t.params}) {${wasmFastPath}
