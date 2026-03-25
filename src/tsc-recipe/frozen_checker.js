@@ -34,3 +34,15 @@ function isRelatedToFast(srcId, tgtId, sf, tf, rel, sn) {
   return -1;
 }
 globalThis._r = isRelatedToFast(1, 2, 4, 8, 0, 1);
+
+function getObjectFlagsF(typeFlags, objectFlags) {
+  return typeFlags & 3899393 ? objectFlags : 0;
+}
+
+function bloomReject(srcBloom, tgtBloom) {
+  if (srcBloom === 0 || tgtBloom === 0) return 0;
+  return (tgtBloom & (~srcBloom)) !== 0 ? 1 : 0;
+}
+
+var _t2 = getObjectFlagsF(524288, 16);
+var _t3 = bloomReject(7, 15);
