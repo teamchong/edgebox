@@ -668,10 +668,14 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   }
   // Override with freeze-compiled WASM (falls through to JS fallback for unknowns)
   // Frozen WASM disabled — false positives (44 diags). Need to fix WASM correctness.
-  // Frozen WASM checker disabled — loading during snapshot corrupts warmup state.
-  // The WasmGC isRelatedToFast (type_checker_gc.wasm) handles flag checks via
-  // source injection. The freeze-compiled checker is redundant.
-  // TODO: load frozen WASM only on workers (not during snapshot creation).
+  // Wire __eb_isSimpleTypeRelatedTo to WasmGC isRelatedToFast (build-time compiled).
+  // Uses the SAME WasmGC module that's already loaded in the snapshot — no separate
+  // standard WASM needed (standard WASM corrupts snapshot state).
+  // NOTE: cannot wrap __eb_isSimpleTypeRelatedTo here because the impl
+  // captures closure functions from the SNAPSHOT's createTypeChecker.
+  // Workers create DIFFERENT createTypeChecker closures. The impl's
+  // references to isEnumTypeRelatedTo etc. point to the WRONG checker.
+  // The build-time transform's inline fallback uses the CORRECT closure.
   // Activate other globals (force-TurboFan on JS impls — future: freeze to WASM)
   var _ebFuncs = ['isTypeRelatedTo'];
   for (var _ebi = 0; _ebi < _ebFuncs.length; _ebi++) {
