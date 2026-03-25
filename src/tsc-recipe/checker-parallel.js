@@ -50,9 +50,18 @@ globalThis.__gcFlagsDone = false;
   // the main culprit: default constructor only sets flags+checker, all other
   // properties added dynamically → hundreds of hidden class transitions.
   var origTypeProto = ts.objectAllocator.getTypeConstructor().prototype;
-  // MonoType: 11 properties = sweet spot for hidden class.
-  // Data stays as direct JS properties (fastest for V8 inline cache).
-  // WASM arrays are populated separately via createType patch for WASM checker.
+  // MonoType: WASM data model via public API (no source injection).
+  // Constructor writes flags to WasmGC array using predicted type ID.
+  // TSC's createType does: result = new Type(checker, flags); result.id = typeCount++;
+  // We predict the ID by tracking our own counter (types are created sequentially).
+  var _monoTypeCount = 0;
+  var _monoFlagsArr = null; // set after WASM loads
+  var _monoSetFlag = null;
+  globalThis.__connectMonoType = function(flagsArr, setFlag) {
+    _monoFlagsArr = flagsArr;
+    _monoSetFlag = setFlag;
+    _monoTypeCount = 0; // reset for each checker instance
+  };
   function MonoType(checker, flags) {
     this.flags = flags;
     this.checker = checker;
@@ -65,6 +74,13 @@ globalThis.__gcFlagsDone = false;
     this.value = void 0;
     this.regularType = void 0;
     this.freshType = void 0;
+    // Write flags to WASM array — no source injection needed.
+    // TSC will set this.id = typeCount right after this constructor.
+    // typeCount starts at 1 and increments by 1 per createType call.
+    _monoTypeCount++;
+    if (_monoSetFlag && _monoTypeCount < 131072) {
+      _monoSetFlag(_monoFlagsArr, _monoTypeCount, flags | 0);
+    }
   }
   MonoType.prototype = Object.create(origTypeProto);
   MonoType.prototype.constructor = MonoType;
@@ -183,8 +199,10 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     globalThis.__gcPropTypeArr = _checkerInst.exports.newFlags(131072);
     globalThis.__gcPropCountArr = _checkerInst.exports.newFlags(16384);
     globalThis.__gcCheckStructural = _checkerInst.exports.checkStructural;
-    // WASM arrays populated via createType patch (flags) and
-    // setStructuredTypeMembers patch (bloom + properties).
+    // Connect WASM arrays to MonoType constructor (no source injection).
+    if (globalThis.__connectMonoType) {
+      globalThis.__connectMonoType(globalThis.__gcFlagsArr, _checkerInst.exports.setFlag);
+    }
     // 3. __gcCheck: thin wrapper → native WASM checkRelation + checkSrcToUnion
     var _checker = _checkerInst.exports.checkRelation;
     var _unionChecker = _checkerInst.exports.checkSrcToUnion;
