@@ -20,11 +20,6 @@ const transforms = [
     params: 'source, target, relation, errorReporter',
     captures: ['strictNullChecks', 'wildcardType', 'assignableRelation', 'comparableRelation', 'strictSubtypeRelation'],
   },
-  {
-    name: 'isTypeRelatedTo',
-    params: 'source, target, relation',
-    captures: ['comparableRelation', 'identityRelation'],
-  },
 ];
 
 function findFuncBounds(source, signature) {

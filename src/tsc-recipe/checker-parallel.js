@@ -622,7 +622,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   }
   // Override with freeze-compiled WASM (falls through to JS fallback for unknowns)
   // Frozen WASM disabled — false positives (44 diags). Need to fix WASM correctness.
-  if (false && globalThis.__frozenIsRelated) {
+  if (false) {
     var _frozenCheck = globalThis.__frozenIsRelated;
     var _jsFallback = globalThis.__eb_isSimpleTypeRelatedTo;
     globalThis.__eb_isSimpleTypeRelatedTo = function(source, target, relation, errorReporter,
@@ -631,8 +631,16 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       var rel = relation === assignableRelation ? 0 : relation === comparableRelation ? 1 :
                 relation === strictSubtypeRelation ? 3 : 4;
       var r = _frozenCheck(source.id | 0, target.id | 0, sf, tf, rel, strictNullChecks ? 1 : 0);
-      if (r === 1) return true;
-      if (r === 0) return false;
+      // Validate: compare WASM result with JS result
+      if (r !== -1) {
+        var jsResult = _jsFallback(source, target, relation, errorReporter,
+            strictNullChecks, wildcardType, assignableRelation, comparableRelation, strictSubtypeRelation);
+        var wasmBool = r === 1;
+        if (wasmBool !== jsResult) {
+          __edgebox_write_stderr('[WASM MISMATCH] src=' + source.id + '(f=' + sf + ') tgt=' + target.id + '(f=' + tf + ') rel=' + rel + ' wasm=' + r + ' js=' + jsResult + '\n');
+        }
+        return jsResult; // always use JS result for correctness during validation
+      }
       // -1 = unknown, fall through to JS
       return _jsFallback(source, target, relation, errorReporter,
             strictNullChecks, wildcardType, assignableRelation, comparableRelation, strictSubtypeRelation);
@@ -642,7 +650,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     }
   }
   // Activate other globals (force-TurboFan on JS impls — future: freeze to WASM)
-  var _ebFuncs = ['isTypeRelatedTo'];
+  var _ebFuncs = [];
   for (var _ebi = 0; _ebi < _ebFuncs.length; _ebi++) {
     var _ebName = '__eb_' + _ebFuncs[_ebi];
     var _ebImpl = globalThis[_ebName + '_impl'];
