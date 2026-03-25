@@ -159,11 +159,11 @@ git commit -m "fix(quickjs): description of changes"
 
 | | Cold | vs Node.js |
 |---|------|-----------|
-| Node.js TSC | 3.2s | 1.0x |
-| **EdgeBox** | **2.6s** | **1.23x faster** |
-| tsgo (native Zig) | 0.75s | 4.3x faster |
+| Node.js TSC | 3.3s | 1.0x |
+| **EdgeBox** | **1.4s** | **2.3x faster** |
+| tsgo (native Go) | 0.75s | 4.3x faster |
 
-EdgeBox advantage: WasmGC TurboFan inlining + monomorphic Node constructor + parallel workers + V8 snapshot + Zig IO cache.
+EdgeBox advantage: freeze-compiled WASM (build-time TurboFan) + MonoType/MonoSymbol hidden class + closure-to-global transform + SF cache snapshot + parallel workers (cores/4).
 
 ### AOT Compute Kernels (freeze)
 

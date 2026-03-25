@@ -58,6 +58,18 @@ V8 inlines WASM calls into JS — zero boundary overhead
 
 ## Benchmarks
 
+### TSC Type Checking (playwright, 2058 diagnostics)
+
+| Runner | Cold | vs Node.js |
+|--------|------|-----------|
+| Node.js TSC | 3.3s | 1.0x |
+| **EdgeBox** | **1.4s** | **2.3x faster** |
+| tsgo (native Go) | 0.75s | 4.3x faster |
+
+EdgeBox advantage: freeze-compiled WASM (build-time TurboFan) + MonoType/MonoSymbol single hidden class + closure-to-global transform + SF cache snapshot + auto-scaled parallel workers.
+
+### AOT Compute Kernels (freeze)
+
 **Overall: 2.56x faster than Node.js** across 40 benchmarks (26 wins, 5 ties, 5 losses, 4 at parity).
 
 ### Headline Results (AOT+JIT on Node.js v24)
