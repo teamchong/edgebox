@@ -54,7 +54,7 @@ void edgebox_v8_init() {
   // Tested: without maglev=2.53s, with maglev(30)=2.51s, maglev(10)=2.87s (too aggressive)
   // --max-semi-space-size=64: large young gen reduces GC pauses during type creation
   // Tested: 16=1.85s, 64=1.75s, 128=1.79s — 64MB is sweet spot
-  const char* default_flags = "--max-old-space-size=4096 --concurrent-sparkplug --max-semi-space-size=64 --turbo-inline-js-wasm-calls --allow-natives-syntax --maglev --invocation-count-for-maglev=30 --code-cache-preserve-tiering";
+  const char* default_flags = "--max-old-space-size=4096 --concurrent-sparkplug --max-semi-space-size=64 --turbo-inline-js-wasm-calls --allow-natives-syntax --maglev --invocation-count-for-maglev=30";
   char flags_buf[1024];
   if (extra_flags && strlen(extra_flags) > 0) {
     snprintf(flags_buf, sizeof(flags_buf), "%s %s", default_flags, extra_flags);
