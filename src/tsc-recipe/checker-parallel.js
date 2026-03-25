@@ -619,6 +619,15 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   // Without this, the FIRST getSemanticDiagnostics call pays ~300ms initialization.
   // getTypeChecker() is cheap if checker already exists.
   var _tc2 = program.getTypeChecker();
+  // Activate global __eb_isSimpleTypeRelatedTo (build-time transformed).
+  // The closure version delegates to this global. Use native JS impl for now.
+  // TODO: replace with freeze-compiled WASM version for native speed.
+  if (typeof __eb_isSimpleTypeRelatedTo_impl === 'function') {
+    globalThis.__eb_isSimpleTypeRelatedTo = __eb_isSimpleTypeRelatedTo_impl;
+    if (globalThis.__edgebox_force_turbofan) {
+      globalThis.__edgebox_force_turbofan(globalThis.__eb_isSimpleTypeRelatedTo);
+    }
+  }
   globalThis.__pc[ck] = program;
   if (!globalThis.__wildcardTypeId) globalThis.__wildcardTypeId = 0;
 
@@ -754,7 +763,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
 
   var t3 = Date.now();
   var _gcInfo = '';
-  if (globalThis.__gcTotal) _gcInfo = ' gc:Y' + (globalThis.__gcHit||0) + '/N' + (globalThis.__gcHitNo||0) + '/?' + (globalThis.__gcMiss||0) + '(fl:' + (globalThis.__gcMissFlags||0) + ')=' + Math.round(100*((globalThis.__gcHit||0)+(globalThis.__gcHitNo||0))/globalThis.__gcTotal) + '%';
+  if (globalThis.__getWasmStats) _gcInfo = ' ' + globalThis.__getWasmStats();
   __edgebox_write_stderr('[recipe] w' + workerId + '/' + workerCount + ' parse:' + (t2-t1) + 'ms check:' + (t3-t2) + 'ms total:' + (t3-t0) + 'ms files:' + filesChecked + '/' + checkFiles.length + _gcInfo + String.fromCharCode(10));
   return output.join(NL);
   } catch(e) { return '[recipe-error] w' + workerId + ': ' + (e && e.stack ? e.stack : String(e)); }
