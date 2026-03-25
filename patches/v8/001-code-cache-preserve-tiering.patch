@@ -1,3 +1,48 @@
+diff --git a/src/execution/tiering-manager.cc b/src/execution/tiering-manager.cc
+index 7a63125b3eb..a3c963360c1 100644
+--- a/src/execution/tiering-manager.cc
++++ b/src/execution/tiering-manager.cc
+@@ -399,6 +399,27 @@ OptimizationDecision TieringManager::ShouldOptimize(
+     return OptimizationDecision::DoNotOptimize();
+   }
+ 
++  // EDGEBOX PATCH: if function name matches turbo_filter AND
++  // code_cache_preserve_tiering is on, go directly to TurboFan.
++  // This lets the embedder control which functions get instant TurboFan
++  // via --turbo-filter=funcName1,funcName2,...
++  if (v8_flags.code_cache_preserve_tiering &&
++      v8_flags.turbofan &&
++      current_code_kind != CodeKind::TURBOFAN_JS) {
++    // turbo_filter defaults to "*". When code_cache_preserve_tiering is on
++    // and turbo_filter is NOT "*", only matching functions get early TurboFan.
++    const char* filter = v8_flags.turbo_filter;
++    if (filter && filter[0] != '*') {
++      if (shared->PassesFilter(v8_flags.turbo_filter)) {
++        if (v8_flags.trace_opt) {
++          PrintF("[EDGEBOX instant TurboFan for %s]\n",
++                 shared->DebugNameCStr().get());
++        }
++        return OptimizationDecision::TurbofanHotAndStable();
++      }
++    }
++  }
++
+   if (TiersUpToMaglev(current_code_kind) &&
+       shared->PassesFilter(v8_flags.maglev_filter) &&
+       !shared->maglev_compilation_failed()) {
+@@ -619,6 +640,12 @@ void TieringManager::OnInterruptTick(DirectHandle<JSFunction> function,
+       }
+       function->SetInterruptBudget(isolate_, BudgetModification::kRaise);
+     }
++    // EDGEBOX PATCH: if turbo_filter matches, immediately request TurboFan.
++    if (v8_flags.code_cache_preserve_tiering &&
++        v8_flags.turbo_filter && v8_flags.turbo_filter[0] != '*' &&
++        function->shared()->PassesFilter(v8_flags.turbo_filter)) {
++      Optimize(*function, OptimizationDecision::TurbofanHotAndStable());
++    }
+     return;
+   }
+ 
 diff --git a/src/flags/flag-definitions.h b/src/flags/flag-definitions.h
 index aab9435dbb5..3f113a91cb1 100644
 --- a/src/flags/flag-definitions.h
