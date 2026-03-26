@@ -308,16 +308,6 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
 
     } // close else (WASM available)
   }
-  // Test Zig parser + V8 bridge (if available)
-  if (typeof __edgebox_zig_parse === 'function' && typeof globalThis.__zigCreateSourceFile === 'function') {
-    var _zigTestSrc = 'const x: number = 1;\nlet y = x + 2;\n';
-    var _zigAST = __edgebox_zig_parse(_zigTestSrc);
-    if (_zigAST) {
-      var _zigSF = globalThis.__zigCreateSourceFile(_zigTestSrc, 'test.ts', _zigAST);
-      __edgebox_write_stderr('[recipe] Zig bridge: ' + (_zigAST.byteLength / 24) + ' flat nodes → ' + (_zigSF.statements ? _zigSF.statements.length : 0) + ' statements\n');
-    }
-  }
-
   // WASM may not be loaded during snapshot creation — that's OK.
   // Workers will load WASM on first __edgebox_check after snapshot restore.
 
@@ -447,57 +437,6 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   // Worker 1 resolves a module → stores in Zig cache → workers 2+3 find it instantly.
   // Saves ~130ms per extra worker (191ms resolution × 2/3 hit rate).
   var hasNodeModules = __edgebox_dir_exists(cwd + '/node_modules') === 1;
-  // Override getSourceFile to use Zig parser (when available and enabled)
-  // Zig parser: opt-in via EDGEBOX_ZIG_PARSE env (bridge overhead still too high for net benefit)
-  // When enabled: 447 files parsed by Zig (32ms) + bridge (880ms) = 912ms vs TSC's 750ms
-  // Need: C++ bridge (create nodes in native) or lazy materialization to beat TSC
-  // Zig parser: enabled for a SINGLE test file to identify forEachChild crash.
-  // If it crashes, log the error and fall back to TSC for ALL files.
-  // Zig parser disabled: 2024/2058 diags (34 missing from utilsBundle.ts require() handling).
-  // Bridge improvements: operator tokens, ternary expressions, 40+ SyntaxKind mappings.
-  // Remaining issues: typeof import() type annotations not treated as imports,
-  // binder crash on destructuring assignment flow. Re-enable after these fixes.
-  var useZigParser = false;
-  var zigParseCount = 0, zigFallbackCount = 0;
-
-  // Instrument forEachChild to detect infinite recursion
-  if (useZigParser && ts.forEachChild) {
-    var origFEC = ts.forEachChild;
-    var fecDepth = 0;
-    ts.forEachChild = function(node, cbNode, cbNodes) {
-      fecDepth++;
-      if (fecDepth > 500) {
-        __edgebox_write_stderr('[HANG] forEachChild depth=' + fecDepth + ' kind=' + node.kind + ' pos=' + node.pos + '\n');
-        fecDepth--;
-        return undefined;
-      }
-      var result = origFEC(node, cbNode, cbNodes);
-      fecDepth--;
-      return result;
-    };
-  }
-
-  if (useZigParser) {
-    var origGetSourceFile = host.getSourceFile;
-    host.getSourceFile = function(fileName, languageVersionOrOptions, onError) {
-      // Use Zig for first N .ts files to isolate the hang
-      // Binary search: find which file count causes hang
-      // Zig for .d.ts files (type declarations — no errors, just type info).
-      // TSC for .ts files (implementation — has errors, needs full AST).
-      // .d.ts files are 88 files / 3.5MB = 140ms parse savings.
-      // Zig for .ts files (implementation code).
-      // TSC for .d.ts (type declarations — need complete export structure).
-      // sf.imports pre-set prevents forEachChild hang.
-      // ALL files parsed by Zig (57ms, no hang). 33/2058 diags — need more AST completeness.
-      // Zig parser: check pre-loaded cache first
-      if (globalThis.__zigSourceFileCache && globalThis.__zigSourceFileCache.has(fileName)) {
-        zigParseCount++;
-        return globalThis.__zigSourceFileCache.get(fileName);
-      }
-      zigFallbackCount++;
-      return origGetSourceFile.call(this, fileName, languageVersionOrOptions, onError);
-    };
-  }
 
   var hasZigResolveCache = typeof __edgebox_resolve_cache_get === 'function';
   host.resolveModuleNames = function(moduleNames, containingFile) {
@@ -576,55 +515,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   // returns instantly from the Map. No sequential Zig+bridge overhead.
   // Only worker 0 does batch pre-load — workers share nothing (separate isolates)
   // so each would redundantly parse all files. Worker 0 parses, others use TSC.
-  __edgebox_write_stderr('[recipe] w' + workerId + ' batch-start useZig=' + useZigParser + '\n');
-  if (useZigParser && !globalThis.__zigSourceFileCache && workerId === 0) {
-    var cache = new Map();
-    var t_zig0 = Date.now();
-    __edgebox_write_stderr('[recipe] batch files: ' + parsed.fileNames.length + '\n');
-    var tsFileCount = 0;
-    for (var fi = 0; fi < parsed.fileNames.length; fi++) {
-      var fn = parsed.fileNames[fi];
-      if (fn.endsWith('.d.ts')) continue;
-      tsFileCount++;
-      var content = ts.sys.readFile(fn);
-      if (content === undefined) continue;
-      try {
-        var _tp0 = Date.now();
-        var flatAST = __edgebox_zig_parse(content);
-        var _tp1 = Date.now();
-        if (flatAST && flatAST.byteLength >= 24) {
-          var sf = globalThis.__zigCreateSourceFile(content, fn, flatAST);
-          var _tp2 = Date.now();
-          if (_tp2 - _tp0 > 100) __edgebox_write_stderr('[SLOW] ' + fn.split('/').pop() + ' zig=' + (_tp1-_tp0) + 'ms bridge=' + (_tp2-_tp1) + 'ms\n');
-          if (sf && sf.statements) {
-            if (sf.imports) {
-              for (var ii = 0; ii < sf.imports.length; ii++) {
-                var imp = sf.imports[ii];
-                if (imp.kind === 11 && !imp.text) {
-                  imp.text = content.substring(imp.pos + 1, imp.end - 1);
-                }
-              }
-            }
-            // Validate: try forEachChild on each statement to catch bridge bugs early.
-            // If any node has undefined children where TSC expects them, skip this file.
-            var valid = true;
-            try {
-              for (var vi = 0; vi < sf.statements.length; vi++) {
-                ts.forEachChild(sf.statements[vi], function(n) {
-                  if (n) ts.forEachChild(n, function() {}); // 2-deep validation
-                });
-              }
-            } catch(ve) { valid = false; }
-            if (valid) cache.set(fn, sf);
-          }
-        }
-      } catch(e) {}
-      if (tsFileCount % 50 === 0) __edgebox_write_stderr('[recipe] batch ' + tsFileCount + ' ts files processed\n');
-    }
-    globalThis.__zigSourceFileCache = cache;
-    __edgebox_write_stderr('[recipe] w' + workerId + ' batch Zig: ' + cache.size + ' files in ' + (Date.now() - t_zig0) + 'ms\n');
-  }
-
+  __edgebox_write_stderr('[recipe] w' + workerId + ' batch-start\n');
   var program, builder;
   if (isWarm && useIncremental) {
     // Warm: incremental program — only checks changed files
@@ -654,7 +545,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     program = ts.createProgram(parsed.fileNames, parsed.options, host, oldProgram);
     __edgebox_write_stderr('[recipe] w' + workerId + ' createProgram=' + (Date.now()-_cpT0) + 'ms gsf=' + _gsfTime + 'ms(' + _gsfCount + ') rmn=' + _rmnTime + 'ms(' + _rmnCount + ')\n');
   }
-  __edgebox_write_stderr('[recipe] POST-createProgram zig=' + zigParseCount + ' fb=' + zigFallbackCount + '\n');
+  __edgebox_write_stderr('[recipe] POST-createProgram\n');
   // Pre-initialize the TypeChecker — this creates intrinsic types, global symbols.
   // Without this, the FIRST getSemanticDiagnostics call pays ~300ms initialization.
   // getTypeChecker() is cheap if checker already exists.
@@ -693,7 +584,6 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
 
 
   var t2 = Date.now();
-  __edgebox_write_stderr('[recipe] w' + workerId + ' zig=' + zigParseCount + ' fb=' + zigFallbackCount + '\n');
   var files = program.getSourceFiles();
   var NL = String.fromCharCode(10);
   var output = [];
