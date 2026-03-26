@@ -742,7 +742,6 @@ export fn edgebox_claim_block(block_size: u32) u32 {
 export fn edgebox_reset_work() void {
     work_file_index.store(0, .release);
     program_ready.store(0, .release);
-    edgebox_sf_store_clear();
 }
 
 // ── Phase Barrier for Coordinated Cold Start ──
@@ -767,7 +766,7 @@ export fn edgebox_wait_program_ready() void {
             std.Thread.yield() catch {};
         }
         spins += 1;
-        if (spins > 5000000) break; // Safety: don't wait forever (~10s max)
+        if (spins > 100000) break; // Safety: don't wait forever (>1s)
     }
 }
 
@@ -808,68 +807,6 @@ export fn edgebox_shared_cache_set(key: i32, value: i32) callconv(.c) void {
 export fn edgebox_shared_cache_clear() callconv(.c) void {
     for (&shared_cache_keys) |*k| k.store(0, .release);
     for (&shared_cache_vals) |*v| v.store(0, .release);
-}
-
-// ── Shared SourceFile Store (worker 0 → workers 1-N) ──
-// Worker 0 serializes parsed SourceFile ASTs to this store after createProgram.
-// Workers 1-N deserialize from this store instead of re-parsing.
-// Eliminates ~1100ms of redundant TypeScript parsing per worker.
-//
-// Each entry: fileName → serialized AST bytes (compact binary format).
-// The serialization captures: node tree (kind/pos/end/flags), identifiers, literals.
-// Workers reconstruct SourceFile objects from this data without running TS parser.
-
-const MAX_SF_ENTRIES: u32 = 2048;
-var sf_store_keys: [MAX_SF_ENTRIES]?[]const u8 = [_]?[]const u8{null} ** MAX_SF_ENTRIES;
-var sf_store_vals: [MAX_SF_ENTRIES]?[]const u8 = [_]?[]const u8{null} ** MAX_SF_ENTRIES;
-var sf_store_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
-var sf_store_mutex: std.Thread.Mutex = .{};
-
-/// Store a serialized SourceFile AST. Called by worker 0 after parsing.
-export fn edgebox_sf_store_put(key_ptr: [*]const u8, key_len: c_int, val_ptr: [*]const u8, val_len: c_int) void {
-    if (key_len <= 0 or val_len <= 0) return;
-    const key = alloc.dupe(u8, key_ptr[0..@intCast(key_len)]) catch return;
-    const val = alloc.dupe(u8, val_ptr[0..@intCast(val_len)]) catch return;
-    sf_store_mutex.lock();
-    defer sf_store_mutex.unlock();
-    const idx = sf_store_count.load(.acquire);
-    if (idx >= MAX_SF_ENTRIES) return;
-    sf_store_keys[idx] = key;
-    sf_store_vals[idx] = val;
-    sf_store_count.store(idx + 1, .release);
-}
-
-/// Get a serialized SourceFile AST by fileName. Returns null if not found.
-export fn edgebox_sf_store_get(key_ptr: [*]const u8, key_len: c_int, out_len: *c_int) ?[*]const u8 {
-    if (key_len <= 0) { out_len.* = 0; return null; }
-    const key = key_ptr[0..@intCast(key_len)];
-    // No lock needed for reads — we only read entries that are already committed
-    const count = sf_store_count.load(.acquire);
-    for (0..count) |i| {
-        if (sf_store_keys[i]) |k| {
-            if (std.mem.eql(u8, k, key)) {
-                if (sf_store_vals[i]) |v| {
-                    out_len.* = @intCast(v.len);
-                    return v.ptr;
-                }
-            }
-        }
-    }
-    out_len.* = 0;
-    return null;
-}
-
-/// Clear the SourceFile store between requests.
-export fn edgebox_sf_store_clear() void {
-    sf_store_mutex.lock();
-    defer sf_store_mutex.unlock();
-    sf_store_count.store(0, .release);
-    // Don't free — entries may be referenced by V8 ArrayBuffers
-}
-
-/// Get count of stored SourceFiles.
-export fn edgebox_sf_store_count() u32 {
-    return sf_store_count.load(.acquire);
 }
 
 // All type data lives in WasmGC modules:

@@ -200,29 +200,18 @@ pub fn init(worker_count: u32) !void {
                 defer alloc.free(bp);
                 bridge_src = edgebox_read_file(bp.ptr, @intCast(bp.len), &bridge_len);
             }
-            // Load SF serializer (cross-worker AST sharing)
-            const sf_ser_path = std.fmt.allocPrint(alloc, "{s}/src/tsc-recipe/sf_serializer.js", .{eb_root}) catch null;
-            var sf_ser_len: c_int = 0;
-            var sf_ser_src: ?[*]const u8 = null;
-            if (sf_ser_path) |sp| {
-                defer alloc.free(sp);
-                sf_ser_src = edgebox_read_file(sp.ptr, @intCast(sp.len), &sf_ser_len);
-            }
-            // Concatenate recipe + bridge + sf_serializer
+            // Concatenate recipe + bridge
             var full_recipe: ?[*]const u8 = null;
             var full_recipe_len: c_int = 0;
-            const bridge_data = if (bridge_src != null and bridge_len > 0) bridge_src.?[0..@as(usize, @intCast(bridge_len))] else "";
-            const sf_ser_data = if (sf_ser_src != null and sf_ser_len > 0) sf_ser_src.?[0..@as(usize, @intCast(sf_ser_len))] else "";
-            if (r_src != null) {
-                const rl: usize = @intCast(r_len);
-                const total = rl + 1 + bridge_data.len + 1 + sf_ser_data.len;
+            if (r_src != null and bridge_src != null and bridge_len > 0) {
+                const total = @as(usize, @intCast(r_len)) + 1 + @as(usize, @intCast(bridge_len));
                 const buf = alloc.alloc(u8, total) catch null;
                 if (buf) |b| {
+                    const rl: usize = @intCast(r_len);
+                    const bl: usize = @intCast(bridge_len);
                     @memcpy(b[0..rl], r_src.?[0..rl]);
                     b[rl] = '\n';
-                    @memcpy(b[rl + 1 .. rl + 1 + bridge_data.len], bridge_data);
-                    b[rl + 1 + bridge_data.len] = '\n';
-                    @memcpy(b[rl + 2 + bridge_data.len .. total], sf_ser_data);
+                    @memcpy(b[rl + 1 .. rl + 1 + bl], bridge_src.?[0..bl]);
                     full_recipe = b.ptr;
                     full_recipe_len = @intCast(total);
                 }
@@ -559,8 +548,6 @@ pub fn dispatch(cwd: []const u8) void {
     } else {
         edgebox_clear_file_cache();
     }
-    // Create SF cache dir for cross-worker AST sharing
-    std.fs.cwd().makePath("/tmp/edgebox-sf-cache") catch {};
     prewarmDir(cwd);
     for (0..pool_size) |i| {
         workers[i].cwd = cwd;

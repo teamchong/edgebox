@@ -12,29 +12,10 @@
 #include <v8-persistent-handle.h>
 #include <v8-function.h>
 #include <v8-container.h>
-#include <v8-typed-array.h>
 #include <cstring>
 #include <cstdio>
 #include <string>
-#include <vector>
 #include <unistd.h>
-
-// Forward declarations for callbacks used in g_external_refs
-static void SfStorePutCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
-static void SfStoreGetCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
-static void SfStoreCountCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
-static void ZigCreateSourceFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
-
-// Flat AST node from Zig parser (24 bytes, extern struct)
-struct FlatNode {
-  uint16_t kind;
-  uint16_t flags;
-  uint32_t start;
-  uint32_t end;
-  uint32_t parent;
-  uint32_t first_child;
-  uint32_t next_sibling;
-};
 
 // Platform init via rusty_v8's C API (avoids libplatform dependency)
 extern "C" {
@@ -243,12 +224,8 @@ static const intptr_t g_external_refs[] = {
   reinterpret_cast<intptr_t>(ResolveCacheSetCallback),
   reinterpret_cast<intptr_t>(ResolveRelativeCallback),
   reinterpret_cast<intptr_t>(ZigParseCallback),
-  reinterpret_cast<intptr_t>(ZigCreateSourceFileCallback),
   reinterpret_cast<intptr_t>(SharedCacheGetCallback),
   reinterpret_cast<intptr_t>(SharedCacheSetCallback),
-  reinterpret_cast<intptr_t>(SfStorePutCallback),
-  reinterpret_cast<intptr_t>(SfStoreGetCallback),
-  reinterpret_cast<intptr_t>(SfStoreCountCallback),
   0  // sentinel
 };
 
@@ -278,15 +255,12 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
     global->Set(isolate, "__edgebox_claim_file", v8::FunctionTemplate::New(isolate, ClaimFileCallback));
     global->Set(isolate, "__edgebox_signal_program_ready", v8::FunctionTemplate::New(isolate, SignalProgramReadyCallback));
     global->Set(isolate, "__edgebox_wait_program_ready", v8::FunctionTemplate::New(isolate, WaitProgramReadyCallback));
-    global->Set(isolate, "__edgebox_sf_store_put", v8::FunctionTemplate::New(isolate, SfStorePutCallback));
-    global->Set(isolate, "__edgebox_sf_store_get", v8::FunctionTemplate::New(isolate, SfStoreGetCallback));
-    global->Set(isolate, "__edgebox_sf_store_count", v8::FunctionTemplate::New(isolate, SfStoreCountCallback));
+    // IOStats removed — migrated to WasmGC
     global->Set(isolate, "__edgebox_root", v8::FunctionTemplate::New(isolate, RootCallback));
     global->Set(isolate, "__edgebox_resolve_cache_get", v8::FunctionTemplate::New(isolate, ResolveCacheGetCallback));
     global->Set(isolate, "__edgebox_resolve_cache_set", v8::FunctionTemplate::New(isolate, ResolveCacheSetCallback));
     global->Set(isolate, "__edgebox_resolve_relative", v8::FunctionTemplate::New(isolate, ResolveRelativeCallback));
     global->Set(isolate, "__edgebox_zig_parse", v8::FunctionTemplate::New(isolate, ZigParseCallback));
-    global->Set(isolate, "__edgebox_zig_create_sf", v8::FunctionTemplate::New(isolate, ZigCreateSourceFileCallback));
     global->Set(isolate, "__edgebox_shared_cache_get", v8::FunctionTemplate::New(isolate, SharedCacheGetCallback));
     global->Set(isolate, "__edgebox_shared_cache_set", v8::FunctionTemplate::New(isolate, SharedCacheSetCallback));
     global->Set(isolate, "__edgebox_write_file", v8::FunctionTemplate::New(isolate, WriteFileCallback));
@@ -709,50 +683,6 @@ static void WaitProgramReadyCallback(const v8::FunctionCallbackInfo<v8::Value>& 
   edgebox_wait_program_ready();
 }
 
-// ── Shared SourceFile Store (worker 0 → workers 1-N) ──
-extern "C" void edgebox_sf_store_put(const char* key, int key_len, const char* val, int val_len);
-extern "C" const char* edgebox_sf_store_get(const char* key, int key_len, int* out_len);
-extern "C" void edgebox_sf_store_clear();
-extern "C" unsigned int edgebox_sf_store_count();
-
-static void SfStorePutCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  // JS: __edgebox_sf_store_put(fileName, arrayBuffer)
-  if (args.Length() < 2) return;
-  auto* isolate = args.GetIsolate();
-  v8::String::Utf8Value key(isolate, args[0]);
-  if (!*key) return;
-  if (args[1]->IsArrayBuffer()) {
-    auto ab = args[1].As<v8::ArrayBuffer>();
-    auto store = ab->GetBackingStore();
-    edgebox_sf_store_put(*key, key.length(), (const char*)store->Data(), store->ByteLength());
-  } else if (args[1]->IsUint8Array()) {
-    auto u8arr = args[1].As<v8::Uint8Array>();
-    auto ab = u8arr->Buffer();
-    auto store = ab->GetBackingStore();
-    edgebox_sf_store_put(*key, key.length(),
-      (const char*)store->Data() + u8arr->ByteOffset(), u8arr->ByteLength());
-  }
-}
-
-static void SfStoreGetCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  // JS: __edgebox_sf_store_get(fileName) → ArrayBuffer | undefined
-  if (args.Length() < 1) return;
-  auto* isolate = args.GetIsolate();
-  v8::String::Utf8Value key(isolate, args[0]);
-  if (!*key) return;
-  int out_len = 0;
-  const char* data = edgebox_sf_store_get(*key, key.length(), &out_len);
-  if (data && out_len > 0) {
-    // Create ArrayBuffer with copy of data (each isolate needs its own copy)
-    auto ab = v8::ArrayBuffer::New(isolate, out_len);
-    memcpy(ab->GetBackingStore()->Data(), data, out_len);
-    args.GetReturnValue().Set(ab);
-  }
-}
-
-static void SfStoreCountCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  args.GetReturnValue().Set(v8::Number::New(args.GetIsolate(), edgebox_sf_store_count()));
-}
 
 extern void edgebox_submit_result(int worker_id, const char* data, int data_len);
 extern void edgebox_worker_done(int worker_id);
@@ -822,8 +752,7 @@ static void ResolveRelativeCallback(const v8::FunctionCallbackInfo<v8::Value>& a
 }
 
 static void ZigParseCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  // Mode 1: __edgebox_zig_parse(sourceText) → ArrayBuffer of flat AST nodes
-  // Mode 2: __edgebox_zig_parse(sourceText, fileName) → SourceFile object (C++ bridge)
+  // JS: __edgebox_zig_parse(sourceText) → ArrayBuffer of flat AST nodes (24 bytes each)
   if (args.Length() < 1) return;
   auto* isolate = args.GetIsolate();
   v8::String::Utf8Value source(isolate, args[0]);
@@ -831,343 +760,16 @@ static void ZigParseCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
   const char* out_nodes = nullptr;
   int out_count = 0;
   int ok = edgebox_zig_parse(*source, source.length(), &out_nodes, &out_count);
-  if (ok != 1 || !out_nodes || out_count <= 0) return;
-
-  if (args.Length() < 2 || !args[1]->IsString()) {
-    // Mode 1: return ArrayBuffer (backward compat)
+  if (ok == 1 && out_nodes && out_count > 0) {
+    // Create ArrayBuffer with copy of flat AST data (24 bytes per node)
     size_t byte_len = (size_t)out_count * 24;
     auto ab = v8::ArrayBuffer::New(isolate, byte_len);
-    if (ab->Data()) memcpy(ab->Data(), out_nodes, byte_len);
+    void* data = ab->Data();
+    if (data) {
+      memcpy(data, out_nodes, byte_len);
+    }
     args.GetReturnValue().Set(ab);
-    return;
   }
-
-  // Mode 2: create SourceFile directly in C++
-  auto context = isolate->GetCurrentContext();
-  const FlatNode* nodes = reinterpret_cast<const FlatNode*>(out_nodes);
-  int nodeCount = out_count;
-
-  // For very large files (>50K nodes), fall back to returning ArrayBuffer
-  // to avoid V8 heap pressure from creating too many objects at once
-  if (nodeCount > 50000) {
-    size_t bl = (size_t)nodeCount * 24;
-    auto ab = v8::ArrayBuffer::New(isolate, bl);
-    auto bs = ab->GetBackingStore();
-    if (bs && bs->Data()) memcpy(bs->Data(), out_nodes, bl);
-    args.GetReturnValue().Set(ab);
-    return;
-  }
-
-  auto global = context->Global();
-  auto tsVal = global->Get(context, v8::String::NewFromUtf8Literal(isolate, "ts")).ToLocalChecked();
-  if (!tsVal->IsObject()) { edgebox_write_stderr("[cpp-bridge] ts not found\n", 26); return; }
-  auto ts = tsVal.As<v8::Object>();
-  auto allocVal = ts->Get(context, v8::String::NewFromUtf8Literal(isolate, "objectAllocator")).ToLocalChecked();
-  if (!allocVal->IsObject()) return;
-  auto alloc_obj = allocVal.As<v8::Object>();
-  auto getNodeCtorVal = alloc_obj->Get(context, v8::String::NewFromUtf8Literal(isolate, "getNodeConstructor")).ToLocalChecked();
-  if (!getNodeCtorVal->IsFunction()) return;
-  auto NodeCtor = getNodeCtorVal.As<v8::Function>()->Call(context, alloc_obj, 0, nullptr).ToLocalChecked().As<v8::Function>();
-
-  auto s_flags = v8::String::NewFromUtf8Literal(isolate, "flags");
-  auto s_parent = v8::String::NewFromUtf8Literal(isolate, "parent");
-
-  // Create ALL nodes in C++ (no JS loop)
-  std::vector<v8::Local<v8::Object>> tscNodes(nodeCount);
-  v8::Local<v8::Value> ctorArgs[3];
-
-  for (int i = 0; i < nodeCount; i++) {
-    ctorArgs[0] = v8::Number::New(isolate, nodes[i].kind);
-    ctorArgs[1] = v8::Number::New(isolate, nodes[i].start);
-    ctorArgs[2] = v8::Number::New(isolate, nodes[i].end);
-    auto maybeNode = NodeCtor->NewInstance(context, 3, ctorArgs);
-    if (maybeNode.IsEmpty()) return;
-    tscNodes[i] = maybeNode.ToLocalChecked();
-    if (nodes[i].flags) tscNodes[i]->Set(context, s_flags, v8::Number::New(isolate, nodes[i].flags)).Check();
-  }
-
-  // Set parents
-  for (int i = 0; i < nodeCount; i++) {
-    if (nodes[i].parent != 0xFFFFFFFF && (int)nodes[i].parent < nodeCount) {
-      tscNodes[i]->Set(context, s_parent, tscNodes[nodes[i].parent]).Check();
-    }
-  }
-
-  // Set text on identifiers/string literals
-  auto skVal = ts->Get(context, v8::String::NewFromUtf8Literal(isolate, "SyntaxKind")).ToLocalChecked().As<v8::Object>();
-  int idKind = skVal->Get(context, v8::String::NewFromUtf8Literal(isolate, "Identifier")).ToLocalChecked()->Int32Value(context).FromMaybe(80);
-  int strLitKind = skVal->Get(context, v8::String::NewFromUtf8Literal(isolate, "StringLiteral")).ToLocalChecked()->Int32Value(context).FromMaybe(11);
-  int numLitKind = skVal->Get(context, v8::String::NewFromUtf8Literal(isolate, "NumericLiteral")).ToLocalChecked()->Int32Value(context).FromMaybe(9);
-  auto s_text = v8::String::NewFromUtf8Literal(isolate, "text");
-  auto s_escapedText = v8::String::NewFromUtf8Literal(isolate, "escapedText");
-
-  for (int i = 0; i < nodeCount; i++) {
-    int kind = nodes[i].kind;
-    int s = nodes[i].start, e = nodes[i].end;
-    if (kind == idKind) {
-      while (s < e && ((*source)[s] <= ' ')) s++;
-      while (e > s && ((*source)[e-1] <= ' ')) e--;
-      if (e > s) {
-        auto txt = v8::String::NewFromUtf8(isolate, *source + s, v8::NewStringType::kNormal, e - s).ToLocalChecked();
-        tscNodes[i]->Set(context, s_escapedText, txt).Check();
-        tscNodes[i]->Set(context, s_text, txt).Check();
-      }
-    } else if (kind == strLitKind && e > s + 1) {
-      auto txt = v8::String::NewFromUtf8(isolate, *source + s + 1, v8::NewStringType::kNormal, e - s - 2).ToLocalChecked();
-      tscNodes[i]->Set(context, s_text, txt).Check();
-    } else if (kind == numLitKind) {
-      while (s < e && (*source)[s] == ' ') s++;
-      if (e > s) {
-        auto txt = v8::String::NewFromUtf8(isolate, *source + s, v8::NewStringType::kNormal, e - s).ToLocalChecked();
-        tscNodes[i]->Set(context, s_text, txt).Check();
-      }
-    }
-  }
-
-  // Call JS __zigMapChildren to map flat children → named properties
-  auto mapFn = global->Get(context, v8::String::NewFromUtf8Literal(isolate, "__zigMapChildren")).ToLocalChecked();
-  if (!mapFn->IsFunction()) {
-    // Try globalThis
-    mapFn = global->Get(context, v8::String::NewFromUtf8Literal(isolate, "__zigMapChildren")).ToLocalChecked();
-  }
-  // Create shared nodes array + flat buffer (reuse for both calls)
-  auto nodesArr = v8::Array::New(isolate, nodeCount);
-  for (int i = 0; i < nodeCount; i++) nodesArr->Set(context, i, tscNodes[i]).Check();
-  size_t byte_len = (size_t)nodeCount * 24;
-  auto ab = v8::ArrayBuffer::New(isolate, byte_len);
-  auto backing = ab->GetBackingStore();
-  if (backing && backing->Data()) {
-    memcpy(backing->Data(), out_nodes, byte_len);
-  }
-
-  if (mapFn->IsFunction()) {
-    v8::Local<v8::Value> mapArgs[2] = { nodesArr, ab };
-    auto mapResult = mapFn.As<v8::Function>()->Call(context, global, 2, mapArgs);
-    if (mapResult.IsEmpty()) return; // mapChildren failed
-  }
-
-  // Call JS __zigBuildSourceFile to assemble the SourceFile wrapper
-  auto buildFn = global->Get(context, v8::String::NewFromUtf8Literal(isolate, "__zigBuildSourceFile")).ToLocalChecked();
-  if (buildFn->IsFunction()) {
-    v8::Local<v8::Value> buildArgs[4] = { nodesArr, args[0], args[1], ab };
-    auto result = buildFn.As<v8::Function>()->Call(context, global, 4, buildArgs);
-    if (!result.IsEmpty()) {
-      args.GetReturnValue().Set(result.ToLocalChecked());
-    }
-  }
-}
-
-// ── C++ SourceFile creator (standalone, unused — Mode 2 of ZigParseCallback is preferred) ──
-static void ZigCreateSourceFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  // JS: __edgebox_zig_create_sf(sourceText, fileName) → SourceFile object
-  // Does: Zig parse → flat AST → create all V8 Node objects in C++ → return SourceFile
-  if (args.Length() < 2) return;
-  auto* isolate = args.GetIsolate();
-  auto context = isolate->GetCurrentContext();
-
-  v8::String::Utf8Value source(isolate, args[0]);
-  v8::String::Utf8Value fileName(isolate, args[1]);
-  if (!*source || !*fileName) return;
-
-  // Step 1: Zig parse (fast — ~0.05ms per file)
-  const char* out_nodes = nullptr;
-  int out_count = 0;
-  int ok = edgebox_zig_parse(*source, source.length(), &out_nodes, &out_count);
-  if (ok != 1 || !out_nodes || out_count <= 0) return;
-
-  const FlatNode* nodes = reinterpret_cast<const FlatNode*>(out_nodes);
-  int nodeCount = out_count;
-
-  // Step 2: Get the Node constructor from ts.objectAllocator
-  // We need: globalThis.ts.objectAllocator.getNodeConstructor()
-  auto global = context->Global();
-  auto tsVal = global->Get(context, v8::String::NewFromUtf8Literal(isolate, "ts")).ToLocalChecked();
-  if (!tsVal->IsObject()) return;
-  auto ts = tsVal.As<v8::Object>();
-  auto allocVal = ts->Get(context, v8::String::NewFromUtf8Literal(isolate, "objectAllocator")).ToLocalChecked();
-  if (!allocVal->IsObject()) return;
-  auto alloc = allocVal.As<v8::Object>();
-  auto getNodeCtorVal = alloc->Get(context, v8::String::NewFromUtf8Literal(isolate, "getNodeConstructor")).ToLocalChecked();
-  if (!getNodeCtorVal->IsFunction()) return;
-  auto getNodeCtor = getNodeCtorVal.As<v8::Function>();
-  auto nodeCtorVal = getNodeCtor->Call(context, alloc, 0, nullptr).ToLocalChecked();
-  if (!nodeCtorVal->IsFunction()) return;
-  auto NodeCtor = nodeCtorVal.As<v8::Function>();
-
-  // Also get SourceFile constructor and SyntaxKind constants
-  auto getSFCtorVal = alloc->Get(context, v8::String::NewFromUtf8Literal(isolate, "getSourceFileConstructor")).ToLocalChecked();
-  v8::Local<v8::Function> SFCtor;
-  if (getSFCtorVal->IsFunction()) {
-    SFCtor = getSFCtorVal.As<v8::Function>()->Call(context, alloc, 0, nullptr).ToLocalChecked().As<v8::Function>();
-  } else {
-    SFCtor = NodeCtor; // fallback
-  }
-
-  auto skVal = ts->Get(context, v8::String::NewFromUtf8Literal(isolate, "SyntaxKind")).ToLocalChecked();
-  if (!skVal->IsObject()) return;
-  auto SK = skVal.As<v8::Object>();
-
-  // Cache string keys for fast property access
-  auto s_kind = v8::String::NewFromUtf8Literal(isolate, "kind");
-  auto s_pos = v8::String::NewFromUtf8Literal(isolate, "pos");
-  auto s_end = v8::String::NewFromUtf8Literal(isolate, "end");
-  auto s_flags = v8::String::NewFromUtf8Literal(isolate, "flags");
-  auto s_parent = v8::String::NewFromUtf8Literal(isolate, "parent");
-  auto s_text = v8::String::NewFromUtf8Literal(isolate, "text");
-  auto s_escapedText = v8::String::NewFromUtf8Literal(isolate, "escapedText");
-  auto s_statements = v8::String::NewFromUtf8Literal(isolate, "statements");
-  auto s_fileName = v8::String::NewFromUtf8Literal(isolate, "fileName");
-
-  // Step 3: Create ALL V8 nodes in one pass
-  std::vector<v8::Local<v8::Object>> tscNodes(nodeCount);
-  v8::Local<v8::Value> ctorArgs[3];
-
-  for (int i = 0; i < nodeCount; i++) {
-    ctorArgs[0] = v8::Number::New(isolate, nodes[i].kind);
-    ctorArgs[1] = v8::Number::New(isolate, nodes[i].start);
-    ctorArgs[2] = v8::Number::New(isolate, nodes[i].end);
-    auto maybeNode = NodeCtor->NewInstance(context, 3, ctorArgs);
-    if (maybeNode.IsEmpty()) return;
-    tscNodes[i] = maybeNode.ToLocalChecked();
-    tscNodes[i]->Set(context, s_flags, v8::Number::New(isolate, nodes[i].flags)).Check();
-  }
-
-  // Step 4: Set parent references
-  for (int i = 0; i < nodeCount; i++) {
-    if (nodes[i].parent != 0xFFFFFFFF && (int)nodes[i].parent < nodeCount) {
-      tscNodes[i]->Set(context, s_parent, tscNodes[nodes[i].parent]).Check();
-    }
-  }
-
-  // Step 5: Set text on Identifiers and StringLiterals
-  // Get SyntaxKind.Identifier and SyntaxKind.StringLiteral values
-  auto idKindVal = SK->Get(context, v8::String::NewFromUtf8Literal(isolate, "Identifier")).ToLocalChecked();
-  auto strLitKindVal = SK->Get(context, v8::String::NewFromUtf8Literal(isolate, "StringLiteral")).ToLocalChecked();
-  auto numLitKindVal = SK->Get(context, v8::String::NewFromUtf8Literal(isolate, "NumericLiteral")).ToLocalChecked();
-  int idKind = idKindVal->Int32Value(context).FromMaybe(80);
-  int strLitKind = strLitKindVal->Int32Value(context).FromMaybe(11);
-  int numLitKind = numLitKindVal->Int32Value(context).FromMaybe(9);
-
-  for (int i = 0; i < nodeCount; i++) {
-    int kind = nodes[i].kind;
-    if (kind == idKind) {
-      // Identifier: text = sourceText.substring(start, end).trim()
-      int s = nodes[i].start, e = nodes[i].end;
-      // Trim whitespace
-      while (s < e && ((*source)[s] == ' ' || (*source)[s] == '\n' || (*source)[s] == '\r' || (*source)[s] == '\t')) s++;
-      while (e > s && ((*source)[e-1] == ' ' || (*source)[e-1] == '\n' || (*source)[e-1] == '\r' || (*source)[e-1] == '\t')) e--;
-      if (e > s) {
-        auto txt = v8::String::NewFromUtf8(isolate, *source + s, v8::NewStringType::kNormal, e - s).ToLocalChecked();
-        tscNodes[i]->Set(context, s_escapedText, txt).Check();
-        tscNodes[i]->Set(context, s_text, txt).Check();
-      }
-    } else if (kind == strLitKind) {
-      int s = nodes[i].start + 1, e = nodes[i].end - 1; // skip quotes
-      if (e > s) {
-        auto txt = v8::String::NewFromUtf8(isolate, *source + s, v8::NewStringType::kNormal, e - s).ToLocalChecked();
-        tscNodes[i]->Set(context, s_text, txt).Check();
-      }
-    } else if (kind == numLitKind) {
-      int s = nodes[i].start, e = nodes[i].end;
-      while (s < e && (*source)[s] == ' ') s++;
-      if (e > s) {
-        auto txt = v8::String::NewFromUtf8(isolate, *source + s, v8::NewStringType::kNormal, e - s).ToLocalChecked();
-        tscNodes[i]->Set(context, s_text, txt).Check();
-      }
-    }
-  }
-
-  // Step 6: Call JS-side mapChildren (reuse the version-proof bridge)
-  // This is the only JS call — maps flat children to named properties
-  auto mapChildrenFn = global->Get(context, v8::String::NewFromUtf8Literal(isolate, "__zigMapChildren")).ToLocalChecked();
-  if (mapChildrenFn->IsFunction()) {
-    // Pass the nodes array and flat data to JS for child mapping
-    auto nodesArr = v8::Array::New(isolate, nodeCount);
-    for (int i = 0; i < nodeCount; i++) {
-      nodesArr->Set(context, i, tscNodes[i]).Check();
-    }
-    // Create ArrayBuffer view of flat nodes for child traversal
-    size_t byte_len = (size_t)nodeCount * 24;
-    auto ab = v8::ArrayBuffer::New(isolate, byte_len);
-    memcpy(ab->GetBackingStore()->Data(), out_nodes, byte_len);
-
-    v8::Local<v8::Value> mapArgs[2] = { nodesArr, ab };
-    mapChildrenFn.As<v8::Function>()->Call(context, global, 2, mapArgs).ToLocalChecked();
-  }
-
-  // Step 7: Build SourceFile wrapper
-  auto sfKindVal = SK->Get(context, v8::String::NewFromUtf8Literal(isolate, "SourceFile")).ToLocalChecked();
-  int sfKind = sfKindVal->Int32Value(context).FromMaybe(308);
-  ctorArgs[0] = v8::Number::New(isolate, sfKind);
-  ctorArgs[1] = v8::Number::New(isolate, 0);
-  ctorArgs[2] = v8::Number::New(isolate, source.length());
-  auto sf = SFCtor->NewInstance(context, 3, ctorArgs).ToLocalChecked();
-
-  sf->Set(context, s_flags, v8::Number::New(isolate, 0)).Check();
-  sf->Set(context, s_text, args[0]).Check(); // original source text
-  sf->Set(context, s_fileName, args[1]).Check();
-  sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "path"), v8::String::Empty(isolate)).Check();
-  sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "resolvedPath"), v8::String::Empty(isolate)).Check();
-  sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "originalFileName"), args[1]).Check();
-  sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "languageVersion"), v8::Number::New(isolate, 99)).Check();
-  sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "languageVariant"), v8::Number::New(isolate, 0)).Check();
-  sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "scriptKind"), v8::Number::New(isolate, 3)).Check();
-  sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "isDeclarationFile"), v8::Boolean::New(isolate, false)).Check();
-  sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "hasNoDefaultLib"), v8::Boolean::New(isolate, false)).Check();
-  sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "nodeCount"), v8::Number::New(isolate, nodeCount)).Check();
-  sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "identifierCount"), v8::Number::New(isolate, 0)).Check();
-  sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "symbolCount"), v8::Number::New(isolate, 0)).Check();
-
-  // Empty arrays/maps
-  auto emptyArr = v8::Array::New(isolate, 0);
-  sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "parseDiagnostics"), emptyArr).Check();
-  sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "bindDiagnostics"), emptyArr).Check();
-  sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "referencedFiles"), emptyArr).Check();
-  sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "typeReferenceDirectives"), emptyArr).Check();
-  sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "libReferenceDirectives"), emptyArr).Check();
-  sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "amdDependencies"), emptyArr).Check();
-  sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "imports"), emptyArr).Check();
-  sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "moduleAugmentations"), emptyArr).Check();
-  sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "ambientModuleNames"), emptyArr).Check();
-
-  // Create Map objects via JS (can't create Map in C++ easily)
-  auto mapCtorVal = global->Get(context, v8::String::NewFromUtf8Literal(isolate, "Map")).ToLocalChecked();
-  if (mapCtorVal->IsFunction()) {
-    auto MapCtor = mapCtorVal.As<v8::Function>();
-    sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "pragmas"), MapCtor->NewInstance(context, 0, nullptr).ToLocalChecked()).Check();
-    sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "identifiers"), MapCtor->NewInstance(context, 0, nullptr).ToLocalChecked()).Check();
-  }
-
-  // Root children = statements
-  uint32_t rootFirst = nodes[0].first_child;
-  auto stmts = v8::Array::New(isolate);
-  int stmtIdx = 0;
-  uint32_t ch = rootFirst;
-  while (ch != 0xFFFFFFFF && (int)ch < nodeCount) {
-    tscNodes[ch]->Set(context, s_parent, sf).Check();
-    stmts->Set(context, stmtIdx++, tscNodes[ch]).Check();
-    ch = nodes[ch].next_sibling;
-  }
-  stmts->Set(context, v8::String::NewFromUtf8Literal(isolate, "pos"), v8::Number::New(isolate, -1)).Check();
-  stmts->Set(context, v8::String::NewFromUtf8Literal(isolate, "end"), v8::Number::New(isolate, -1)).Check();
-  stmts->Set(context, v8::String::NewFromUtf8Literal(isolate, "hasTrailingComma"), v8::Boolean::New(isolate, false)).Check();
-  stmts->Set(context, v8::String::NewFromUtf8Literal(isolate, "transformFlags"), v8::Number::New(isolate, 0)).Check();
-  sf->Set(context, s_statements, stmts).Check();
-
-  // EndOfFileToken
-  auto eofKindVal = SK->Get(context, v8::String::NewFromUtf8Literal(isolate, "EndOfFileToken")).ToLocalChecked();
-  int eofKind = eofKindVal->Int32Value(context).FromMaybe(1);
-  auto getTokenCtorVal = alloc->Get(context, v8::String::NewFromUtf8Literal(isolate, "getTokenConstructor")).ToLocalChecked();
-  if (getTokenCtorVal->IsFunction()) {
-    ctorArgs[0] = v8::Number::New(isolate, eofKind);
-    ctorArgs[1] = v8::Number::New(isolate, source.length());
-    ctorArgs[2] = v8::Number::New(isolate, source.length());
-    auto eof = getTokenCtorVal.As<v8::Function>()->Call(context, alloc, 0, nullptr).ToLocalChecked().As<v8::Function>()->NewInstance(context, 3, ctorArgs).ToLocalChecked();
-    eof->Set(context, s_parent, sf).Check();
-    sf->Set(context, v8::String::NewFromUtf8Literal(isolate, "endOfFileToken"), eof).Check();
-  }
-
-  args.GetReturnValue().Set(sf);
 }
 
 // Setup context with IO globals. If snapshot exists, uses snapshot context.
@@ -1229,19 +831,7 @@ void* edgebox_v8_setup_context(void* iso_ptr) {
     set("__edgebox_wait_program_ready", WaitProgramReadyCallback);
     set("__edgebox_worker_done", WorkerDoneCallback);
   }
-  // SF store callbacks — register on ALL contexts (snapshot may not preserve template functions)
-  {
-    auto globalObj = context->Global();
-    auto set = [&](const char* name, v8::FunctionCallback cb) {
-      globalObj->Set(context,
-        v8::String::NewFromUtf8(isolate, name).ToLocalChecked(),
-        v8::Function::New(context, cb).ToLocalChecked()).Check();
-    };
-    set("__edgebox_sf_store_put", SfStorePutCallback);
-    set("__edgebox_sf_store_get", SfStoreGetCallback);
-    set("__edgebox_sf_store_count", SfStoreCountCallback);
-    set("__edgebox_zig_create_sf", ZigCreateSourceFileCallback);
-  }
+  // Snapshot workers: IO callbacks already baked in via external_references
 
   auto* persistent = new v8::Persistent<v8::Context>(isolate, context);
   return persistent;

@@ -457,11 +457,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   // Bridge improvements: operator tokens, ternary expressions, 40+ SyntaxKind mappings.
   // Remaining issues: typeof import() type annotations not treated as imports,
   // binder crash on destructuring assignment flow. Re-enable after these fixes.
-  // Zig parser: C++ bridge creates V8 nodes natively from Zig flat AST.
-  // Zero-copy: Zig memory → C++ reads → V8 objects. No JS loop.
-  // Zig parser: lazy SourceFile creation from flat AST buffer.
-  // Nodes materialized on-demand — only ~30% of nodes touched by binder/checker.
-  var useZigParser = typeof __edgebox_zig_parse === 'function' && typeof globalThis.__zigCreateSourceFileLazy === 'function';
+  var useZigParser = false;
   var zigParseCount = 0, zigFallbackCount = 0;
 
   // Instrument forEachChild to detect infinite recursion
@@ -568,59 +564,65 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   }
   var isWarm = !!globalThis.__pc[ck]; // truly warm = from previous check, not from snapshot
   // Adaptive strategy:
-  // Cold: worker 0 parses → serializes ASTs → signals ready → workers 1-N deserialize → all check.
+  // Cold: all workers in parallel with createProgram (fastest parse).
   // Warm: worker 0 only with createIncrementalProgram (cache reuse + incremental check).
   if (isWarm && workerId > 0) {
     __edgebox_write_stderr('[recipe] w' + workerId + ' warm skip\n');
     return '';
   }
-  // ── PHASED COLD START ──
-  // Workers 1-N: wait for worker 0 to finish parsing before doing anything.
-  // Worker 0 serializes parsed SourceFiles to shared Zig buffer.
-  // Workers 1-N reconstruct SourceFiles from buffer (skip TS parser entirely).
-  // Load SF serializer on first use (cross-worker AST sharing)
-  if (!globalThis.__serializeSourceFile && typeof __edgebox_read_file === 'function' && typeof __edgebox_root === 'function') {
-    try {
-      var _serSrc = __edgebox_read_file(__edgebox_root() + '/src/tsc-recipe/sf_serializer.js');
-      if (_serSrc) eval(_serSrc);
-    } catch(e) { __edgebox_write_stderr('[recipe] sf_serializer load: ' + e.message + '\n'); }
-  }
-  // Phase barrier: worker 0 parses first, populates file cache + resolve cache.
-  // Workers 1-N wait for worker 0's parse, then parse from cached file content (no disk IO).
-  // Serialization of ASTs is too slow (1240ms) — just let workers re-parse from memory.
-  var usePhaseBarrier = !isWarm && typeof __edgebox_signal_program_ready === 'function' && workerCount > 1;
-  if (usePhaseBarrier && workerId > 0) {
-    __edgebox_write_stderr('[recipe] w' + workerId + ' waiting for worker 0 to parse...\n');
-    __edgebox_wait_program_ready();
-    __edgebox_write_stderr('[recipe] w' + workerId + ' worker 0 done, starting parse from cache\n');
-  }
-  // Zig parser + C++ bridge: on-demand getSourceFile override.
-  // C++ does: Zig parse → flat AST → create V8 nodes natively → map children via JS.
-  if (useZigParser) {
-    var _origHostGSF_zig = host.getSourceFile;
-    host.getSourceFile = function(fileName, languageVersionOrOptions, onError) {
-      // Skip .d.ts — TSC parser handles these (lib files have special handling)
-      if (fileName.endsWith('.d.ts')) {
-        return _origHostGSF_zig.call(this, fileName, languageVersionOrOptions, onError);
-      }
-      var content = ts.sys.readFile(fileName);
-      if (content === undefined) return _origHostGSF_zig.call(this, fileName, languageVersionOrOptions, onError);
+  // ── BATCH PRE-LOAD: Zig-parse ALL .ts files BEFORE createProgram ──
+  // This is the key to speed: createProgram calls getSourceFile for each
+  // imported file sequentially. If files are already cached, each call
+  // returns instantly from the Map. No sequential Zig+bridge overhead.
+  // Only worker 0 does batch pre-load — workers share nothing (separate isolates)
+  // so each would redundantly parse all files. Worker 0 parses, others use TSC.
+  __edgebox_write_stderr('[recipe] w' + workerId + ' batch-start useZig=' + useZigParser + '\n');
+  if (useZigParser && !globalThis.__zigSourceFileCache && workerId === 0) {
+    var cache = new Map();
+    var t_zig0 = Date.now();
+    __edgebox_write_stderr('[recipe] batch files: ' + parsed.fileNames.length + '\n');
+    var tsFileCount = 0;
+    for (var fi = 0; fi < parsed.fileNames.length; fi++) {
+      var fn = parsed.fileNames[fi];
+      if (fn.endsWith('.d.ts')) continue;
+      tsFileCount++;
+      var content = ts.sys.readFile(fn);
+      if (content === undefined) continue;
       try {
-        // Zig parse → flat AST buffer → lazy node materialization
+        var _tp0 = Date.now();
         var flatAST = __edgebox_zig_parse(content);
+        var _tp1 = Date.now();
         if (flatAST && flatAST.byteLength >= 24) {
-          var sf = __zigCreateSourceFileLazy(content, fileName, flatAST);
+          var sf = globalThis.__zigCreateSourceFile(content, fn, flatAST);
+          var _tp2 = Date.now();
+          if (_tp2 - _tp0 > 100) __edgebox_write_stderr('[SLOW] ' + fn.split('/').pop() + ' zig=' + (_tp1-_tp0) + 'ms bridge=' + (_tp2-_tp1) + 'ms\n');
           if (sf && sf.statements) {
-            zigParseCount++;
-            return sf;
+            if (sf.imports) {
+              for (var ii = 0; ii < sf.imports.length; ii++) {
+                var imp = sf.imports[ii];
+                if (imp.kind === 11 && !imp.text) {
+                  imp.text = content.substring(imp.pos + 1, imp.end - 1);
+                }
+              }
+            }
+            // Validate: try forEachChild on each statement to catch bridge bugs early.
+            // If any node has undefined children where TSC expects them, skip this file.
+            var valid = true;
+            try {
+              for (var vi = 0; vi < sf.statements.length; vi++) {
+                ts.forEachChild(sf.statements[vi], function(n) {
+                  if (n) ts.forEachChild(n, function() {}); // 2-deep validation
+                });
+              }
+            } catch(ve) { valid = false; }
+            if (valid) cache.set(fn, sf);
           }
         }
-      } catch(e) {
-        if (zigFallbackCount < 3) __edgebox_write_stderr('[recipe] zig parse error: ' + fileName.split('/').pop() + ' ' + e.message + '\n');
-      }
-      zigFallbackCount++;
-      return _origHostGSF_zig.call(this, fileName, languageVersionOrOptions, onError);
-    };
+      } catch(e) {}
+      if (tsFileCount % 50 === 0) __edgebox_write_stderr('[recipe] batch ' + tsFileCount + ' ts files processed\n');
+    }
+    globalThis.__zigSourceFileCache = cache;
+    __edgebox_write_stderr('[recipe] w' + workerId + ' batch Zig: ' + cache.size + ' files in ' + (Date.now() - t_zig0) + 'ms\n');
   }
 
   var program, builder;
@@ -639,20 +641,8 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     // DISABLED: skip-createProgram. Pre-program uses different host
     // (createCompilerHost vs recipe host) → wrong module resolution → wrong diags.
     program = globalThis.__preProgram;
-  } else if (usePhaseBarrier && workerId > 0) {
-    // Cold workers 1-N: parse from Zig file cache (no disk IO — worker 0 already read all files)
-    var _cpT0 = Date.now();
-    var _gsfCount = 0, _gsfTime = 0, _rmnCount = 0, _rmnTime = 0;
-    var _origGSF = host.getSourceFile;
-    host.getSourceFile = function() { var _t = Date.now(); _gsfCount++; var r = _origGSF.apply(this, arguments); _gsfTime += Date.now() - _t; return r; };
-    if (host.resolveModuleNames) {
-      var _origRMN = host.resolveModuleNames;
-      host.resolveModuleNames = function() { var _t = Date.now(); _rmnCount++; var r = _origRMN.apply(this, arguments); _rmnTime += Date.now() - _t; return r; };
-    }
-    program = ts.createProgram(parsed.fileNames, parsed.options, host, oldProgram);
-    __edgebox_write_stderr('[recipe] w' + workerId + ' createProgram=' + (Date.now()-_cpT0) + 'ms gsf=' + _gsfTime + 'ms(' + _gsfCount + ') rmn=' + _rmnTime + 'ms(' + _rmnCount + ') (from cache)\n');
   } else {
-    // Cold worker 0 (or no sf store): plain createProgram — time the phases
+    // Cold: plain createProgram — time the phases
     var _cpT0 = Date.now();
     var _gsfCount = 0, _gsfTime = 0, _rmnCount = 0, _rmnTime = 0;
     var _origGSF = host.getSourceFile;
@@ -663,14 +653,6 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     }
     program = ts.createProgram(parsed.fileNames, parsed.options, host, oldProgram);
     __edgebox_write_stderr('[recipe] w' + workerId + ' createProgram=' + (Date.now()-_cpT0) + 'ms gsf=' + _gsfTime + 'ms(' + _gsfCount + ') rmn=' + _rmnTime + 'ms(' + _rmnCount + ')\n');
-
-    // Worker 0: signal parse done so workers 1-N can start.
-    // File content + resolve results already cached in Zig shared memory.
-    // Workers 1-N will re-parse from cached content (no disk IO, ~500ms vs ~1100ms).
-    if (usePhaseBarrier && workerId === 0) {
-      __edgebox_signal_program_ready();
-      __edgebox_write_stderr('[recipe] w0 signaled program_ready\n');
-    }
   }
   __edgebox_write_stderr('[recipe] POST-createProgram zig=' + zigParseCount + ' fb=' + zigFallbackCount + '\n');
   // Pre-initialize the TypeChecker — this creates intrinsic types, global symbols.
