@@ -12,6 +12,9 @@
 #include <v8-persistent-handle.h>
 #include <v8-function.h>
 #include <v8-container.h>
+#include <v8-typed-array.h>
+#include <v8-value-serializer.h>
+#include <v8-array-buffer.h>
 #include <cstring>
 #include <cstdio>
 #include <string>
@@ -144,8 +147,231 @@ static void ResolveCacheGetCallback(const v8::FunctionCallbackInfo<v8::Value>& a
 static void ResolveCacheSetCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void ResolveRelativeCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 static void ZigParseCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+// Live shared AST — MonoNode writes to Zig on construction
+static void AstAllocNodeCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void AstSetFlagsCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void AstSetTextCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void AstSetExtraCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void AstSetOpTokenCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void AstSetChildrenCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void AstClaimCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void AstWaitFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void AstMarkReadyCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void AstGetRootCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void AstReadNodeCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void AstReadChildrenCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void AstReadTextCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void AstTriplePosCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+// V8 ValueSerializer — serialize entire SourceFile tree to binary blob
+static void AstV8SerializeCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+static void AstV8DeserializeCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
 // Dead stubs — type system migrated to WasmGC. Kept for external_refs compatibility.
 static void NoopCallback(const v8::FunctionCallbackInfo<v8::Value>&) {}
+
+// ── Live Shared AST — MonoNode writes to Zig on construction ──
+// Zig externs
+extern "C" uint32_t shared_ast_alloc_node(uint16_t kind, uint32_t pos, uint32_t end);
+extern "C" void shared_ast_set_flags(uint32_t id, uint32_t flags);
+extern "C" void shared_ast_set_parent(uint32_t id, uint32_t parent_id);
+extern "C" int shared_ast_set_text(uint32_t id, const char* text, int text_len);
+extern "C" int shared_ast_claim(const char* path, int path_len);
+extern "C" void shared_ast_mark_ready(const char* path, int path_len, uint32_t worker_id, uint32_t root_node_id, uint32_t t_start, uint32_t t_end);
+extern "C" uint32_t shared_ast_get_root(const char* path, int path_len);
+
+// FlatNode layout for reading (must match shared_ast.zig)
+struct FlatNode {
+  uint16_t kind;
+  uint16_t _pad;
+  uint32_t flags;  // TSC NodeFlags uses 32 bits
+  uint32_t pos;
+  uint32_t end;
+  uint32_t parent;
+  uint32_t text_offset;
+  uint32_t text_len;
+  uint32_t modifier_flags;
+  uint32_t transform_flags;
+  uint16_t op;
+  uint16_t token;
+};
+extern "C" const FlatNode* shared_ast_get_node(uint32_t id);
+extern "C" void shared_ast_get_children(uint32_t id, const uint32_t** out_ptr, uint32_t* out_count);
+extern "C" void shared_ast_get_text(uint32_t id, const char** out_ptr, uint32_t* out_len);
+
+// JS: __edgebox_ast_alloc_node(kind, pos, end) → _id
+static void AstAllocNodeCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 3) { args.GetReturnValue().Set(-1); return; }
+  auto ctx = args.GetIsolate()->GetCurrentContext();
+  uint16_t kind = (uint16_t)args[0]->Int32Value(ctx).FromMaybe(0);
+  uint32_t pos = args[1]->Uint32Value(ctx).FromMaybe(0);
+  uint32_t end = args[2]->Uint32Value(ctx).FromMaybe(0);
+  args.GetReturnValue().Set(v8::Integer::NewFromUnsigned(args.GetIsolate(), shared_ast_alloc_node(kind, pos, end)));
+}
+
+// JS: __edgebox_ast_set_flags(_id, flags)
+static void AstSetFlagsCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 2) return;
+  auto ctx = args.GetIsolate()->GetCurrentContext();
+  uint32_t id = args[0]->Uint32Value(ctx).FromMaybe(0);
+  uint32_t flags = args[1]->Uint32Value(ctx).FromMaybe(0);
+  shared_ast_set_flags(id, flags);
+}
+
+// JS: __edgebox_ast_set_extra(_id, modifierFlags, transformFlags)
+extern "C" void shared_ast_set_extra_flags(uint32_t id, uint32_t modifier, uint32_t transform);
+static void AstSetExtraCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 3) return;
+  auto ctx = args.GetIsolate()->GetCurrentContext();
+  uint32_t id = args[0]->Uint32Value(ctx).FromMaybe(0);
+  uint32_t mod = args[1]->Uint32Value(ctx).FromMaybe(0);
+  uint32_t trans = args[2]->Uint32Value(ctx).FromMaybe(0);
+  shared_ast_set_extra_flags(id, mod, trans);
+}
+
+// JS: __edgebox_ast_set_op_token(_id, operator, token)
+extern "C" void shared_ast_set_op_token(uint32_t id, uint16_t op, uint16_t token);
+static void AstSetOpTokenCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 3) return;
+  auto ctx = args.GetIsolate()->GetCurrentContext();
+  uint32_t id = args[0]->Uint32Value(ctx).FromMaybe(0);
+  uint16_t op = (uint16_t)args[1]->Int32Value(ctx).FromMaybe(0);
+  uint16_t token = (uint16_t)args[2]->Int32Value(ctx).FromMaybe(0);
+  shared_ast_set_op_token(id, op, token);
+}
+
+// JS: __edgebox_ast_set_text(_id, text) → 1=ok, 0=overflow
+static void AstSetTextCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 2) { args.GetReturnValue().Set(0); return; }
+  v8::String::Utf8Value text(args.GetIsolate(), args[1]);
+  if (!*text) { args.GetReturnValue().Set(0); return; }
+  uint32_t id = args[0]->Uint32Value(args.GetIsolate()->GetCurrentContext()).FromMaybe(0);
+  args.GetReturnValue().Set(shared_ast_set_text(id, *text, text.length()));
+}
+
+// JS: __edgebox_ast_set_children(_id, propId, childIdsArray, fileHash)
+extern "C" void shared_ast_set_children(uint32_t id, uint16_t prop_id, const uint32_t* children, int count, uint32_t file_hash);
+static void AstSetChildrenCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 4 || !args[2]->IsArray()) return;
+  auto* isolate = args.GetIsolate();
+  auto ctx = isolate->GetCurrentContext();
+  uint32_t id = args[0]->Uint32Value(ctx).FromMaybe(0);
+  uint16_t prop_id = (uint16_t)args[1]->Int32Value(ctx).FromMaybe(0);
+  auto arr = args[2].As<v8::Array>();
+  uint32_t file_hash = args[3]->Uint32Value(ctx).FromMaybe(0);
+  uint32_t len = arr->Length();
+  if (len == 0) return;
+  uint32_t stack_buf[64];
+  uint32_t* children = len <= 64 ? stack_buf : new uint32_t[len];
+  for (uint32_t i = 0; i < len; i++) {
+    children[i] = arr->Get(ctx, i).ToLocalChecked()->Uint32Value(ctx).FromMaybe(0xFFFFFFFF);
+  }
+  shared_ast_set_children(id, prop_id, children, len, file_hash);
+  if (len > 64) delete[] children;
+}
+
+// JS: __edgebox_ast_wait_file(fileName) — blocks until READY
+extern "C" void shared_ast_wait_file(const char* path, int path_len);
+static void AstWaitFileCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 1) return;
+  v8::String::Utf8Value path(args.GetIsolate(), args[0]);
+  if (!*path) return;
+  shared_ast_wait_file(*path, path.length());
+}
+
+// JS: __edgebox_ast_claim(fileName) → 0=parse, 1=wait, 2=ready
+static void AstClaimCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 1) { args.GetReturnValue().Set(0); return; }
+  v8::String::Utf8Value path(args.GetIsolate(), args[0]);
+  if (!*path) { args.GetReturnValue().Set(0); return; }
+  args.GetReturnValue().Set(shared_ast_claim(*path, path.length()));
+}
+
+// JS: __edgebox_ast_mark_ready(fileName, workerId, rootNodeId, tripleStart, tripleEnd)
+static void AstMarkReadyCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 5) return;
+  auto* isolate = args.GetIsolate();
+  auto ctx = isolate->GetCurrentContext();
+  v8::String::Utf8Value path(isolate, args[0]);
+  if (!*path) return;
+  uint32_t wid = args[1]->Uint32Value(ctx).FromMaybe(0);
+  uint32_t root = args[2]->Uint32Value(ctx).FromMaybe(0xFFFFFFFF);
+  uint32_t tStart = args[3]->Uint32Value(ctx).FromMaybe(0);
+  uint32_t tEnd = args[4]->Uint32Value(ctx).FromMaybe(0);
+  shared_ast_mark_ready(*path, path.length(), wid, root, tStart, tEnd);
+}
+
+// JS: __edgebox_ast_get_root(fileName) → rootNodeId or -1
+static void AstGetRootCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 1) { args.GetReturnValue().Set(-1); return; }
+  v8::String::Utf8Value path(args.GetIsolate(), args[0]);
+  if (!*path) { args.GetReturnValue().Set(-1); return; }
+  uint32_t root = shared_ast_get_root(*path, path.length());
+  args.GetReturnValue().Set(v8::Integer::New(args.GetIsolate(), (int32_t)root));
+}
+
+// JS: __edgebox_ast_read_node(_id) → [kind, flags, pos, end, parent] or null
+static void AstReadNodeCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 1) { args.GetReturnValue().SetNull(); return; }
+  auto* isolate = args.GetIsolate();
+  auto ctx = isolate->GetCurrentContext();
+  uint32_t id = args[0]->Uint32Value(ctx).FromMaybe(0xFFFFFFFF);
+  auto* node = shared_ast_get_node(id);
+  if (!node) { args.GetReturnValue().SetNull(); return; }
+  auto arr = v8::Array::New(isolate, 9);
+  arr->Set(ctx, 0, v8::Integer::New(isolate, node->kind)).Check();
+  arr->Set(ctx, 1, v8::Integer::NewFromUnsigned(isolate, node->flags)).Check();
+  arr->Set(ctx, 2, v8::Integer::NewFromUnsigned(isolate, node->pos)).Check();
+  arr->Set(ctx, 3, v8::Integer::NewFromUnsigned(isolate, node->end)).Check();
+  arr->Set(ctx, 4, v8::Integer::New(isolate, (int32_t)node->parent)).Check();
+  arr->Set(ctx, 5, v8::Integer::NewFromUnsigned(isolate, node->modifier_flags)).Check();
+  arr->Set(ctx, 6, v8::Integer::NewFromUnsigned(isolate, node->transform_flags)).Check();
+  arr->Set(ctx, 7, v8::Integer::New(isolate, node->op)).Check();
+  arr->Set(ctx, 8, v8::Integer::New(isolate, node->token)).Check();
+  args.GetReturnValue().Set(arr);
+}
+
+// JS: __edgebox_ast_read_children(fileName) → flat array of this file's triples
+// Reads only triples for the specified file (using stored triple range).
+extern "C" const uint32_t* shared_ast_get_triple_pool();
+extern "C" void shared_ast_get_triple_range(const char* path, int path_len, uint32_t* out_start, uint32_t* out_end);
+extern "C" uint32_t shared_ast_get_triple_pos();
+static void AstReadChildrenCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 1) { args.GetReturnValue().Set(v8::Array::New(args.GetIsolate(), 0)); return; }
+  auto* isolate = args.GetIsolate();
+  auto ctx = isolate->GetCurrentContext();
+  v8::String::Utf8Value path(isolate, args[0]);
+  if (!*path) { args.GetReturnValue().Set(v8::Array::New(isolate, 0)); return; }
+  uint32_t tStart = 0, tEnd = 0;
+  shared_ast_get_triple_range(*path, path.length(), &tStart, &tEnd);
+  const uint32_t* pool = shared_ast_get_triple_pool();
+  if (!pool || tEnd <= tStart) {
+    args.GetReturnValue().Set(v8::Array::New(isolate, 0));
+    return;
+  }
+  uint32_t count = tEnd - tStart;
+  auto arr = v8::Array::New(isolate, count);
+  for (uint32_t i = 0; i < count; i++) {
+    arr->Set(ctx, i, v8::Integer::NewFromUnsigned(isolate, pool[tStart + i])).Check();
+  }
+  args.GetReturnValue().Set(arr);
+}
+
+// JS: __edgebox_ast_triple_pos() → current triple write position
+static void AstTriplePosCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  args.GetReturnValue().Set(v8::Integer::NewFromUnsigned(args.GetIsolate(), shared_ast_get_triple_pos()));
+}
+
+// JS: __edgebox_ast_read_text(_id) → string or undefined
+static void AstReadTextCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 1) { args.GetReturnValue().SetUndefined(); return; }
+  auto* isolate = args.GetIsolate();
+  uint32_t id = args[0]->Uint32Value(isolate->GetCurrentContext()).FromMaybe(0xFFFFFFFF);
+  const char* text = nullptr;
+  uint32_t len = 0;
+  shared_ast_get_text(id, &text, &len);
+  if (!text || len == 0) { args.GetReturnValue().SetUndefined(); return; }
+  args.GetReturnValue().Set(v8::String::NewFromUtf8(isolate, text, v8::NewStringType::kNormal, len).ToLocalChecked());
+}
+
 
 // ── Shared Cache — cross-worker lock-free cache ──
 extern "C" int edgebox_shared_cache_get(int key);
@@ -164,6 +390,80 @@ static void SharedCacheSetCallback(const v8::FunctionCallbackInfo<v8::Value>& ar
   int key = args[0]->Int32Value(ctx).FromJust();
   int value = args[1]->Int32Value(ctx).FromJust();
   edgebox_shared_cache_set(key, value);
+}
+
+// ── V8 ValueSerializer — serialize/deserialize entire SourceFile tree ──
+// Uses V8's structured clone algorithm (same as postMessage/structuredClone).
+// Handles cycles (parent refs), Maps, all JS types. Binary format, ~75 bytes/node.
+
+extern "C" uint32_t shared_ast_store_blob(const char* path, int path_len, const uint8_t* data, uint32_t data_len);
+extern "C" void shared_ast_get_blob(const char* path, int path_len, const uint8_t** out_ptr, uint32_t* out_len);
+
+class AstSerializeDelegate : public v8::ValueSerializer::Delegate {
+public:
+  explicit AstSerializeDelegate(v8::Isolate* isolate) : isolate_(isolate) {}
+  void ThrowDataCloneError(v8::Local<v8::String> message) override {
+    isolate_->ThrowException(v8::Exception::Error(message));
+  }
+private:
+  v8::Isolate* isolate_;
+};
+
+// JS: __edgebox_ast_v8_serialize(sourceFile, fileName) → stores serialized blob in Zig
+static void AstV8SerializeCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 2) return;
+  auto* isolate = args.GetIsolate();
+  auto ctx = isolate->GetCurrentContext();
+
+  AstSerializeDelegate delegate(isolate);
+  v8::ValueSerializer serializer(isolate, &delegate);
+  serializer.WriteHeader();
+  auto result = serializer.WriteValue(ctx, args[0]);
+  if (result.IsNothing() || !result.FromJust()) {
+    // Serialization failed (DataCloneError) — return false
+    args.GetReturnValue().Set(false);
+    return;
+  }
+  auto [data, size] = serializer.Release();
+
+  // Store in Zig blob pool
+  v8::String::Utf8Value path(isolate, args[1]);
+  if (*path && size > 0) {
+    uint32_t offset = shared_ast_store_blob(*path, path.length(), data, (uint32_t)size);
+    free(data);
+    args.GetReturnValue().Set(offset != 0xFFFFFFFF);
+  } else {
+    free(data);
+    args.GetReturnValue().Set(false);
+  }
+}
+
+// JS: __edgebox_ast_v8_deserialize(fileName) → returns deserialized SourceFile tree
+static void AstV8DeserializeCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 1) { args.GetReturnValue().SetNull(); return; }
+  auto* isolate = args.GetIsolate();
+  auto ctx = isolate->GetCurrentContext();
+
+  v8::String::Utf8Value path(isolate, args[0]);
+  if (!*path) { args.GetReturnValue().SetNull(); return; }
+
+  const uint8_t* blob_data = nullptr;
+  uint32_t blob_len = 0;
+  shared_ast_get_blob(*path, path.length(), &blob_data, &blob_len);
+  if (!blob_data || blob_len == 0) { args.GetReturnValue().SetNull(); return; }
+
+  v8::ValueDeserializer deserializer(isolate, blob_data, blob_len);
+  auto header_ok = deserializer.ReadHeader(ctx);
+  if (header_ok.IsNothing() || !header_ok.FromJust()) {
+    args.GetReturnValue().SetNull();
+    return;
+  }
+  auto value = deserializer.ReadValue(ctx);
+  if (value.IsEmpty()) {
+    args.GetReturnValue().SetNull();
+    return;
+  }
+  args.GetReturnValue().Set(value.ToLocalChecked());
 }
 
 // ── Type Relation Cache — 3-param exact match, no hash collisions ──
@@ -251,6 +551,22 @@ static const intptr_t g_external_refs[] = {
   reinterpret_cast<intptr_t>(SharedCacheSetCallback),
   reinterpret_cast<intptr_t>(TypeCacheGetCallback),
   reinterpret_cast<intptr_t>(TypeCacheSetCallback),
+  reinterpret_cast<intptr_t>(AstAllocNodeCallback),
+  reinterpret_cast<intptr_t>(AstSetFlagsCallback),
+  reinterpret_cast<intptr_t>(AstSetTextCallback),
+  reinterpret_cast<intptr_t>(AstSetExtraCallback),
+  reinterpret_cast<intptr_t>(AstSetOpTokenCallback),
+  reinterpret_cast<intptr_t>(AstSetChildrenCallback),
+  reinterpret_cast<intptr_t>(AstClaimCallback),
+  reinterpret_cast<intptr_t>(AstWaitFileCallback),
+  reinterpret_cast<intptr_t>(AstMarkReadyCallback),
+  reinterpret_cast<intptr_t>(AstGetRootCallback),
+  reinterpret_cast<intptr_t>(AstReadNodeCallback),
+  reinterpret_cast<intptr_t>(AstReadChildrenCallback),
+  reinterpret_cast<intptr_t>(AstReadTextCallback),
+  reinterpret_cast<intptr_t>(AstTriplePosCallback),
+  reinterpret_cast<intptr_t>(AstV8SerializeCallback),
+  reinterpret_cast<intptr_t>(AstV8DeserializeCallback),
   0  // sentinel
 };
 
@@ -291,6 +607,24 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
     global->Set(isolate, "__edgebox_type_cache_get", v8::FunctionTemplate::New(isolate, TypeCacheGetCallback));
     global->Set(isolate, "__edgebox_type_cache_set", v8::FunctionTemplate::New(isolate, TypeCacheSetCallback));
     global->Set(isolate, "__edgebox_write_file", v8::FunctionTemplate::New(isolate, WriteFileCallback));
+    // Shared AST — cross-worker parse splitting
+    // Live shared AST — MonoNode writes to Zig on construction
+    global->Set(isolate, "__edgebox_ast_alloc_node", v8::FunctionTemplate::New(isolate, AstAllocNodeCallback));
+    global->Set(isolate, "__edgebox_ast_set_flags", v8::FunctionTemplate::New(isolate, AstSetFlagsCallback));
+    global->Set(isolate, "__edgebox_ast_set_text", v8::FunctionTemplate::New(isolate, AstSetTextCallback));
+    global->Set(isolate, "__edgebox_ast_set_extra", v8::FunctionTemplate::New(isolate, AstSetExtraCallback));
+    global->Set(isolate, "__edgebox_ast_set_op_token", v8::FunctionTemplate::New(isolate, AstSetOpTokenCallback));
+    global->Set(isolate, "__edgebox_ast_set_children", v8::FunctionTemplate::New(isolate, AstSetChildrenCallback));
+    global->Set(isolate, "__edgebox_ast_claim", v8::FunctionTemplate::New(isolate, AstClaimCallback));
+    global->Set(isolate, "__edgebox_ast_wait_file", v8::FunctionTemplate::New(isolate, AstWaitFileCallback));
+    global->Set(isolate, "__edgebox_ast_mark_ready", v8::FunctionTemplate::New(isolate, AstMarkReadyCallback));
+    global->Set(isolate, "__edgebox_ast_get_root", v8::FunctionTemplate::New(isolate, AstGetRootCallback));
+    global->Set(isolate, "__edgebox_ast_read_node", v8::FunctionTemplate::New(isolate, AstReadNodeCallback));
+    global->Set(isolate, "__edgebox_ast_read_children", v8::FunctionTemplate::New(isolate, AstReadChildrenCallback));
+    global->Set(isolate, "__edgebox_ast_read_text", v8::FunctionTemplate::New(isolate, AstReadTextCallback));
+    global->Set(isolate, "__edgebox_ast_triple_pos", v8::FunctionTemplate::New(isolate, AstTriplePosCallback));
+    global->Set(isolate, "__edgebox_ast_v8_serialize", v8::FunctionTemplate::New(isolate, AstV8SerializeCallback));
+    global->Set(isolate, "__edgebox_ast_v8_deserialize", v8::FunctionTemplate::New(isolate, AstV8DeserializeCallback));
     // IsSimpleTypeRelated removed — migrated to WasmGC
     global->Set(isolate, "__edgebox_submit_result", v8::FunctionTemplate::New(isolate, SubmitResultCallback));
     global->Set(isolate, "__edgebox_worker_done", v8::FunctionTemplate::New(isolate, WorkerDoneCallback));
@@ -857,6 +1191,24 @@ void* edgebox_v8_setup_context(void* iso_ptr) {
     set("__edgebox_signal_program_ready", SignalProgramReadyCallback);
     set("__edgebox_wait_program_ready", WaitProgramReadyCallback);
     set("__edgebox_worker_done", WorkerDoneCallback);
+    // Shared AST — cross-worker parse splitting
+    // Live shared AST
+    set("__edgebox_ast_alloc_node", AstAllocNodeCallback);
+    set("__edgebox_ast_set_flags", AstSetFlagsCallback);
+    set("__edgebox_ast_set_text", AstSetTextCallback);
+    set("__edgebox_ast_set_extra", AstSetExtraCallback);
+    set("__edgebox_ast_set_op_token", AstSetOpTokenCallback);
+    set("__edgebox_ast_set_children", AstSetChildrenCallback);
+    set("__edgebox_ast_claim", AstClaimCallback);
+    set("__edgebox_ast_wait_file", AstWaitFileCallback);
+    set("__edgebox_ast_mark_ready", AstMarkReadyCallback);
+    set("__edgebox_ast_get_root", AstGetRootCallback);
+    set("__edgebox_ast_read_node", AstReadNodeCallback);
+    set("__edgebox_ast_read_children", AstReadChildrenCallback);
+    set("__edgebox_ast_read_text", AstReadTextCallback);
+    set("__edgebox_ast_triple_pos", AstTriplePosCallback);
+    set("__edgebox_ast_v8_serialize", AstV8SerializeCallback);
+    set("__edgebox_ast_v8_deserialize", AstV8DeserializeCallback);
   }
   // Snapshot workers: IO callbacks already baked in via external_references
 

@@ -44,6 +44,7 @@ globalThis.__gcFlagsDone = false;
   }
   MonoNode.prototype = Object.create(origNodeProto);
   MonoNode.prototype.constructor = MonoNode;
+  // Enable/disable Zig writes per-request
 
   // MonoType — pre-initialize ALL properties to force single hidden class.
   // V8 profile shows LoadIC_Megamorphic = 17% of runtime. Type objects are
@@ -154,6 +155,361 @@ globalThis.__gcFlagsDone = false;
     getSignatureConstructor: function() { return MonoSignature; },
     getSourceMapSourceConstructor: ts.objectAllocator.getSourceMapSourceConstructor,
   });
+})();
+
+// 0.9. Shared AST — live write model.
+// MonoNode constructor writes to Zig. Reconstruction reads from Zig.
+// Property name table for child→parent mapping.
+(function() {
+  if (typeof __edgebox_ast_alloc_node !== 'function') return;
+
+  // Property name table — compact IDs for child property names.
+  // ALL TSC child property names. IDs 1-20 = arrays, 21+ = single children.
+  // Must be complete — dynamic assignment creates per-worker IDs that don't transfer.
+  var PROP_NAMES = [
+    '',
+    // Array child properties (1-20)
+    'statements', 'members', 'parameters', 'typeParameters',
+    'heritageClauses', 'types', 'elements', 'properties',
+    'modifiers', 'decorators', 'clauses', 'declarations',
+    'arguments', 'typeArguments', 'templateSpans', 'jsDoc',
+    'tags', 'typeNames', 'elementTypes', 'objectBindingPatternElements',
+    // Single child properties (21+)
+    'expression', 'name', 'type', 'body', 'initializer',
+    'condition', 'thenStatement', 'elseStatement',
+    'left', 'right', 'operatorToken', 'argument',
+    'returnType', 'constraint', 'default',
+    'moduleSpecifier', 'importClause', 'namedBindings',
+    'exportClause', 'declaration', 'declarationList',
+    'tryBlock', 'catchClause', 'finallyBlock',
+    'variableDeclaration', 'block', 'label', 'statement',
+    'caseBlock', 'template', 'head',
+    'tag', 'typeExpression',
+    'questionToken', 'dotDotDotToken', 'exclamationToken',
+    'asteriskToken', 'equalsToken',
+    'whenTrue', 'whenFalse', 'awaitModifier',
+    'objectAssignmentInitializer', 'propertyName',
+    'exprName', 'literal', 'objectType', 'indexType',
+    'checkType', 'extendsType', 'trueType', 'falseType',
+    'readonlyToken', 'typeParameter', 'nameType', 'questionDotToken',
+    'colonToken', 'assertsModifier', 'parameterName',
+    'moduleReference', 'isTypeOnly', 'qualifiedName',
+    // Additional child properties found in TSC AST
+    'argumentExpression', 'tagName', 'attributes', 'openingElement',
+    'closingElement', 'openingFragment', 'closingFragment', 'children',
+    'dotToken', 'keywordToken', 'operator', 'operand',
+    'whenFalse', 'colonToken', 'incrementor', 'forOfStatement',
+    'catchClause', 'finallyBlock', 'tryBlock',
+    'awaiter', 'elseClause', 'caseClause', 'defaultClause',
+    'variableDeclarationList', 'moduleBody', 'exportAssignment',
+    'importEqualsDeclaration', 'namespaceExportDeclaration',
+    'classExpression', 'arrowFunction', 'templateHead',
+    'templateExpression', 'templateMiddle', 'templateTail',
+    'typeAnnotation', 'typeNode', 'typeName',
+    'fullName', 'moduleSpecifier',
+    'importSpecifiers', 'exportSpecifiers', 'moduleBindings',
+    'assertClause', 'assertionKey', 'value',
+    'exclamationToken', 'questionToken', 'dotDotDotToken',
+    'initializer', 'objectBindingPattern', 'arrayBindingPattern',
+    'elementType', 'externalModuleReference',
+    'equalsGreaterThanToken', 'comment', 'qualifier',
+  ];
+  var PROP_NAME_TO_ID = {};
+  for (var _pi = 0; _pi < PROP_NAMES.length; _pi++) {
+    if (PROP_NAMES[_pi]) PROP_NAME_TO_ID[PROP_NAMES[_pi]] = _pi;
+  }
+
+  // Reconstruction: read nodes + triples from Zig, create MonoNode tree.
+  // Called when claim=2 (file already parsed by another worker).
+  // One bulk read of ALL triples, then group by parent, build tree.
+  globalThis.__sharedAstReconstruct = function(fileName, sourceText) {
+    var rootId = __edgebox_ast_get_root(fileName);
+    if (rootId < 0 || rootId === 0xFFFFFFFF) return null;
+
+    // Read triples for this file — now stored as quads (fileHash, parent, prop, child)
+    var quads = __edgebox_ast_read_children(fileName); // returns flat array for file's range
+    if (!quads) return null;
+
+    // Compute file hash (same as link step)
+    var _fh = 0;
+    for (var _hi = 0; _hi < fileName.length; _hi++) _fh = ((_fh << 5) - _fh + fileName.charCodeAt(_hi)) | 0;
+    _fh = (_fh >>> 0);
+
+    // Build child map, filtering by file hash (skip interleaved triples from other files)
+    var childMap = {};
+    for (var ti = 0; ti < quads.length; ti += 4) {
+      if (quads[ti] !== _fh) continue; // wrong file — interleaved
+      var pid = quads[ti + 1], propId = quads[ti + 2], cid = quads[ti + 3];
+      if (!childMap[pid]) childMap[pid] = [];
+      childMap[pid].push({p: propId, c: cid});
+    }
+
+    // Cache of already-built nodes (dedup)
+    var builtNodes = {};
+
+    function buildNode(id) {
+      if (builtNodes[id]) return builtNodes[id];
+      var data = __edgebox_ast_read_node(id);
+      if (!data) return null;
+      // Disable Zig writes during reconstruction
+      // Use SourceFile constructor for kind=308 (has methods like getLineAndCharacterOfPosition)
+      var NodeCtor = data[0] === 308 ? ts.objectAllocator.getSourceFileConstructor() : ts.objectAllocator.getNodeConstructor();
+      var node = new NodeCtor(data[0], data[2], data[3]);
+      node.flags = data[1];
+      node.modifierFlagsCache = data[5] || 0;
+      node.transformFlags = data[6] || 0;
+      builtNodes[id] = node;
+
+      // Restore text + all other scalars from combined format "prefix:text\njson"
+      var _stored = __edgebox_ast_read_text(id);
+      if (_stored) {
+        var _nl = _stored.indexOf('\x01');
+        var _textPart = _nl >= 0 ? _stored.substring(0, _nl) : (_stored.charAt(1) === ':' ? _stored : '');
+        var _jsonPart = _nl >= 0 ? _stored.substring(_nl + 1) : (_stored.charAt(0) === '{' ? _stored : '');
+        if (_textPart) {
+          var _pre = _textPart.charAt(0);
+          var _val = _textPart.substring(2);
+          if (_pre === 'E') node.escapedText = _val;
+          else if (_pre === 'T') node.text = _val;
+        }
+        if (_jsonPart) {
+          var _props = JSON.parse(_jsonPart);
+          for (var _pk in _props) node[_pk] = _props[_pk];
+        }
+      }
+
+      // Set children by property name
+      var entries = childMap[id];
+      if (entries) {
+        // Group by propId
+        var groups = {};
+        for (var i = 0; i < entries.length; i++) {
+          var e = entries[i];
+          if (!groups[e.p]) groups[e.p] = [];
+          groups[e.p].push(e.c);
+        }
+        for (var gp in groups) {
+          var kids = groups[gp];
+          var gpNum = Number(gp);
+          var isArray = (gpNum & 0x8000) !== 0;
+          var realPropId = gpNum & 0x7FFF;
+          var propName = PROP_NAMES[realPropId];
+          if (!propName) continue;
+          if (kids.length === 1 && !isArray) {
+            var child = buildNode(kids[0]);
+            if (child) { child.parent = node; node[propName] = child; }
+          } else {
+            var arr = [];
+            for (var j = 0; j < kids.length; j++) {
+              if (kids[j] === 0xFFFFFFFE) continue; // empty array marker
+              var child = buildNode(kids[j]);
+              if (child) { child.parent = node; arr.push(child); }
+            }
+            arr.pos = -1; arr.end = -1; arr.hasTrailingComma = false; arr.transformFlags = 0;
+            node[propName] = arr;
+          }
+        }
+      }
+      return node;
+    }
+
+    var root = buildNode(rootId);
+    if (!root) return null;
+
+    // SourceFile properties
+    root.fileName = fileName;
+    root.text = sourceText;
+    root.path = fileName;
+    root.resolvedPath = fileName;
+    root.originalFileName = fileName;
+    root.languageVersion = 99;
+    root.languageVariant = fileName.endsWith('.tsx') ? 1 : 0;
+    root.scriptKind = fileName.endsWith('.tsx') ? 4 : fileName.endsWith('.ts') ? 3 : 1;
+    root.isDeclarationFile = fileName.endsWith('.d.ts');
+    if (root.hasNoDefaultLib === undefined) root.hasNoDefaultLib = false;
+    root.bindDiagnostics = [];
+    root.bindSuggestionDiagnostics = [];
+    root.pragmas = new Map();
+    if (!root.referencedFiles) root.referencedFiles = [];
+    if (!root.typeReferenceDirectives) root.typeReferenceDirectives = [];
+    if (!root.libReferenceDirectives) root.libReferenceDirectives = [];
+    root.amdDependencies = [];
+    root.commentDirectives = [];
+    root.parseDiagnostics = [];
+    root.identifiers = new Map();
+    root.nodeCount = 0;
+    root.identifierCount = 0;
+    if (typeof ts.computeLineStarts === 'function') {
+      root.lineMap = ts.computeLineStarts(sourceText);
+    }
+    var _eofPos = sourceText.length > 0 ? sourceText.length - 1 : 0;
+    var eofToken = new (ts.objectAllocator.getTokenConstructor())(1, _eofPos, sourceText.length);
+    eofToken.flags = root.flags;
+    eofToken.parent = root;
+    root.endOfFileToken = eofToken;
+
+    return root;
+  };
+
+  // ── Post-parse link: allocate _zid + write triples in ONE pass ──
+  // Called for claimed files AFTER parse. Walks the parsed tree,
+  // allocates fresh _zid for each node, writes child triples to Zig.
+  // No stale IDs: _zid is allocated HERE, not in constructor.
+  // No snapshot pollution: only runs during request processing.
+  // Uses cached kind→property mapping — O(1) per node after first kind.
+
+  var _kindChildProps = {}; // kind → [{propId, propName, isArray}]
+
+  // Non-child properties to skip when discovering children via Object.keys
+  var _skipProps = {
+    pos:1, end:1, kind:1, flags:1, id:1, parent:1, symbol:1, locals:1,
+    nextContainer:1, localSymbol:1, flowNode:1, emitNode:1,
+    contextualType:1, inferenceContext:1, original:1, jsDocCache:1,
+    modifierFlagsCache:1, transformFlags:1, _nameHash:1, checker:1, _zid:1,
+    text:1, fileName:1, path:1, resolvedPath:1, originalFileName:1,
+    languageVersion:1, languageVariant:1, scriptKind:1, isDeclarationFile:1,
+    hasNoDefaultLib:1, bindDiagnostics:1, bindSuggestionDiagnostics:1,
+    pragmas:1, checkJsDirective:1, referencedFiles:1, typeReferenceDirectives:1,
+    libReferenceDirectives:1, amdDependencies:1, commentDirectives:1,
+    nodeCount:1, identifierCount:1, identifiers:1, parseDiagnostics:1,
+    endOfFileToken:1, externalModuleIndicator:1, commonJsModuleIndicator:1, jsDoc:1,
+    lineMap:1, classifiableNames:1, packageJsonLocations:1,
+    packageJsonScope:1, setExternalModuleIndicator:1,
+  };
+
+  // Auto-assign propId for properties not in our hardcoded list
+  var _nextDynPropId = PROP_NAMES.length;
+  var _dynProps = []; // track dynamically assigned props for debugging
+  function getPropId(name) {
+    var id = PROP_NAME_TO_ID[name];
+    if (id) return id;
+    id = _nextDynPropId++;
+    PROP_NAME_TO_ID[name] = id;
+    PROP_NAMES[id] = name;
+    _dynProps.push(name);
+    return id;
+  }
+
+  function getChildProps(node) {
+    // Discover child properties via Object.keys + kind check.
+    // val.kind !== undefined catches ALL node children including tokens
+    // (questionToken, dotDotDotToken, etc.) that forEachChild skips.
+    var props = [];
+    var keys = Object.keys(node);
+    for (var i = 0; i < keys.length; i++) {
+      var name = keys[i];
+      if (_skipProps[name]) continue;
+      var val = node[name];
+      if (val === undefined || val === null) continue;
+      if (Array.isArray(val)) {
+        // Include arrays that ARE NodeArrays (have .pos) — even if empty.
+        // Also include non-empty arrays where first element is an AST child.
+        var isNodeArray = val.pos !== undefined; // TSC NodeArray has .pos
+        var hasAstChildren = val.length > 0 && val[0] && val[0].kind !== undefined;
+        if (isNodeArray || hasAstChildren) {
+          var pid = PROP_NAME_TO_ID[name];
+          if (pid) props.push({propId: pid, propName: name, isArray: true});
+        }
+      } else if (val.kind !== undefined) {
+        props.push({propId: getPropId(name), propName: name, isArray: false});
+      }
+    }
+    return props;
+  }
+
+  globalThis.__sharedAstLink = function(sf, fileName, workerId) {
+    if (!sf) return;
+    // File hash for filtering interleaved triples during reconstruction
+    var _fileHash = 0;
+    for (var _hi = 0; _hi < fileName.length; _hi++) _fileHash = ((_fileHash << 5) - _fileHash + fileName.charCodeAt(_hi)) | 0;
+    _fileHash = (_fileHash >>> 0); // unsigned
+
+    function allocAndLink(node) {
+      // Allocate fresh _zid in Zig for this node
+      var id = __edgebox_ast_alloc_node(node.kind, node.pos, node.end);
+      if (id === 0xFFFFFFFF) return id;
+      node._zid = id;
+
+      // Write flags + text + extra
+      if (node.flags) __edgebox_ast_set_flags(id, node.flags | 0);
+      if (node.modifierFlagsCache || node.transformFlags) {
+        __edgebox_ast_set_extra(id, node.modifierFlagsCache || 0, node.transformFlags || 0);
+      }
+      // Store ALL own scalar properties as JSON.
+      // text/escapedText stored separately (prepended with "T:" or "E:" prefix).
+      // JSON stores everything else.
+      var _nodeText = node.escapedText;
+      var _textPrefix = 'E';
+      if (_nodeText === undefined || _nodeText === '') {
+        if (node.kind !== 308 && node.text !== undefined && node.text !== '' && typeof node.text === 'string') {
+          _nodeText = node.text;
+          _textPrefix = 'T';
+        }
+      }
+      // Build JSON of ALL other non-child non-skip scalars
+      var _json = JSON.stringify(node, function(k, v) {
+        if (k === '') return v;
+        if (k === 'parent' || k === '_zid' || k === 'escapedText' || k === 'text') return undefined;
+        // Module indicators: store as boolean (they're node refs or functions)
+        if (k === 'externalModuleIndicator' || k === 'commonJsModuleIndicator') return v ? true : undefined;
+        // Lib/reference directives: arrays of {fileName,pos,end} — critical for lib resolution
+        if (k === 'referencedFiles' || k === 'typeReferenceDirectives' || k === 'libReferenceDirectives') return v && v.length > 0 ? v : undefined;
+        if (k === 'hasNoDefaultLib') return v ? true : undefined;
+        if (_skipProps[k]) return undefined;
+        var t = typeof v;
+        if (t === 'string' || t === 'number' || t === 'boolean') return v;
+        return undefined;
+      });
+      // Combine: "prefix:text\njson" or just "prefix:text" or just json
+      var _blob = '';
+      if (_nodeText && typeof _nodeText === 'string') _blob = _textPrefix + ':' + _nodeText;
+      if (_json && _json !== '{}') _blob += (_blob ? '\x01' : '') + _json;
+      if (_blob) {
+        if (!__edgebox_ast_set_text(id, _blob)) return 0xFFFFFFFF;
+      }
+
+      var props = getChildProps(node);
+      for (var pi = 0; pi < props.length; pi++) {
+        var p = props[pi];
+        var val = node[p.propName];
+        if (!val) continue;
+
+        if (p.isArray) {
+          var childIds = [];
+          for (var ci = 0; ci < val.length; ci++) {
+            if (val[ci] && val[ci].kind !== undefined) {
+              var cid = allocAndLink(val[ci]);
+              if (cid !== 0xFFFFFFFF) childIds.push(cid);
+            }
+          }
+          // Mark as array with high bit (0x8000) so reconstruction knows
+          if (childIds.length > 0) {
+            __edgebox_ast_set_children(id, p.propId | 0x8000, childIds, _fileHash);
+          } else {
+            // Empty array — store marker so reconstruction creates empty NodeArray
+            __edgebox_ast_set_children(id, p.propId | 0x8000, [0xFFFFFFFE], _fileHash);
+          }
+        } else if (val.kind !== undefined) {
+          var cid = allocAndLink(val);
+          if (cid !== 0xFFFFFFFF) __edgebox_ast_set_children(id, p.propId, [cid], _fileHash);
+        }
+      }
+      return id;
+    }
+
+    _dynProps = [];
+    var tripleStart = __edgebox_ast_triple_pos();
+    var rootId = allocAndLink(sf);
+    var tripleEnd = __edgebox_ast_triple_pos();
+    if (rootId !== 0xFFFFFFFF) {
+      if (_dynProps.length > 0) {
+        __edgebox_write_stderr('[link] w' + workerId + ' dynamic props: ' + _dynProps.join(',') + '\n');
+      }
+      __edgebox_ast_mark_ready(fileName, workerId, rootId, tripleStart, tripleEnd);
+    } else {
+      __edgebox_write_stderr('[link] w' + workerId + ' FAILED: ' + fileName.split('/').pop() + ' (pool overflow)\n');
+    }
+  };
 })();
 
 // 1. Cache createSourceFile for .d.ts files (lib files parsed identically every time)
@@ -535,14 +891,102 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   } else {
     var _cpT0 = Date.now();
     var _gsfCount = 0, _gsfTime = 0, _rmnCount = 0, _rmnTime = 0;
+    var _gsfParsed = 0, _gsfReconstructed = 0, _gsfWaited = 0;
     var _origGSF = host.getSourceFile;
-    host.getSourceFile = function() { var _t = Date.now(); _gsfCount++; var r = _origGSF.apply(this, arguments); _gsfTime += Date.now() - _t; return r; };
+    var _hasSplitParse = typeof __edgebox_ast_claim === 'function' && workerCount > 1;
+    if (_hasSplitParse) {
+      // DHCP parse splitting: each file claimed by one worker, others reconstruct.
+      // Like Go's goroutine pool — Zig coordinates, V8 workers parse in parallel.
+      // claim=0: we own it → parse + link to Zig shared memory
+      // claim=1: another worker parsing → parse normally (no wait — deadlocks)
+      // claim=2: already parsed → reconstruct from Zig (skip parse entirely)
+      host.getSourceFile = function(fileName, languageVersionOrOptions, onError) {
+        var _t = Date.now();
+        _gsfCount++;
+        var claim = __edgebox_ast_claim(fileName);
+        if (claim === 2 && typeof __edgebox_ast_v8_deserialize === 'function') {
+          _gsfReconstructed++;
+          var deserialized = __edgebox_ast_v8_deserialize(fileName);
+          if (deserialized && deserialized.kind === 308) {
+            var SFProto = ts.objectAllocator.getSourceFileConstructor().prototype;
+            Object.setPrototypeOf(deserialized, SFProto);
+            var sourceText = ts.sys.readFile(fileName);
+            if (sourceText) {
+              deserialized.text = sourceText;
+              if (typeof ts.computeLineStarts === 'function') {
+                deserialized.lineMap = ts.computeLineStarts(sourceText);
+              }
+            }
+            _gsfTime += Date.now() - _t;
+            return deserialized;
+          }
+          _gsfReconstructed--;
+          _gsfWaited++;
+          var r = _origGSF.call(this, fileName, languageVersionOrOptions, onError);
+          _gsfTime += Date.now() - _t;
+          return r;
+        }
+        if (claim === 0) {
+          _gsfParsed++;
+          var r = _origGSF.call(this, fileName, languageVersionOrOptions, onError);
+          if (r && typeof __edgebox_ast_v8_serialize === 'function') {
+            var _savedFuncs = {};
+            var _sfKeys = Object.keys(r);
+            for (var _ski = 0; _ski < _sfKeys.length; _ski++) {
+              if (typeof r[_sfKeys[_ski]] === 'function') {
+                _savedFuncs[_sfKeys[_ski]] = r[_sfKeys[_ski]];
+                delete r[_sfKeys[_ski]];
+              }
+            }
+            var _savedText = r.text;
+            delete r.text;
+            var _ok = __edgebox_ast_v8_serialize(r, fileName);
+            r.text = _savedText;
+            for (var _rk in _savedFuncs) r[_rk] = _savedFuncs[_rk];
+            if (_ok) __edgebox_ast_mark_ready(fileName, workerId, 0, 0, 0);
+          }
+          _gsfTime += Date.now() - _t;
+          return r;
+        }
+        // claim=1: another worker parsing — parse normally (no wait — deadlocks)
+        _gsfWaited++;
+        var r = _origGSF.call(this, fileName, languageVersionOrOptions, onError);
+        _gsfTime += Date.now() - _t;
+        return r;
+      };
+    } else {
+      host.getSourceFile = function() { var _t = Date.now(); _gsfCount++; var r = _origGSF.apply(this, arguments); _gsfTime += Date.now() - _t; return r; };
+    }
     if (host.resolveModuleNames) {
       var _origRMN = host.resolveModuleNames;
       host.resolveModuleNames = function() { var _t = Date.now(); _rmnCount++; var r = _origRMN.apply(this, arguments); _rmnTime += Date.now() - _t; return r; };
     }
-    program = ts.createProgram(parsed.fileNames, parsed.options, host, oldProgram);
-    __edgebox_write_stderr('[recipe] w' + workerId + ' createProgram=' + (Date.now()-_cpT0) + 'ms gsf=' + _gsfTime + 'ms(' + _gsfCount + ') rmn=' + _rmnTime + 'ms(' + _rmnCount + ')\n');
+    // Split root files: worker 0 gets .d.ts (shared deps), workers 1+ get .ts (unique sources).
+    // Worker 0 parses shared deps first → marks ready in Zig.
+    // Workers 1+ parse unique source files first, discover shared deps via imports later.
+    // By then worker 0 finished → claim=2 → reconstruct from Zig (skip parse).
+    var _rootNames = parsed.fileNames;
+    if (_hasSplitParse) {
+      var _allFiles = parsed.fileNames;
+      var _dtsFiles = [];
+      var _tsFiles = [];
+      for (var _fi = 0; _fi < _allFiles.length; _fi++) {
+        if (_allFiles[_fi].endsWith('.d.ts')) _dtsFiles.push(_allFiles[_fi]);
+        else _tsFiles.push(_allFiles[_fi]);
+      }
+      // Worker 0: all .d.ts + first 1/N of .ts
+      // Workers 1+: remaining .ts slices (no overlap)
+      var _tsPerWorker = Math.floor(_tsFiles.length / workerCount);
+      var _myTsStart = _tsPerWorker * workerId;
+      var _myTsEnd = workerId === workerCount - 1 ? _tsFiles.length : _tsPerWorker * (workerId + 1);
+      if (workerId === 0) {
+        _rootNames = _dtsFiles.concat(_tsFiles.slice(_myTsStart, _myTsEnd));
+      } else {
+        _rootNames = _tsFiles.slice(_myTsStart, _myTsEnd);
+      }
+    }
+    program = ts.createProgram(_rootNames, parsed.options, host, oldProgram);
+    __edgebox_write_stderr('[recipe] w' + workerId + ' createProgram=' + (Date.now()-_cpT0) + 'ms gsf=' + _gsfTime + 'ms(' + _gsfCount + ') rmn=' + _rmnTime + 'ms(' + _rmnCount + ')' + (_hasSplitParse ? ' parsed:' + _gsfParsed + ' reconstructed:' + _gsfReconstructed + ' waited:' + _gsfWaited + ' roots:' + _rootNames.length : '') + '\n');
   }
   __edgebox_write_stderr('[recipe] POST-createProgram\n');
   // Pre-initialize the TypeChecker — this creates intrinsic types, global symbols.
@@ -595,8 +1039,17 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   // Default order is 16% faster than largest-first for single-threaded check.
   // Work-stealing still distributes files across workers, just in dependency order.
   var checkFiles = [];
-  for (var fi = 0; fi < files.length; fi++)
-    if (!files[fi].isDeclarationFile) checkFiles.push(files[fi]);
+  if (_hasSplitParse && _rootNames !== parsed.fileNames) {
+    // Split roots: only check files assigned to THIS worker (avoid duplicates)
+    var _myRootSet = {};
+    for (var _ri = 0; _ri < _rootNames.length; _ri++) _myRootSet[_rootNames[_ri]] = true;
+    for (var fi = 0; fi < files.length; fi++) {
+      if (!files[fi].isDeclarationFile && _myRootSet[files[fi].fileName]) checkFiles.push(files[fi]);
+    }
+  } else {
+    for (var fi = 0; fi < files.length; fi++)
+      if (!files[fi].isDeclarationFile) checkFiles.push(files[fi]);
+  }
 
   // Hash each file — check if diagnostics are cached from previous run
   var dc = globalThis.__ebDiagCache;
@@ -656,13 +1109,24 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   } else if (isWarm) {
     // Warm without incremental: check all files with cache reuse
     for (var i = 0; i < checkFiles.length; i++) checkFile(checkFiles[i]);
+  } else if (_hasSplitParse && _rootNames !== parsed.fileNames) {
+    // Cold + split roots: each worker checks ALL its root files (no work-stealing).
+    // Roots are disjoint — no duplicates possible.
+    for (var i = 0; i < checkFiles.length; i++) {
+      filesChecked++;
+      var file = checkFiles[i];
+      var diags = program.getSemanticDiagnostics(file);
+      for (var k = 0; k < diags.length; k++) {
+        var d = diags[k];
+        if (d.file) {
+          var pos = d.file.getLineAndCharacterOfPosition(d.start || 0);
+          output.push(d.file.fileName + '(' + (pos.line+1) + ',' + (pos.character+1) + '): error TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, ' '));
+        }
+      }
+    }
   } else {
-    // Cold: parallel work-stealing.
+    // Cold: parallel work-stealing (same roots across all workers).
     var hasCachedDiags = Object.keys(dc.hashes).length > 0;
-    // Block work-stealing: claim 8 consecutive files at a time.
-    // Balances cache locality (sequential checking) with load balancing.
-    // Tested: block=4 (1.76s), block=8 (1.72s best), block=16 (1.76s),
-    // static partition (1.83s — poor balance).
     var BLOCK = 8;
     while (true) {
       var blockStart = __edgebox_claim_file();

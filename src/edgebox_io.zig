@@ -7,6 +7,11 @@
 const std = @import("std");
 const alloc = std.heap.page_allocator;
 
+// Import shared AST pool — exports shared_ast_* C ABI functions for cross-worker parse splitting
+comptime {
+    _ = @import("shared_ast.zig");
+}
+
 // Import Zig parser — exports edgebox_zig_parse C ABI function
 comptime {
     _ = @import("zig_parser_core.zig");
@@ -739,9 +744,12 @@ export fn edgebox_claim_block(block_size: u32) u32 {
     return work_file_index.fetchAdd(block_size, .monotonic);
 }
 
+const shared_ast = @import("shared_ast.zig");
+
 export fn edgebox_reset_work() void {
     work_file_index.store(0, .release);
     phase_channel.reset();
+    shared_ast.resetAll();
 }
 
 // ── Phase Channel for Coordinated Cold Start ──
