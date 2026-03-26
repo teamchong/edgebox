@@ -575,5 +575,24 @@
     return sf;
   };
 
+  // __zigMapChildren: called by C++ bridge to map flat children to named properties.
+  // C++ creates the V8 objects (fast), this function maps children (version-proof).
+  // nodesArr: V8 Array of Node objects. flatBuf: ArrayBuffer of FlatNode data.
+  globalThis.__zigMapChildren = function(nodesArr, flatBuf) {
+    var view = new DataView(flatBuf);
+    var nodeCount = nodesArr.length;
+    for (var k = 0; k < nodeCount; k++) {
+      var firstChild = view.getUint32(k * 24 + 16, true);
+      if (firstChild === 0xFFFFFFFF) continue;
+      var children = [];
+      var ch = firstChild;
+      while (ch !== 0xFFFFFFFF && ch < nodeCount && children.length < 2000) {
+        children.push(nodesArr[ch]);
+        ch = view.getUint32(ch * 24 + 20, true);
+      }
+      mapChildren(nodesArr[k], children, nodesArr[k].kind);
+    }
+  };
+
   __edgebox_write_stderr('[bridge] loaded with ' + Object.keys(SK).length / 2 + ' SyntaxKinds\n');
 })();

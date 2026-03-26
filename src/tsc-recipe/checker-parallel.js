@@ -457,10 +457,14 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   // Bridge improvements: operator tokens, ternary expressions, 40+ SyntaxKind mappings.
   // Remaining issues: typeof import() type annotations not treated as imports,
   // binder crash on destructuring assignment flow. Re-enable after these fixes.
-  // Zig parser: parses fast (37ms) but JS bridge reconstruction is SLOWER than TSC (2.3s vs 1.3s).
-  // Need: C++ bridge that creates nodes natively, or lazy materialization.
-  // Bridge is version-proof (uses ts.SyntaxKind constants).
-  var useZigParser = false;
+  // Zig parser: C++ bridge creates V8 nodes natively from Zig flat AST.
+  // Zero-copy: Zig memory → C++ reads → V8 objects. No JS loop.
+  var useZigParser = typeof __edgebox_zig_create_sf === 'function' || typeof globalThis.__edgebox_zig_create_sf === 'function';
+  if (!useZigParser && typeof __edgebox_zig_parse === 'function') {
+    // C++ bridge not available, use JS bridge as fallback
+    useZigParser = typeof globalThis.__zigCreateSourceFile === 'function';
+  }
+  __edgebox_write_stderr('[recipe] w' + workerId + ' useZigParser=' + useZigParser + ' zig_create_sf=' + typeof __edgebox_zig_create_sf + ' zig_parse=' + typeof __edgebox_zig_parse + ' zigCreateSF=' + typeof globalThis.__zigCreateSourceFile + '\n');
   var zigParseCount = 0, zigFallbackCount = 0;
 
   // Instrument forEachChild to detect infinite recursion
@@ -593,27 +597,34 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     __edgebox_wait_program_ready();
     __edgebox_write_stderr('[recipe] w' + workerId + ' worker 0 done, starting parse from cache\n');
   }
-  // Zig parser: intercept getSourceFile on-demand (no batch, createProgram drives it)
+  // Zig parser + C++ bridge: on-demand getSourceFile override.
+  // C++ does: Zig parse → flat AST → create V8 nodes natively → map children via JS.
   if (useZigParser) {
     var _origHostGSF_zig = host.getSourceFile;
     host.getSourceFile = function(fileName, languageVersionOrOptions, onError) {
-      // Skip .d.ts — TSC parser handles these better (lib files, declaration files)
+      // Skip .d.ts — TSC parser handles these (lib files have special handling)
       if (fileName.endsWith('.d.ts')) {
         return _origHostGSF_zig.call(this, fileName, languageVersionOrOptions, onError);
       }
       var content = ts.sys.readFile(fileName);
       if (content === undefined) return _origHostGSF_zig.call(this, fileName, languageVersionOrOptions, onError);
       try {
-        var flatAST = __edgebox_zig_parse(content);
-        if (flatAST && flatAST.byteLength >= 24) {
-          var sf = globalThis.__zigCreateSourceFile(content, fileName, flatAST);
-          if (sf && sf.statements) {
-            zigParseCount++;
-            return sf;
-          }
+        var sf;
+        if (typeof __edgebox_zig_create_sf === 'function') {
+          // C++ bridge: Zig parse + V8 node creation in native
+          sf = __edgebox_zig_create_sf(content, fileName);
+        } else if (typeof __edgebox_zig_parse === 'function' && typeof globalThis.__zigCreateSourceFile === 'function') {
+          // JS bridge: Zig parse + JS node creation
+          var flatAST = __edgebox_zig_parse(content);
+          if (flatAST && flatAST.byteLength >= 24) sf = globalThis.__zigCreateSourceFile(content, fileName, flatAST);
         }
-      } catch(e) {}
-      // Fallback to TSC parser on any error
+        if (sf && sf.statements) {
+          zigParseCount++;
+          return sf;
+        }
+      } catch(e) {
+        if (zigFallbackCount < 3) __edgebox_write_stderr('[recipe] zig parse error: ' + fileName.split('/').pop() + ' ' + e.message + '\n');
+      }
       zigFallbackCount++;
       return _origHostGSF_zig.call(this, fileName, languageVersionOrOptions, onError);
     };
