@@ -260,7 +260,7 @@ globalThis.__gcFlagsDone = false;
       node.transformFlags = data[6] || 0;
       builtNodes[id] = node;
 
-      // Restore text + all other scalars from combined format "prefix:text\njson"
+      // Restore text + scalars from "prefix:text\x01json"
       var _stored = __edgebox_ast_read_text(id);
       if (_stored) {
         var _nl = _stored.indexOf('\x01');
@@ -274,6 +274,15 @@ globalThis.__gcFlagsDone = false;
         }
         if (_jsonPart) {
           var _props = JSON.parse(_jsonPart);
+          // Extract SF reference directives (injected during link, bypasses _skipProps)
+          if (_props.__sfRefs) {
+            var _refs = _props.__sfRefs;
+            if (_refs.rf) node._referencedFiles = _refs.rf;
+            if (_refs.trd) node._typeReferenceDirectives = _refs.trd;
+            if (_refs.lrd) node._libReferenceDirectives = _refs.lrd;
+            if (_refs.hndl) node._hasNoDefaultLib = true;
+            delete _props.__sfRefs;
+          }
           for (var _pk in _props) node[_pk] = _props[_pk];
         }
       }
@@ -326,13 +335,17 @@ globalThis.__gcFlagsDone = false;
     root.languageVariant = fileName.endsWith('.tsx') ? 1 : 0;
     root.scriptKind = fileName.endsWith('.tsx') ? 4 : fileName.endsWith('.ts') ? 3 : 1;
     root.isDeclarationFile = fileName.endsWith('.d.ts');
-    if (root.hasNoDefaultLib === undefined) root.hasNoDefaultLib = false;
+    root.hasNoDefaultLib = root._hasNoDefaultLib || false;
+    delete root._hasNoDefaultLib;
     root.bindDiagnostics = [];
     root.bindSuggestionDiagnostics = [];
     root.pragmas = new Map();
-    if (!root.referencedFiles) root.referencedFiles = [];
-    if (!root.typeReferenceDirectives) root.typeReferenceDirectives = [];
-    if (!root.libReferenceDirectives) root.libReferenceDirectives = [];
+    root.referencedFiles = root._referencedFiles || [];
+    delete root._referencedFiles;
+    root.typeReferenceDirectives = root._typeReferenceDirectives || [];
+    delete root._typeReferenceDirectives;
+    root.libReferenceDirectives = root._libReferenceDirectives || [];
+    delete root._libReferenceDirectives;
     root.amdDependencies = [];
     root.commentDirectives = [];
     root.parseDiagnostics = [];
@@ -407,8 +420,8 @@ globalThis.__gcFlagsDone = false;
         var isNodeArray = val.pos !== undefined; // TSC NodeArray has .pos
         var hasAstChildren = val.length > 0 && val[0] && val[0].kind !== undefined;
         if (isNodeArray || hasAstChildren) {
-          var pid = PROP_NAME_TO_ID[name];
-          if (pid) props.push({propId: pid, propName: name, isArray: true});
+          var pid = getPropId(name);
+          props.push({propId: pid, propName: name, isArray: true});
         }
       } else if (val.kind !== undefined) {
         props.push({propId: getPropId(name), propName: name, isArray: false});
@@ -452,15 +465,25 @@ globalThis.__gcFlagsDone = false;
         if (k === 'parent' || k === '_zid' || k === 'escapedText' || k === 'text') return undefined;
         // Module indicators: store as boolean (they're node refs or functions)
         if (k === 'externalModuleIndicator' || k === 'commonJsModuleIndicator') return v ? true : undefined;
-        // Lib/reference directives: arrays of {fileName,pos,end} — critical for lib resolution
-        if (k === 'referencedFiles' || k === 'typeReferenceDirectives' || k === 'libReferenceDirectives') return v && v.length > 0 ? v : undefined;
-        if (k === 'hasNoDefaultLib') return v ? true : undefined;
         if (_skipProps[k]) return undefined;
         var t = typeof v;
         if (t === 'string' || t === 'number' || t === 'boolean') return v;
         return undefined;
       });
-      // Combine: "prefix:text\njson" or just "prefix:text" or just json
+      // SourceFile: inject reference directives into JSON (bypasses _skipProps)
+      if (node.kind === 308) {
+        var _sfRefs = {};
+        if (node.referencedFiles && node.referencedFiles.length > 0) _sfRefs.rf = node.referencedFiles;
+        if (node.typeReferenceDirectives && node.typeReferenceDirectives.length > 0) _sfRefs.trd = node.typeReferenceDirectives;
+        if (node.libReferenceDirectives && node.libReferenceDirectives.length > 0) _sfRefs.lrd = node.libReferenceDirectives;
+        if (node.hasNoDefaultLib) _sfRefs.hndl = true;
+        var _sfRefsStr = JSON.stringify(_sfRefs);
+        if (_sfRefsStr !== '{}') {
+          if (!_json || _json === '{}') _json = '{"__sfRefs":' + _sfRefsStr + '}';
+          else _json = _json.slice(0, -1) + ',"__sfRefs":' + _sfRefsStr + '}';
+        }
+      }
+      // Combine: "prefix:text\x01json"
       var _blob = '';
       if (_nodeText && typeof _nodeText === 'string') _blob = _textPrefix + ':' + _nodeText;
       if (_json && _json !== '{}') _blob += (_blob ? '\x01' : '') + _json;
@@ -506,8 +529,6 @@ globalThis.__gcFlagsDone = false;
         __edgebox_write_stderr('[link] w' + workerId + ' dynamic props: ' + _dynProps.join(',') + '\n');
       }
       __edgebox_ast_mark_ready(fileName, workerId, rootId, tripleStart, tripleEnd);
-    } else {
-      __edgebox_write_stderr('[link] w' + workerId + ' FAILED: ' + fileName.split('/').pop() + ' (pool overflow)\n');
     }
   };
 })();
@@ -904,21 +925,15 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
         var _t = Date.now();
         _gsfCount++;
         var claim = __edgebox_ast_claim(fileName);
-        if (claim === 2 && typeof __edgebox_ast_v8_deserialize === 'function') {
+        if (claim === 2) {
           _gsfReconstructed++;
-          var deserialized = __edgebox_ast_v8_deserialize(fileName);
-          if (deserialized && deserialized.kind === 308) {
-            var SFProto = ts.objectAllocator.getSourceFileConstructor().prototype;
-            Object.setPrototypeOf(deserialized, SFProto);
-            var sourceText = ts.sys.readFile(fileName);
-            if (sourceText) {
-              deserialized.text = sourceText;
-              if (typeof ts.computeLineStarts === 'function') {
-                deserialized.lineMap = ts.computeLineStarts(sourceText);
-              }
+          var sourceText = ts.sys.readFile(fileName);
+          if (sourceText) {
+            var r = __sharedAstReconstruct(fileName, sourceText);
+            if (r && r.kind === 308 && r.statements) {
+              _gsfTime += Date.now() - _t;
+              return r;
             }
-            _gsfTime += Date.now() - _t;
-            return deserialized;
           }
           _gsfReconstructed--;
           _gsfWaited++;
@@ -929,22 +944,7 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
         if (claim === 0) {
           _gsfParsed++;
           var r = _origGSF.call(this, fileName, languageVersionOrOptions, onError);
-          if (r && typeof __edgebox_ast_v8_serialize === 'function') {
-            var _savedFuncs = {};
-            var _sfKeys = Object.keys(r);
-            for (var _ski = 0; _ski < _sfKeys.length; _ski++) {
-              if (typeof r[_sfKeys[_ski]] === 'function') {
-                _savedFuncs[_sfKeys[_ski]] = r[_sfKeys[_ski]];
-                delete r[_sfKeys[_ski]];
-              }
-            }
-            var _savedText = r.text;
-            delete r.text;
-            var _ok = __edgebox_ast_v8_serialize(r, fileName);
-            r.text = _savedText;
-            for (var _rk in _savedFuncs) r[_rk] = _savedFuncs[_rk];
-            if (_ok) __edgebox_ast_mark_ready(fileName, workerId, 0, 0, 0);
-          }
+          if (r) __sharedAstLink(r, fileName, workerId);
           _gsfTime += Date.now() - _t;
           return r;
         }
@@ -1115,7 +1115,12 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     for (var i = 0; i < checkFiles.length; i++) {
       filesChecked++;
       var file = checkFiles[i];
+      try {
       var diags = program.getSemanticDiagnostics(file);
+      } catch(_diagErr) {
+        __edgebox_write_stderr('[check-crash] w' + workerId + ' file=' + file.fileName.split('/').pop() + ' err=' + _diagErr.message + '\n');
+        continue;
+      }
       for (var k = 0; k < diags.length; k++) {
         var d = diags[k];
         if (d.file) {
