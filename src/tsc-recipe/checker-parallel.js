@@ -300,32 +300,46 @@ globalThis.__gcFlagsDone = false;
       node.flags = data[1];
       node.modifierFlagsCache = data[5] || 0;
       node.transformFlags = data[6] || 0;
+      // Unpack tagged scalars from operator/token fields
+      var _rawOp = data[7] || 0;
+      if (_rawOp & 0x8000) node.isTypeOnly = true;
+      var _opTag = (_rawOp >> 13) & 0x3;
+      var _opVal = _rawOp & 0x1FFF;
+      if (_opTag === 0 && _opVal) node.operator = _opVal;
+      else if (_opTag === 1) node.numericLiteralFlags = _opVal;
+      else if (_opTag === 2) node.templateFlags = _opVal;
+      var _rawTok = data[8] || 0;
+      if (_rawTok & 0x200) node.isTypeOf = true;
+      if (_rawTok & 0x400) node.possiblyExhaustive = true;
+      if (_rawTok & 0x800) node.multiLine = true;
+      var _tokTag = (_rawTok >> 12) & 0x1;
+      var _tokVal = _rawTok & 0x1FF;
+      if (_tokTag === 0 && _tokVal) node.token = _tokVal;
+      else if (_tokTag === 1 && _tokVal) node.phaseModifier = _tokVal;
       builtNodes[id] = node;
 
-      // Restore text + scalars from "prefix:text\x01json"
+      // Read text/metadata — no JSON, direct binary
       var _stored = __edgebox_ast_read_text(id);
       if (_stored) {
-        var _nl = _stored.indexOf('\x01');
-        var _textPart = _nl >= 0 ? _stored.substring(0, _nl) : (_stored.charAt(1) === ':' ? _stored : '');
-        var _jsonPart = _nl >= 0 ? _stored.substring(_nl + 1) : (_stored.charAt(0) === '{' ? _stored : '');
-        if (_textPart) {
-          var _pre = _textPart.charAt(0);
-          var _val = _textPart.substring(2);
-          if (_pre === 'E') node.escapedText = _val;
-          else if (_pre === 'T') node.text = _val;
+        var _tag = _stored.charAt(0);
+        if (_tag === 'E') node.escapedText = _stored.substring(1);
+        else if (_tag === 'T') node.text = _stored.substring(1);
+        else if (_tag === 'B') {
+          var _sep = _stored.indexOf('\x01');
+          node.text = _stored.substring(1, _sep);
+          node.rawText = _stored.substring(_sep + 1);
         }
-        if (_jsonPart) {
-          var _props = JSON.parse(_jsonPart);
-          // Extract SF reference directives (injected during link, bypasses _skipProps)
-          if (_props.__sfRefs) {
-            var _refs = _props.__sfRefs;
-            if (_refs.rf) node._referencedFiles = _refs.rf;
-            if (_refs.trd) node._typeReferenceDirectives = _refs.trd;
-            if (_refs.lrd) node._libReferenceDirectives = _refs.lrd;
-            if (_refs.hndl) node._hasNoDefaultLib = true;
-            delete _props.__sfRefs;
+        else if (_tag === 'S') {
+          // SourceFile metadata: pipe-separated
+          var _parts = _stored.substring(1).split('\x01');
+          for (var _pi = 0; _pi < _parts.length; _pi++) {
+            var _p = _parts[_pi];
+            if (_p === 'M') node._extMod = true;
+            else if (_p === 'N') node._noDefLib = true;
+            else if (_p.charAt(0) === 'R') { if (!node._refFiles) node._refFiles = []; node._refFiles.push({fileName:_p.substring(1),pos:-1,end:-1}); }
+            else if (_p.charAt(0) === 'D') { if (!node._typeRefDirs) node._typeRefDirs = []; node._typeRefDirs.push({fileName:_p.substring(1),pos:-1,end:-1}); }
+            else if (_p.charAt(0) === 'L') { if (!node._libRefDirs) node._libRefDirs = []; node._libRefDirs.push({fileName:_p.substring(1),pos:-1,end:-1}); }
           }
-          for (var _pk in _props) node[_pk] = _props[_pk];
         }
       }
 
@@ -377,17 +391,19 @@ globalThis.__gcFlagsDone = false;
     root.languageVariant = fileName.endsWith('.tsx') ? 1 : 0;
     root.scriptKind = fileName.endsWith('.tsx') ? 4 : fileName.endsWith('.ts') ? 3 : 1;
     root.isDeclarationFile = fileName.endsWith('.d.ts');
-    root.hasNoDefaultLib = root._hasNoDefaultLib || false;
-    delete root._hasNoDefaultLib;
+    root.hasNoDefaultLib = root._noDefLib || false;
+    delete root._noDefLib;
+    if (root._extMod) root.externalModuleIndicator = true;
+    delete root._extMod;
     root.bindDiagnostics = [];
     root.bindSuggestionDiagnostics = [];
     root.pragmas = new Map();
-    root.referencedFiles = root._referencedFiles || [];
-    delete root._referencedFiles;
-    root.typeReferenceDirectives = root._typeReferenceDirectives || [];
-    delete root._typeReferenceDirectives;
-    root.libReferenceDirectives = root._libReferenceDirectives || [];
-    delete root._libReferenceDirectives;
+    root.referencedFiles = root._refFiles || [];
+    delete root._refFiles;
+    root.typeReferenceDirectives = root._typeRefDirs || [];
+    delete root._typeRefDirs;
+    root.libReferenceDirectives = root._libRefDirs || [];
+    delete root._libRefDirs;
     root.amdDependencies = [];
     root.commentDirectives = [];
     root.parseDiagnostics = [];
@@ -413,24 +429,7 @@ globalThis.__gcFlagsDone = false;
   // No snapshot pollution: only runs during request processing.
   // Uses cached kind→property mapping — O(1) per node after first kind.
 
-  // Non-child properties to skip during JSON scalar storage
-  var _skipProps = {
-    pos:1, end:1, kind:1, flags:1, id:1, parent:1, symbol:1, locals:1,
-    nextContainer:1, localSymbol:1, flowNode:1, emitNode:1,
-    contextualType:1, inferenceContext:1, original:1, jsDocCache:1,
-    modifierFlagsCache:1, transformFlags:1, _nameHash:1, checker:1, _zid:1,
-    text:1, fileName:1, path:1, resolvedPath:1, originalFileName:1,
-    languageVersion:1, languageVariant:1, scriptKind:1, isDeclarationFile:1,
-    hasNoDefaultLib:1, bindDiagnostics:1, bindSuggestionDiagnostics:1,
-    pragmas:1, checkJsDirective:1, referencedFiles:1, typeReferenceDirectives:1,
-    libReferenceDirectives:1, amdDependencies:1, commentDirectives:1,
-    nodeCount:1, identifierCount:1, identifiers:1, parseDiagnostics:1,
-    endOfFileToken:1, externalModuleIndicator:1, commonJsModuleIndicator:1, jsDoc:1,
-    lineMap:1, classifiableNames:1, packageJsonLocations:1,
-    packageJsonScope:1, setExternalModuleIndicator:1,
-  };
-
-  var _dynProps = []; // unused — schema-driven, kept for link logging
+  // No _skipProps, no JSON — all data stored in binary FlatNode + string pool
 
   function getChildProps(node) {
     // Schema-driven: use _CHILD_SCHEMA[kind] for exact child properties.
@@ -472,52 +471,47 @@ globalThis.__gcFlagsDone = false;
       if (id === 0xFFFFFFFF) return id;
       node._zid = id;
 
-      // Write flags + text + extra
+      // All binary — no JSON.stringify, no JSON.parse
       if (node.flags) __edgebox_ast_set_flags(id, node.flags | 0);
       if (node.modifierFlagsCache || node.transformFlags) {
         __edgebox_ast_set_extra(id, node.modifierFlagsCache || 0, node.transformFlags || 0);
       }
-      // Store ALL own scalar properties as JSON.
-      // text/escapedText stored separately (prepended with "T:" or "E:" prefix).
-      // JSON stores everything else.
-      var _nodeText = node.escapedText;
-      var _textPrefix = 'E';
-      if (_nodeText === undefined || _nodeText === '') {
-        if (node.kind !== 308 && node.text !== undefined && node.text !== '' && typeof node.text === 'string') {
-          _nodeText = node.text;
-          _textPrefix = 'T';
+      // Pack ALL scalars into FlatNode operator/token — tagged, no JSON
+      // operator u16: bit 15 = isTypeOnly, bits 13-14 = tag (0=operator,1=numericLiteralFlags,2=templateFlags), bits 0-12 = value
+      // token u16: bit 12 = tag (0=token,1=phaseModifier), bits 9-11 = bool flags, bits 0-8 = value
+      var _op = 0;
+      if (node.isTypeOnly) _op |= 0x8000;
+      if (node.operator) _op |= (node.operator & 0x1FFF);
+      else if (node.numericLiteralFlags) _op |= 0x2000 | (node.numericLiteralFlags & 0x1FFF);
+      else if (node.templateFlags) _op |= 0x4000 | (node.templateFlags & 0x1FFF);
+      var _tok = 0;
+      if (node.token) _tok = node.token & 0x1FF;
+      else if (node.phaseModifier) _tok = 0x1000 | (node.phaseModifier & 0x1FF);
+      if (node.isTypeOf) _tok |= 0x200;
+      if (node.possiblyExhaustive) _tok |= 0x400;
+      if (node.multiLine) _tok |= 0x800;
+      if (_op || _tok) __edgebox_ast_set_op_token(id, _op & 0xFFFF, _tok & 0xFFFF);
+      // Store text directly — no JSON wrapper
+      // E = escapedText, T = text, B = text + rawText (template literals)
+      var _txt = node.escapedText;
+      if (_txt !== undefined && _txt !== '' && typeof _txt === 'string') {
+        __edgebox_ast_set_text(id, 'E' + _txt);
+      } else if (node.kind !== 308 && node.text !== undefined && typeof node.text === 'string') {
+        if (node.rawText !== undefined && typeof node.rawText === 'string') {
+          __edgebox_ast_set_text(id, 'B' + node.text + '\x01' + node.rawText);
+        } else if (node.text !== '') {
+          __edgebox_ast_set_text(id, 'T' + node.text);
         }
       }
-      // Build JSON of ALL other non-child non-skip scalars
-      var _json = JSON.stringify(node, function(k, v) {
-        if (k === '') return v;
-        if (k === 'parent' || k === '_zid' || k === 'escapedText' || k === 'text') return undefined;
-        // Module indicators: store as boolean (they're node refs or functions)
-        if (k === 'externalModuleIndicator' || k === 'commonJsModuleIndicator') return v ? true : undefined;
-        if (_skipProps[k]) return undefined;
-        var t = typeof v;
-        if (t === 'string' || t === 'number' || t === 'boolean') return v;
-        return undefined;
-      });
-      // SourceFile: inject reference directives into JSON (bypasses _skipProps)
+      // SourceFile metadata: pipe-separated, no JSON
       if (node.kind === 308) {
-        var _sfRefs = {};
-        if (node.referencedFiles && node.referencedFiles.length > 0) _sfRefs.rf = node.referencedFiles;
-        if (node.typeReferenceDirectives && node.typeReferenceDirectives.length > 0) _sfRefs.trd = node.typeReferenceDirectives;
-        if (node.libReferenceDirectives && node.libReferenceDirectives.length > 0) _sfRefs.lrd = node.libReferenceDirectives;
-        if (node.hasNoDefaultLib) _sfRefs.hndl = true;
-        var _sfRefsStr = JSON.stringify(_sfRefs);
-        if (_sfRefsStr !== '{}') {
-          if (!_json || _json === '{}') _json = '{"__sfRefs":' + _sfRefsStr + '}';
-          else _json = _json.slice(0, -1) + ',"__sfRefs":' + _sfRefsStr + '}';
-        }
-      }
-      // Combine: "prefix:text\x01json"
-      var _blob = '';
-      if (_nodeText && typeof _nodeText === 'string') _blob = _textPrefix + ':' + _nodeText;
-      if (_json && _json !== '{}') _blob += (_blob ? '\x01' : '') + _json;
-      if (_blob) {
-        if (!__edgebox_ast_set_text(id, _blob)) return 0xFFFFFFFF;
+        var _m = [];
+        if (node.externalModuleIndicator) _m.push('M');
+        if (node.hasNoDefaultLib) _m.push('N');
+        if (node.referencedFiles) for (var _i = 0; _i < node.referencedFiles.length; _i++) _m.push('R' + node.referencedFiles[_i].fileName);
+        if (node.typeReferenceDirectives) for (var _i = 0; _i < node.typeReferenceDirectives.length; _i++) _m.push('D' + node.typeReferenceDirectives[_i].fileName);
+        if (node.libReferenceDirectives) for (var _i = 0; _i < node.libReferenceDirectives.length; _i++) _m.push('L' + node.libReferenceDirectives[_i].fileName);
+        if (_m.length > 0) __edgebox_ast_set_text(id, 'S' + _m.join('\x01'));
       }
 
       var props = getChildProps(node);
@@ -549,14 +543,10 @@ globalThis.__gcFlagsDone = false;
       return id;
     }
 
-    _dynProps = [];
     var tripleStart = __edgebox_ast_triple_pos();
     var rootId = allocAndLink(sf);
     var tripleEnd = __edgebox_ast_triple_pos();
     if (rootId !== 0xFFFFFFFF) {
-      if (_dynProps.length > 0) {
-        __edgebox_write_stderr('[link] w' + workerId + ' dynamic props: ' + _dynProps.join(',') + '\n');
-      }
       __edgebox_ast_mark_ready(fileName, workerId, rootId, tripleStart, tripleEnd);
     }
   };
