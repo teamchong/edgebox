@@ -457,9 +457,9 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   // Bridge improvements: operator tokens, ternary expressions, 40+ SyntaxKind mappings.
   // Remaining issues: typeof import() type annotations not treated as imports,
   // binder crash on destructuring assignment flow. Re-enable after these fixes.
-  // Zig parser: intercepts getSourceFile — createProgram decides which files to parse.
-  // DISABLED: binder crashes on Zig-parsed ASTs (destructuring assignment flow, typeof import).
-  // Fix the 3 remaining bridge gaps, then re-enable.
+  // Zig parser: parses fast (37ms) but JS bridge reconstruction is SLOWER than TSC (2.3s vs 1.3s).
+  // Need: C++ bridge that creates nodes natively, or lazy materialization.
+  // Bridge is version-proof (uses ts.SyntaxKind constants).
   var useZigParser = false;
   var zigParseCount = 0, zigFallbackCount = 0;
 
