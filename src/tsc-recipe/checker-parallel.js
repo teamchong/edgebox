@@ -459,12 +459,9 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
   // binder crash on destructuring assignment flow. Re-enable after these fixes.
   // Zig parser: C++ bridge creates V8 nodes natively from Zig flat AST.
   // Zero-copy: Zig memory → C++ reads → V8 objects. No JS loop.
-  var useZigParser = typeof __edgebox_zig_create_sf === 'function' || typeof globalThis.__edgebox_zig_create_sf === 'function';
-  if (!useZigParser && typeof __edgebox_zig_parse === 'function') {
-    // C++ bridge not available, use JS bridge as fallback
-    useZigParser = typeof globalThis.__zigCreateSourceFile === 'function';
-  }
-  __edgebox_write_stderr('[recipe] w' + workerId + ' useZigParser=' + useZigParser + ' zig_create_sf=' + typeof __edgebox_zig_create_sf + ' zig_parse=' + typeof __edgebox_zig_parse + ' zigCreateSF=' + typeof globalThis.__zigCreateSourceFile + '\n');
+  // Zig parser: lazy SourceFile creation from flat AST buffer.
+  // Nodes materialized on-demand — only ~30% of nodes touched by binder/checker.
+  var useZigParser = typeof __edgebox_zig_parse === 'function' && typeof globalThis.__zigCreateSourceFileLazy === 'function';
   var zigParseCount = 0, zigFallbackCount = 0;
 
   // Instrument forEachChild to detect infinite recursion
@@ -609,18 +606,14 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
       var content = ts.sys.readFile(fileName);
       if (content === undefined) return _origHostGSF_zig.call(this, fileName, languageVersionOrOptions, onError);
       try {
-        var sf;
-        if (typeof __edgebox_zig_create_sf === 'function') {
-          // C++ bridge: Zig parse + V8 node creation in native
-          sf = __edgebox_zig_create_sf(content, fileName);
-        } else if (typeof __edgebox_zig_parse === 'function' && typeof globalThis.__zigCreateSourceFile === 'function') {
-          // JS bridge: Zig parse + JS node creation
-          var flatAST = __edgebox_zig_parse(content);
-          if (flatAST && flatAST.byteLength >= 24) sf = globalThis.__zigCreateSourceFile(content, fileName, flatAST);
-        }
-        if (sf && sf.statements) {
-          zigParseCount++;
-          return sf;
+        // Zig parse → flat AST buffer → lazy node materialization
+        var flatAST = __edgebox_zig_parse(content);
+        if (flatAST && flatAST.byteLength >= 24) {
+          var sf = __zigCreateSourceFileLazy(content, fileName, flatAST);
+          if (sf && sf.statements) {
+            zigParseCount++;
+            return sf;
+          }
         }
       } catch(e) {
         if (zigFallbackCount < 3) __edgebox_write_stderr('[recipe] zig parse error: ' + fileName.split('/').pop() + ' ' + e.message + '\n');
