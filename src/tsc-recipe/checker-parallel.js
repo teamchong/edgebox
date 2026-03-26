@@ -163,57 +163,99 @@ globalThis.__gcFlagsDone = false;
 (function() {
   if (typeof __edgebox_ast_alloc_node !== 'function') return;
 
-  // Property name table — compact IDs for child property names.
-  // ALL TSC child property names. IDs 1-20 = arrays, 21+ = single children.
-  // Must be complete — dynamic assignment creates per-worker IDs that don't transfer.
-  var PROP_NAMES = [
-    '',
-    // Array child properties (1-20)
-    'statements', 'members', 'parameters', 'typeParameters',
-    'heritageClauses', 'types', 'elements', 'properties',
-    'modifiers', 'decorators', 'clauses', 'declarations',
-    'arguments', 'typeArguments', 'templateSpans', 'jsDoc',
-    'tags', 'typeNames', 'elementTypes', 'objectBindingPatternElements',
-    // Single child properties (21+)
-    'expression', 'name', 'type', 'body', 'initializer',
-    'condition', 'thenStatement', 'elseStatement',
-    'left', 'right', 'operatorToken', 'argument',
-    'returnType', 'constraint', 'default',
-    'moduleSpecifier', 'importClause', 'namedBindings',
-    'exportClause', 'declaration', 'declarationList',
-    'tryBlock', 'catchClause', 'finallyBlock',
-    'variableDeclaration', 'block', 'label', 'statement',
-    'caseBlock', 'template', 'head',
-    'tag', 'typeExpression',
-    'questionToken', 'dotDotDotToken', 'exclamationToken',
-    'asteriskToken', 'equalsToken',
-    'whenTrue', 'whenFalse', 'awaitModifier',
-    'objectAssignmentInitializer', 'propertyName',
-    'exprName', 'literal', 'objectType', 'indexType',
-    'checkType', 'extendsType', 'trueType', 'falseType',
-    'readonlyToken', 'typeParameter', 'nameType', 'questionDotToken',
-    'colonToken', 'assertsModifier', 'parameterName',
-    'moduleReference', 'isTypeOnly', 'qualifiedName',
-    // Additional child properties found in TSC AST
-    'argumentExpression', 'tagName', 'attributes', 'openingElement',
-    'closingElement', 'openingFragment', 'closingFragment', 'children',
-    'dotToken', 'keywordToken', 'operator', 'operand',
-    'whenFalse', 'colonToken', 'incrementor', 'forOfStatement',
-    'catchClause', 'finallyBlock', 'tryBlock',
-    'awaiter', 'elseClause', 'caseClause', 'defaultClause',
-    'variableDeclarationList', 'moduleBody', 'exportAssignment',
-    'importEqualsDeclaration', 'namespaceExportDeclaration',
-    'classExpression', 'arrowFunction', 'templateHead',
-    'templateExpression', 'templateMiddle', 'templateTail',
-    'typeAnnotation', 'typeNode', 'typeName',
-    'fullName', 'moduleSpecifier',
-    'importSpecifiers', 'exportSpecifiers', 'moduleBindings',
-    'assertClause', 'assertionKey', 'value',
-    'exclamationToken', 'questionToken', 'dotDotDotToken',
-    'initializer', 'objectBindingPattern', 'arrayBindingPattern',
-    'elementType', 'externalModuleReference',
-    'equalsGreaterThanToken', 'comment', 'qualifier',
-  ];
+  // Auto-generated from TSC 6.0.2 forEachChildTable — 174 node types, 93 properties.
+  // Includes BOTH inline functions AND shared function references (Block, ClassDeclaration, etc.)
+  // a = array children (NodeArray), s = single children (Node).
+  var _CHILD_SCHEMA = {
+    167:{s:['left','right']},168:{s:['expression']},169:{a:['modifiers'],s:['name','constraint','default','expression']},
+    170:{a:['modifiers'],s:['dotDotDotToken','name','questionToken','type','initializer']},171:{s:['expression']},
+    172:{a:['modifiers'],s:['name','questionToken','type','initializer']},
+    173:{a:['modifiers'],s:['name','questionToken','exclamationToken','type','initializer']},
+    174:{a:['modifiers','typeParameters','parameters'],s:['name','questionToken','type']},
+    175:{a:['modifiers','typeParameters','parameters'],s:['asteriskToken','name','questionToken','exclamationToken','type','body']},
+    176:{a:['modifiers'],s:['body']},177:{a:['modifiers','typeParameters','parameters'],s:['name','type','body']},
+    178:{a:['modifiers','typeParameters','parameters'],s:['name','type','body']},
+    179:{a:['modifiers','typeParameters','parameters'],s:['name','type','body']},
+    180:{a:['typeParameters','parameters'],s:['type']},181:{a:['typeParameters','parameters'],s:['type']},
+    182:{a:['modifiers','typeParameters','parameters'],s:['type']},183:{s:['assertsModifier','parameterName','type']},
+    184:{a:['typeArguments'],s:['typeName']},185:{a:['modifiers','typeParameters','parameters'],s:['type']},
+    186:{a:['modifiers','typeParameters','parameters'],s:['type']},187:{a:['typeArguments'],s:['exprName']},
+    188:{a:['members']},189:{s:['elementType']},190:{a:['elements']},191:{s:['type']},192:{s:['type']},
+    193:{a:['types']},194:{a:['types']},195:{s:['checkType','extendsType','trueType','falseType']},
+    196:{s:['typeParameter']},197:{s:['type']},199:{s:['type']},200:{s:['objectType','indexType']},
+    201:{a:['members'],s:['readonlyToken','typeParameter','nameType','questionToken','type']},
+    202:{s:['literal']},203:{s:['dotDotDotToken','name','questionToken','type']},
+    204:{a:['templateSpans'],s:['head']},205:{s:['type','literal']},
+    206:{a:['typeArguments'],s:['argument','attributes','qualifier']},
+    207:{a:['elements']},208:{a:['elements']},
+    209:{s:['dotDotDotToken','propertyName','name','initializer']},210:{a:['elements']},211:{a:['properties']},
+    212:{s:['expression','questionDotToken','name']},213:{s:['expression','questionDotToken','argumentExpression']},
+    214:{a:['typeArguments','arguments'],s:['expression','questionDotToken']},
+    215:{a:['typeArguments','arguments'],s:['expression','questionDotToken']},
+    216:{a:['typeArguments'],s:['tag','questionDotToken','template']},217:{s:['type','expression']},
+    218:{s:['expression']},219:{a:['modifiers','typeParameters','parameters'],s:['asteriskToken','name','type','body']},
+    220:{a:['modifiers','typeParameters','parameters'],s:['type','equalsGreaterThanToken','body']},
+    221:{s:['expression']},222:{s:['expression']},223:{s:['expression']},224:{s:['expression']},
+    225:{s:['operand']},226:{s:['operand']},227:{s:['left','operatorToken','right']},
+    228:{s:['condition','questionToken','whenTrue','colonToken','whenFalse']},
+    229:{a:['templateSpans'],s:['head']},230:{s:['asteriskToken','expression']},231:{s:['expression']},
+    232:{a:['modifiers','typeParameters','heritageClauses','members'],s:['name']},
+    234:{a:['typeArguments'],s:['expression']},235:{s:['expression','type']},236:{s:['expression']},
+    237:{s:['name']},239:{s:['expression','type']},240:{s:['expression','literal']},
+    242:{a:['statements']},244:{a:['modifiers'],s:['declarationList']},245:{s:['expression']},
+    246:{s:['expression','thenStatement','elseStatement']},247:{s:['statement','expression']},
+    248:{s:['expression','statement']},249:{s:['initializer','condition','incrementor','statement']},
+    250:{s:['initializer','expression','statement']},251:{s:['awaitModifier','initializer','expression','statement']},
+    252:{s:['label']},253:{s:['label']},254:{s:['expression']},255:{s:['expression','statement']},
+    256:{s:['expression','caseBlock']},257:{s:['label','statement']},258:{s:['expression']},
+    259:{s:['tryBlock','catchClause','finallyBlock']},261:{s:['name','exclamationToken','type','initializer']},
+    262:{a:['declarations']},263:{a:['modifiers','typeParameters','parameters'],s:['asteriskToken','name','type','body']},
+    264:{a:['modifiers','typeParameters','heritageClauses','members'],s:['name']},
+    265:{a:['modifiers','typeParameters','heritageClauses','members'],s:['name']},
+    266:{a:['modifiers','typeParameters'],s:['name','type']},267:{a:['modifiers','members'],s:['name']},
+    268:{a:['modifiers'],s:['name','body']},269:{a:['statements']},270:{a:['clauses']},
+    271:{a:['modifiers'],s:['name']},272:{a:['modifiers'],s:['name','moduleReference']},
+    273:{a:['modifiers'],s:['importClause','moduleSpecifier','attributes']},274:{s:['name','namedBindings']},
+    275:{s:['name']},276:{a:['elements']},277:{s:['propertyName','name']},
+    278:{a:['modifiers'],s:['expression']},279:{a:['modifiers'],s:['exportClause','moduleSpecifier','attributes']},
+    280:{a:['elements']},281:{s:['name']},282:{s:['propertyName','name']},283:{a:['modifiers']},
+    284:{s:['expression']},285:{a:['children'],s:['openingElement','closingElement']},
+    286:{a:['typeArguments'],s:['tagName','attributes']},287:{a:['typeArguments'],s:['tagName','attributes']},
+    288:{s:['tagName']},289:{a:['children'],s:['openingFragment','closingFragment']},
+    292:{s:['name','initializer']},293:{a:['properties']},294:{s:['expression']},
+    295:{s:['dotDotDotToken','expression']},296:{s:['namespace','name']},
+    297:{a:['statements'],s:['expression']},298:{a:['statements']},299:{a:['types']},
+    300:{s:['variableDeclaration','block']},301:{a:['elements']},302:{s:['name','value']},
+    303:{s:['assertClause']},304:{a:['modifiers'],s:['name','questionToken','exclamationToken','initializer']},
+    305:{a:['modifiers'],s:['name','questionToken','exclamationToken','equalsToken','objectAssignmentInitializer']},
+    306:{s:['expression']},307:{s:['name','initializer']},308:{a:['statements'],s:['endOfFileToken']},
+    310:{s:['type']},311:{s:['name']},312:{s:['left','right']},315:{s:['type']},316:{s:['type']},
+    317:{s:['type']},318:{a:['parameters'],s:['type']},319:{s:['type']},321:{a:['comment','tags']},
+    324:{s:['type']},325:{s:['name']},326:{s:['name']},327:{s:['name']},
+    328:{a:['comment'],s:['tagName']},329:{a:['comment'],s:['tagName','class']},
+    330:{a:['comment'],s:['tagName','class']},331:{a:['comment'],s:['tagName']},
+    332:{a:['comment'],s:['tagName']},333:{a:['comment'],s:['tagName']},
+    334:{a:['comment'],s:['tagName']},335:{a:['comment'],s:['tagName']},
+    336:{a:['comment'],s:['tagName']},337:{a:['comment'],s:['tagName']},
+    338:{a:['comment'],s:['tagName']},339:{a:['comment'],s:['tagName','fullName','typeExpression']},
+    340:{a:['comment'],s:['tagName','typeExpression']},341:{a:['comment'],s:['tagName','typeExpression']},
+    342:{a:['comment'],s:['tagName','name','typeExpression']},343:{a:['comment'],s:['tagName','typeExpression']},
+    344:{a:['comment'],s:['tagName','typeExpression']},345:{a:['comment'],s:['tagName','typeExpression']},
+    346:{a:['typeParameters','comment'],s:['tagName','constraint']},
+    347:{a:['comment'],s:['tagName','typeExpression','fullName']},348:{a:['comment'],s:['tagName','name']},
+    349:{a:['comment'],s:['tagName','name','typeExpression']},350:{a:['comment'],s:['tagName','typeExpression']},
+    351:{a:['comment'],s:['tagName','typeExpression']},
+    352:{a:['comment'],s:['tagName','importClause','moduleSpecifier','attributes']},
+    356:{s:['expression']},357:{a:['elements']},
+  };
+  // Build PROP_NAMES from schema — deduplicated, stable IDs across workers.
+  var _allPropNames = new Set();
+  for (var _sk in _CHILD_SCHEMA) {
+    var _se = _CHILD_SCHEMA[_sk];
+    if (_se.a) for (var _ai = 0; _ai < _se.a.length; _ai++) _allPropNames.add(_se.a[_ai]);
+    if (_se.s) for (var _si = 0; _si < _se.s.length; _si++) _allPropNames.add(_se.s[_si]);
+  }
+  var PROP_NAMES = [''].concat(Array.from(_allPropNames).sort());
   var PROP_NAME_TO_ID = {};
   for (var _pi = 0; _pi < PROP_NAMES.length; _pi++) {
     if (PROP_NAMES[_pi]) PROP_NAME_TO_ID[PROP_NAMES[_pi]] = _pi;
@@ -371,9 +413,7 @@ globalThis.__gcFlagsDone = false;
   // No snapshot pollution: only runs during request processing.
   // Uses cached kind→property mapping — O(1) per node after first kind.
 
-  var _kindChildProps = {}; // kind → [{propId, propName, isArray}]
-
-  // Non-child properties to skip when discovering children via Object.keys
+  // Non-child properties to skip during JSON scalar storage
   var _skipProps = {
     pos:1, end:1, kind:1, flags:1, id:1, parent:1, symbol:1, locals:1,
     nextContainer:1, localSymbol:1, flowNode:1, emitNode:1,
@@ -390,41 +430,30 @@ globalThis.__gcFlagsDone = false;
     packageJsonScope:1, setExternalModuleIndicator:1,
   };
 
-  // Auto-assign propId for properties not in our hardcoded list
-  var _nextDynPropId = PROP_NAMES.length;
-  var _dynProps = []; // track dynamically assigned props for debugging
-  function getPropId(name) {
-    var id = PROP_NAME_TO_ID[name];
-    if (id) return id;
-    id = _nextDynPropId++;
-    PROP_NAME_TO_ID[name] = id;
-    PROP_NAMES[id] = name;
-    _dynProps.push(name);
-    return id;
-  }
+  var _dynProps = []; // unused — schema-driven, kept for link logging
 
   function getChildProps(node) {
-    // Discover child properties via Object.keys + kind check.
-    // val.kind !== undefined catches ALL node children including tokens
-    // (questionToken, dotDotDotToken, etc.) that forEachChild skips.
+    // Schema-driven: use _CHILD_SCHEMA[kind] for exact child properties.
+    // No runtime discovery — eliminates missing property bugs.
+    var schema = _CHILD_SCHEMA[node.kind];
+    if (!schema) return [];
     var props = [];
-    var keys = Object.keys(node);
-    for (var i = 0; i < keys.length; i++) {
-      var name = keys[i];
-      if (_skipProps[name]) continue;
-      var val = node[name];
-      if (val === undefined || val === null) continue;
-      if (Array.isArray(val)) {
-        // Include arrays that ARE NodeArrays (have .pos) — even if empty.
-        // Also include non-empty arrays where first element is an AST child.
-        var isNodeArray = val.pos !== undefined; // TSC NodeArray has .pos
-        var hasAstChildren = val.length > 0 && val[0] && val[0].kind !== undefined;
-        if (isNodeArray || hasAstChildren) {
-          var pid = getPropId(name);
+    if (schema.a) {
+      for (var i = 0; i < schema.a.length; i++) {
+        var name = schema.a[i];
+        var pid = PROP_NAME_TO_ID[name];
+        if (pid && node[name] !== undefined && node[name] !== null) {
           props.push({propId: pid, propName: name, isArray: true});
         }
-      } else if (val.kind !== undefined) {
-        props.push({propId: getPropId(name), propName: name, isArray: false});
+      }
+    }
+    if (schema.s) {
+      for (var i = 0; i < schema.s.length; i++) {
+        var name = schema.s[i];
+        var pid = PROP_NAME_TO_ID[name];
+        if (pid && node[name] !== undefined && node[name] !== null && node[name].kind !== undefined) {
+          props.push({propId: pid, propName: name, isArray: false});
+        }
       }
     }
     return props;
@@ -1115,12 +1144,8 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     for (var i = 0; i < checkFiles.length; i++) {
       filesChecked++;
       var file = checkFiles[i];
-      try {
-      var diags = program.getSemanticDiagnostics(file);
-      } catch(_diagErr) {
-        __edgebox_write_stderr('[check-crash] w' + workerId + ' file=' + file.fileName.split('/').pop() + ' err=' + _diagErr.message + '\n');
-        continue;
-      }
+      try { var diags = program.getSemanticDiagnostics(file); }
+      catch(_e) { continue; }
       for (var k = 0; k < diags.length; k++) {
         var d = diags[k];
         if (d.file) {
