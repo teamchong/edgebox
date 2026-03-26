@@ -226,6 +226,9 @@ static const intptr_t g_external_refs[] = {
   reinterpret_cast<intptr_t>(ZigParseCallback),
   reinterpret_cast<intptr_t>(SharedCacheGetCallback),
   reinterpret_cast<intptr_t>(SharedCacheSetCallback),
+  reinterpret_cast<intptr_t>(SfStorePutCallback),
+  reinterpret_cast<intptr_t>(SfStoreGetCallback),
+  reinterpret_cast<intptr_t>(SfStoreCountCallback),
   0  // sentinel
 };
 
@@ -255,7 +258,9 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
     global->Set(isolate, "__edgebox_claim_file", v8::FunctionTemplate::New(isolate, ClaimFileCallback));
     global->Set(isolate, "__edgebox_signal_program_ready", v8::FunctionTemplate::New(isolate, SignalProgramReadyCallback));
     global->Set(isolate, "__edgebox_wait_program_ready", v8::FunctionTemplate::New(isolate, WaitProgramReadyCallback));
-    // IOStats removed — migrated to WasmGC
+    global->Set(isolate, "__edgebox_sf_store_put", v8::FunctionTemplate::New(isolate, SfStorePutCallback));
+    global->Set(isolate, "__edgebox_sf_store_get", v8::FunctionTemplate::New(isolate, SfStoreGetCallback));
+    global->Set(isolate, "__edgebox_sf_store_count", v8::FunctionTemplate::New(isolate, SfStoreCountCallback));
     global->Set(isolate, "__edgebox_root", v8::FunctionTemplate::New(isolate, RootCallback));
     global->Set(isolate, "__edgebox_resolve_cache_get", v8::FunctionTemplate::New(isolate, ResolveCacheGetCallback));
     global->Set(isolate, "__edgebox_resolve_cache_set", v8::FunctionTemplate::New(isolate, ResolveCacheSetCallback));
@@ -683,6 +688,50 @@ static void WaitProgramReadyCallback(const v8::FunctionCallbackInfo<v8::Value>& 
   edgebox_wait_program_ready();
 }
 
+// ── Shared SourceFile Store (worker 0 → workers 1-N) ──
+extern "C" void edgebox_sf_store_put(const char* key, int key_len, const char* val, int val_len);
+extern "C" const char* edgebox_sf_store_get(const char* key, int key_len, int* out_len);
+extern "C" void edgebox_sf_store_clear();
+extern "C" unsigned int edgebox_sf_store_count();
+
+static void SfStorePutCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  // JS: __edgebox_sf_store_put(fileName, arrayBuffer)
+  if (args.Length() < 2) return;
+  auto* isolate = args.GetIsolate();
+  v8::String::Utf8Value key(isolate, args[0]);
+  if (!*key) return;
+  if (args[1]->IsArrayBuffer()) {
+    auto ab = args[1].As<v8::ArrayBuffer>();
+    auto store = ab->GetBackingStore();
+    edgebox_sf_store_put(*key, key.length(), (const char*)store->Data(), store->ByteLength());
+  } else if (args[1]->IsUint8Array()) {
+    auto u8arr = args[1].As<v8::Uint8Array>();
+    auto ab = u8arr->Buffer();
+    auto store = ab->GetBackingStore();
+    edgebox_sf_store_put(*key, key.length(),
+      (const char*)store->Data() + u8arr->ByteOffset(), u8arr->ByteLength());
+  }
+}
+
+static void SfStoreGetCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  // JS: __edgebox_sf_store_get(fileName) → ArrayBuffer | undefined
+  if (args.Length() < 1) return;
+  auto* isolate = args.GetIsolate();
+  v8::String::Utf8Value key(isolate, args[0]);
+  if (!*key) return;
+  int out_len = 0;
+  const char* data = edgebox_sf_store_get(*key, key.length(), &out_len);
+  if (data && out_len > 0) {
+    // Create ArrayBuffer with copy of data (each isolate needs its own copy)
+    auto ab = v8::ArrayBuffer::New(isolate, out_len);
+    memcpy(ab->GetBackingStore()->Data(), data, out_len);
+    args.GetReturnValue().Set(ab);
+  }
+}
+
+static void SfStoreCountCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  args.GetReturnValue().Set(v8::Number::New(args.GetIsolate(), edgebox_sf_store_count()));
+}
 
 extern void edgebox_submit_result(int worker_id, const char* data, int data_len);
 extern void edgebox_worker_done(int worker_id);
@@ -831,7 +880,18 @@ void* edgebox_v8_setup_context(void* iso_ptr) {
     set("__edgebox_wait_program_ready", WaitProgramReadyCallback);
     set("__edgebox_worker_done", WorkerDoneCallback);
   }
-  // Snapshot workers: IO callbacks already baked in via external_references
+  // SF store callbacks — register on ALL contexts (snapshot may not preserve template functions)
+  {
+    auto globalObj = context->Global();
+    auto set = [&](const char* name, v8::FunctionCallback cb) {
+      globalObj->Set(context,
+        v8::String::NewFromUtf8(isolate, name).ToLocalChecked(),
+        v8::Function::New(context, cb).ToLocalChecked()).Check();
+    };
+    set("__edgebox_sf_store_put", SfStorePutCallback);
+    set("__edgebox_sf_store_get", SfStoreGetCallback);
+    set("__edgebox_sf_store_count", SfStoreCountCallback);
+  }
 
   auto* persistent = new v8::Persistent<v8::Context>(isolate, context);
   return persistent;
