@@ -9,44 +9,44 @@ const Scanner = @import("zig_scanner.zig").Scanner;
 const SK = @import("zig_scanner.zig").SK;
 const TokenKind = @import("zig_scanner.zig").TokenKind;
 
-// Node kinds that are AST nodes (not tokens)
+// Node kinds — TypeScript 6.0.2 SyntaxKind values
 pub const NK = struct {
-    pub const SourceFile: u16 = 316;
-    pub const Block: u16 = 241;
-    pub const VariableStatement: u16 = 243;
-    pub const VariableDeclarationList: u16 = 261;
-    pub const VariableDeclaration: u16 = 260;
-    pub const ExpressionStatement: u16 = 244;
-    pub const IfStatement: u16 = 245;
-    pub const ReturnStatement: u16 = 253;
-    pub const FunctionDeclaration: u16 = 262;
-    pub const ClassDeclaration: u16 = 263;
-    pub const InterfaceDeclaration: u16 = 264;
-    pub const TypeAliasDeclaration: u16 = 265;
-    pub const EnumDeclaration: u16 = 266;
-    pub const ImportDeclaration: u16 = 272;
-    pub const ExportDeclaration: u16 = 278;
-    pub const ExportAssignment: u16 = 277;
+    pub const SourceFile: u16 = 308;
+    pub const Block: u16 = 242;
+    pub const VariableStatement: u16 = 244;
+    pub const VariableDeclarationList: u16 = 262;
+    pub const VariableDeclaration: u16 = 261;
+    pub const ExpressionStatement: u16 = 245;
+    pub const IfStatement: u16 = 246;
+    pub const ReturnStatement: u16 = 254;
+    pub const FunctionDeclaration: u16 = 263;
+    pub const ClassDeclaration: u16 = 264;
+    pub const InterfaceDeclaration: u16 = 265;
+    pub const TypeAliasDeclaration: u16 = 266;
+    pub const EnumDeclaration: u16 = 267;
+    pub const ImportDeclaration: u16 = 273;
+    pub const ExportDeclaration: u16 = 279;
+    pub const ExportAssignment: u16 = 278;
     // Expressions
     pub const Identifier: u16 = 80;
     pub const StringLiteral: u16 = 11;
     pub const NumericLiteral: u16 = 9;
-    pub const CallExpression: u16 = 213;
-    pub const PropertyAccessExpression: u16 = 211;
-    pub const ElementAccessExpression: u16 = 212;
-    pub const BinaryExpression: u16 = 226;
-    pub const ArrowFunction: u16 = 219;
-    pub const ObjectLiteralExpression: u16 = 210;
-    pub const ArrayLiteralExpression: u16 = 209;
-    pub const ParenthesizedExpression: u16 = 217;
+    pub const CallExpression: u16 = 214;
+    pub const PropertyAccessExpression: u16 = 212;
+    pub const ElementAccessExpression: u16 = 213;
+    pub const BinaryExpression: u16 = 227;
+    pub const ArrowFunction: u16 = 220;
+    pub const ObjectLiteralExpression: u16 = 211;
+    pub const ArrayLiteralExpression: u16 = 210;
+    pub const ParenthesizedExpression: u16 = 218;
     // Types
-    pub const TypeReference: u16 = 183;
+    pub const TypeReference: u16 = 184;
     pub const UnionType: u16 = 193;
-    pub const ArrayType: u16 = 188;
-    pub const LiteralType: u16 = 200;
-    pub const FunctionType: u16 = 184;
-    pub const Parameter: u16 = 169;
-    pub const PropertySignature: u16 = 171;
+    pub const ArrayType: u16 = 189;
+    pub const LiteralType: u16 = 202;
+    pub const FunctionType: u16 = 185;
+    pub const Parameter: u16 = 170;
+    pub const PropertySignature: u16 = 172;
 };
 
 // Flat AST node — 20 bytes, cache-friendly, zero GC
