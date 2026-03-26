@@ -166,6 +166,29 @@ static void SharedCacheSetCallback(const v8::FunctionCallbackInfo<v8::Value>& ar
   edgebox_shared_cache_set(key, value);
 }
 
+// ── Type Relation Cache — 3-param exact match, no hash collisions ──
+extern "C" int edgebox_type_cache_get(int src_id, int tgt_id, int rel);
+extern "C" void edgebox_type_cache_set(int src_id, int tgt_id, int rel, int result);
+
+static void TypeCacheGetCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 3) { args.GetReturnValue().Set(0); return; }
+  auto ctx = args.GetIsolate()->GetCurrentContext();
+  int src = args[0]->Int32Value(ctx).FromJust();
+  int tgt = args[1]->Int32Value(ctx).FromJust();
+  int rel = args[2]->Int32Value(ctx).FromJust();
+  args.GetReturnValue().Set(edgebox_type_cache_get(src, tgt, rel));
+}
+
+static void TypeCacheSetCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  if (args.Length() < 4) return;
+  auto ctx = args.GetIsolate()->GetCurrentContext();
+  int src = args[0]->Int32Value(ctx).FromJust();
+  int tgt = args[1]->Int32Value(ctx).FromJust();
+  int rel = args[2]->Int32Value(ctx).FromJust();
+  int result = args[3]->Int32Value(ctx).FromJust();
+  edgebox_type_cache_set(src, tgt, rel, result);
+}
+
 // ── Snapshot: pre-compile TypeScript for instant worker startup ──
 
 static v8::StartupData g_snapshot = {nullptr, 0};
@@ -226,6 +249,8 @@ static const intptr_t g_external_refs[] = {
   reinterpret_cast<intptr_t>(ZigParseCallback),
   reinterpret_cast<intptr_t>(SharedCacheGetCallback),
   reinterpret_cast<intptr_t>(SharedCacheSetCallback),
+  reinterpret_cast<intptr_t>(TypeCacheGetCallback),
+  reinterpret_cast<intptr_t>(TypeCacheSetCallback),
   0  // sentinel
 };
 
@@ -263,6 +288,8 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
     global->Set(isolate, "__edgebox_zig_parse", v8::FunctionTemplate::New(isolate, ZigParseCallback));
     global->Set(isolate, "__edgebox_shared_cache_get", v8::FunctionTemplate::New(isolate, SharedCacheGetCallback));
     global->Set(isolate, "__edgebox_shared_cache_set", v8::FunctionTemplate::New(isolate, SharedCacheSetCallback));
+    global->Set(isolate, "__edgebox_type_cache_get", v8::FunctionTemplate::New(isolate, TypeCacheGetCallback));
+    global->Set(isolate, "__edgebox_type_cache_set", v8::FunctionTemplate::New(isolate, TypeCacheSetCallback));
     global->Set(isolate, "__edgebox_write_file", v8::FunctionTemplate::New(isolate, WriteFileCallback));
     // IsSimpleTypeRelated removed — migrated to WasmGC
     global->Set(isolate, "__edgebox_submit_result", v8::FunctionTemplate::New(isolate, SubmitResultCallback));

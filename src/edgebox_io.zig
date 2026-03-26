@@ -769,37 +769,86 @@ export fn edgebox_wait_program_ready() void {
 // Example: TSC recipe caches type relation results so worker 1 can reuse
 // worker 0's computation of isTypeRelatedTo(TypeA, TypeB).
 
-const SHARED_CACHE_SIZE: u32 = 65536; // 64K entries, power of 2 for fast modulo
-const SHARED_CACHE_EMPTY: i32 = 0;
+const SHARED_CACHE_SIZE: u32 = 262144; // 256K entries, power of 2
 
-var shared_cache_keys: [SHARED_CACHE_SIZE]std.atomic.Value(i32) = [_]std.atomic.Value(i32){std.atomic.Value(i32).init(0)} ** SHARED_CACHE_SIZE;
-var shared_cache_vals: [SHARED_CACHE_SIZE]std.atomic.Value(i32) = [_]std.atomic.Value(i32){std.atomic.Value(i32).init(0)} ** SHARED_CACHE_SIZE;
+// Type relation cache: stores exact (source_id, target_id, relation) → result.
+// Layout per u64 entry: [source_id:20 | target_id:20 | relation:4 | result:4 | tag:16]
+// No hash collisions — exact ID comparison. Slot collisions = cache miss (safe).
+// tag = 0xEB to distinguish populated entries from empty (0).
+var shared_cache: [SHARED_CACHE_SIZE]std.atomic.Value(u64) = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** SHARED_CACHE_SIZE;
 
-/// Get value from shared cross-worker cache. Returns 0 if not found.
-/// Lock-free: uses atomic load. Safe to call from any worker thread.
+const TAG: u64 = 0xEB;
+
+fn packEntry(src_id: u32, tgt_id: u32, rel: u32, result: u32) u64 {
+    return (@as(u64, src_id & 0xFFFFF) << 44) |
+           (@as(u64, tgt_id & 0xFFFFF) << 24) |
+           (@as(u64, rel & 0xF) << 20) |
+           (@as(u64, result & 0xF) << 16) |
+           TAG;
+}
+
+fn slotIndex(src_id: u32, tgt_id: u32, rel: u32) u32 {
+    return ((src_id *% 2654435761 +% tgt_id *% 2246822519 +% rel) & (SHARED_CACHE_SIZE - 1));
+}
+
+/// Get type relation from cache. Exact match on (src_id, tgt_id, rel).
+/// Returns: 0 = miss, 1 = related, 2 = not related.
 export fn edgebox_shared_cache_get(key: i32) callconv(.c) i32 {
-    if (key == SHARED_CACHE_EMPTY) return 0;
-    const idx = @as(u32, @bitCast(key)) & (SHARED_CACHE_SIZE - 1);
-    const stored_key = shared_cache_keys[idx].load(.acquire);
-    if (stored_key == key) {
-        return shared_cache_vals[idx].load(.acquire);
+    if (key == 0) return 0;
+    const ukey = @as(u32, @bitCast(key));
+    const idx = ukey & (SHARED_CACHE_SIZE - 1);
+    const entry = shared_cache[idx].load(.acquire);
+    if (entry == 0) return 0;
+    const stored_key = @as(u32, @truncate(entry >> 32));
+    if (stored_key == ukey) {
+        return @as(i32, @bitCast(@as(u32, @truncate(entry & 0xFFFFFFFF))));
     }
     return 0;
 }
 
-/// Set value in shared cross-worker cache. Lock-free: uses atomic store.
-/// Collisions silently overwrite (cache, not map — losing an entry is OK).
+/// Set type relation in cache.
 export fn edgebox_shared_cache_set(key: i32, value: i32) callconv(.c) void {
-    if (key == SHARED_CACHE_EMPTY) return;
-    const idx = @as(u32, @bitCast(key)) & (SHARED_CACHE_SIZE - 1);
-    shared_cache_keys[idx].store(key, .release);
-    shared_cache_vals[idx].store(value, .release);
+    if (key == 0) return;
+    const ukey = @as(u32, @bitCast(key));
+    const uval = @as(u32, @bitCast(value));
+    const idx = ukey & (SHARED_CACHE_SIZE - 1);
+    const combined = (@as(u64, ukey) << 32) | @as(u64, uval);
+    shared_cache[idx].store(combined, .release);
 }
 
-/// Clear shared cache. Called between requests to prevent stale data.
+/// 3-param get: exact match on (src_id, tgt_id, rel). No hash collisions.
+export fn edgebox_type_cache_get(src_id: i32, tgt_id: i32, rel: i32) callconv(.c) i32 {
+    const s = @as(u32, @bitCast(src_id));
+    const t = @as(u32, @bitCast(tgt_id));
+    const r = @as(u32, @bitCast(rel));
+    const idx = slotIndex(s, t, r);
+    const entry = shared_cache[idx].load(.acquire);
+    if (entry == 0) return 0;
+    // Verify exact match: entry stores [src:20 | tgt:20 | rel:4 | result:4 | tag:16]
+    if ((entry & 0xFF) != TAG) return 0;
+    const e_src = @as(u32, @truncate(entry >> 44)) & 0xFFFFF;
+    const e_tgt = @as(u32, @truncate(entry >> 24)) & 0xFFFFF;
+    const e_rel = @as(u32, @truncate(entry >> 20)) & 0xF;
+    if (e_src == (s & 0xFFFFF) and e_tgt == (t & 0xFFFFF) and e_rel == (r & 0xF)) {
+        return @as(i32, @intCast((entry >> 16) & 0xF));
+    }
+    return 0;
+}
+
+/// 4-param set: stores exact (src_id, tgt_id, rel, result).
+export fn edgebox_type_cache_set(src_id: i32, tgt_id: i32, rel: i32, result: i32) callconv(.c) void {
+    const s = @as(u32, @bitCast(src_id));
+    const t = @as(u32, @bitCast(tgt_id));
+    const r = @as(u32, @bitCast(rel));
+    const v = @as(u32, @bitCast(result));
+    const idx = slotIndex(s, t, r);
+    const entry = packEntry(s, t, r, v);
+    shared_cache[idx].store(entry, .release);
+}
+
+/// Clear shared cache.
 export fn edgebox_shared_cache_clear() callconv(.c) void {
-    for (&shared_cache_keys) |*k| k.store(0, .release);
-    for (&shared_cache_vals) |*v| v.store(0, .release);
+    for (&shared_cache) |*e| e.store(0, .release);
 }
 
 // All type data lives in WasmGC modules:

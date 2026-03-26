@@ -22,10 +22,9 @@ fn log(msg: []const u8) void {
 
 pub fn start() !void {
     const cpu_count = std.Thread.getCpuCount() catch 4;
-    // Auto-scale workers based on CPU cores.
-    // Each worker uses ~100MB (snapshot + V8 heap). Reserve cores for TurboFan background threads.
-    // Formula: cores/4 (leave room for concurrent TurboFan + GC), clamped to [2, 8].
-    // Override with EDGEBOX_WORKERS env var.
+    // Parallel V8 workers split the checking load.
+    // Zig handles: file cache (zero-copy), resolve cache (shared), channel (phase barrier).
+    // Each worker parses independently (V8 isolate per worker), checks a subset of files.
     const auto_workers: u32 = @intCast(@min(8, @max(2, cpu_count / 4)));
     const env_workers = std.posix.getenv("EDGEBOX_WORKERS");
     const worker_count: u32 = if (env_workers) |ew|

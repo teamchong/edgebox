@@ -137,9 +137,10 @@ for (const t of transforms) {
   globalFuncs += `function ${ebName}_impl(${t.params}, ${extraParams}) `;
   globalFuncs += originalBody.substring(sig.length - 1) + '\n'; // starts from {
 
-  // Create wrapper with WasmGC fast-path + inline fallback
+  // Create wrapper with shared cache + inline fallback
   const paramNames = t.params.split(',').map(s => s.trim());
   let wasmFastPath = '';
+
   if (false && t.name === "isSimpleTypeRelatedTo") {
     // WasmGC isRelatedToFast: built at build time, runs in snapshot.
     // Handles flag checks as pure integer ops — no closure refs needed.
