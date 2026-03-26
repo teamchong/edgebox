@@ -533,7 +533,15 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     // (createCompilerHost vs recipe host) → wrong module resolution → wrong diags.
     program = globalThis.__preProgram;
   } else {
-    // Cold: plain createProgram — time the phases
+    // Cold: phase-coordinated parallel.
+    // Workers 1-N wait on channel for worker 0 to finish createProgram.
+    // Worker 0 populates Zig file cache + resolve cache, then signals.
+    // Workers 1-N get file content from Zig cache (zero-copy, in-memory pointer).
+    if (workerCount > 1 && workerId > 0 && typeof __edgebox_wait_program_ready === 'function') {
+      __edgebox_write_stderr('[recipe] w' + workerId + ' waiting for w0...\n');
+      __edgebox_wait_program_ready(); // blocks on channel condvar
+      __edgebox_write_stderr('[recipe] w' + workerId + ' w0 done, parsing from cache\n');
+    }
     var _cpT0 = Date.now();
     var _gsfCount = 0, _gsfTime = 0, _rmnCount = 0, _rmnTime = 0;
     var _origGSF = host.getSourceFile;
@@ -544,6 +552,11 @@ globalThis.__edgebox_check = function(cwd, workerId, workerCount) {
     }
     program = ts.createProgram(parsed.fileNames, parsed.options, host, oldProgram);
     __edgebox_write_stderr('[recipe] w' + workerId + ' createProgram=' + (Date.now()-_cpT0) + 'ms gsf=' + _gsfTime + 'ms(' + _gsfCount + ') rmn=' + _rmnTime + 'ms(' + _rmnCount + ')\n');
+    // Worker 0: signal workers 1-N that file cache + resolve cache are populated
+    if (workerCount > 1 && workerId === 0 && typeof __edgebox_signal_program_ready === 'function') {
+      __edgebox_signal_program_ready();
+      __edgebox_write_stderr('[recipe] w0 signaled program_ready\n');
+    }
   }
   __edgebox_write_stderr('[recipe] POST-createProgram\n');
   // Pre-initialize the TypeChecker — this creates intrinsic types, global symbols.
