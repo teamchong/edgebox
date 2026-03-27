@@ -320,6 +320,30 @@ export fn shared_ast_get_triple_pos() u32 {
     return next_triple.load(.monotonic);
 }
 
+// ── SharedArrayBuffer pool pointers — direct JS access to Zig memory ──
+
+export fn shared_ast_node_pool_ptr() ?[*]u8 {
+    if (node_pool.len == 0) return null;
+    return @ptrCast(node_pool.ptr);
+}
+export fn shared_ast_node_pool_size() u32 {
+    return MAX_NODES * @sizeOf(FlatNode);
+}
+export fn shared_ast_triple_pool_ptr() ?[*]u8 {
+    if (triple_pool.len == 0) return null;
+    return @ptrCast(triple_pool.ptr);
+}
+export fn shared_ast_triple_pool_size() u32 {
+    return MAX_TRIPLES * 4 * @sizeOf(u32);
+}
+export fn shared_ast_string_pool_ptr() ?[*]u8 {
+    if (string_pool.len == 0) return null;
+    return string_pool.ptr;
+}
+export fn shared_ast_string_pool_size() u32 {
+    return MAX_STRINGS;
+}
+
 // ── V8 Serialized Blob Storage ──
 
 /// Store a V8-serialized blob. Returns offset in blob_pool, or NONE on overflow.

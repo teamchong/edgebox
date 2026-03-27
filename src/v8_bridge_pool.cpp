@@ -392,6 +392,25 @@ static void SharedCacheSetCallback(const v8::FunctionCallbackInfo<v8::Value>& ar
   edgebox_shared_cache_set(key, value);
 }
 
+// ── SharedArrayBuffer — expose Zig pools directly to JS ──
+// JS reads FlatNode fields via DataView — zero bridge calls.
+
+extern "C" void* shared_ast_node_pool_ptr();
+extern "C" uint32_t shared_ast_node_pool_size();
+extern "C" void* shared_ast_triple_pool_ptr();
+extern "C" uint32_t shared_ast_triple_pool_size();
+extern "C" void* shared_ast_string_pool_ptr();
+extern "C" uint32_t shared_ast_string_pool_size();
+
+// JS: __edgebox_ast_pools() — placeholder for SharedArrayBuffer optimization.
+// TODO: Use rusty_v8's v8__ArrayBuffer__New__with_backing_store to expose
+// Zig pools directly as ArrayBuffers (zero-copy DataView reads).
+// Requires proper shared_ptr conversion via
+// std__shared_ptr__v8__BackingStore__CONVERT__std__unique_ptr.
+static void AstGetPoolsCallback(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  args.GetReturnValue().SetNull();
+}
+
 // ── V8 ValueSerializer — serialize/deserialize entire SourceFile tree ──
 // Uses V8's structured clone algorithm (same as postMessage/structuredClone).
 // Handles cycles (parent refs), Maps, all JS types. Binary format, ~75 bytes/node.
@@ -567,6 +586,7 @@ static const intptr_t g_external_refs[] = {
   reinterpret_cast<intptr_t>(AstTriplePosCallback),
   reinterpret_cast<intptr_t>(AstV8SerializeCallback),
   reinterpret_cast<intptr_t>(AstV8DeserializeCallback),
+  reinterpret_cast<intptr_t>(AstGetPoolsCallback),
   0  // sentinel
 };
 
@@ -625,6 +645,7 @@ int edgebox_v8_create_snapshot(const char* ts_code, int ts_len, const char* shim
     global->Set(isolate, "__edgebox_ast_triple_pos", v8::FunctionTemplate::New(isolate, AstTriplePosCallback));
     global->Set(isolate, "__edgebox_ast_v8_serialize", v8::FunctionTemplate::New(isolate, AstV8SerializeCallback));
     global->Set(isolate, "__edgebox_ast_v8_deserialize", v8::FunctionTemplate::New(isolate, AstV8DeserializeCallback));
+    global->Set(isolate, "__edgebox_ast_pools", v8::FunctionTemplate::New(isolate, AstGetPoolsCallback));
     // IsSimpleTypeRelated removed — migrated to WasmGC
     global->Set(isolate, "__edgebox_submit_result", v8::FunctionTemplate::New(isolate, SubmitResultCallback));
     global->Set(isolate, "__edgebox_worker_done", v8::FunctionTemplate::New(isolate, WorkerDoneCallback));
@@ -1209,6 +1230,7 @@ void* edgebox_v8_setup_context(void* iso_ptr) {
     set("__edgebox_ast_triple_pos", AstTriplePosCallback);
     set("__edgebox_ast_v8_serialize", AstV8SerializeCallback);
     set("__edgebox_ast_v8_deserialize", AstV8DeserializeCallback);
+    set("__edgebox_ast_pools", AstGetPoolsCallback);
   }
   // Snapshot workers: IO callbacks already baked in via external_references
 

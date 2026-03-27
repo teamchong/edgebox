@@ -261,15 +261,45 @@ globalThis.__gcFlagsDone = false;
     if (PROP_NAMES[_pi]) PROP_NAME_TO_ID[PROP_NAMES[_pi]] = _pi;
   }
 
-  // Reconstruction: read nodes + triples from Zig, create MonoNode tree.
-  // Called when claim=2 (file already parsed by another worker).
-  // One bulk read of ALL triples, then group by parent, build tree.
+  // SharedArrayBuffer pools — set once, used for all reconstructions
+  var _pools = null;
+  var _nodeView = null; // DataView over node_pool
+  var _tripleArr = null; // Uint32Array over triple_pool
+  var _stringBytes = null; // Uint8Array over string_pool
+  var _textDecoder = typeof TextDecoder !== 'undefined' ? new TextDecoder() : null;
+  var _NODE_SIZE = 40;
+
+  function ensurePools() {
+    if (_pools) return true;
+    if (typeof __edgebox_ast_pools !== 'function') return false;
+    _pools = __edgebox_ast_pools();
+    if (!_pools) return false;
+    _nodeView = new DataView(_pools.nodes);
+    _tripleArr = new Uint32Array(_pools.triples);
+    _stringBytes = new Uint8Array(_pools.strings);
+    _NODE_SIZE = _pools.nodeSize || 40;
+    return true;
+  }
+
+  // Read text from string pool via SharedArrayBuffer — zero bridge calls
+  function readTextDirect(textOffset, textLen) {
+    if (textOffset === 0xFFFFFFFF || textLen === 0) return null;
+    if (_textDecoder) return _textDecoder.decode(_stringBytes.subarray(textOffset, textOffset + textLen));
+    // Fallback for snapshot context (no TextDecoder)
+    var s = '';
+    for (var i = 0; i < textLen; i++) s += String.fromCharCode(_stringBytes[textOffset + i]);
+    return s;
+  }
+
+  // Reconstruction: read nodes + triples from SharedArrayBuffer, create MonoNode tree.
+  // ZERO C++ bridge calls for node/text reads — direct DataView access to Zig memory.
   globalThis.__sharedAstReconstruct = function(fileName, sourceText) {
+    if (!ensurePools()) return null;
     var rootId = __edgebox_ast_get_root(fileName);
     if (rootId < 0 || rootId === 0xFFFFFFFF) return null;
 
-    // Read triples for this file — now stored as quads (fileHash, parent, prop, child)
-    var quads = __edgebox_ast_read_children(fileName); // returns flat array for file's range
+    // Read triple range for this file (still one bridge call — could optimize later)
+    var quads = __edgebox_ast_read_children(fileName);
     if (!quads) return null;
 
     // Compute file hash (same as link step)
@@ -291,24 +321,39 @@ globalThis.__gcFlagsDone = false;
 
     function buildNode(id) {
       if (builtNodes[id]) return builtNodes[id];
-      var data = __edgebox_ast_read_node(id);
-      if (!data) return null;
-      // Disable Zig writes during reconstruction
-      // Use SourceFile constructor for kind=308 (has methods like getLineAndCharacterOfPosition)
-      var NodeCtor = data[0] === 308 ? ts.objectAllocator.getSourceFileConstructor() : ts.objectAllocator.getNodeConstructor();
-      var node = new NodeCtor(data[0], data[2], data[3]);
-      node.flags = data[1];
-      node.modifierFlagsCache = data[5] || 0;
-      node.transformFlags = data[6] || 0;
-      // Unpack tagged scalars from operator/token fields
-      var _rawOp = data[7] || 0;
+      var _usePool = _pools && _nodeView;
+      // Read FlatNode — DataView (zero bridge calls) or C++ bridge (fallback)
+      var _kind, _flags, _pos, _end, _modFlags, _tfFlags, _rawOp, _rawTok;
+      if (_usePool) {
+        var _off = id * _NODE_SIZE;
+        _kind = _nodeView.getUint16(_off, true);
+        if (_kind === 0) return null;
+        _flags = _nodeView.getUint32(_off + 4, true);
+        _pos = _nodeView.getUint32(_off + 8, true);
+        _end = _nodeView.getUint32(_off + 12, true);
+        _modFlags = _nodeView.getUint32(_off + 28, true);
+        _tfFlags = _nodeView.getUint32(_off + 32, true);
+        _rawOp = _nodeView.getUint16(_off + 36, true);
+        _rawTok = _nodeView.getUint16(_off + 38, true);
+      } else {
+        var data = __edgebox_ast_read_node(id);
+        if (!data) return null;
+        _kind = data[0]; _flags = data[1]; _pos = data[2]; _end = data[3];
+        _modFlags = data[5] || 0; _tfFlags = data[6] || 0;
+        _rawOp = data[7] || 0; _rawTok = data[8] || 0;
+      }
+      var NodeCtor = _kind === 308 ? ts.objectAllocator.getSourceFileConstructor() : ts.objectAllocator.getNodeConstructor();
+      var node = new NodeCtor(_kind, _pos, _end);
+      node.flags = _flags;
+      node.modifierFlagsCache = _modFlags;
+      node.transformFlags = _tfFlags;
+      // Unpack tagged scalars
       if (_rawOp & 0x8000) node.isTypeOnly = true;
       var _opTag = (_rawOp >> 13) & 0x3;
       var _opVal = _rawOp & 0x1FFF;
       if (_opTag === 0 && _opVal) node.operator = _opVal;
       else if (_opTag === 1) node.numericLiteralFlags = _opVal;
       else if (_opTag === 2) node.templateFlags = _opVal;
-      var _rawTok = data[8] || 0;
       if (_rawTok & 0x200) node.isTypeOf = true;
       if (_rawTok & 0x400) node.possiblyExhaustive = true;
       if (_rawTok & 0x800) node.multiLine = true;
@@ -318,8 +363,16 @@ globalThis.__gcFlagsDone = false;
       else if (_tokTag === 1 && _tokVal) node.phaseModifier = _tokVal;
       builtNodes[id] = node;
 
-      // Read text/metadata — no JSON, direct binary
-      var _stored = __edgebox_ast_read_text(id);
+      // Read text — DataView (zero bridge calls) or C++ bridge (fallback)
+      var _stored;
+      if (_usePool) {
+        var _off2 = id * _NODE_SIZE;
+        var _txtOff = _nodeView.getUint32(_off2 + 20, true);
+        var _txtLen = _nodeView.getUint32(_off2 + 24, true);
+        _stored = (_txtOff !== 0xFFFFFFFF && _txtLen > 0) ? readTextDirect(_txtOff, _txtLen) : null;
+      } else {
+        _stored = __edgebox_ast_read_text(id);
+      }
       if (_stored) {
         var _tag = _stored.charAt(0);
         if (_tag === 'E') node.escapedText = _stored.substring(1);
